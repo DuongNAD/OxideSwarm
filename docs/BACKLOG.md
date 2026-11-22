@@ -173,6 +173,9 @@ and SEC-17 added, the table holds 215 items: 143 Implemented, 18 Partial and 54 
 Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged): 216 distinct items, 144 Implemented, 18 Partial and 54 Planned; 26 remaining open items are In and 46 are Out.
 Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
 27 open items are In and 46 are Out.
+Recounted on 2026-11-21 from the rows after items through TEST-84, APP-6, and FEAT-9 Implemented: 247 items, 172 Implemented, 21 Partial and 54 Planned; 25 open items are In and 50 are Out (TEST-56 keeps `Line` `In` while pull request 361 is marked open).
+Recounted on 2026-11-21 after LV-10 (steps 1–3) and PROTO-5 Partial: 247 items, 172 Implemented, 23 Partial and 52 Planned; 25 open items are In and 50 are Out.
+Recounted on 2026-11-21 after SCHED-5 Implemented (plus SCHED-4c and SCHED-4d implemented while SCHED-4 stays Partial pending live 2-machine hardware batch): 247 items, 173 Implemented, 23 Partial and 51 Planned; 25 open items are In and 49 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -326,7 +329,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | FEAT-6 | Refuse the master-role claim (failover itself is SCALE-4) | P3 | L | FEAT-1 | D1 | Implemented |  | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Implemented |  | (design 0066), 224 |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented |  | 40, 110, 120 |
-| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | Out | 232 (`FEAT-9a`, design 0068) |
+| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Implemented |  | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented |  | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented |  | 118 (design), 125, 126, 127, 131 |
 | MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Implemented |  | 211, 212, 230, 231, 242, 249, 250, 253, 259 |
@@ -346,7 +349,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Implemented |  | 222, (design 0050) |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Implemented |  | 227, (design 0050) |
 | SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | Out | 214, (design 0060) |
-| SCHED-5 | Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct | P2 | M |  |  | Planned | Out |  |
+| SCHED-5 | Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct | P2 | M |  |  | Implemented |  | (design 0099) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned | Out |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned | Out |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned | Out |  |
@@ -369,13 +372,13 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
 | LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Implemented |  | 270, (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Partial | In | 342, (design 0058) |
-| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
+| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Partial | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | 262, (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented |  | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented |  | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
-| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
+| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Partial | Out | (design 0083) |
 | SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
@@ -756,16 +759,6 @@ Each item below needs a design record before code.
 - **Done when:** A `Command` test kills the worker, and a second worker finds the state file and skips
   finished steps.
 
-### FEAT-9: GPU workloads beyond the benchmark
-
-- **Evidence:** Read.
-- **Status:** Partial (`FEAT-9a` / decision `Q56` implemented in [design 0068](design/0068-task-vram-accounting.md)). Tasks now accept `--vram-mb` / `vram_mb` (protocol v9, store v3) with master scheduler VRAM budget tracking and anti-starvation hold-back.
-- **Problem (remaining `D6`):** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity` is never read, and custom WGSL user kernels remain unimplemented. Real-GPU preference still prefers an idle `wgpu` worker over a simulated GPU worker when an idle real GPU is available.
-- **Do (default of D6):** State "benchmark only" in `README.md:26` and `PROJECT.md:3`. If the owner
-  puts kernels in scope, add a `TaskSpec` with user WGSL and buffers through blobs.
-- **Done when:** The documents say benchmark only, or a user kernel matches a CPU reference on Metal,
-  Vulkan and DirectX 12.
-
 ### CACHE-1: Reuse the result of an identical task
 
 - **Evidence:** Read, on 2026-11-08 at `master` `fec164e`. No code in `crates/` maps a task to an
@@ -897,12 +890,15 @@ then JOIN-2 and USB-1 in parallel.
   its worker is requeued at once. A v2 secret worker keeps working next to a member worker. A
   machine on another network joins through `--p2p` with an invite sent by chat, and the run is
   recorded with its date.
-- **Status (2026-11-18, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
+- **Status (2026-11-21, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
   loses every connection at once (worker sessions over TCP and QUIC, client connections over TCP
   and P2P, blob and MCP connections), and the tasks on its workers are requeued at once without the
-  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. Open:
+  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. ENROLL-1d
+  dashboard API/UI, tests, and docs are built (`crates/master/src/web_ui/members.rs`,
+  `crates/master/src/dashboard.html`, `tests/dashboard_api_test.rs`, `tests/dashboard_security_test.rs`,
+  `docs/reference.md`, `docs/guides/add-a-machine.md`, `docs/SECURITY.md`, `README.md`). Open:
   cancelling the member's submitted tasks (design 0051 D5 step 2, a store format change for the
-  owner) and ENROLL-1d.
+  owner) and the recorded live `--p2p` invite run from another network.
 
 ### USB-1: Set up machines from a USB stick
 
@@ -1021,24 +1017,6 @@ owner's decisions Q8, Q9 and Q12 are open.
   identical tasks finishing at least 30 % sooner than with today's placement, unknown keys keep
   today's placement exactly (the existing scheduler tests pass unchanged), and a live two-machine
   batch like the one above finishes within 1.5 times the fast machine's own time.
-
-### SCHED-5: Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct
-
-- **Evidence:** Reproduced under `TEST-81` (pull request 404): when host CPU sits above
-  `max_host_cpu_pct` (`85.0`) on every eligible worker, queued tasks wait silently without any hint to
-  the user; a temporary per-pass `DEBUG` log emitted 51 copies in 5 s (~10/s) while `submit 3` stalled.
-- **Problem:** When every worker sits above `85 %` host CPU, queued tasks stay `Queued` silently
-  without any hint to the user. A naive per-pass scheduler log floods (~36,000 lines/hour at
-  `DEBUG`), fires for unrelated skips whenever any other worker reads busy (for example a GPU task
-  with no GPU worker), and includes `Disconnected` workers with stale CPU readings.
-- **Do:** Write a design record choosing the visible form (for example `status`, `ListWorkers`,
-  dashboard, and/or rate-limited master logs), taking the PR 404 review constraints as input:
-  1. Count only skips whose reason is `ScheduleSkipReason::AllEligibleWorkersSaturated`.
-  2. Filter candidate seats to connected (non-`Disconnected`) workers only.
-  3. Report once per change of the busy-worker set (or equivalent non-flooding transition) rather
-     than on every scheduling pass.
-- **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
-  those constraints without flooding or stale disconnected entries, and tests cover the behavior.
 
 ## Phase 8: product and ecosystem
 
@@ -1254,6 +1232,10 @@ none needs a design record of its own.
 - **Done when:** The new test passes on Linux, macOS and Windows, and the repository page shows
   "Cite this repository". Step 4 is finished when the DOI of a release is in `README.md`. Until
   then the item is Partial.
+- **Status (2026-11-21, Partial):** Steps 1 to 3 are complete (`CITATION.cff` at format version `1.2.0`
+  matching `Cargo.toml` `0.4.4` and `MIT` / `Apache-2.0`, stdlib check in
+  `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`). Step 4 (enabling
+  Zenodo archiving and adding the release DOI) stays with the owner.
 
 ### LV-14: Governance files and a licence that GitHub detects
 
@@ -1325,6 +1307,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Pin a second release (v0.3.0 while the window reaches back to 9) in the skew job, with its
   `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
 - **Done when:** Each pull request shows a table row of a real release one protocol back.
+- **Status (2026-11-21, Partial):** Local implementation and tests pass (`.github/workflows/ci.yml`
+  `release-skew` pins `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release with
+  per-tag directory isolation, `scripts/release_skew.py` adds `--release-tag` for distinct summary
+  tables, `tests/test_release_skew.py` tests both CLI behavior and static CI workflow invariants,
+  and `CLAUDE.md` / `docs/reference.md` are updated); awaiting a live GitHub pull request CI run of
+  `release skew (ubuntu-latest)` showing the `v0.3.0` table row per "Done when".
 
 ### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
 
@@ -2558,3 +2546,11 @@ Add one dated line per finished item, newest last.
 - 2026-11-20: TEST-83 Implemented (pull request 406, open; text in the archive): replaced all `36` audited Category 1 wall-clock upper bounds plus `4` adjacent upper bounds across `18` files / `15` binaries in `rusty_grid_core` (`lib`, `m1_3d_adversarial_stress`, `m1_stress_challenge`) and `rusty_grid_master` (`lib`, `cluster_auth_e2e`, `m10_streaming_stress`, `m2_challenger_2_stress`, `m2_stress_challenge`, `m4_challenger_2_stress`, `m9_stress_challenge_2`, `master_limits_and_scheduling`, `master_quic_limits`, `test_challenger_m4_scheduler_runner`, `worker_crash_rescheduling_test`, `zero_copy_quic_test`), skipping `m2_challenger_1_stress` (`TEST-70`), `m4_challenger_1_stress` (`TEST-71`), and `master_restart_recovery` (`TEST-75`) as instructed, with `0` `!cfg!(debug_assertions)` release-only SLAs in `core`/`master`/`tests`; replaced proof proxies with structural checks (`mapreduce`, `recovery_tests`, `scheduler`, QUIC flow-control pause in `m2_challenger_2_stress` and `zero_copy_quic_test`, Slowloris `try_read` `WouldBlock` + `120 s` malformed handshake in `m2_stress_challenge`, `first.close_reason().is_none()` in `master_quic_limits`), removed `1000`/`5000 msg/s` throughput floors in `m1_stress_challenge`, fixed the raw-worker `AssignTask`/reaper race in `worker_crash_rescheduling_test` and `m9_stress_challenge_2` (`ReaperConfig(50 ms, 1 s)`, heartbeating until `AssignTask` under a `60 s` `select!` guard, keeping `(writer, reader)` open until `wait_task` resolves), and widened hang guards to `60 s` (and inner sleep targets to `120 s`); `5` cheap targeted before-loops passed `20/20` on `f485533e` (expensive full-binary before-loops skipped), and all `15` touched binaries passed `20/20` after under 6 Python CPU busy loops on Apple M5 with private `HOME` (`core --lib` `165.40 s`, `m1_3d_adversarial_stress` `3640.83 s`, `m1_stress_challenge` `48.74 s`, `master --lib` `485.30 s`, `cluster_auth_e2e` `62.43 s`, `m10_streaming_stress` `18.92 s`, `m2_challenger_2_stress` `22.97 s`, `m2_stress_challenge` `211.20 s`, `m4_challenger_2_stress` `103.60 s`, `m9_stress_challenge_2` `48.16 s`, `master_limits_and_scheduling` `87.71 s`, `master_quic_limits` `73.76 s`, `test_challenger_m4_scheduler_runner` `10.05 s`, `worker_crash_rescheduling_test` `50.04 s`, `zero_copy_quic_test` `20.48 s`).
 - 2026-11-20: TEST-25 Partial (branch `win/test-25-24h-soak-record`, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): committed `22.73 h` (`81,826.46 s`, stopped early at owner decision with ~`1.27 h` left) Windows `x86_64` loopback soak record `benchmarks/endurance/results/2026-11-19-soak-24h-loopback-windows-amd64-intel-core-i5-14600kf.json` on `rusty-grid 0.4.4` (`cfb0679`), assembled from preserved logs, pre-stop status (`pending=0`, `running=0`), `/api/tasks`, periodic snapshots, and idle disk/state captures: `63,059` unique master-logged task results across `12` master generations and `71` worker logs (`61,642` `exit_code=0`, `1,360` `exit_code=130`, `57` `exit_code=124` 60 s watchdog timeouts clustered in `06:30–06:31Z` [`9`] and `10:33–11:55Z` [`48`] during `25–52 s` log gaps), `0` duplicates, `0` log-level `ERROR`/panics, `112` failover sweeps, `27` orphan requeues; idle `master-blobs` (`4,244,637,442 B`), worker caches (`<= 2,105,542,715 B`), `0` `.part`/`.tmp`/`.locks` leftovers, runtime `journal.bin` compaction (`2,104,993 -> 54,043 B`), and `0` leftover processes; in-memory `TaskLedger` SHA-256 verification, 60 s `BackgroundSampler` means, continuous `probe_samples` p99, and `fault_events_log` marked `not_evaluated_due_to_early_stop`. Stays Partial pending the 3-machine run.
 - 2026-11-20: TEST-84 Implemented (pull request 407, open; text in the archive): replaced all `19` audited Category 1 wall-clock upper bounds across `12` files / `12` binaries in `agent_mesh` (`lib`, `adversarial_challenge`), `rusty_grid_android_bridge` (`lib`, `m5a_challenger_2_stress`, `mobile_coordination_test`), `rusty_grid_cli` (`mcp_server_e2e`, `test_cli_cancel_and_result`, `test_m2_identity_scripts`, `test_mcp_concurrent_and_deadlines`, `test_p2p_key_persistence`), and Python tests (`tests/test_agent_bridge.py`, `tests/test_sec6_mesh_sandbox.py`), with `0` `!cfg!(debug_assertions)` release-only SLAs in those crates or scripts; replaced proof proxies with structural checks (`drain_finished` in `android_bridge`, `Cancelled` queue state in `test_cli_cancel_and_result`, `release.gate` + `ReleaseOnDrop` release-gated evacuation tasks with `evacuation_count == 1`/`2` + `ReaperConfig(1 s, 120 s)` in `m5a_challenger_2_stress` and `mobile_coordination_test`, `watch_*.lock` + `first.poll() is None` in `test_agent_bridge.py`), replaced the dead `"RustyGrid Worker started"` wait in `test_p2p_key_persistence` with `saw_warn` + `saw_dialing` (keeping a `2 s` post-dial window), preserved `>= 900 ms` / `>= 950 ms` `1 s` lower bounds (`30 s` `task_result` guard), renamed `test_worker_auto_reconnect_preserves_identity` and `test_fast_evacuation_without_task_loss`, and widened hang guards to `60 s` (`120 s` inner sleeps); `5` cheap targeted before-loops passed `20/20` on `origin/master` (`e31b69e3`), and all `12` touched binaries passed `20/20` after (including post-review re-runs of the 5 review-updated binaries) under 6 Python CPU busy loops on Apple M5 with private `HOME` (`agent_mesh --lib` `53.26 s`, `adversarial_challenge` `38.18 s`, `android_bridge --lib` `91.60 s`, `m5a_challenger_2_stress` `62.05 s`, `mobile_coordination_test` `1045.91 s`, `mcp_server_e2e` `75.44 s`, `test_cli_cancel_and_result` `59.86 s`, `test_m2_identity_scripts` `32.13 s`, `test_mcp_concurrent_and_deadlines` `160.00 s`, `test_p2p_key_persistence` `84.91 s`, `test_agent_bridge.py` `1121.88 s`, `test_sec6_mesh_sandbox.py` `192.31 s`).
+- 2026-11-21: FEAT-9 Implemented (default of D6; text in the archive): updated `PROJECT.md` and `README.md` (alongside `docs/reference.md`) to state explicitly that built-in `GpuCompute` is benchmark only (seeded matrix multiplication; no user WGSL kernels) while user GPU workloads run as `Command` tasks (`docs/guides/gpu-workloads.md`), alongside `FEAT-9a` VRAM accounting (pull request 232, [design 0068](design/0068-task-vram-accounting.md)).
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header from the rows after `TEST-84`, `APP-6`, and `FEAT-9` Implemented: 247 items, 172 Implemented, 21 Partial, 54 Planned, 0 Design only; 25 open items are In and 50 are Out (`TEST-56` keeps `Line` `In` while pull request 361 is marked open).
+- 2026-11-21: LV-10 Partial (steps 1–3, [design 0058](design/0058-lasting-value.md)): added `CITATION.cff` (CFF 1.2.0, `version: "0.4.4"`, `MIT` / `Apache-2.0`, `"The OxideSwarm Authors"`), stdlib metadata/version-sync test in `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`; step 4 (Zenodo DOI) stays with the owner.
+- 2026-11-21: PROTO-5 Partial ([design 0083](design/0083-one-version-window.md)): pinned `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release in `.github/workflows/ci.yml` `release-skew` with per-tag directory isolation, added `--release-tag` to `scripts/release_skew.py`, added CLI and static CI workflow tests in `tests/test_release_skew.py`, and updated `CLAUDE.md` and `docs/reference.md`; stays Partial awaiting live GitHub pull request CI run of `release skew (ubuntu-latest)` showing the `v0.3.0` table row.
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header after `LV-10` and `PROTO-5` Partial: 247 items, 172 Implemented, 23 Partial, 52 Planned, 0 Design only; 25 open items are In and 50 are Out.
+- 2026-11-21: ENROLL-1d Partial (API/UI/tests/docs complete; [design 0051](design/0051-machine-identity-and-invites.md)): wired `MasterAuthContext` and `WaiterMap` onto `MasterHandle` and `WebUiState`; added `MemberConnections::list_active`, `revoke_member_with_teardown` reuse, `AuthScope::Admin` enforcement on all `/api/members*` and `/api/invites*` routes (`crates/master/src/auth.rs`), `Method::DELETE` CORS preflight, and `crates/master/src/web_ui/members.rs`; added XSS-safe `Members` tab to `crates/master/src/dashboard.html`; expanded `tests/dashboard_api_test.rs` and `tests/dashboard_security_test.rs`; updated `docs/reference.md`, `docs/guides/add-a-machine.md`, `docs/SECURITY.md`, `README.md`, and `design/0051`. `ENROLL-1` remains `Partial` pending `ENROLL-1c` step 2 (store format change) and the recorded live two-network `--p2p` run.
+- 2026-11-21: SCHED-5 Implemented ([design 0099](design/0099-scheduler-backpressure-visibility.md); text in the archive) and SCHED-4c / SCHED-4d implemented ([design 0060](design/0060-speed-aware-placement.md)): `WorkloadScheduler::schedule_batch` now emits a transition-triggered `warn!` once per change of the connected, free-slotted, CPU-busy worker set when tasks skip with `AllEligibleWorkersSaturated` (clearing silently at `info!` without `"saturated"` on recovery and ignoring `Disconnected` workers and non-`AllEligibleWorkersSaturated` skips); `crates/core/src/placement.rs` reserves `opt:` (`opt:repeatable`) and `speed:` (`speed:<factor>`) without bumping `PROTOCOL_VERSION_CURRENT` (`10`) or `STORE_FORMAT_VERSION` (`4`); CLI `--repeatable` / MCP `repeatable`, in-memory `SpeculativeAttempt` + sibling cancellation/failure tolerance in `TaskQueue`, and bounded `(total_cluster_slots / 10).max(1)` straggler re-run in `crates/master/src/reaper.rs` complete `SCHED-4c`; `SpeedBook::relative_speed_factors`, `WorkerRegistry::list_all_workers` `speed:<factor>` tags, `workers --json` `"speed"`, `WorkerUiInfo::speed_factor`, and `.badge-speed` / `#mSpeed` in `dashboard.html` complete `SCHED-4d`. `SCHED-4` remains `Partial` (`Out`) pending a dated live two-machine hardware batch (`<= 1.5x` the fast machine's own time).
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header after `SCHED-5` Implemented: 247 items, 173 Implemented, 23 Partial, 51 Planned, 0 Design only; 25 open items are In and 49 are Out.

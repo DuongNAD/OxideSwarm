@@ -461,6 +461,7 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
         mobile_status: None,
         peer_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
         preserved_thermal_until: None,
+        session_live: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
 
     // Test silence predicate at various simulated durations

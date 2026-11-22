@@ -1,3 +1,5 @@
+#![cfg(feature = "dashboard")]
+
 //! Adversarial Stress & Empirical Challenge Suite for Milestone 10:
 //! REST API Endpoints & MasterServer Lifecycle.
 //!

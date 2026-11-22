@@ -1903,3 +1903,289 @@ async fn test_three_d_tasks_require_three_d_protocol_capability_for_placement() 
         worker_with_3d.worker_id
     );
 }
+
+#[tokio::test]
+async fn sched4c_speculative_lifecycle_cancel_sibling_and_failure_tolerance() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+
+    // 1. Speculative winner completes first, cancels primary sibling, and ignores stale primary result.
+    let t1 = Task::new(
+        TaskSpec::command("echo", vec!["rep-1".into()]),
+        TaskRequirements::generic(2, 128),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id1 = queue.submit(t1).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id1, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id1)
+        .await
+        .unwrap();
+
+    assert!(queue.try_start_speculative(id1, w_spec, 20).await.is_some());
+    assert!(queue
+        .try_start_speculative(id1, Uuid::new_v4(), 30)
+        .await
+        .is_none());
+
+    // Loads and active running tasks charge both primary and speculative workers.
+    let loads = queue.assigned_loads().await;
+    assert_eq!(loads[&w_primary].slots, 2);
+    assert_eq!(loads[&w_spec].slots, 2);
+    assert_eq!(
+        loads[&w_spec].unstarted_ram_mb,
+        TaskRequirements::generic(2, 128).ram_mb
+    );
+    let active = queue.active_running_tasks().await;
+    assert_eq!(active[&w_primary].len(), 1);
+    assert_eq!(active[&w_spec].len(), 1);
+
+    queue
+        .mark_running_from(w_spec, Some(20), &id1)
+        .await
+        .unwrap();
+    assert_eq!(queue.assigned_loads().await[&w_spec].unstarted_ram_mb, 0);
+
+    let win = queue
+        .record_result_from(
+            w_spec,
+            Some(20),
+            TaskResult::success(w_spec, id1, "fast\n", 50, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(win.disposition, ResultDisposition::Terminal);
+    assert_eq!(win.state, TaskState::Completed);
+    let (sib_wid, sib_sid, sib_live) = win.cancel_sibling.expect("expected cancel_sibling");
+    assert_eq!((sib_wid, sib_sid), (w_primary, Some(10)));
+    assert!(sib_live.is_none());
+    assert_eq!(
+        queue.get_task(&id1).await.unwrap().assigned_worker_id,
+        Some(w_spec)
+    );
+    assert!(queue.assigned_loads().await.is_empty());
+
+    let late_primary = queue
+        .record_result_from(
+            w_primary,
+            Some(10),
+            TaskResult::success(w_primary, id1, "slow\n", 900, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late_primary.disposition, ResultDisposition::Stale);
+
+    // 2. Primary fails while speculative is running -> speculative is promoted and completes task.
+    let t2 = Task::new(
+        TaskSpec::command("echo", vec!["rep-2".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id2 = queue.submit(t2).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id2, w_primary, 11)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(11), &id2)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id2, w_spec, 21).await.is_some());
+    queue
+        .mark_running_from(w_spec, Some(21), &id2)
+        .await
+        .unwrap();
+
+    let primary_fail = queue
+        .record_result_from(
+            w_primary,
+            Some(11),
+            TaskResult::failure(w_primary, id2, 2, "", "boom", 100, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(primary_fail.disposition, ResultDisposition::SiblingFailed);
+    assert_eq!(primary_fail.state, TaskState::Running);
+    assert_eq!(
+        queue.get_task(&id2).await.unwrap().assigned_worker_id,
+        Some(w_spec)
+    );
+
+    let spec_win = queue
+        .record_result_from(
+            w_spec,
+            Some(21),
+            TaskResult::success(w_spec, id2, "ok\n", 80, false),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spec_win.disposition, ResultDisposition::Terminal);
+    assert_eq!(spec_win.state, TaskState::Completed);
+
+    // 3. Cancel notifies both primary and speculative workers.
+    let t3 = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id3 = queue.submit(t3).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id3, w_primary, 12)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(12), &id3)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id3, w_spec, 22).await.is_some());
+
+    let cancel = queue
+        .cancel_task_detailed(&id3, Some("user abort".into()))
+        .await
+        .unwrap();
+    assert!(cancel.newly_cancelled);
+    assert_eq!(cancel.worker_to_notify, Some(w_primary));
+    let (extra_wid, extra_sid, extra_live) = cancel
+        .extra_worker_to_notify
+        .expect("expected extra_worker_to_notify");
+    assert_eq!((extra_wid, extra_sid), (w_spec, 22));
+    assert!(extra_live.is_some());
+    assert!(queue.assigned_loads().await.is_empty());
+}
+
+#[tokio::test]
+async fn tier5_session_resume_hold_mid_speculative_primary_disconnect() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    queue.set_session_resume_hold(Duration::from_secs(30)).await;
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+
+    let t1 = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id1 = queue.submit(t1).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id1, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id1)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id1, w_spec, 20).await.is_some());
+    queue
+        .mark_running_from(w_spec, Some(20), &id1)
+        .await
+        .unwrap();
+
+    // Primary disconnects while speculative copy is running: speculative promotes immediately
+    // rather than holding the task for primary resume.
+    queue
+        .handle_session_disconnected(&w_primary, Some(10), "disconnect", false)
+        .await;
+    let task_after = queue.get_task(&id1).await.unwrap();
+    assert_eq!(task_after.assigned_worker_id, Some(w_spec));
+    assert_eq!(task_after.state, TaskState::Running);
+
+    // Old primary reconnects and offers id1 in ResumeSession: must be in stale_to_cancel.
+    let adopt = queue.adopt_session_tasks(w_primary, 11, &[id1]).await;
+    assert!(adopt.newly_adopted.is_empty());
+    assert!(adopt.already_owned.is_empty());
+    assert_eq!(adopt.stale_to_cancel, vec![id1]);
+    assert_eq!(
+        queue.get_task(&id1).await.unwrap().assigned_worker_id,
+        Some(w_spec)
+    );
+}
+
+#[tokio::test]
+async fn tier5_session_resume_hold_mid_speculative_secondary_disconnect() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    queue.set_session_resume_hold(Duration::from_secs(30)).await;
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+
+    let t1 = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id1 = queue.submit(t1).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id1, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id1)
+        .await
+        .unwrap();
+    assert!(queue.try_start_speculative(id1, w_spec, 20).await.is_some());
+    queue
+        .mark_running_from(w_spec, Some(20), &id1)
+        .await
+        .unwrap();
+
+    // Speculative worker disconnects: speculative attempt clears and primary keeps ownership.
+    queue
+        .handle_session_disconnected(&w_spec, Some(20), "disconnect", false)
+        .await;
+    let task_after = queue.get_task(&id1).await.unwrap();
+    assert_eq!(task_after.assigned_worker_id, Some(w_primary));
+    assert_eq!(task_after.state, TaskState::Running);
+
+    // Speculative worker reconnects and offers id1 in ResumeSession: must cancel orphaned copy.
+    let adopt = queue.adopt_session_tasks(w_spec, 21, &[id1]).await;
+    assert!(adopt.newly_adopted.is_empty());
+    assert!(adopt.already_owned.is_empty());
+    assert_eq!(adopt.stale_to_cancel, vec![id1]);
+    assert_eq!(
+        queue.get_task(&id1).await.unwrap().assigned_worker_id,
+        Some(w_primary)
+    );
+}
+
+#[tokio::test]
+async fn revoked_primary_checkpoint_is_dropped_when_speculative_copy_is_promoted() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+    let task = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id = queue.submit(task).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id)
+        .await
+        .unwrap();
+    let checkpoint = CheckpointData::new(
+        1,
+        rusty_grid_core::task::Bytes::copy_from_slice(b"from-revoked-member"),
+    );
+    assert!(queue
+        .record_checkpoint_from(w_primary, Some(10), id, checkpoint)
+        .await
+        .unwrap());
+    assert!(queue.get_checkpoint(&id).await.is_some());
+    assert!(queue.try_start_speculative(id, w_spec, 20).await.is_some());
+
+    // The primary's member is revoked: the speculative copy is promoted, and the checkpoint the
+    // revoked member wrote must not survive for a later resume.
+    queue.handle_workers_revoked(&[w_primary], "revoked").await;
+    let after = queue.get_task(&id).await.unwrap();
+    assert_eq!(after.assigned_worker_id, Some(w_spec));
+    assert!(queue.get_checkpoint(&id).await.is_none());
+}

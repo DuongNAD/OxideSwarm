@@ -856,24 +856,34 @@ impl<
             }
         };
 
-        // Tags only the master may set (design 0083 M1): the master adds its own `proto:<n>`, so a
-        // worker-supplied `proto:*` is dropped for every worker; `ext:*` is dropped from a worker
-        // below the extension protocol, which cannot enforce an extension whatever it claims (a
-        // v0.3.0 worker does not reserve the prefix and may carry `--tag ext:<id>`).
+        // Tags only the master may set (design 0083 M1, design 0060 D3/D4, M5 Tier-5): the master
+        // adds `proto:<n>`, `speed:<factor>`, `link:<path>`, `id:<uuid>`, `state:<state>`, and
+        // `feat:<feature>` itself, and `opt:*` is reserved for task options, so worker-supplied
+        // values for any of those prefixes are dropped; `ext:*` is dropped from a worker below the
+        // extension protocol, which cannot enforce an extension whatever it claims (a v0.3.0
+        // worker does not reserve the prefix and may carry `--tag ext:<id>`).
         let mut capabilities = capabilities;
         let tags_before = capabilities.tags.len();
         capabilities.tags.retain(|t| {
             let ext_forged = peer_version < rusty_grid_core::task::EXTENSION_PROTOCOL_VERSION
                 && t.starts_with(rusty_grid_core::placement::EXT_TAG_PREFIX);
-            !(t.starts_with(rusty_grid_core::placement::PROTO_TAG_PREFIX) || ext_forged)
+            !(t.starts_with(rusty_grid_core::placement::PROTO_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::SPEED_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::OPT_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::STATE_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::ID_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::LINK_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::FEAT_TAG_PREFIX)
+                || ext_forged)
         });
         if capabilities.tags.len() != tags_before {
             warn!(
                 worker_id = %worker_id,
                 peer_version,
                 dropped = tags_before - capabilities.tags.len(),
-                "Dropped worker-supplied master-only tags (proto:*, and ext:* from a worker below \
-                 the extension protocol) at registration"
+                "Dropped worker-supplied master-only tags (proto:*, speed:*, opt:*, state:*, \
+                 id:*, link:*, feat:*, and ext:* from a worker below the extension protocol) at \
+                 registration"
             );
         }
 
@@ -1691,15 +1701,51 @@ impl<
                     .queue
                     .adopt_session_tasks(worker_id, session_id, &running)
                     .await;
-                if !outcome.adopted.is_empty() {
-                    self.registry
-                        .add_adopted_tasks(&worker_id, session_id, outcome.adopted.len())
-                        .await;
+                let mut to_bind =
+                    Vec::with_capacity(outcome.newly_adopted.len() + outcome.already_owned.len());
+                to_bind.extend_from_slice(&outcome.newly_adopted);
+                to_bind.extend_from_slice(&outcome.already_owned);
+
+                if !outcome.newly_adopted.is_empty() {
+                    let live = match self
+                        .registry
+                        .add_adopted_tasks(&worker_id, session_id, outcome.newly_adopted.len())
+                        .await
+                    {
+                        Some(live) => Some(live),
+                        None => {
+                            self.registry
+                                .session_live_handle(&worker_id, session_id)
+                                .await
+                        }
+                    };
+                    if let Some(live) = live {
+                        self.queue
+                            .set_assigned_session_live(&to_bind, worker_id, session_id, live)
+                            .await;
+                    }
                     info!(
                         worker_id = %worker_id,
                         session_id = session_id,
-                        adopted = ?outcome.adopted,
+                        adopted = ?outcome.newly_adopted,
+                        already_owned = ?outcome.already_owned,
                         "Worker resumed session and adopted in-flight task(s)"
+                    );
+                } else if !outcome.already_owned.is_empty() {
+                    if let Some(live) = self
+                        .registry
+                        .session_live_handle(&worker_id, session_id)
+                        .await
+                    {
+                        self.queue
+                            .set_assigned_session_live(&to_bind, worker_id, session_id, live)
+                            .await;
+                    }
+                    debug!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        already_owned = ?outcome.already_owned,
+                        "Worker ResumeSession reported task(s) already owned by this session"
                     );
                 }
                 for stale_id in outcome.stale_to_cancel {
@@ -1727,7 +1773,11 @@ impl<
                 }
                 #[cfg(feature = "dashboard")]
                 if let Some(ref b_tx) = self.broadcast_tx {
-                    for tid in outcome.adopted.iter().chain(outcome.newly_failed.iter()) {
+                    for tid in outcome
+                        .newly_adopted
+                        .iter()
+                        .chain(outcome.newly_failed.iter())
+                    {
                         if let Some(info) = self.queue.get_task(tid).await {
                             let _ = b_tx.send(
                                 crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
@@ -2126,7 +2176,7 @@ mod tests {
         );
 
         let session_id = info.session_id;
-        let outbound_tx = registry
+        let (outbound_tx, _) = registry
             .reserve_dispatch(&worker_id, session_id)
             .await
             .unwrap();
@@ -2779,7 +2829,7 @@ mod tests {
                 other => panic!("expected RegisterAck, got {other:?}"),
             }
             let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
-            let outbound_tx = registry
+            let (outbound_tx, _) = registry
                 .reserve_dispatch(&worker_id, session_id)
                 .await
                 .unwrap();
@@ -2951,7 +3001,7 @@ mod tests {
                 other => panic!("expected RegisterAck, got {other:?}"),
             }
             let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
-            let outbound_tx = registry
+            let (outbound_tx, _) = registry
                 .reserve_dispatch(&worker_id, session_id)
                 .await
                 .unwrap();
@@ -3198,5 +3248,185 @@ mod tests {
             "expected disconnect reason from LaneKind::Data error path, got: {}",
             history[0].reason
         );
+    }
+
+    #[tokio::test]
+    async fn tier5_wire_register_strips_all_master_reserved_tags() {
+        use rusty_grid_core::protocol::ProtocolCapabilities;
+
+        // 1. v10 peer: strips opt:*, speed:*, proto:*, state:*, id:*, link:*, feat:*, while
+        //    preserving ext:32770, slots:4, and user:legit.
+        let (ctrl_master, ctrl_worker) = tokio::io::duplex(64 * 1024);
+        let (data_master, _data_worker) = tokio::io::duplex(64 * 1024);
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(&BlobStoreConfig::new(
+            temp.path().join("blobs"),
+            DEFAULT_BLOB_STORE_MAX_BYTES,
+        ))
+        .unwrap();
+
+        let handle = spawn_test_multiplexed_session(
+            ctrl_master,
+            data_master,
+            registry.clone(),
+            queue.clone(),
+            notify.clone(),
+            waiters.clone(),
+            stop_rx,
+            Some(Arc::clone(&blob_store)),
+        );
+
+        let worker_id = Uuid::new_v4();
+        let victim_id = Uuid::new_v4();
+        let mut caps = WorkerCapabilities::new("spoof-wire-worker", 4, 4096, false, false, None);
+        caps.tags = vec![
+            "opt:repeatable".into(),
+            "speed:0.01".into(),
+            "proto:99".into(),
+            "state:disconnected".into(),
+            format!("id:{victim_id}"),
+            "link:Relay (DERP):999.0ms".into(),
+            "feat:workspaces".into(),
+            "ext:32770".into(),
+            "slots:4".into(),
+            "user:legit".into(),
+        ];
+
+        let mut worker_transport = MessageTransport::with_codec(ctrl_worker, WireCodec::Json);
+        worker_transport
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: caps.clone(),
+                protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+
+        let ack = worker_transport.recv_msg::<MasterMessage>().await.unwrap();
+        assert!(matches!(
+            ack,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+
+        let stored = registry
+            .get_worker(worker_id)
+            .await
+            .expect("worker registered");
+        for forbidden in [
+            "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:",
+        ] {
+            assert!(
+                !stored
+                    .capabilities
+                    .tags
+                    .iter()
+                    .any(|t| t.starts_with(forbidden)),
+                "forged prefix `{forbidden}` survived Register sanitization: {:?}",
+                stored.capabilities.tags
+            );
+        }
+        assert!(stored.capabilities.tags.iter().any(|t| t == "ext:32770"));
+        assert!(stored.capabilities.tags.iter().any(|t| t == "slots:4"));
+        assert!(stored.capabilities.tags.iter().any(|t| t == "user:legit"));
+        assert!(stored.capabilities.tags.iter().any(|t| {
+            t == &format!(
+                "proto:{}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
+            )
+        }));
+
+        let _ = stop_tx.send(true);
+        let _ = handle.await;
+
+        // 2. v9 peer: also strips ext:* in addition to all other master-owned prefixes.
+        let (ctrl_master_v9, ctrl_worker_v9) = tokio::io::duplex(64 * 1024);
+        let (data_master_v9, _data_worker_v9) = tokio::io::duplex(64 * 1024);
+        let (stop_tx_v9, stop_rx_v9) = watch::channel(false);
+        let pre_auth_v9 = PreAuthSession::new_multiplexed(
+            ctrl_master_v9,
+            data_master_v9,
+            SocketAddr::from(([127, 0, 0, 1], 55_001)),
+            WireCodec::Json,
+            #[cfg(feature = "p2p")]
+            None,
+            #[cfg(feature = "p2p")]
+            None,
+        );
+        let reg_v9 = registry.clone();
+        let q_v9 = queue.clone();
+        let n_v9 = notify.clone();
+        let w_v9 = waiters.clone();
+        let b_v9 = Arc::clone(&blob_store);
+        let handle_v9 = tokio::spawn(async move {
+            WorkerSession::run_connection(
+                pre_auth_v9,
+                reg_v9,
+                q_v9,
+                n_v9,
+                w_v9,
+                10,
+                Duration::from_secs(5),
+                stop_rx_v9,
+                None,
+                WireCodec::Json,
+                None,
+                MasterAuthContext::default(),
+                None,
+                Some(b_v9),
+                #[cfg(feature = "dashboard")]
+                None,
+            )
+            .await
+        });
+
+        let wid_v9 = Uuid::new_v4();
+        let mut wt_v9 = MessageTransport::with_codec(ctrl_worker_v9, WireCodec::Json);
+        wt_v9
+            .send_msg(&WorkerMessage::Register {
+                worker_id: wid_v9,
+                capabilities: caps,
+                protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+        let ack_v9 = wt_v9.recv_msg::<MasterMessage>().await.unwrap();
+        assert!(matches!(
+            ack_v9,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        let stored_v9 = registry
+            .get_worker(wid_v9)
+            .await
+            .expect("v9 worker registered");
+        for forbidden in [
+            "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:", "ext:",
+        ] {
+            assert!(
+                !stored_v9
+                    .capabilities
+                    .tags
+                    .iter()
+                    .any(|t| t.starts_with(forbidden)),
+                "v9 forged prefix `{forbidden}` survived Register sanitization: {:?}",
+                stored_v9.capabilities.tags
+            );
+        }
+        assert!(stored_v9.capabilities.tags.iter().any(|t| t == "slots:4"));
+        assert!(stored_v9
+            .capabilities
+            .tags
+            .iter()
+            .any(|t| t == "user:legit"));
+        assert!(stored_v9.capabilities.tags.iter().any(|t| t == "proto:9"));
+
+        let _ = stop_tx_v9.send(true);
+        let _ = handle_v9.await;
     }
 }

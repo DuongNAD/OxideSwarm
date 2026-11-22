@@ -1,9 +1,11 @@
 use super::tasks_and_blobs::apply_task_result;
 use super::*;
 use rusty_grid_core::blob_transfer::{BlobReply, BlobRequest};
+#[cfg(feature = "p2p")]
+use rusty_grid_core::protocol::ProtocolError;
 use rusty_grid_core::protocol::{
-    ClientMessage, ClientResponse, InboundMessage, ProtocolCapabilities, ProtocolError,
-    PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE,
+    ClientMessage, ClientResponse, InboundMessage, ProtocolCapabilities, PROTOCOL_VERSION_CURRENT,
+    PROTOCOL_VERSION_MIN_COMPATIBLE,
 };
 use rusty_grid_core::task::Task;
 use rusty_grid_core::{MasterMessage, MessageTransport, WorkerCapabilities, WorkerMessage};
@@ -696,23 +698,24 @@ fn test_master_spawn_warns_when_p2p_minimal_preset_is_enabled_and_ignores_env() 
             );
             let _ = m_off.shutdown();
 
-            warnings.lock().unwrap().clear();
-            tracing::callsite::rebuild_interest_cache();
-            let min_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
-                .with_p2p(true)
-                .with_p2p_minimal_preset(true)
-                .with_ephemeral_key(true);
-            let m2 = MasterServer::spawn(min_cfg).await.expect("spawn m2");
-            assert!(
-                warnings
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|w| w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")),
-                "with_p2p_minimal_preset(true) must emit a tracing::warn! on MasterServer::spawn, got: {:?}",
-                *warnings.lock().unwrap()
-            );
-            let _ = m2.shutdown();
+            #[cfg(feature = "p2p")]
+            {
+                warnings.lock().unwrap().clear();
+                tracing::callsite::rebuild_interest_cache();
+                let min_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                    .with_p2p(true)
+                    .with_p2p_minimal_preset(true)
+                    .with_ephemeral_key(true);
+                let m2 = MasterServer::spawn(min_cfg).await.expect("spawn m2");
+                assert!(
+                    warnings.lock().unwrap().iter().any(|w| {
+                        w.contains("P2P minimal preset is enabled (p2p_minimal_preset=true)")
+                    }),
+                    "with_p2p_minimal_preset(true) must emit a tracing::warn! on MasterServer::spawn, got: {:?}",
+                    *warnings.lock().unwrap()
+                );
+                let _ = m2.shutdown();
+            }
         });
     });
 
@@ -1731,38 +1734,41 @@ async fn test_failed_store_is_reported_in_cluster_status_and_dashboard() {
 
     // 3. Dashboard /api/status carries store_error on both ClusterStatusDto and its tasks QueueStats,
     // and GET / serves dashboard.html with the storeErrorBanner alert.
-    let dash_addr = h
-        .dashboard_addr()
-        .expect("dashboard must be enabled in this test");
-    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    let status_dto: crate::dashboard::dto::ClusterStatusDto =
-        reqwest::get(format!("http://{dash_addr}/api/status"))
+    #[cfg(feature = "dashboard")]
+    {
+        let dash_addr = h
+            .dashboard_addr()
+            .expect("dashboard must be enabled in this test");
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let status_dto: crate::dashboard::dto::ClusterStatusDto =
+            reqwest::get(format!("http://{dash_addr}/api/status"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(
+            status_dto
+                .store_error
+                .as_deref()
+                .is_some_and(|s| s.contains("injected sync failure")),
+            "expected store_error in ClusterStatusDto, got {:?}",
+            status_dto.store_error
+        );
+        assert_eq!(status_dto.tasks.store_error, status_dto.store_error);
+
+        let html = reqwest::get(format!("http://{dash_addr}/"))
             .await
             .unwrap()
-            .json()
+            .text()
             .await
             .unwrap();
-    assert!(
-        status_dto
-            .store_error
-            .as_deref()
-            .is_some_and(|s| s.contains("injected sync failure")),
-        "expected store_error in ClusterStatusDto, got {:?}",
-        status_dto.store_error
-    );
-    assert_eq!(status_dto.tasks.store_error, status_dto.store_error);
-
-    let html = reqwest::get(format!("http://{dash_addr}/"))
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(
-        html.contains("id=\"storeErrorBanner\"")
-            && html.contains("Task store failed: durability is off until restart"),
-        "dashboard.html must contain #storeErrorBanner for store_error visibility"
-    );
+        assert!(
+            html.contains("id=\"storeErrorBanner\"")
+                && html.contains("Task store failed: durability is off until restart"),
+            "dashboard.html must contain #storeErrorBanner for store_error visibility"
+        );
+    }
 
     h.shutdown().unwrap();
 }

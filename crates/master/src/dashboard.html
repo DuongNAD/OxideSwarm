@@ -705,6 +705,16 @@
             font-weight: 700;
             white-space: nowrap;
         }
+        .badge-speed {
+            font-size: 9.5px;
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.12);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
 
         /* Link Badges: Direct P2P, DERP Relay, TCP/LAN */
         .link-badge {
@@ -904,11 +914,183 @@
             line-height: 1.45;
         }
 
+        /* Members & Enrollment Tab */
+        .members-view {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .members-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            color: var(--text-dim);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 5px;
+        }
+        .member-card {
+            background: var(--surface-subtle);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .node-title-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+            flex: 1;
+            flex-wrap: wrap;
+        }
+        .member-meta-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            font-size: 11px;
+            color: var(--text-dim);
+        }
+        .badge-role-admin {
+            background: rgba(239, 68, 68, 0.18);
+            color: var(--dot-red);
+            border: 1px solid rgba(239, 68, 68, 0.35);
+        }
+        .badge-role-client {
+            background: rgba(59, 130, 246, 0.18);
+            color: var(--accent);
+            border: 1px solid rgba(59, 130, 246, 0.35);
+        }
+        .badge-role-worker {
+            background: rgba(34, 197, 94, 0.16);
+            color: var(--dot-green);
+            border: 1px solid rgba(34, 197, 94, 0.35);
+        }
+        .badge-pending {
+            background: rgba(234, 179, 8, 0.18);
+            color: var(--dot-busy);
+            border: 1px solid rgba(234, 179, 8, 0.35);
+        }
+        .badge-revoked {
+            background: rgba(148, 163, 184, 0.16);
+            color: var(--text-dim);
+            border: 1px solid var(--border);
+        }
+        .inline-form-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+        }
+        .member-inline-input {
+            flex: 1;
+            min-width: 110px;
+            padding: 5px 8px;
+            font-size: 12px;
+        }
+        .btn-approve {
+            border-color: rgba(34, 197, 94, 0.45);
+            color: var(--dot-green);
+        }
+        .btn-approve:hover {
+            background: rgba(34, 197, 94, 0.14);
+            border-color: var(--dot-green);
+        }
+        .btn-danger {
+            border-color: rgba(239, 68, 68, 0.45);
+            color: var(--dot-red);
+        }
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.14);
+            border-color: var(--dot-red);
+        }
+        .members-banner-alert {
+            background: rgba(234, 179, 8, 0.12);
+            border: 1px solid var(--dot-busy);
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 12px;
+            display: none;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .members-banner-alert.active {
+            display: flex;
+        }
+        .members-feedback {
+            font-size: 11px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--surface-subtle);
+            display: none;
+        }
+        .members-feedback.active {
+            display: block;
+        }
+        .invite-secret-box {
+            display: none;
+            flex-direction: column;
+            gap: 6px;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid var(--dot-green);
+            background: rgba(34, 197, 94, 0.08);
+            font-size: 11px;
+        }
+        .invite-secret-box.active {
+            display: flex;
+        }
+        .invite-token-mono {
+            font-family: monospace;
+            font-size: 11px;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 6px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            background: var(--log-bg);
+            color: var(--text);
+        }
+        .invite-checks-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            font-size: 12px;
+        }
+        .invite-check-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
+        }
+
         /* Ultra-Narrow Screens (<380px) */
         @media (max-width: 380px) {
             .topbar { padding: 6px 8px; }
             .brand-title { font-size: 14px; }
-            .tab-btn { font-size: 11px; padding: 5px 6px; }
+            .tab-btn { font-size: 10.5px; padding: 5px 4px; }
             .node-name { max-width: 100px; }
             .meter-track { width: 20px; }
         }
@@ -1081,11 +1263,12 @@
         <!-- Dynamic Master Auto-Discovery Toast Notification -->
         <div id="discoveryToast" style="display:none; position:fixed; top:54px; left:50%; transform:translateX(-50%); z-index:9999; background:rgba(17,24,39,0.95); border:1px solid var(--accent); color:var(--text); padding:8px 14px; border-radius:6px; font-size:12px; font-weight:600; box-shadow:0 4px 12px rgba(0,0,0,0.5); text-align:center; max-width:90%; pointer-events:none; transition:all 0.2s ease;"></div>
 
-        <!-- 3-Tab Navigation Bar -->
+        <!-- 4-Tab Navigation Bar -->
         <nav class="tab-nav-bar" id="tabNavBar">
             <button class="tab-btn active" id="btnTabConsole" onclick="switchTab('console')">Console</button>
             <button class="tab-btn" id="btnTabModes" onclick="switchTab('modes')">Modes</button>
             <button class="tab-btn" id="btnTabDevices" onclick="switchTab('devices')">Devices (<span id="tabDevicesBadge">0</span>)</button>
+            <button class="tab-btn" id="btnTabMembers" onclick="switchTab('members')">Members (<span id="tabMembersBadge">0</span>)</button>
         </nav>
 
         <!-- TAB 1: TERMINAL CONSOLE -->
@@ -1231,6 +1414,90 @@
                 </div>
             </div>
         </div>
+
+        <!-- TAB 4: CLUSTER MEMBERS & INVITES (Admin scope) -->
+        <div class="tab-pane" id="tabMembers">
+            <div class="members-view" id="membersView">
+                <div class="members-banner-alert" id="membersAuthBanner">
+                    <span id="membersAuthMsg">Admin token required to view and manage cluster members and invites.</span>
+                    <button type="button" class="btn-mode-act" data-action="switch-admin-token">Switch to Admin token</button>
+                </div>
+
+                <div class="members-feedback" id="membersFeedback" role="status"></div>
+
+                <div class="cluster-banner">
+                    <div class="banner-stat">Members: <strong id="sumMembersCount">0</strong></div>
+                    <div class="banner-stat">Pending: <strong id="sumPendingCount">0</strong></div>
+                    <div class="banner-stat">Active Lanes: <strong id="sumMemberConnsCount">0</strong></div>
+                    <div class="banner-stat">Auth Mode: <strong id="sumAuthMode">--</strong></div>
+                    <div class="banner-stat">Master Key FP: <strong id="sumMasterFp">--</strong></div>
+                    <div class="banner-stat" style="margin-left:auto;">
+                        <button type="button" class="btn-mode-act" data-action="refresh-members">↻ Refresh</button>
+                    </div>
+                </div>
+
+                <div class="members-section">
+                    <div class="section-header">
+                        <span>Pending Enrollments</span>
+                        <span id="pendingCountLabel">0 waiting</span>
+                    </div>
+                    <div id="pendingList" style="display:flex; flex-direction:column; gap:8px;"></div>
+                </div>
+
+                <div class="members-section">
+                    <div class="section-header">
+                        <span>Enrolled Members</span>
+                        <span id="membersCountLabel">0 enrolled</span>
+                    </div>
+                    <div id="membersList" style="display:flex; flex-direction:column; gap:8px;"></div>
+                </div>
+
+                <div class="members-section">
+                    <div class="section-header">
+                        <span>Cluster Invites</span>
+                        <span id="invitesCountLabel">0 total</span>
+                    </div>
+
+                    <div class="member-card" id="invitesCreateBox">
+                        <div class="invite-checks-row">
+                            <span style="font-size:11px; color:var(--text-dim); font-weight:600;">Roles:</span>
+                            <label class="invite-check-label"><input type="checkbox" id="inviteRoleWorker" checked> worker</label>
+                            <label class="invite-check-label"><input type="checkbox" id="inviteRoleClient"> client</label>
+                            <label class="invite-check-label"><input type="checkbox" id="inviteRoleAdmin"> admin</label>
+                        </div>
+                        <div class="inline-form-row">
+                            <label style="font-size:11px; color:var(--text-dim);">Uses:
+                                <input type="number" id="inviteMaxUses" class="cmd-input" style="width:68px; padding:4px 6px; font-size:12px;" min="1" max="1000" value="1">
+                            </label>
+                            <label style="font-size:11px; color:var(--text-dim);">Expires:
+                                <select id="inviteExpires" class="cmd-input" style="padding:4px 6px; font-size:12px;">
+                                    <option value="3600">1h</option>
+                                    <option value="86400" selected>24h</option>
+                                    <option value="604800">7d</option>
+                                    <option value="2592000">30d</option>
+                                </select>
+                            </label>
+                            <label class="invite-check-label" style="font-size:11px;">
+                                <input type="checkbox" id="inviteRequireApproval" checked> Require approval
+                            </label>
+                            <button type="button" class="btn-mode-act btn-approve" data-action="create-invite">Create Invite</button>
+                        </div>
+                        <div id="inviteAdminRuleHint" style="display:none; font-size:11px; color:var(--dot-busy);">Admin invites always require approval and max_uses = 1.</div>
+                    </div>
+
+                    <div class="invite-secret-box" id="createdInviteResult">
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
+                            <strong>New invite token (shown once — copy now):</strong>
+                            <button type="button" class="btn-mode-act btn-approve" data-action="copy-invite">Copy</button>
+                        </div>
+                        <input type="text" readonly id="createdInviteTokenInput" class="invite-token-mono" aria-label="Created invite token">
+                        <div id="createdInviteMeta" style="color:var(--text-dim);"></div>
+                    </div>
+
+                    <div id="invitesList" style="display:flex; flex-direction:column; gap:8px;"></div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Device Detail Modal Bottom Sheet -->
@@ -1280,6 +1547,10 @@
                 <div class="detail-item">
                     <div class="detail-label">Độ trễ (RTT)</div>
                     <div class="detail-val" id="mRtt">--</div>
+                </div>
+                <div class="detail-item">
+                    <div class="detail-label">Tốc độ tương đối (Speed)</div>
+                    <div class="detail-val" id="mSpeed">--</div>
                 </div>
                 <div class="detail-item" style="grid-column: span 2;">
                     <div class="detail-label">Node ID & P2P Heartbeat</div>
@@ -1466,6 +1737,10 @@
             const overlay = document.getElementById('loginOverlay');
             if (overlay) overlay.classList.remove('active');
             syncData().catch(() => {});
+            const tabMembers = document.getElementById('tabMembers');
+            if (tabMembers && tabMembers.classList.contains('active')) {
+                syncMembers().catch(() => {});
+            }
         }
         (function wireLoginForm() {
             const form = document.getElementById('loginForm');
@@ -1554,25 +1829,32 @@
             const isConsole = name === 'console';
             const isDevices = name === 'devices';
             const isModes = name === 'modes';
+            const isMembers = name === 'members';
 
             const tabConsole = document.getElementById('tabConsole');
             const tabDevices = document.getElementById('tabDevices');
             const tabModes = document.getElementById('tabModes');
+            const tabMembers = document.getElementById('tabMembers');
             const btnConsole = document.getElementById('btnTabConsole');
             const btnDevices = document.getElementById('btnTabDevices');
             const btnModes = document.getElementById('btnTabModes');
+            const btnMembers = document.getElementById('btnTabMembers');
 
             if (tabConsole) tabConsole.classList.toggle('active', isConsole);
             if (tabDevices) tabDevices.classList.toggle('active', isDevices);
             if (tabModes) tabModes.classList.toggle('active', isModes);
+            if (tabMembers) tabMembers.classList.toggle('active', isMembers);
             if (btnConsole) btnConsole.classList.toggle('active', isConsole);
             if (btnDevices) btnDevices.classList.toggle('active', isDevices);
             if (btnModes) btnModes.classList.toggle('active', isModes);
+            if (btnMembers) btnMembers.classList.toggle('active', isMembers);
 
             if (isDevices) {
                 syncData().catch(() => {});
             } else if (isModes) {
                 syncModes();
+            } else if (isMembers) {
+                syncMembers().catch(() => {});
             }
         }
 
@@ -1678,6 +1960,475 @@
             const consoleStatus = document.getElementById('modeConsoleStatus');
             if (consoleStatus) consoleStatus.textContent = '● READY';
         }
+
+        // ---- Cluster Members & Invites Management (Admin Scope) ----
+        let armedRevokeMemberId = null;
+        let membersSyncPromise = null;
+        const lastRenderedMemberNames = new Map();
+
+        function isInputFocusedInside(container) {
+            const active = typeof document !== 'undefined' ? document.activeElement : null;
+            if (!container || !active) return false;
+            const tag = String(active.tagName || '').toUpperCase();
+            if (tag !== 'INPUT') return false;
+            if (typeof container.contains === 'function') return container.contains(active);
+            const inputs = container.querySelectorAll ? container.querySelectorAll('input') : [];
+            for (const inp of inputs) {
+                if (inp === active) return true;
+            }
+            return false;
+        }
+
+        function setMembersAuthBanner(visible, message) {
+            const banner = document.getElementById('membersAuthBanner');
+            const msgEl = document.getElementById('membersAuthMsg');
+            if (!banner) return;
+            banner.classList.toggle('active', Boolean(visible));
+            if (msgEl && message) msgEl.textContent = message;
+        }
+
+        function setMembersFeedback(message, isError) {
+            const el = document.getElementById('membersFeedback');
+            if (!el) return;
+            if (!message) {
+                el.classList.remove('active');
+                el.textContent = '';
+                return;
+            }
+            el.textContent = message;
+            el.style.color = isError ? 'var(--dot-red)' : 'var(--dot-green)';
+            el.style.borderColor = isError ? 'var(--dot-red)' : 'var(--dot-green)';
+            el.classList.add('active');
+        }
+
+        function formatUnixSecs(ts) {
+            if (!ts || typeof ts !== 'number') return '--';
+            try { return new Date(ts * 1000).toLocaleString(); } catch (_) { return String(ts); }
+        }
+
+        function renderRoleBadges(roles) {
+            const list = Array.isArray(roles) ? roles : [];
+            if (list.length === 0) return html`<span class="role-badge badge-revoked">none</span>`;
+            return joinHtml(list.map(r => {
+                const roleStr = String(r);
+                const cls = roleStr === 'admin'
+                    ? 'badge-role-admin'
+                    : (roleStr === 'client' ? 'badge-role-client' : 'badge-role-worker');
+                return html`<span class="role-badge ${cls}">${roleStr}</span>`;
+            }), ' ');
+        }
+
+        function renderPendingList(pending, isBackground) {
+            const el = document.getElementById('pendingList');
+            const countEl = document.getElementById('pendingCountLabel');
+            const items = Array.isArray(pending) ? pending : [];
+            if (countEl) countEl.textContent = `${items.length} waiting`;
+            if (!el) return;
+            if (isBackground && isInputFocusedInside(el)) return;
+            const codeDrafts = new Map();
+            const fpDrafts = new Map();
+            if (el.querySelectorAll) {
+                for (const inp of el.querySelectorAll('input')) {
+                    const codePid = inp.getAttribute('data-pending-code');
+                    if (codePid && inp.value !== '') codeDrafts.set(codePid, inp.value);
+                    const fpPid = inp.getAttribute('data-pending-fp');
+                    if (fpPid && inp.value !== '') fpDrafts.set(fpPid, inp.value);
+                }
+            }
+            if (items.length === 0) {
+                setHtml(el, html`<div style="font-size:12px; color:var(--text-dim);">No pending enrollment requests.</div>`);
+                return;
+            }
+            setHtml(el, joinHtml(items.map(p => html`
+                <div class="member-card">
+                    <div class="card-row-1">
+                        <div class="node-title-group">
+                            <span class="role-badge badge-pending">PENDING</span>
+                            <span class="node-name">${p.name}</span>
+                            ${renderRoleBadges(p.roles)}
+                        </div>
+                        <span class="metric-pill">${p.os}/${p.arch}</span>
+                    </div>
+                    <div class="member-meta-row">
+                        <span>Pending ID: <code>${p.pending_id}</code></span>
+                        <span>Member ID: <code>${p.member_id}</code></span>
+                    </div>
+                    <div class="member-meta-row">
+                        <span>From: <code>${p.remote_addr}</code></span>
+                        <span>Invite: <code>${p.invite_id}</code></span>
+                        <span>Master FP: <code>${p.master_fingerprint}</code></span>
+                    </div>
+                    <div class="member-meta-row">
+                        <span>Requested: ${formatUnixSecs(p.requested_at)}</span>
+                        <span>Expires: ${formatUnixSecs(p.expires_at)}</span>
+                    </div>
+                    <div class="inline-form-row">
+                        <input type="text" class="cmd-input member-inline-input" maxlength="7" inputmode="numeric" placeholder="6-digit pairing code" data-pending-code="${p.pending_id}">
+                        <input type="text" class="cmd-input member-inline-input" maxlength="19" placeholder="Fingerprint (optional)" data-pending-fp="${p.pending_id}">
+                        <button type="button" class="btn-mode-act btn-approve" data-action="approve-pending" data-id="${p.pending_id}">Approve</button>
+                        <button type="button" class="btn-mode-act btn-danger" data-action="reject-pending" data-id="${p.pending_id}">Reject</button>
+                    </div>
+                </div>
+            `), ''));
+            if ((codeDrafts.size > 0 || fpDrafts.size > 0) && el.querySelectorAll) {
+                for (const inp of el.querySelectorAll('input')) {
+                    const codePid = inp.getAttribute('data-pending-code');
+                    if (codePid && codeDrafts.has(codePid)) inp.value = codeDrafts.get(codePid);
+                    const fpPid = inp.getAttribute('data-pending-fp');
+                    if (fpPid && fpDrafts.has(fpPid)) inp.value = fpDrafts.get(fpPid);
+                }
+            }
+        }
+
+        function renderMembersList(members, activeConnections, isBackground) {
+            const el = document.getElementById('membersList');
+            const countEl = document.getElementById('membersCountLabel');
+            const items = Array.isArray(members) ? members : [];
+            const conns = Array.isArray(activeConnections) ? activeConnections : [];
+            if (countEl) countEl.textContent = `${items.length} enrolled`;
+            if (!el) return;
+            if (isBackground && isInputFocusedInside(el)) return;
+            const renameDrafts = new Map();
+            if (el.querySelectorAll) {
+                for (const inp of el.querySelectorAll('input')) {
+                    const mid = inp.getAttribute('data-rename-input');
+                    if (mid && lastRenderedMemberNames.has(mid) && inp.value !== lastRenderedMemberNames.get(mid)) {
+                        renameDrafts.set(mid, inp.value);
+                    }
+                }
+            }
+            if (items.length === 0) {
+                lastRenderedMemberNames.clear();
+                setHtml(el, html`<div style="font-size:12px; color:var(--text-dim);">No enrolled members.</div>`);
+                return;
+            }
+            const byMember = new Map();
+            for (const c of conns) {
+                if (!c || !c.member_id) continue;
+                if (!byMember.has(c.member_id)) byMember.set(c.member_id, []);
+                byMember.get(c.member_id).push(c);
+            }
+            setHtml(el, joinHtml(items.map(m => {
+                const mConns = byMember.get(m.id) || [];
+                const lanesHtml = mConns.length > 0
+                    ? joinHtml(mConns.map(c => html`<span class="metric-pill">${c.lane}</span>`), ' ')
+                    : html`<span class="metric-pill">offline</span>`;
+                const isArmed = armedRevokeMemberId === m.id;
+                const revokeControls = isArmed
+                    ? html`
+                        <button type="button" class="btn-mode-act btn-danger" data-action="confirm-revoke-member" data-id="${m.id}">Confirm Revoke</button>
+                        <button type="button" class="btn-mode-act" data-action="cancel-revoke-member" data-id="${m.id}">Cancel</button>
+                    `
+                    : html`
+                        <button type="button" class="btn-mode-act btn-danger" data-action="revoke-member" data-id="${m.id}">Revoke</button>
+                    `;
+                return html`
+                    <div class="member-card">
+                        <div class="card-row-1">
+                            <div class="node-title-group">
+                                <span class="status-dot ${mConns.length > 0 ? 'dot-online' : 'dot-offline'}"></span>
+                                <span class="node-name">${m.name}</span>
+                                ${renderRoleBadges(m.roles)}
+                            </div>
+                            <span class="metric-pill">${mConns.length} conn(s)</span>
+                        </div>
+                        <div class="member-meta-row">
+                            <span>ID: <code>${m.id}</code></span>
+                            <span>FP: <code>${m.fingerprint || '--'}</code></span>
+                        </div>
+                        <div class="member-meta-row">
+                            <span>Enrolled: ${formatUnixSecs(m.enrolled_at)}</span>
+                            <span>Last seen: ${formatUnixSecs(m.last_seen)}</span>
+                            ${m.via_invite ? html`<span>Invite: <code>${m.via_invite}</code></span>` : html``}
+                        </div>
+                        <div class="member-meta-row">
+                            <span>Lanes:</span> ${lanesHtml}
+                        </div>
+                        <div class="inline-form-row">
+                            <input type="text" class="cmd-input member-inline-input" maxlength="64" placeholder="New member name" value="${m.name}" data-rename-input="${m.id}">
+                            <button type="button" class="btn-mode-act" data-action="rename-member" data-id="${m.id}">Rename</button>
+                            ${revokeControls}
+                        </div>
+                    </div>
+                `;
+            }), ''));
+            lastRenderedMemberNames.clear();
+            for (const m of items) {
+                lastRenderedMemberNames.set(m.id, m.name);
+            }
+            if (renameDrafts.size > 0 && el.querySelectorAll) {
+                for (const inp of el.querySelectorAll('input')) {
+                    const mid = inp.getAttribute('data-rename-input');
+                    if (mid && renameDrafts.has(mid)) {
+                        inp.value = renameDrafts.get(mid);
+                    }
+                }
+            }
+        }
+
+        function renderInvitesList(invites) {
+            const el = document.getElementById('invitesList');
+            const countEl = document.getElementById('invitesCountLabel');
+            const items = Array.isArray(invites) ? invites : [];
+            if (countEl) countEl.textContent = `${items.length} total`;
+            if (!el) return;
+            if (items.length === 0) {
+                setHtml(el, html`<div style="font-size:12px; color:var(--text-dim);">No active or past invites.</div>`);
+                return;
+            }
+            const nowSecs = Math.floor(Date.now() / 1000);
+            setHtml(el, joinHtml(items.map(inv => {
+                const statusLabel = inv.revoked
+                    ? 'revoked'
+                    : (inv.uses_remaining === 0 ? 'exhausted' : (inv.expires_at <= nowSecs ? 'expired' : 'active'));
+                const statusCls = statusLabel === 'active' ? 'badge-role-worker' : 'badge-revoked';
+                return html`
+                    <div class="member-card">
+                        <div class="card-row-1">
+                            <div class="node-title-group">
+                                <span class="role-badge ${statusCls}">${statusLabel}</span>
+                                <code>${inv.invite_id}</code>
+                                ${renderRoleBadges(inv.roles)}
+                            </div>
+                            <span class="metric-pill">${inv.uses_remaining}/${inv.max_uses} uses</span>
+                        </div>
+                        <div class="member-meta-row">
+                            <span>Approval: ${inv.require_approval ? 'required' : 'auto'}</span>
+                            <span>Expires: ${formatUnixSecs(inv.expires_at)}</span>
+                        </div>
+                        ${!inv.revoked ? html`
+                            <div class="inline-form-row" style="justify-content:flex-end;">
+                                <button type="button" class="btn-mode-act btn-danger" data-action="revoke-invite" data-id="${inv.invite_id}">Revoke Invite</button>
+                            </div>
+                        ` : html``}
+                    </div>
+                `;
+            }), ''));
+        }
+
+        function syncMembers(isBackground) {
+            const bg = Boolean(isBackground);
+            if (!membersSyncPromise) {
+                membersSyncPromise = doSyncMembers(bg).finally(() => { membersSyncPromise = null; });
+            }
+            return membersSyncPromise;
+        }
+
+        async function doSyncMembers(isBackground) {
+            const [mRes, iRes] = await Promise.all([
+                apiFetch('/api/members'),
+                apiFetch('/api/invites')
+            ]);
+            if (mRes.status === 403 || iRes.status === 403) {
+                setMembersAuthBanner(true, 'Admin token required (current token lacks Admin scope).');
+                return;
+            }
+            if (!mRes.ok) throw new Error(await errorText(mRes));
+            if (!iRes.ok) throw new Error(await errorText(iRes));
+            setMembersAuthBanner(false);
+
+            const mData = await mRes.json();
+            const iData = await iRes.json();
+            const members = Array.isArray(mData.members) ? mData.members : [];
+            const pending = Array.isArray(mData.pending) ? mData.pending : [];
+            const activeConns = Array.isArray(mData.active_connections) ? mData.active_connections : [];
+            const invites = Array.isArray(iData.invites) ? iData.invites : [];
+
+            const badge = document.getElementById('tabMembersBadge');
+            if (badge) badge.textContent = String(members.length);
+            const sumMem = document.getElementById('sumMembersCount');
+            if (sumMem) sumMem.textContent = String(members.length);
+            const sumPen = document.getElementById('sumPendingCount');
+            if (sumPen) {
+                sumPen.textContent = String(pending.length);
+                sumPen.style.color = pending.length > 0 ? 'var(--dot-busy)' : '';
+            }
+            const sumConns = document.getElementById('sumMemberConnsCount');
+            if (sumConns) sumConns.textContent = String(activeConns.length);
+            const sumAuth = document.getElementById('sumAuthMode');
+            if (sumAuth) sumAuth.textContent = mData.auth_mode || '--';
+            const sumFp = document.getElementById('sumMasterFp');
+            if (sumFp) sumFp.textContent = mData.master_fingerprint || '--';
+
+            renderPendingList(pending, isBackground);
+            renderMembersList(members, activeConns, isBackground);
+            renderInvitesList(invites);
+        }
+
+        function findInputByAttr(container, attrName, attrVal) {
+            if (!container) return null;
+            const inputs = container.querySelectorAll('input');
+            for (const inp of inputs) {
+                if (inp.getAttribute(attrName) === attrVal) return inp;
+            }
+            return null;
+        }
+
+        function syncAdminInviteFormRules() {
+            const adminChk = document.getElementById('inviteRoleAdmin');
+            const usesInp = document.getElementById('inviteMaxUses');
+            const apChk = document.getElementById('inviteRequireApproval');
+            const hint = document.getElementById('inviteAdminRuleHint');
+            if (!adminChk || !usesInp || !apChk) return;
+            const isAdmin = adminChk.checked;
+            if (isAdmin) {
+                usesInp.value = '1';
+                apChk.checked = true;
+            }
+            usesInp.disabled = isAdmin;
+            apChk.disabled = isAdmin;
+            if (hint) hint.style.display = isAdmin ? 'block' : 'none';
+        }
+
+        async function handleMembersAction(action, id) {
+            if (action === 'switch-admin-token') {
+                clearToken();
+                showLogin('Nhập Admin token để quản lý Members & Invites.');
+                return;
+            }
+            if (action === 'refresh-members') {
+                setMembersFeedback('', false);
+                await syncMembers();
+                return;
+            }
+            if (action === 'copy-invite') {
+                const tokEl = document.getElementById('createdInviteTokenInput');
+                const val = tokEl ? tokEl.value : '';
+                if (!val) return;
+                try {
+                    await navigator.clipboard.writeText(val);
+                    setMembersFeedback('Copied invite token to clipboard.', false);
+                } catch (_) {
+                    if (tokEl) { tokEl.focus(); tokEl.select(); }
+                    setMembersFeedback('Select and copy the invite token above.', false);
+                }
+                return;
+            }
+            if (action === 'create-invite') {
+                const roles = [];
+                if (document.getElementById('inviteRoleWorker')?.checked) roles.push('worker');
+                if (document.getElementById('inviteRoleClient')?.checked) roles.push('client');
+                if (document.getElementById('inviteRoleAdmin')?.checked) roles.push('admin');
+                const maxUses = parseInt(document.getElementById('inviteMaxUses')?.value || '1', 10);
+                const expiresInSecs = parseInt(document.getElementById('inviteExpires')?.value || '86400', 10);
+                const requireApproval = Boolean(document.getElementById('inviteRequireApproval')?.checked);
+
+                const res = await apiFetch('/api/invites', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        roles,
+                        max_uses: Number.isFinite(maxUses) ? maxUses : 1,
+                        expires_in_secs: Number.isFinite(expiresInSecs) ? expiresInSecs : 86400,
+                        require_approval: requireApproval
+                    })
+                });
+                if (res.status === 403) {
+                    setMembersAuthBanner(true, 'Admin token required to create invites.');
+                    return;
+                }
+                if (!res.ok) {
+                    setMembersFeedback(await errorText(res), true);
+                    return;
+                }
+                const data = await res.json();
+                const box = document.getElementById('createdInviteResult');
+                const tokEl = document.getElementById('createdInviteTokenInput');
+                const metaEl = document.getElementById('createdInviteMeta');
+                if (tokEl) tokEl.value = data.invite || '';
+                if (metaEl) {
+                    metaEl.textContent = `Invite ID: ${data.invite_id} · Roles: ${(data.roles || []).join(', ')} · Master FP: ${data.master_fingerprint || '--'}`;
+                }
+                if (box) box.classList.add('active');
+                setMembersFeedback(`Created invite ${data.invite_id}.`, false);
+                await syncMembers();
+                return;
+            }
+            if (!id) return;
+            const encodedId = encodeURIComponent(id);
+
+            if (action === 'approve-pending') {
+                const pendingList = document.getElementById('pendingList');
+                const codeInp = findInputByAttr(pendingList, 'data-pending-code', id);
+                const fpInp = findInputByAttr(pendingList, 'data-pending-fp', id);
+                const pairingCode = codeInp ? codeInp.value.trim() : '';
+                const fp = fpInp ? fpInp.value.trim() : '';
+                const body = fp ? { pairing_code: pairingCode, fingerprint: fp } : { pairing_code: pairingCode };
+                const res = await apiFetch(`/api/members/${encodedId}/approve`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (res.status === 403) { setMembersAuthBanner(true, 'Admin token required.'); return; }
+                if (!res.ok) { setMembersFeedback(await errorText(res), true); return; }
+                const member = await res.json();
+                setMembersFeedback(`Approved member ${member.name} (${member.id}).`, false);
+                await syncMembers();
+            } else if (action === 'reject-pending') {
+                const res = await apiFetch(`/api/members/${encodedId}/reject`, { method: 'POST' });
+                if (res.status === 403) { setMembersAuthBanner(true, 'Admin token required.'); return; }
+                if (!res.ok) { setMembersFeedback(await errorText(res), true); return; }
+                setMembersFeedback(`Rejected pending enrollment ${id}.`, false);
+                await syncMembers();
+            } else if (action === 'rename-member') {
+                const membersList = document.getElementById('membersList');
+                const nameInp = findInputByAttr(membersList, 'data-rename-input', id);
+                const newName = nameInp ? nameInp.value.trim() : '';
+                const res = await apiFetch(`/api/members/${encodedId}/rename`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName })
+                });
+                if (res.status === 403) { setMembersAuthBanner(true, 'Admin token required.'); return; }
+                if (!res.ok) { setMembersFeedback(await errorText(res), true); return; }
+                const member = await res.json();
+                lastRenderedMemberNames.delete(id);
+                if (nameInp) nameInp.value = member.name || '';
+                setMembersFeedback(`Renamed member to ${member.name}.`, false);
+                await syncMembers();
+            } else if (action === 'revoke-member') {
+                armedRevokeMemberId = id;
+                await syncMembers();
+            } else if (action === 'cancel-revoke-member') {
+                armedRevokeMemberId = null;
+                await syncMembers();
+            } else if (action === 'confirm-revoke-member') {
+                armedRevokeMemberId = null;
+                const res = await apiFetch(`/api/members/${encodedId}/revoke`, { method: 'POST' });
+                if (res.status === 403) { setMembersAuthBanner(true, 'Admin token required.'); return; }
+                if (!res.ok) { setMembersFeedback(await errorText(res), true); return; }
+                const out = await res.json();
+                setMembersFeedback(`Revoked ${out.name || id} (closed ${out.disconnected_sessions || 0} sessions, requeued ${out.revoked_workers || 0} workers).`, false);
+                await syncMembers();
+            } else if (action === 'revoke-invite') {
+                const res = await apiFetch(`/api/invites/${encodedId}`, { method: 'DELETE' });
+                if (res.status === 403) { setMembersAuthBanner(true, 'Admin token required.'); return; }
+                if (!res.ok) { setMembersFeedback(await errorText(res), true); return; }
+                setMembersFeedback(`Revoked invite ${id}.`, false);
+                await syncMembers();
+            }
+        }
+
+        (function wireMembersView() {
+            const view = document.getElementById('membersView');
+            if (view) {
+                view.addEventListener('click', (ev) => {
+                    const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-action]') : null;
+                    if (!btn) return;
+                    const action = btn.getAttribute('data-action');
+                    const id = btn.getAttribute('data-id');
+                    handleMembersAction(action, id).catch(err => {
+                        if (!err || !err.isAuth) {
+                            setMembersFeedback(err && err.message ? err.message : 'Request failed', true);
+                        }
+                    });
+                });
+            }
+            const adminChk = document.getElementById('inviteRoleAdmin');
+            if (adminChk) {
+                adminChk.addEventListener('change', syncAdminInviteFormRules);
+            }
+        })();
 
         // 2. Light / Dark Mode Toggle with Persistence
         function initTheme() {
@@ -2236,6 +2987,14 @@
                     gpuBadge = html`<span class="badge-gpu" title="${w.gpu_device_name || 'GPU'}">⚡ ${gName}</span>`;
                 }
 
+                // Telemetry: Relative Speed Badge (SCHED-4d)
+                let speedBadge = '';
+                if (w.speed_factor !== null && w.speed_factor !== undefined && Number.isFinite(Number(w.speed_factor))) {
+                    const sf = Number(w.speed_factor);
+                    const speedStr = Number.isInteger(sf) ? sf.toFixed(1) : String(Math.round(sf * 100) / 100);
+                    speedBadge = html`<span class="badge-speed" title="Relative task speed (${speedStr}x; 1.0x = fastest)">Speed ${speedStr}x</span>`;
+                }
+
                 // Telemetry: Mobile Battery & Thermal
                 const mobileParts = [];
                 if (w.battery_pct !== null && w.battery_pct !== undefined) {
@@ -2292,6 +3051,7 @@
                                     <span>${ramUsedGb}/${ramTotalGb}GB</span>
                                 </div>
                                 ${gpuBadge}
+                                ${speedBadge}
                                 ${mobileParts}
                             </div>
                         </div>
@@ -2381,7 +3141,13 @@
             }
         }
         syncData().catch(() => {});
-        setInterval(() => syncData().catch(() => {}), 3000);
+        setInterval(() => {
+            syncData().catch(() => {});
+            const tabMembers = document.getElementById('tabMembers');
+            if (tabMembers && tabMembers.classList.contains('active')) {
+                syncMembers(true).catch(() => {});
+            }
+        }, 3000);
 
         // 7. Device Detail Modal Controls
         let activeModalWorker = null;
@@ -2462,6 +3228,17 @@
             const rttEl = document.getElementById('mRtt');
             if (rttEl) {
                 rttEl.textContent = (w.rtt_ms !== null && w.rtt_ms !== undefined) ? `${Math.round(num(w.rtt_ms))} ms` : '--';
+            }
+
+            const speedEl = document.getElementById('mSpeed');
+            if (speedEl) {
+                if (w.speed_factor !== null && w.speed_factor !== undefined && Number.isFinite(Number(w.speed_factor))) {
+                    const sf = Number(w.speed_factor);
+                    const speedStr = Number.isInteger(sf) ? sf.toFixed(1) : String(Math.round(sf * 100) / 100);
+                    speedEl.textContent = `${speedStr}x (1.0x = fastest)`;
+                } else {
+                    speedEl.textContent = '--';
+                }
             }
 
             const idEl = document.getElementById('mId');

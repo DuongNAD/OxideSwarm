@@ -443,7 +443,7 @@ pub struct WorkerArgs {
     #[arg(
         long = "tag",
         value_name = "TAG",
-        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso:, tool: and feat: are reserved"
+        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso:, tool:, feat:, ext:, proto:, opt: and speed: are reserved"
     )]
     pub tags: Vec<String>,
 
@@ -925,6 +925,12 @@ pub struct SubmitArgs {
         help = "Workspace tasks: maximum megabytes one workspace sync may scan (default: 2048)"
     )]
     pub workspace_max_mb: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Mark this task as safe to re-run speculatively on another worker if a running attempt becomes a straggler"
+    )]
+    pub repeatable: bool,
 
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,

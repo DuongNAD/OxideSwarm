@@ -316,14 +316,19 @@ jobs:
         run: python tests/run_mesh_simulation_tests.py
 
   release-skew:
-    # PROTO-2, design 0076 D2: the newest release and the pull request's build, in three pairs on loopback.
-    # The expected verdict of each pair follows from the two builds' protocol constants and the one-version
-    # window (design 0083); a pair that differs from it fails, as does a refusal that prints no version error.
-    # Not a required check.
+    # PROTO-2 (design 0076 D2) & PROTO-5 (design 0083): test both the newest release and the pinned
+    # release one protocol back (PREVIOUS_PROTOCOL_RELEASE) against the pull request's build, in three
+    # pairs on loopback. The expected verdict of each pair follows from the two builds' protocol
+    # constants and the one-version window (design 0083); a pair that differs from it fails, as does
+    # a refusal that prints no version error. Not a required check.
     name: release skew (ubuntu-latest)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # PROTO-5 (design 0083): pinned release one protocol back (protocol 9 while CURRENT=10, MIN=9).
+      # Move this pin at each wire change.
+      PREVIOUS_PROTOCOL_RELEASE: v0.3.0
     permissions:
       contents: read
     steps:
@@ -337,33 +342,43 @@ jobs:
         with:
           python-version: '3.12'
       - run: cargo build --locked --bin oxideswarm
-      - name: download the newest release and run the skew script
+      - name: download releases and run the skew script
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
-          if [ -z "$tag" ]; then
+          latest_tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -z "$latest_tag" ]; then
             echo "::notice::No release exists yet, so there is nothing to run against the pull request's build."
             echo "### Release skew" >> "$GITHUB_STEP_SUMMARY"
             echo "No release exists yet." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          ver="${tag#v}"
-          name="oxideswarm-${ver}-x86_64-unknown-linux-gnu"
-          dl="$RUNNER_TEMP/release-dl"
-          out="$RUNNER_TEMP/release-bin"
-          mkdir -p "$dl" "$out"
-          gh release download "$tag" -p "${name}.tar.gz" -p SHA256SUMS -D "$dl"
-          (cd "$dl" && grep -F "  ${name}.tar.gz" SHA256SUMS | sha256sum -c -)
-          tar -xzf "$dl/${name}.tar.gz" -C "$out"
-          # The release's protocol constants give the expected verdict of each pair (design 0083).
-          gh api -H "Accept: application/vnd.github.raw" \
-            "repos/${GH_REPO}/contents/crates/core/src/protocol.rs?ref=${tag}" > "$dl/protocol.rs"
-          echo "Release ${tag} against the pull request build"
-          python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm \
-            --release-protocol-rs "$dl/protocol.rs"
+          tags=("$latest_tag")
+          if [ -n "${PREVIOUS_PROTOCOL_RELEASE:-}" ] && [ "${PREVIOUS_PROTOCOL_RELEASE}" != "${latest_tag}" ]; then
+            tags+=("${PREVIOUS_PROTOCOL_RELEASE}")
+          fi
+          overall_rc=0
+          for tag in "${tags[@]}"; do
+            ver="${tag#v}"
+            name="oxideswarm-${ver}-x86_64-unknown-linux-gnu"
+            dl="$RUNNER_TEMP/release-dl/${tag}"
+            out="$RUNNER_TEMP/release-bin/${tag}"
+            mkdir -p "$dl" "$out"
+            gh release download "$tag" -p "${name}.tar.gz" -p SHA256SUMS -D "$dl"
+            (cd "$dl" && grep -F "  ${name}.tar.gz" SHA256SUMS | sha256sum -c -)
+            tar -xzf "$dl/${name}.tar.gz" -C "$out"
+            # The release's protocol constants give the expected verdict of each pair (design 0083).
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${GH_REPO}/contents/crates/core/src/protocol.rs?ref=${tag}" > "$dl/protocol.rs"
+            echo "Release ${tag} against the pull request build"
+            if ! python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm \
+              --release-protocol-rs "$dl/protocol.rs" --release-tag "$tag"; then
+              overall_rc=1
+            fi
+          done
+          exit "$overall_rc"
 
   audit:
     name: cargo audit

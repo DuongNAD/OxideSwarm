@@ -91,6 +91,12 @@ async fn listed_worker(
     let link = "link:TCP/LAN".to_string();
 
     let mut caps = w.capabilities;
+    caps.tags.retain(|t| {
+        !(t.starts_with(rusty_grid_core::placement::LINK_TAG_PREFIX)
+            || t.starts_with(rusty_grid_core::placement::ID_TAG_PREFIX)
+            || t.starts_with(rusty_grid_core::placement::STATE_TAG_PREFIX)
+            || t.starts_with(rusty_grid_core::placement::FEAT_TAG_PREFIX))
+    });
     caps.tags.push(link);
     caps.tags.push(format!(
         "{}{}",
@@ -538,7 +544,7 @@ pub(super) const ENROLL_CONFIRM_TIMEOUT_SECS: u64 = 120;
 /// bookkeeping write failed (`S1`, `NIT 2`).
 const MEMBER_STORE_RESYNC_INTERVAL: Duration = Duration::from_secs(2);
 
-pub(super) async fn run_member_store_blocking<T, F>(f: F) -> GridResult<T>
+pub(crate) async fn run_member_store_blocking<T, F>(f: F) -> GridResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> GridResult<T> + Send + 'static,
@@ -1094,6 +1100,92 @@ pub(super) async fn wait_for_pending_enrollment<S>(
     }
 }
 
+#[allow(dead_code)]
+pub(crate) struct RevokeMemberOutcome {
+    pub member_id: String,
+    pub name: String,
+    pub disconnected_sessions: usize,
+    pub closed_worker_sessions: usize,
+    pub revoked_workers: usize,
+    pub kept_own_conn: Option<ConnectionId>,
+}
+
+/// Persists member revocation, closes every live connection of the member across all lanes
+/// (optionally keeping `keep_conn` open until the caller finishes sending its reply), releases
+/// worker-ID ownership, and requeues tasks running on the revoked member's workers immediately.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn revoke_member_with_teardown(
+    target: String,
+    keep_conn: Option<ConnectionId>,
+    auth_ctx: &MasterAuthContext,
+    registry: &WorkerRegistry,
+    queue: &TaskQueue,
+    scheduler_notify: &Arc<tokio::sync::Notify>,
+    waiters: &WaiterMap,
+    #[cfg(feature = "dashboard")] broadcast_tx: Option<
+        &tokio::sync::broadcast::Sender<crate::dashboard::dto::DashboardStreamMessage>,
+    >,
+) -> GridResult<RevokeMemberOutcome> {
+    let members_store = auth_ctx.members.clone();
+    let (entry, owned_workers) =
+        run_member_store_blocking(move || members_store.revoke_member(&target)).await?;
+
+    // Design 0051 D5. The member is already gone from the store, so its key is refused at its next
+    // handshake (step 4) and any connection that registers from now on refuses itself.
+    //
+    // Step 1: close every connection of the member, on every lane, at once. An admin revoking its
+    // own key keeps this connection until the answer is sent.
+    let own_conn = keep_conn.filter(|id| auth_ctx.member_connections.contains(&entry.id, *id));
+    let closed = auth_ctx
+        .member_connections
+        .close_member(&entry.id, own_conn);
+    let closed_worker_sessions = closed.iter().filter(|lane| lane.is_worker()).count();
+
+    // Step 3: take the member's workers out of service and requeue their tasks at once, without the
+    // resume hold and without their checkpoints. The store's claims and the registry's owners
+    // together cover every worker id the member registered.
+    let mut worker_ids = owned_workers;
+    for wid in registry.release_workers_owned_by(&entry.id).await {
+        if !worker_ids.contains(&wid) {
+            worker_ids.push(wid);
+        }
+    }
+    for wid in &worker_ids {
+        registry.release_worker_owner(wid).await;
+    }
+    handle_workers_revoked_with_broadcast(
+        registry,
+        queue,
+        scheduler_notify,
+        waiters,
+        &worker_ids,
+        "Member revoked by admin",
+        #[cfg(feature = "dashboard")]
+        broadcast_tx,
+    )
+    .await;
+
+    let disconnected_sessions = closed.len() + usize::from(own_conn.is_some());
+    info!(
+        member_id = %entry.id,
+        name = %entry.name,
+        disconnected_sessions,
+        worker_sessions = closed_worker_sessions,
+        client_connections = disconnected_sessions - closed_worker_sessions,
+        worker_ids = worker_ids.len(),
+        "Revoked cluster member and closed its connections"
+    );
+
+    Ok(RevokeMemberOutcome {
+        member_id: entry.id,
+        name: entry.name,
+        disconnected_sessions,
+        closed_worker_sessions,
+        revoked_workers: worker_ids.len(),
+        kept_own_conn: own_conn,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_member_admin_message<S>(
     transport: &mut MessageTransport<S>,
@@ -1299,68 +1391,32 @@ where
             }
         }
         ClientMessage::RevokeMember { target } => {
-            let members_store = auth_ctx.members.clone();
-            match run_member_store_blocking(move || members_store.revoke_member(&target)).await {
-                Ok((entry, owned_workers)) => {
-                    // Design 0051 D5. The member is already gone from the store, so its key is
-                    // refused at its next handshake (step 4) and any connection that registers
-                    // from now on refuses itself.
-                    //
-                    // Step 1: close every connection of the member, on every lane, at once. An
-                    // admin revoking its own key keeps this connection until the answer is sent.
-                    let own_conn = member_conn
-                        .filter(|id| auth_ctx.member_connections.contains(&entry.id, *id));
-                    let closed = auth_ctx
-                        .member_connections
-                        .close_member(&entry.id, own_conn);
-                    let closed_worker_sessions =
-                        closed.iter().filter(|lane| lane.is_worker()).count();
-
-                    // Step 3: take the member's workers out of service and requeue their tasks at
-                    // once, without the resume hold and without their checkpoints. The store's
-                    // claims and the registry's owners together cover every worker id the member
-                    // registered.
-                    let mut worker_ids = owned_workers;
-                    for wid in registry.release_workers_owned_by(&entry.id).await {
-                        if !worker_ids.contains(&wid) {
-                            worker_ids.push(wid);
-                        }
-                    }
-                    for wid in &worker_ids {
-                        registry.release_worker_owner(wid).await;
-                    }
-                    handle_workers_revoked_with_broadcast(
-                        registry,
-                        queue,
-                        scheduler_notify,
-                        waiters,
-                        &worker_ids,
-                        "Member revoked by admin",
-                        #[cfg(feature = "dashboard")]
-                        broadcast_tx,
-                    )
-                    .await;
-
-                    let disconnected_sessions = closed.len() + usize::from(own_conn.is_some());
-                    info!(
-                        member_id = %entry.id,
-                        name = %entry.name,
-                        disconnected_sessions,
-                        worker_sessions = closed_worker_sessions,
-                        client_connections = disconnected_sessions - closed_worker_sessions,
-                        worker_ids = worker_ids.len(),
-                        "Revoked cluster member and closed its connections"
-                    );
+            match revoke_member_with_teardown(
+                target,
+                member_conn,
+                auth_ctx,
+                registry,
+                queue,
+                scheduler_notify,
+                waiters,
+                #[cfg(feature = "dashboard")]
+                broadcast_tx,
+            )
+            .await
+            {
+                Ok(outcome) => {
                     send_client_response(
                         transport,
                         &ClientResponse::MemberRevoked {
-                            member_id: entry.id.clone(),
-                            disconnected_sessions,
+                            member_id: outcome.member_id.clone(),
+                            disconnected_sessions: outcome.disconnected_sessions,
                         },
                     )
                     .await?;
-                    if let Some(own) = own_conn {
-                        auth_ctx.member_connections.close_connection(&entry.id, own);
+                    if let Some(own) = outcome.kept_own_conn {
+                        auth_ctx
+                            .member_connections
+                            .close_connection(&outcome.member_id, own);
                     }
                 }
                 Err(e) => {

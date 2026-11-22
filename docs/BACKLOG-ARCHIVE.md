@@ -1052,6 +1052,17 @@ Each item below needs a design record before code.
 - **Done when:** A changed `Task` layout fails CI without a bump. Mismatched peers refuse with a clear
   message.
 
+### FEAT-9: GPU workloads beyond the benchmark
+
+- **Evidence:** Read.
+- **Status:** Partial (`FEAT-9a` / decision `Q56` implemented in [design 0068](design/0068-task-vram-accounting.md)). Tasks now accept `--vram-mb` / `vram_mb` (protocol v9, store v3) with master scheduler VRAM budget tracking and anti-starvation hold-back.
+- **Problem (remaining `D6`):** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity` is never read, and custom WGSL user kernels remain unimplemented. Real-GPU preference still prefers an idle `wgpu` worker over a simulated GPU worker when an idle real GPU is available.
+- **Do (default of D6):** State "benchmark only" in `README.md:26` and `PROJECT.md:3`. If the owner
+  puts kernels in scope, add a `TaskSpec` with user WGSL and buffers through blobs.
+- **Done when:** The documents say benchmark only, or a user kernel matches a CPU reference on Metal,
+  Vulkan and DirectX 12.
+- **Implemented (2026-11-21, default of D6):** `PROJECT.md` and `README.md` (alongside `docs/reference.md`) now state explicitly that built-in `GpuCompute` is benchmark only (seeded matrix multiplication; no user WGSL kernels), while user GPU workloads run as `Command` tasks (`docs/guides/gpu-workloads.md`). `FEAT-9a` (`--vram-mb` / `vram_mb` VRAM accounting) landed in pull request 232 ([design 0068](design/0068-task-vram-accounting.md)); live per-process free VRAM polling (`FEAT-9b`, [design 0067](design/0067-multi-node-llm-serving-and-admission.md)) and Linux GPU isolation rules (`R20`, [design 0074](design/0074-external-runtime-allowlist-and-gpu-workloads.md)) remain tracked separately. (Historical note: `compute_intensity` was removed from `TaskSpec::GpuCompute` in `F1-b` / [design 0044](design/0044-dead-code-and-connection-loop-unification.md).)
+
 ### FEAT-10: Compile crates with cargo
 
 - **Evidence:** Read.
@@ -1262,6 +1273,31 @@ owner's decisions Q8, Q9 and Q12 are open.
   `18.9 ms` (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json`,
   `2026-11-15-scale2-windows-amd64-1000w.json`). The status rests on the 500-worker target
   (DOC-9).
+
+### SCHED-5: Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct
+
+- **Evidence:** Reproduced under `TEST-81` (pull request 404): when host CPU sits above
+  `max_host_cpu_pct` (`85.0`) on every eligible worker, queued tasks wait silently without any hint to
+  the user; a temporary per-pass `DEBUG` log emitted 51 copies in 5 s (~10/s) while `submit 3` stalled.
+- **Problem:** When every worker sits above `85 %` host CPU, queued tasks stay `Queued` silently
+  without any hint to the user. A naive per-pass scheduler log floods (~36,000 lines/hour at
+  `DEBUG`), fires for unrelated skips whenever any other worker reads busy (for example a GPU task
+  with no GPU worker), and includes `Disconnected` workers with stale CPU readings.
+- **Do:** Write a design record choosing the visible form (for example `status`, `ListWorkers`,
+  dashboard, and/or rate-limited master logs), taking the PR 404 review constraints as input:
+  1. Count only skips whose reason is `ScheduleSkipReason::AllEligibleWorkersSaturated`.
+  2. Filter candidate seats to connected (non-`Disconnected`) workers only.
+  3. Report once per change of the busy-worker set (or equivalent non-flooding transition) rather
+     than on every scheduling pass.
+- **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
+  those constraints without flooding or stale disconnected entries, and tests cover the behavior.
+- **Implemented (`2026-11-21`):** Added [design 0099](design/0099-scheduler-backpressure-visibility.md)
+  and transition-triggered `warn!` holdback reporting in `WorkloadScheduler::schedule_batch`
+  (`crates/master/src/scheduler.rs`), gated on `ScheduleSkipReason::AllEligibleWorkersSaturated` skips
+  and connected (`status != WorkerStatus::Disconnected`), free-slotted, `host_busy` seats, emitting
+  once per change of the sorted busy-worker ID set and clearing silently (`info!` without
+  `"saturated"`) on recovery, with unit tests in `crates/master/src/scheduler.rs`, integration tests
+  in `tests/e2e_cluster.rs`, and `docs/reference.md` updated.
 
 ## Phase 8: product and ecosystem
 
