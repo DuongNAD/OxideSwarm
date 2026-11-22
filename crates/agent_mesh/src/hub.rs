@@ -365,7 +365,7 @@ impl HubState {
 
         let bridge_opt = self.bridge.read().await.clone();
         if let Some(bridge) = bridge_opt {
-            let grid_status = if bridge.master().queue_stats().await.is_ok() {
+            let grid_status = if bridge.health_check().await.is_ok() {
                 "online"
             } else {
                 "offline"
@@ -382,12 +382,16 @@ impl HubState {
                         "grid_compile",
                         "grid_submit",
                         "grid_status",
+                        "grid_result",
+                        "grid_cancel",
                         "grid_3d_generate",
                         "grid_auto_rig",
                         "compute",
                         "compile",
                         "status",
                         "submit",
+                        "result",
+                        "cancel",
                         "3d_generate",
                         "auto_rig"
                     ],

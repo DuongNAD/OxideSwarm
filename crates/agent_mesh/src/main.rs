@@ -5,10 +5,15 @@
 
 #![forbid(unsafe_code)]
 
-use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig};
+use agent_mesh::{
+    AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, GridBackend, HubConfig,
+    RemoteMasterBackend, RemoteMasterConfig, DEFAULT_RPC_TIMEOUT,
+};
 use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_core::error::GridError;
+use rusty_grid_core::noise_auth::{default_node_key_path, NodeKeypair, PublicKey};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -55,9 +60,37 @@ pub enum Commands {
         #[arg(long, env = "OXIDE_GRID_MASTER", num_args = 0..=1, default_missing_value = "127.0.0.1:0")]
         grid_master: Option<String>,
 
+        /// Connect the hub's AgentGridBridge to an already-running OxideSwarm Master
+        /// (e.g. 127.0.0.1:8088, auto, or a P2P ticket). Conflicts with --grid-master.
+        #[arg(
+            long,
+            env = "OXIDE_GRID_CONNECT",
+            conflicts_with = "grid_master",
+            value_name = "HOST:PORT"
+        )]
+        grid_connect: Option<String>,
+
         /// Shared cluster secret for Master Grid authentication (hex string or path to secret file)
         #[arg(long, env = "OXIDESWARM_SECRET", hide_env_values = true)]
         secret: Option<String>,
+
+        /// Path to file holding the shared cluster secret (hex); falls back to
+        /// OXIDESWARM_SECRET_FILE and ~/.oxideswarm/cluster.secret.
+        #[arg(
+            long,
+            env = "OXIDESWARM_SECRET_FILE",
+            value_name = "PATH",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        secret_file: Option<PathBuf>,
+
+        /// Pinned Master OXS-AUTH v3 X25519 public key (64 hex chars).
+        #[arg(long, env = "RUSTY_GRID_MASTER_KEY", value_name = "HEX")]
+        master_key: Option<String>,
+
+        /// Custom iroh relay URL (https://...) for P2P --grid-connect targets.
+        #[arg(long, env = "RUSTY_GRID_RELAY_URL", value_name = "URL")]
+        relay_url: Option<String>,
 
         /// Maximum megabytes of active (non-terminal) task payloads held in the embedded Master
         /// Grid queue (`--grid-master`; default 256).
@@ -311,6 +344,58 @@ fn grid_master_secret(
     .into())
 }
 
+/// Resolves the cluster secret for `hub --grid-connect` following `oxideswarm` precedence:
+/// `--secret` / `OXIDESWARM_SECRET` (hex or path) > `--secret-file` / `OXIDESWARM_SECRET_FILE` >
+/// default secret file (`~/.oxideswarm/cluster.secret`) if it exists.
+///
+/// An explicit empty secret or secret-file path fails closed rather than silently disabling auth.
+fn resolve_remote_master_secret(
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    default_secret_file: Option<&Path>,
+) -> Result<Option<ClusterSecret>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(raw) = secret {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "--secret / OXIDESWARM_SECRET is set but empty; give a valid cluster secret or remove it"
+                    .into(),
+            );
+        }
+        let cs = ClusterSecret::from_hex(trimmed)
+            .or_else(|_| ClusterSecret::load_file(Path::new(trimmed)))?;
+        return Ok(Some(cs));
+    }
+    if let Some(path) = secret_file {
+        if path.as_os_str().is_empty() {
+            return Err(
+                "--secret-file / OXIDESWARM_SECRET_FILE is set but empty; give a valid path or remove it"
+                    .into(),
+            );
+        }
+        return Ok(Some(ClusterSecret::load_file(path)?));
+    }
+    if let Some(path) = default_secret_file.filter(|p| p.is_file()) {
+        return Ok(Some(ClusterSecret::load_file(path)?));
+    }
+    Ok(None)
+}
+
+/// Resolves OXS-AUTH v3 client credentials when `--master-key` / `RUSTY_GRID_MASTER_KEY` is set.
+fn resolve_remote_v3_auth(
+    master_key: Option<&str>,
+) -> Result<Option<(NodeKeypair, PublicKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(hex) = master_key.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let master_pub = PublicKey::from_hex(hex)?;
+    let node_path = default_node_key_path().ok_or(
+        "Could not determine home directory for ~/.oxideswarm/node.key (needed with --master-key)",
+    )?;
+    let (node_key, _) = NodeKeypair::load_or_generate_file(&node_path)?;
+    Ok(Some((node_key, master_pub)))
+}
+
 /// Resolves the active task byte budget (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) for the
 /// embedded master of `hub --grid-master`. Refuses `0`, because a zero byte cap would reject every
 /// task.
@@ -332,6 +417,32 @@ fn build_grid_master_server_config(bind_addr: SocketAddr, max_active_bytes: usiz
     ServerConfig::new(bind_addr).with_max_active_bytes(max_active_bytes)
 }
 
+/// Resolves when `agent-mesh hub` receives a shutdown signal (`SIGINT`/Ctrl-C, or `SIGTERM` on
+/// Unix) so `hub.stop()` and `bridge.close()` run and the process exits `0`.
+async fn wait_for_hub_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => res,
+            _ = async {
+                match terminate.as_mut() {
+                    Some(sigterm) => {
+                        sigterm.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriber = FmtSubscriber::builder()
@@ -347,7 +458,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             insecure,
             grid_master,
+            grid_connect,
             secret,
+            secret_file,
+            master_key,
+            relay_url,
             max_active_mb,
         } => {
             if token.as_deref() == Some("") {
@@ -366,6 +481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             let hub = AgentMeshHub::with_config(config);
 
+            let mut bridge_opt: Option<Arc<AgentGridBridge>> = None;
             let master_handle_opt = if let Some(ref master_spec) = grid_master {
                 let spec = master_spec.trim();
                 let bind_addr: SocketAddr =
@@ -385,28 +501,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     build_grid_master_server_config(bind_addr, max_active_bytes);
                 // `secret` already holds OXIDESWARM_SECRET when the flag is absent (clap `env`).
                 let default_secret_file = ClusterSecret::default_path();
-                match grid_master_secret(
-                    secret.as_deref(),
-                    bind_addr,
-                    insecure,
-                    default_secret_file.as_deref(),
-                )? {
-                    Some(cs) => server_config = server_config.with_cluster_secret(cs),
-                    None if !bind_addr.ip().is_loopback() => eprintln!(
-                        "[HUB] WARNING: the embedded Master Grid on {bind_addr} runs WITHOUT a cluster secret (--insecure). Anyone who can reach it can run tasks on its workers."
-                    ),
-                    None => {}
+                if let Some(ref path) = secret_file {
+                    if secret.is_none() {
+                        if path.as_os_str().is_empty() {
+                            return Err(
+                                "--secret-file / OXIDESWARM_SECRET_FILE is set but empty".into()
+                            );
+                        }
+                        server_config =
+                            server_config.with_cluster_secret(ClusterSecret::load_file(path)?);
+                    }
+                }
+                if server_config.cluster_secret.is_none() {
+                    match grid_master_secret(
+                        secret.as_deref(),
+                        bind_addr,
+                        insecure,
+                        default_secret_file.as_deref(),
+                    )? {
+                        Some(cs) => server_config = server_config.with_cluster_secret(cs),
+                        None if !bind_addr.ip().is_loopback() => eprintln!(
+                            "[HUB] WARNING: the embedded Master Grid on {bind_addr} runs WITHOUT a cluster secret (--insecure). Anyone who can reach it can run tasks on its workers."
+                        ),
+                        None => {}
+                    }
                 }
 
                 let master_handle = MasterServer::spawn(server_config).await?;
                 let master_actual_addr = master_handle.server_addr();
                 let bridge = Arc::new(AgentGridBridge::new(master_handle.clone()));
-                hub.attach_bridge(bridge).await;
+                hub.attach_bridge(Arc::clone(&bridge)).await;
+                bridge_opt = Some(bridge);
                 println!(
                     "[HUB] Embedded Master Grid runtime active on {}",
                     master_actual_addr
                 );
                 Some(master_handle)
+            } else if let Some(ref connect_spec) = grid_connect {
+                let default_secret_file = ClusterSecret::default_path();
+                let remote_secret = resolve_remote_master_secret(
+                    secret.as_deref(),
+                    secret_file.as_deref(),
+                    default_secret_file.as_deref(),
+                )?;
+                let v3_auth = resolve_remote_v3_auth(master_key.as_deref())?;
+                let clean_relay_url = relay_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
+                let mut remote_cfg = RemoteMasterConfig::new(connect_spec.trim());
+                remote_cfg.secret = remote_secret;
+                remote_cfg.v3_auth = v3_auth;
+                remote_cfg.relay_url = clean_relay_url;
+                remote_cfg.insecure = insecure;
+                remote_cfg.rpc_timeout = DEFAULT_RPC_TIMEOUT;
+
+                let backend = Arc::new(RemoteMasterBackend::new(remote_cfg)?);
+                match backend.health_check().await {
+                    Ok(()) => {
+                        println!(
+                            "[HUB] Remote Master Grid bridge connected to {}",
+                            backend.master_addr()
+                        );
+                    }
+                    Err(
+                        ref e @ (GridError::AuthFailed(_)
+                        | GridError::AuthRequired(_)
+                        | GridError::IncompatibleVersion(_)
+                        | GridError::Config(_)),
+                    ) => {
+                        return Err(format!(
+                            "Failed to connect Remote Master Grid bridge to {}: {e}",
+                            backend.master_addr()
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[HUB] WARNING: Remote Master at {} is not yet reachable ({e}); \
+                             bridge attached and will report offline in /api/nodes until reachable",
+                            backend.master_addr()
+                        );
+                    }
+                }
+
+                let bridge = Arc::new(AgentGridBridge::with_backend(backend));
+                hub.attach_bridge(Arc::clone(&bridge)).await;
+                bridge_opt = Some(bridge);
+                None
             } else {
                 None
             };
@@ -428,10 +612,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("[HUB] Token authentication: disabled (loopback only)");
             }
 
-            // Wait for Ctrl+C
-            tokio::signal::ctrl_c().await?;
+            // Wait for shutdown signal (SIGINT / Ctrl+C, or SIGTERM on Unix)
+            wait_for_hub_shutdown_signal().await?;
             println!("\n[HUB] Shutdown signal received. Stopping hub...");
             hub.stop().await;
+            if let Some(bridge) = bridge_opt {
+                bridge.close().await;
+            }
             if let Some(handle) = master_handle_opt {
                 let _ = handle.shutdown();
             }
@@ -918,5 +1105,98 @@ mod tests {
             b"hello"
         );
         assert!(read_data_payload_bytes(None, Some(&dir.path().join("missing.bin"))).is_err());
+    }
+
+    #[test]
+    fn hub_grid_connect_flags_parse_and_conflict_with_grid_master() {
+        let cli = Cli::try_parse_from([
+            "agent-mesh",
+            "hub",
+            "--listen",
+            "127.0.0.1:0",
+            "--grid-connect",
+            "127.0.0.1:8088",
+            "--secret-file",
+            "/tmp/cluster.secret",
+            "--master-key",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "--relay-url",
+            "https://relay.example.com/",
+        ])
+        .expect("parse hub --grid-connect flags");
+        match cli.command {
+            Commands::Hub {
+                grid_master,
+                grid_connect,
+                secret_file,
+                master_key,
+                relay_url,
+                ..
+            } => {
+                assert!(grid_master.is_none());
+                assert_eq!(grid_connect.as_deref(), Some("127.0.0.1:8088"));
+                assert_eq!(
+                    secret_file.as_deref(),
+                    Some(Path::new("/tmp/cluster.secret"))
+                );
+                assert_eq!(
+                    master_key.as_deref(),
+                    Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+                );
+                assert_eq!(relay_url.as_deref(), Some("https://relay.example.com/"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let conflict = Cli::try_parse_from([
+            "agent-mesh",
+            "hub",
+            "--grid-master",
+            "127.0.0.1:0",
+            "--grid-connect",
+            "127.0.0.1:8088",
+        ])
+        .expect_err("--grid-master and --grid-connect must conflict");
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resolve_remote_master_secret_precedence_and_empty_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = dir.path().join("default.secret");
+        let explicit_path = dir.path().join("explicit.secret");
+        let s_default = ClusterSecret::generate().unwrap();
+        let s_explicit_file = ClusterSecret::generate().unwrap();
+        let s_explicit_hex = ClusterSecret::generate().unwrap();
+        s_default.save_file(&default_path, false).unwrap();
+        s_explicit_file.save_file(&explicit_path, false).unwrap();
+
+        // Explicit secret wins over secret-file and default.
+        let chosen = resolve_remote_master_secret(
+            Some(&s_explicit_hex.to_hex()),
+            Some(&explicit_path),
+            Some(&default_path),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(chosen.to_hex(), s_explicit_hex.to_hex());
+
+        // Explicit secret-file wins over default.
+        let chosen = resolve_remote_master_secret(None, Some(&explicit_path), Some(&default_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.to_hex(), s_explicit_file.to_hex());
+
+        // Default secret file is used when present.
+        let chosen = resolve_remote_master_secret(None, None, Some(&default_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.to_hex(), s_default.to_hex());
+
+        // Empty explicit secret or secret-file fails closed.
+        assert!(resolve_remote_master_secret(Some(""), None, Some(&default_path)).is_err());
+        assert!(
+            resolve_remote_master_secret(None, Some(Path::new("")), Some(&default_path)).is_err()
+        );
     }
 }
