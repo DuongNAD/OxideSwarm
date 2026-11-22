@@ -163,8 +163,23 @@ fn preset_vram_high_skips_2gb_4gb_6143mb_and_preserves_bug3_cpu_defaults() {
         w_sim.clone(),
     ];
 
-    // Both `auto` and `triposr` with quality="high" (even without --gpu/--vram-mb) require 6144 MB.
-    for eng in [None, Some("triposr")] {
+    // `auto` always runs the CPU SDF tier, so even quality="high" needs no VRAM and runs on a CPU
+    // worker (it must never wait for a GPU it will not use).
+    let t_auto_high = gen3d_task(None, "high", TaskRequirements::generic(2, 60));
+    assert_eq!(config.required_vram_mb(&t_auto_high), 0);
+    let auto_report = WorkloadScheduler::matchmake(
+        &config,
+        std::slice::from_ref(&t_auto_high),
+        std::slice::from_ref(&w_cpu),
+    );
+    assert_eq!(
+        auto_report.assignments.len(),
+        1,
+        "auto high must run on CPU"
+    );
+
+    // `triposr` with quality="high" (even without --gpu/--vram-mb) requires 6144 MB.
+    for eng in [Some("triposr")] {
         let t_high = gen3d_task(eng, "high", TaskRequirements::generic(2, 60));
         assert_eq!(config.required_vram_mb(&t_high), 6144);
         let report = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&t_high), &cluster);
@@ -176,7 +191,7 @@ fn preset_vram_high_skips_2gb_4gb_6143mb_and_preserves_bug3_cpu_defaults() {
     }
 
     // Even with ONLY CPU + 2GB workers, a `high` task must skip the 2GB worker (never fall back).
-    let t_high_only_2g = gen3d_task(None, "high", TaskRequirements::generic(1, 60));
+    let t_high_only_2g = gen3d_task(Some("triposr"), "high", TaskRequirements::generic(1, 60));
     let skip_2g =
         WorkloadScheduler::matchmake(&config, &[t_high_only_2g], &[w_cpu.clone(), w_2g.clone()]);
     assert!(
@@ -205,7 +220,7 @@ fn preset_vram_high_skips_2gb_4gb_6143mb_and_preserves_bug3_cpu_defaults() {
     let w_1g = make_worker("gpu-1g", 8, 16384, true, false, Some(1024), false);
     let mut gpu_fast_req = TaskRequirements::generic(1, 60);
     gpu_fast_req.gpu_required = true;
-    let t_fast_gpu = gen3d_task(None, "fast", gpu_fast_req);
+    let t_fast_gpu = gen3d_task(Some("triposr"), "fast", gpu_fast_req);
     assert_eq!(config.required_vram_mb(&t_fast_gpu), 2048);
     let fast_report = WorkloadScheduler::matchmake(&config, &[t_fast_gpu], &[w_1g, w_2g.clone()]);
     assert_eq!(fast_report.assignments[0].worker_id, w_2g.worker_id);
@@ -220,10 +235,10 @@ fn preset_vram_shape_isolation_and_custom_thresholds() {
     config.min_vram_fast_mb = 2048;
 
     let w_8g = make_worker("gpu-8g", 4, 16384, true, false, Some(8192), false);
-    let t_high = gen3d_task(None, "high", TaskRequirements::generic(1, 60));
+    let t_high = gen3d_task(Some("triposr"), "high", TaskRequirements::generic(1, 60));
     let mut req_fast = TaskRequirements::generic(1, 60);
     req_fast.gpu_required = true;
-    let t_fast = gen3d_task(None, "fast", req_fast);
+    let t_fast = gen3d_task(Some("triposr"), "fast", req_fast);
 
     let report = WorkloadScheduler::matchmake(
         &config,
@@ -268,8 +283,8 @@ async fn async_schedule_batch_reserves_preset_vram_and_holds_back() {
 
     // Submit two `high` tasks (each needs 6144 MB, so 8192 MB fits only one at a time)
     // plus a trailing generic task that could otherwise steal slots on `w_8g`.
-    let t1 = gen3d_task(None, "high", TaskRequirements::generic(1, 60));
-    let t2 = gen3d_task(None, "high", TaskRequirements::generic(1, 60));
+    let t1 = gen3d_task(Some("triposr"), "high", TaskRequirements::generic(1, 60));
+    let t2 = gen3d_task(Some("triposr"), "high", TaskRequirements::generic(1, 60));
     let t_cpu = Task::new(
         TaskSpec::command("echo", vec!["filler".into()]),
         TaskRequirements::generic(1, 60),
@@ -392,7 +407,7 @@ async fn hold_back_does_not_steal_stage6_gpu_reserve_slots() {
             TaskRequirements::generic(2, 60),
         );
         let t_gpu = if use_gen3d_high {
-            gen3d_task(None, "high", TaskRequirements::generic(1, 60))
+            gen3d_task(Some("triposr"), "high", TaskRequirements::generic(1, 60))
         } else {
             Task::new(
                 TaskSpec::new_gpu_compute("gpu-1", 32),
@@ -565,7 +580,11 @@ async fn reregister_capability_downgrade_fails_queued_3d_tasks() {
 
     let id_blender = queue.submit(autorig_task(Some("blender"))).await.unwrap();
     let id_high = queue
-        .submit(gen3d_task(None, "high", TaskRequirements::generic(1, 60)))
+        .submit(gen3d_task(
+            Some("triposr"),
+            "high",
+            TaskRequirements::generic(1, 60),
+        ))
         .await
         .unwrap();
 
@@ -712,7 +731,7 @@ async fn reaper_straggler_respects_requires_blender_and_preset_vram() {
 
     let mut blender_task = autorig_task(Some("blender"));
     blender_task.tags.push(OPT_REPEATABLE_TAG.to_string());
-    let mut high_task = gen3d_task(None, "high", TaskRequirements::generic(1, 60));
+    let mut high_task = gen3d_task(Some("triposr"), "high", TaskRequirements::generic(1, 60));
     high_task.tags.push(OPT_REPEATABLE_TAG.to_string());
 
     let b_key = TaskKey::for_task(&blender_task);

@@ -221,7 +221,11 @@ impl SchedulerConfig {
         }
         match &task.spec {
             TaskSpec::Generative3D(spec) => {
-                if matches!(spec.engine(), rusty_grid_core::task::Engine3D::Sdf) {
+                // `auto` always runs the CPU SDF tier on the worker (3D-1 D3), so it needs no VRAM.
+                if matches!(
+                    spec.engine(),
+                    rusty_grid_core::task::Engine3D::Sdf | rusty_grid_core::task::Engine3D::Auto
+                ) {
                     return 0;
                 }
                 let q = spec.quality.trim();

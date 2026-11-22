@@ -638,7 +638,11 @@ fn gen3d_vram_tier_for(task: &Task) -> Option<Generative3DVramTier> {
     let TaskSpec::Generative3D(spec) = &task.spec else {
         return None;
     };
-    if matches!(spec.engine(), rusty_grid_core::task::Engine3D::Sdf) {
+    // `auto` always runs the CPU SDF tier on the worker (3D-1 D3), so it needs no VRAM.
+    if matches!(
+        spec.engine(),
+        rusty_grid_core::task::Engine3D::Sdf | rusty_grid_core::task::Engine3D::Auto
+    ) {
         return None;
     }
     let q = spec.quality.trim();

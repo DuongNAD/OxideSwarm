@@ -1841,7 +1841,11 @@ mod tests {
         )
         .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
         let high_task = Task::new(
-            TaskSpec::Generative3D(Generative3DSpec::new_prompt("robot").with_quality("high")),
+            TaskSpec::Generative3D(
+                Generative3DSpec::new_prompt("robot")
+                    .with_engine("triposr")
+                    .with_quality("high"),
+            ),
             TaskRequirements::generic(1, 60),
         )
         .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);

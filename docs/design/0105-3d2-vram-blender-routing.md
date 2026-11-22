@@ -50,12 +50,12 @@ Wires two missing capability gates into the master scheduler, speculative stragg
 - **Stateless effective VRAM rule** (implemented identically in `SchedulerConfig::required_vram_mb`, `TaskView::gen3d_vram_tier`, and CLI preflight):
   1. If `task.requirements.effective_vram_mb() > 0`, use the explicit `vram_mb`.
   2. Else if `TaskSpec::Generative3D(spec)`:
-     - `Engine3D::Sdf` -> `0` MB (Tier 0 CPU procedural engine uses no GPU VRAM unless `--vram-mb` is passed explicitly).
+     - `Engine3D::Sdf` or `Engine3D::Auto` -> `0` MB (the worker runs `auto` as the Tier 0 CPU procedural engine, 3D-1 D3, so neither uses GPU VRAM unless `--vram-mb` is passed explicitly).
      - Else if `task.requirements.gpu_required || spec.quality.trim().eq_ignore_ascii_case("high")`:
        - `"fast"` -> `config.min_vram_fast_mb` (default `2048` MB)
        - `"high"` -> `config.min_vram_high_mb` (default `6144` MB)
        - `_` (`"standard"`) -> `config.min_vram_standard_mb` (default `4096` MB)
-     - Else (`!gpu_required` and `"fast"`/`"standard"`) -> `0` MB, keeping `Auto` and `TripoSr` `"standard"` defaults CPU-eligible (`BUG-3`).
+     - Else (`!gpu_required` and `"fast"`/`"standard"`) -> `0` MB, keeping `TripoSr` `"standard"` defaults CPU-eligible (`BUG-3`).
   3. Else -> `0` MB.
 - **Implied GPU requirement**: Whenever `req_vram > 0`, `effective_requires_gpu = view.requires_gpu || req_vram > 0` is `true` in `Shape`, `Engine::place`, `Engine::skip_reason`, `Engine::apply_stage6_and_7`, `Engine::rank`, `matchmake_inner`, `gpu_demand`, `schedule_batch`, and `reaper::run_straggler_pass`. This prevents Stage 6 (`preserve_gpu_for_gpu_tasks`) and `prefer_cpu_only` from steering `high` tasks away from GPU workers onto CPU workers.
 - **Cross-pass VRAM reservation**: `TaskQueue::assigned_loads_with<F: Fn(&Task) -> u64>(&self, vram_for_task: F)` (in `crates/master/src/queue.rs`) lets `WorkloadScheduler::schedule_batch` and `reaper::run_straggler_pass` accumulate preset VRAM for active (`Scheduled`, `Running`) and `adoptable_by`-held tasks without mutating `TaskRequirements` or breaking `TaskQueue::assigned_loads()`.
@@ -80,7 +80,7 @@ Wires two missing capability gates into the master scheduler, speculative stragg
 
 - **`crates/master/tests/test_3d2_routing.rs`** (runs under both default features and `--features 3d` using `WorkerCapabilities::with_blender` / `with_vram_mb` and `WorkerMessage::Register`):
   - `--preferred-provider blender` (`AutoRig`, including mixed case/whitespace) routes only to `has_blender == true` workers, skips with `ClusterLacksCapability` when absent, fails immediately under `fail_unfulfillable_tasks`, and does not taint `builtin` `AutoRig` tasks in `Shape` negative-caching.
-  - `Generative3D` `high` (`Auto` and `TripoSr`) skips 2 GB (`2048 MB`), 4 GB (`4096 MB`), and `6143 MB` workers and lands on `6144+ MB`, preserves CPU-only `Sdf` `high` and `Auto`/`TripoSr` `standard` defaults, honors custom `SchedulerConfig::min_vram_*_mb`, separates `high` vs `fast` in `Shape`, reserves preset VRAM across passes via `assigned_loads_with`, holds back saturated 8 GB GPU workers, and checks `reaper::run_straggler_pass` for both `requires_blender` and preset VRAM.
+  - `Generative3D` `high` (`TripoSr`) skips 2 GB (`2048 MB`), 4 GB (`4096 MB`), and `6143 MB` workers and lands on `6144+ MB`, preserves CPU-only `Sdf` `high` and `Auto`/`TripoSr` `standard` defaults, honors custom `SchedulerConfig::min_vram_*_mb`, separates `high` vs `fast` in `Shape`, reserves preset VRAM across passes via `assigned_loads_with`, holds back saturated 8 GB GPU workers, and checks `reaper::run_straggler_pass` for both `requires_blender` and preset VRAM.
 - **`crates/cli/tests/test_3d2_routing.rs`** (default features + `--features 3d`):
   - End-to-end `oxideswarm submit` against `MasterServer` + mock `WorkerMessage::Register` workers verifying `AutoRig --preferred-provider blender` landing + stderr preflight warning, `Generative3D --quality high` skipping a 2 GB worker and landing on an 8 GB worker + stderr VRAM warning, and zero false VRAM warnings on `Auto` / `Sdf` defaults.
 - **Regression suites**: `test_cli_3d_submission` (`--features 3d`), `test_challenger_m4_scheduler_runner` (`--features 3d`), `wire_layout_tests`, `ox-mode test size`, and `ox-mode doc verify`.
@@ -94,3 +94,4 @@ Wires two missing capability gates into the master scheduler, speculative stragg
 ## Status log
 
 - 2026-11-22: Created design record `0105` and implemented Blender capability routing and preset VRAM default routing (`3D-2`).
+- 2026-11-22: Review fix: `auto` is exempt from preset VRAM like `sdf`, because the worker always runs it on the CPU; before, `submit --3d --quality high` waited forever on a CPU-only cluster and raised GPU demand on a mixed one.
