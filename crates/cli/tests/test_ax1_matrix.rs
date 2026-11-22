@@ -864,3 +864,126 @@ async fn test_mcp_matrix_workflows_validation_framing_and_eof_grace() {
         .unwrap_or_else(|| panic!("missing id 99 reply on EOF:\n{out_str}"));
     assert_eq!(reply_99["result"]["isError"], false);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cli_matrix_symlink_cell_dir_fails_closed() {
+    let cluster = Cluster::start_with_tagged_workers(&[("w-a", &["cell-a"])]).await;
+
+    let out_dir = cluster.home.path().join("cli_symlink_out");
+    let outside_dir = cluster.home.path().join("outside_target");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::os::unix::fs::symlink(&outside_dir, out_dir.join("cell-00-cell-a")).unwrap();
+
+    let out = cluster
+        .cli()
+        .args([
+            "submit",
+            "--master",
+            &cluster.addr,
+            "--matrix",
+            "tag=cell-a",
+            "--type",
+            "shell",
+            "--output",
+            "secret.txt",
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--json",
+            "--command",
+            "echo LEAKED_VIA_CLI_SYMLINK > secret.txt",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "CLI matrix output into symlinked cell dir must exit non-zero:\n{}",
+        describe(&out)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["status"], "failed");
+    assert_eq!(v["completed_cells"], 0);
+    assert_eq!(v["error_cells"], 1);
+    assert_eq!(v["cells"][0]["status"], "error");
+    let err = v["cells"][0]["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("symbolic link"),
+        "expected symbolic link refusal in cell error, got: {v}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside_dir).unwrap().count(),
+        0,
+        "symlink target directory must remain completely empty"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mcp_task_result_and_doctor_huge_timeout_do_not_panic() {
+    let cluster = Cluster::start_with_tagged_workers(&[("w-a", &["cell-a"])]).await;
+    let mut mcp = Mcp::start(&cluster);
+
+    // 1. Submit matrix cell then poll task_result(wait=true, wait_secs=u64::MAX).
+    let (submit_body, submit_err) = mcp.submit(json!({
+        "command": "echo",
+        "args": ["task-result-huge"],
+        "matrix": ["tag=cell-a"],
+    }));
+    assert!(!submit_err, "{submit_body}");
+    let task_id = submit_body["cells"][0]["task_id"]
+        .as_str()
+        .expect("matrix cell task_id")
+        .to_string();
+
+    let tr_resp = mcp.call(
+        "tools/call",
+        json!({
+            "name": "task_result",
+            "arguments": {
+                "task_id": task_id,
+                "wait": true,
+                "wait_secs": u64::MAX,
+            }
+        }),
+    );
+    assert!(
+        tr_resp.get("error").is_none(),
+        "unexpected task_result RPC error: {tr_resp}"
+    );
+    assert_eq!(tr_resp["result"]["isError"], false, "{tr_resp}");
+    let tr_text = tr_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("task_result text");
+    let tr_body: Value = serde_json::from_str(tr_text).unwrap();
+    assert_eq!(tr_body["status"], "completed");
+    assert_eq!(tr_body["stdout"], "task-result-huge\n");
+    mcp.ping();
+
+    // 2. Call MCP doctor with timeout_secs=u64::MAX (exercises doctor::collect_with deadline).
+    let doc_resp = mcp.call(
+        "tools/call",
+        json!({
+            "name": "doctor",
+            "arguments": {
+                "timeout_secs": u64::MAX,
+                "skip_gpu": true,
+                "skip_spread": true,
+                "skip_throughput": true,
+            }
+        }),
+    );
+    assert!(
+        doc_resp.get("error").is_none(),
+        "unexpected doctor RPC error: {doc_resp}"
+    );
+    assert_eq!(doc_resp["result"]["isError"], false, "{doc_resp}");
+    let doc_text = doc_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("doctor text");
+    let doc_body: Value = serde_json::from_str(doc_text).unwrap();
+    assert!(
+        !doc_body["checks"].as_array().unwrap().is_empty(),
+        "doctor checks should not be empty: {doc_body}"
+    );
+    mcp.ping();
+}

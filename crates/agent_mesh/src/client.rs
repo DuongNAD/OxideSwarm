@@ -246,6 +246,7 @@ struct ChunkReassembler {
     max_pending_assemblies: usize,
     max_assembled_bytes: usize,
     max_total_bytes: usize,
+    ttl: Duration,
 }
 
 impl ChunkReassembler {
@@ -269,7 +270,14 @@ impl ChunkReassembler {
             max_pending_assemblies,
             max_assembled_bytes,
             max_total_bytes,
+            ttl: CHUNK_ASSEMBLY_TTL,
         }
+    }
+
+    #[cfg(test)]
+    fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
     }
 
     fn remove_assembly(&mut self, key: &(String, String)) -> Option<ChunkAssembly> {
@@ -296,9 +304,10 @@ impl ChunkReassembler {
     }
 
     fn prune_expired(&mut self, now: Instant) {
+        let ttl = self.ttl;
         let mut removed_bytes = 0usize;
         self.inflight.retain(|_, asm| {
-            let keep = now.saturating_duration_since(asm.updated_at) <= CHUNK_ASSEMBLY_TTL;
+            let keep = now.saturating_duration_since(asm.updated_at) <= ttl;
             if !keep {
                 removed_bytes = removed_bytes.saturating_add(asm.total_bytes);
             }
@@ -2583,6 +2592,56 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
             .unwrap()
             .expect("t3 should complete after second chunk");
         assert_eq!(assembled.bytes.len(), 90);
+        assert!(reassembler.inflight.is_empty());
+        assert_eq!(reassembler.total_inflight_bytes, 0);
+    }
+
+    #[test]
+    fn test_chunk_reassembler_prune_expired_ttl() {
+        let mut reassembler = ChunkReassembler::new().with_ttl(Duration::from_millis(20));
+
+        // Insert incomplete chunk 0 for "stale" (32 bytes).
+        assert!(reassembler
+            .insert_chunk("peer", "stale", 0, 2, None, vec![b's'; 32])
+            .unwrap()
+            .is_none());
+        assert_eq!(reassembler.inflight.len(), 1);
+        assert_eq!(reassembler.total_inflight_bytes, 32);
+
+        // Before TTL elapses, prune_expired must retain the assembly.
+        reassembler.prune_expired(Instant::now());
+        assert_eq!(reassembler.inflight.len(), 1);
+        assert_eq!(reassembler.total_inflight_bytes, 32);
+
+        // Sleep past the 20ms TTL, then insert a fresh chunk; insert_chunk calls prune_expired
+        // and must drop the expired "stale" assembly and reclaim its 32 bytes.
+        std::thread::sleep(Duration::from_millis(35));
+        assert!(reassembler
+            .insert_chunk("peer", "fresh", 0, 2, None, vec![b'f'; 16])
+            .unwrap()
+            .is_none());
+        assert!(!reassembler
+            .inflight
+            .contains_key(&("peer".to_string(), "stale".to_string())));
+        assert!(reassembler
+            .inflight
+            .contains_key(&("peer".to_string(), "fresh".to_string())));
+        assert_eq!(reassembler.inflight.len(), 1);
+        assert_eq!(reassembler.total_inflight_bytes, 16);
+
+        // Sending chunk 1 for "stale" after expiry starts a new assembly rather than completing
+        // with the expired chunk 0.
+        assert!(reassembler
+            .insert_chunk("peer", "stale", 1, 2, None, vec![b'x'; 8])
+            .unwrap()
+            .is_none());
+        assert_eq!(reassembler.total_inflight_bytes, 24);
+
+        // Direct prune_expired with a timestamp past TTL clears everything and zeroes byte count.
+        let future = Instant::now()
+            .checked_add(Duration::from_millis(35))
+            .unwrap();
+        reassembler.prune_expired(future);
         assert!(reassembler.inflight.is_empty());
         assert_eq!(reassembler.total_inflight_bytes, 0);
     }

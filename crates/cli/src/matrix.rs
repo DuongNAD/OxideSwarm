@@ -56,6 +56,49 @@ pub(crate) fn safe_deadline(timeout: Duration) -> tokio::time::Instant {
         .unwrap_or(now)
 }
 
+/// Computes `std::time::Instant::now() + timeout`, capping at [`MAX_MATRIX_WAIT`] and using
+/// `checked_add` so extreme user-supplied timeouts never panic.
+pub(crate) fn safe_std_deadline(timeout: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let capped = timeout.min(MAX_MATRIX_WAIT);
+    now.checked_add(capped)
+        .or_else(|| now.checked_add(Duration::from_secs(60)))
+        .unwrap_or(now)
+}
+
+/// Verifies that `<base_out_dir>/<slug>` is not an existing symbolic link or non-directory entry
+/// before downloading matrix cell outputs or saving artifacts.
+pub fn ensure_non_symlink_cell_dir(
+    base_out_dir: &std::path::Path,
+    slug: &str,
+) -> Result<PathBuf, String> {
+    let cell_dir = base_out_dir.join(slug);
+    match std::fs::symlink_metadata(&cell_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "cell output directory '{}' is a symbolic link, which is refused",
+                    cell_dir.display()
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(format!(
+                    "cell output path '{}' exists and is not a directory",
+                    cell_dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot inspect cell output directory '{}': {e}",
+                cell_dir.display()
+            ));
+        }
+    }
+    Ok(cell_dir)
+}
+
 /// Help text for `--matrix`.
 pub const MATRIX_HELP: &str = "Fan out the task over the Cartesian product of KEY=V1,V2,... axes (repeatable; implies --wait). Placement keys: os, arch, worker, iso, tool, tag; process tasks also accept env:<VAR>. Unplaced cells fail upfront via ListWorkers without hanging";
 

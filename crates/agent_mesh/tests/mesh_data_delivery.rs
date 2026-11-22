@@ -721,3 +721,158 @@ async fn test_data_cli_payload_file_binary_stdin_and_multichunk() {
     assert_eq!(persisted_by_sha.get(&multi_sha), Some(&multi_bytes));
     assert_eq!(persisted_by_sha.get(&stdin_sha), Some(&stdin_bytes));
 }
+
+#[tokio::test]
+async fn test_chunk_edge_cases_duplicate_seq_inconsistent_total_and_oob_seq() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::protocol::Message as WsMsg;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = agent_mesh::validate_inbox_dir(&tmp.path().join("chunk-edge-inbox")).unwrap();
+
+    let hub = AgentMeshHub::new();
+    let port = hub.start("127.0.0.1:0").await.expect("start hub");
+    let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+    let consumer = AgentMeshClient::new(&ws_url, "chunk-consumer", "linux").with_inbox_dir(&inbox);
+    consumer.connect().await.unwrap();
+
+    let (mut raw_ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let reg = serde_json::json!({
+        "type": "NodeRegistration",
+        "correlation_id": "reg-edge-sender",
+        "from": "edge-sender",
+        "to": "hub",
+        "platform": "linux",
+    });
+    raw_ws.send(WsMsg::Text(reg.to_string())).await.unwrap();
+    let _reg_ack = raw_ws.next().await.unwrap().unwrap();
+
+    // 1. Duplicate chunk sequence (0, 0, 1) reassembles cleanly to DeliveryAck and persists exact bytes.
+    let dup_payload = b"hello-chunked-dup";
+    let (dup_chunks, dup_corr, dup_sha) =
+        AgentMeshEnvelope::new_data_payload_chunks("edge-sender", "chunk-consumer", dup_payload, 8);
+    assert_eq!(dup_chunks.len(), 3);
+    raw_ws
+        .send(WsMsg::Text(dup_chunks[0].to_json_string().unwrap()))
+        .await
+        .unwrap();
+    raw_ws
+        .send(WsMsg::Text(dup_chunks[0].to_json_string().unwrap()))
+        .await
+        .unwrap();
+    raw_ws
+        .send(WsMsg::Text(dup_chunks[1].to_json_string().unwrap()))
+        .await
+        .unwrap();
+    raw_ws
+        .send(WsMsg::Text(dup_chunks[2].to_json_string().unwrap()))
+        .await
+        .unwrap();
+
+    let ack_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let ack_env = AgentMeshEnvelope::from_json_str(ack_frame.to_text().unwrap()).unwrap();
+    match ack_env {
+        AgentMeshEnvelope::DeliveryAck {
+            correlation_id,
+            status,
+            ..
+        } => {
+            assert_eq!(correlation_id, dup_corr);
+            assert_eq!(status, "data_received_verified");
+        }
+        other => panic!("Expected DeliveryAck for duplicate chunk sequence, got {other:?}"),
+    }
+    let files: Vec<_> = std::fs::read_dir(&inbox)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(files.len(), 1);
+    let persisted = std::fs::read(files[0].path()).unwrap();
+    assert_eq!(persisted, dup_payload);
+    assert_eq!(compute_sha256(&persisted), dup_sha);
+
+    // 2. Inconsistent total_chunks (chunk 0 claims 2, chunk 1 claims 3) must return DeliveryNack(ERR_PAYLOAD_CORRUPT).
+    let (mut bad_total_chunks, bad_total_corr, _) =
+        AgentMeshEnvelope::new_data_payload_chunks("edge-sender", "chunk-consumer", b"abcd", 2);
+    assert_eq!(bad_total_chunks.len(), 2);
+    if let AgentMeshEnvelope::DataPayload {
+        ref mut total_chunks,
+        ..
+    } = bad_total_chunks[1]
+    {
+        *total_chunks = 3;
+    }
+    for env in bad_total_chunks {
+        raw_ws
+            .send(WsMsg::Text(env.to_json_string().unwrap()))
+            .await
+            .unwrap();
+    }
+    let nack_total_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let nack_total_env =
+        AgentMeshEnvelope::from_json_str(nack_total_frame.to_text().unwrap()).unwrap();
+    match nack_total_env {
+        AgentMeshEnvelope::DeliveryNack {
+            correlation_id,
+            error_code,
+            ..
+        } => {
+            assert_eq!(correlation_id, bad_total_corr);
+            assert_eq!(error_code, ERR_PAYLOAD_CORRUPT);
+        }
+        other => {
+            panic!("Expected DeliveryNack(ERR_PAYLOAD_CORRUPT) for inconsistent total_chunks, got {other:?}")
+        }
+    }
+
+    // 3. Out-of-range sequence_number (sequence_number=2 >= total_chunks=2) must return DeliveryNack(ERR_PAYLOAD_CORRUPT).
+    let (mut oob_chunks, oob_corr, _) =
+        AgentMeshEnvelope::new_data_payload_chunks("edge-sender", "chunk-consumer", b"wxyz", 2);
+    assert_eq!(oob_chunks.len(), 2);
+    if let AgentMeshEnvelope::DataPayload {
+        ref mut sequence_number,
+        ..
+    } = oob_chunks[1]
+    {
+        *sequence_number = 2;
+    }
+    raw_ws
+        .send(WsMsg::Text(oob_chunks[1].to_json_string().unwrap()))
+        .await
+        .unwrap();
+    let nack_oob_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let nack_oob_env = AgentMeshEnvelope::from_json_str(nack_oob_frame.to_text().unwrap()).unwrap();
+    match nack_oob_env {
+        AgentMeshEnvelope::DeliveryNack {
+            correlation_id,
+            error_code,
+            ..
+        } => {
+            assert_eq!(correlation_id, oob_corr);
+            assert_eq!(error_code, ERR_PAYLOAD_CORRUPT);
+        }
+        other => panic!(
+            "Expected DeliveryNack(ERR_PAYLOAD_CORRUPT) for out-of-range sequence_number, got {other:?}"
+        ),
+    }
+
+    // Verify neither rejected transfer created any new file in inbox.
+    assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 1);
+
+    let _ = raw_ws.close(None).await;
+    consumer.close().await;
+    hub.stop().await;
+}

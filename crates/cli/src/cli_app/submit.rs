@@ -1656,7 +1656,20 @@ async fn run_matrix_submit(
                     if result.outputs.is_empty() {
                         continue;
                     }
-                    let cell_dir = base_out_dir.join(&exec.cell.slug);
+                    let cell_dir = match crate::matrix::ensure_non_symlink_cell_dir(
+                        base_out_dir,
+                        &exec.cell.slug,
+                    ) {
+                        Ok(dir) => dir,
+                        Err(e) => {
+                            eprintln!(
+                                "Downloading output files for cell '{}' failed: {e}",
+                                exec.cell.label
+                            );
+                            exec.download_error = Some(e);
+                            continue;
+                        }
+                    };
                     match crate::blobs::download_outputs(&connection, &result.outputs, &cell_dir)
                         .await
                     {
@@ -1689,7 +1702,18 @@ async fn run_matrix_submit(
             continue;
         };
         if !result.artifacts.is_empty() {
-            let cell_dir = base_out_dir.join(&exec.cell.slug);
+            let cell_dir =
+                match crate::matrix::ensure_non_symlink_cell_dir(base_out_dir, &exec.cell.slug) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!(
+                            "Saving artifacts for cell '{}' failed: {e}",
+                            exec.cell.label
+                        );
+                        exec.download_error.get_or_insert(e);
+                        continue;
+                    }
+                };
             match crate::connect::save_output_artifacts(&result.artifacts, &cell_dir) {
                 Ok(paths) => exec.saved_artifacts = Some(paths),
                 Err(e) => {

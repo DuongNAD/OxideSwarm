@@ -13,44 +13,13 @@ use rusty_grid_core::task::Task;
 use crate::blobs::{PreparedInputs, UploadReport};
 use crate::connect::{connect_master, save_output_artifacts};
 use crate::matrix::{
-    check_placeability, execute_matrix, expand_cells, MatrixProgressEvent, MatrixReport,
-    MatrixSpec, DEFAULT_MAX_MATRIX_CELLS,
+    check_placeability, ensure_non_symlink_cell_dir, execute_matrix, expand_cells,
+    MatrixProgressEvent, MatrixReport, MatrixSpec, DEFAULT_MAX_MATRIX_CELLS,
 };
 
 use super::submit::prepare_mcp_output_dir_in_dir;
 use super::submit_support::WorkspaceSubmitMeta;
 use super::{McpState, ToolCallContext, ToolCallResult, DEFAULT_MASTER_RPC_TIMEOUT};
-
-fn ensure_non_symlink_cell_dir(
-    base_out_dir: &std::path::Path,
-    slug: &str,
-) -> Result<std::path::PathBuf, String> {
-    let cell_dir = base_out_dir.join(slug);
-    match std::fs::symlink_metadata(&cell_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(format!(
-                    "cell output directory '{}' is a symbolic link, which is refused in MCP output_dir",
-                    cell_dir.display()
-                ));
-            }
-            if !meta.is_dir() {
-                return Err(format!(
-                    "cell output path '{}' exists and is not a directory",
-                    cell_dir.display()
-                ));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(format!(
-                "cannot inspect cell output directory '{}': {e}",
-                cell_dir.display()
-            ));
-        }
-    }
-    Ok(cell_dir)
-}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_mcp_matrix(
