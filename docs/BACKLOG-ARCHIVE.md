@@ -861,6 +861,50 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Do:** Add an uncharged path for announced drains. Correct the test.
 - **Done when:** Repeated evacuations leave `failover_count` at 0.
 
+### 3D-2: Wire VRAM and Blender routing
+
+- **Evidence:** Read. Confirmed by grep.
+- **Problem:** `required_vram_mb` (`crates/master/src/scheduler.rs`) still returns preset defaults for `Generative3D` that are not automatically applied when `--vram-mb` is omitted, and `crates/master` does not read `has_blender` (explicit `TaskRequirements::vram_mb` via `--vram-mb` / MCP `vram_mb` is now enforced under `FEAT-9a` / [design 0068](design/0068-task-vram-accounting.md)). `--blender-path` reaches only the capability probe, and `resolve_blender_binary` misses the macOS and Linux paths that `detect_blender` searches. A Mac can advertise Blender and then fall back silently.
+- **Do:** Wire both into `view_fits`. Share one Blender resolver.
+- **Done when:** A `--preferred-provider blender` task lands only on a Blender worker. A `high` task
+  skips a 2 GB worker.
+- **Implemented (2026-11-22, design 0105, prod/backlog-completion-wave3):** Threaded `TaskView::requires_blender`
+  (`TaskSpec::AutoRig` with trimmed case-insensitive `preferred_provider == "blender"`), `WorkerAttrIndex::blender`,
+  and `RegisteredIndex::any_has_blender` through `crates/master/src/{queue.rs,worker_index.rs,scheduler.rs,reaper.rs}`
+  (`Engine::view_fits`, `place`, `skip_reason`, `hold_back`, and `run_straggler_pass`), wired
+  `SchedulerConfig::required_vram_mb` preset defaults (`2048`/`4096`/`6144` MB for `fast`/`standard`/`high` on
+  non-`Sdf` `Generative3D` when `--gpu` or `--quality high` applies, preserving CPU-only `Sdf` and non-GPU
+  `fast`/`standard` `Auto`/`TripoSr` defaults per `BUG-3`), added non-blocking `ListWorkers` preflight `stderr`
+  warnings in `crates/cli/src/cli_app/submit.rs`, and confirmed `crates/worker/src/autorig/blender_provider.rs`
+  delegates directly to `rusty_grid_core::capabilities::resolve_blender_binary`. Verified by
+  `crates/master/tests/test_3d2_routing.rs` (`4/4`) and `crates/cli/tests/test_3d2_routing.rs` (`4/4` with
+  `--features 3d`).
+
+### 3D-3: Make AutoRig options real or refuse them
+
+- **Evidence:** Read.
+- **Problem:** `--rig-preset quadruped` gives the biped skeleton. `engines/autorig/blender_rig.py:23`
+  parses `--preset` and never reads it. `turnaround` produces an empty action in Blender. OBJ input
+  fails, because it is always written as `input_mesh.glb`. The Blender timeout is fixed at 60 s
+  (`crates/worker/src/runner.rs:2201`). A failure falls back with only a `warn!` and the same device
+  label. The blocking engines take no timeout or cancel.
+- **Do:** Refuse unimplemented presets or implement them. Pick the extension from the magic bytes.
+  Pass the task timeout. Report the provider. Fail when Blender was requested explicitly.
+- **Done when:** `quadruped` gives a non-biped skeleton or an error. An OBJ goes through Blender. The
+  result names the provider. A timeout returns within 1 s of expiry.
+- **Implemented (2026-11-22, design 0106, prod/backlog-completion-wave3):** Validated `rig_preset` (`biped`
+  15 joints, `quadruped` 19 joints, `generic` 5 axial joints), `embed_animations` (`idle`, `walk`, `turnaround`
+  with 97 keyframes in both Rust `anim_synth.rs` and `engines/autorig/blender_rig.py`), and `preferred_provider`
+  (`None`/`builtin`, `auto`, `blender`) upfront in `TaskSpec::validate()` (`crates/core/src/task.rs`),
+  `crates/worker/src/autorig/*`, and `blender_rig.py`, refusing empty or unknown values and failing explicitly
+  (no silent fallback) when `"blender"` is missing or errors; added magic-byte `.glb`/`.gltf`/`.obj` detection
+  with UTF-8 BOM/whitespace stripping in `mesh_loader.rs` and `BlenderRigProvider`; reported concrete
+  `"OxideSwarm-AutoRig-Blender"` vs `"OxideSwarm-AutoRig-Builtin"` in `TaskResult::device_name` and stdout;
+  and propagated task `timeout`, `child_pid`, and `cancel_rx` / cooperative `AtomicBool` stopping (`<= 1 s`
+  settle) across Blender supervision and Rust `autorig/*` and `gen3d/*` workloads (`crates/worker/src/runner/workloads.rs`).
+  Verified against real Blender 5.2.1 LTS plus `crates/worker/tests/test_3d3_autorig_options.rs` (`10/10`),
+  `test_autorig_pipeline` (`15/15`), and `test_challenger_m3_blender_job_object` (`10/10`).
+
 ### MR-1: Let a CLI user ship a mapper and reducer
 
 - **Evidence:** Read.
@@ -905,6 +949,33 @@ The standard in `docs/README.md` requires "only what the code does". These items
   `"offline"` node status and `/api/status` counts (`docs/reference.md` updated). Verified by
   `crates/agent_mesh/tests/mesh_data_delivery.rs` (`7/7`), `cargo test -p agent_mesh --locked` (`124/124`),
   `tests/test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `tests/test_wave2_e2e.py` (`F6` + Tiers 3–4).
+
+### MESH-3: Attach the bridge to a running master
+
+- **Evidence:** Read.
+- **Problem:** `AgentGridBridge::new` takes an in-process `MasterHandle`
+  (`crates/agent_mesh/src/bridge.rs:29`). Mesh tasks therefore run on a second master with no workers
+  until someone points them at it. `grid_submit` overwrites tags, has no files or outputs, and has no
+  cancel. `parse_binary_data` reads hub-local paths that a peer names (`bridge.rs:857`).
+- **Do:** Add a `GridBackend` trait with in-process and `connect_master` versions, and
+  `--grid-connect <HOST>:8088`. Add placement, files, outputs, result and cancel. Remove the file
+  fallback. Document that workers must join.
+- **Done when:** A test with `CARGO_BIN_EXE_agent-mesh` runs `grid_submit` on a separately started
+  master.
+- **Implemented (2026-11-22, pull requests 114, 132, design 0104, prod/backlog-completion-wave3):** Decoupled
+  `AgentGridBridge` (`crates/agent_mesh/src/bridge.rs`) behind async `GridBackend`
+  (`crates/agent_mesh/src/grid_backend.rs`) with `InProcessBackend` (`--grid-master`) and
+  `RemoteMasterBackend` (`crates/agent_mesh/src/remote_backend.rs` directly atop `rusty_grid_core` TCP/P2P +
+  OXS-AUTH v2/v3); added `agent-mesh hub --grid-connect <HOST:PORT>` (`OXIDE_GRID_CONNECT`, conflicting with
+  `--grid-master`, with `--secret`/`--secret-file`/`--master-key`/`--relay-url`/`--insecure`), live `/api/nodes`
+  `"grid"` `"online"`/`"offline"` status, caller tag preservation and `placement` (`os`, `arch`, `worker`,
+  `isolation`, `require_tags`, `require_tools`), upfront `reject_unsupported_workspace` refusal, strict
+  inline-only `files` (`StagedFile`, zero hub-local disk reads), `outputs` (`expected_outputs`) -> SHA-256
+  `artifacts`, `grid_result`/`grid_cancel`, `AgentMeshClient` helpers, and worker-join documentation in
+  `docs/design/0104-mesh3-remote-master-bridge.md` and `docs/reference.md`. Verified by
+  `crates/agent_mesh/tests/grid_remote_master_e2e.rs` (`2/2` using `CARGO_BIN_EXE_agent-mesh` against
+  separately started `oxideswarm master` and `oxideswarm worker`), `test_agent_mesh_rust_hub_cross_interop.py`
+  (`5/5`), and `test_agent_mesh_token_auth.py` (`7/7`).
 
 ### MODE-1: Make `ox-mode` report only what happened
 

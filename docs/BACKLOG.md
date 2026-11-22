@@ -177,6 +177,7 @@ Recounted on 2026-11-21 from the rows after items through TEST-84, APP-6, and FE
 Recounted on 2026-11-21 after LV-10 (steps 1–3) and PROTO-5 Partial: 247 items, 172 Implemented, 23 Partial and 52 Planned; 25 open items are In and 50 are Out.
 Recounted on 2026-11-21 after SCHED-5 Implemented (plus SCHED-4c and SCHED-4d implemented while SCHED-4 stays Partial pending live 2-machine hardware batch): 247 items, 173 Implemented, 23 Partial and 51 Planned; 25 open items are In and 49 are Out.
 Recounted on 2026-11-22 after Wave 2 (`FEAT-5` and `MESH-2` Implemented and archived, `AX-1` Partial, `TEST-41` and `TEST-61` updated): 247 items, 175 Implemented, 24 Partial and 48 Planned; 25 open items are In and 47 are Out.
+Recounted on 2026-11-22 after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented and archived; `AX-2` Partial): 247 items, 178 Implemented, 24 Partial and 45 Planned; 25 open items are In and 44 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -308,12 +309,12 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Implemented |  | 98 |
 | MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Implemented |  | 99 |
 | MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Implemented |  | 108 |
-| 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Planned | Out |  |
-| 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Planned | Out |  |
+| 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Implemented |  | (design 0105) |
+| 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Implemented |  | (design 0106) |
 | MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 |  | Implemented |  | 33 |
 | MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 |  | Implemented |  | 94 |
 | MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 |  | Implemented |  | ea3b5e0c, 85a53f71, 36a2d647 |
-| MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Partial | Out | 114, 132 |
+| MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Implemented |  | 114, 132, (design 0104) |
 | MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 |  | Implemented |  | 92 |
 | BRIDGE-1 | Repair `agent_bridge.py diagnose` | P2 | S | SEC-4 |  | Implemented |  | 77 |
 | AND-1 | Make the Android app build | P1 | M | SEC-3 | Yes | Planned | Out |  |
@@ -405,7 +406,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
-| AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | In | (design 0056) |
+| AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
@@ -649,40 +650,6 @@ The full suite must pass on a clean machine before CI can require it.
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
 
 ## Phase 4: finish partial features
-
-### 3D-2: Wire VRAM and Blender routing
-
-- **Evidence:** Read. Confirmed by grep.
-- **Problem:** `required_vram_mb` (`crates/master/src/scheduler.rs`) still returns preset defaults for `Generative3D` that are not automatically applied when `--vram-mb` is omitted, and `crates/master` does not read `has_blender` (explicit `TaskRequirements::vram_mb` via `--vram-mb` / MCP `vram_mb` is now enforced under `FEAT-9a` / [design 0068](design/0068-task-vram-accounting.md)). `--blender-path` reaches only the capability probe, and `resolve_blender_binary` misses the macOS and Linux paths that `detect_blender` searches. A Mac can advertise Blender and then fall back silently.
-- **Do:** Wire both into `view_fits`. Share one Blender resolver.
-- **Done when:** A `--preferred-provider blender` task lands only on a Blender worker. A `high` task
-  skips a 2 GB worker.
-
-### 3D-3: Make AutoRig options real or refuse them
-
-- **Evidence:** Read.
-- **Problem:** `--rig-preset quadruped` gives the biped skeleton. `engines/autorig/blender_rig.py:23`
-  parses `--preset` and never reads it. `turnaround` produces an empty action in Blender. OBJ input
-  fails, because it is always written as `input_mesh.glb`. The Blender timeout is fixed at 60 s
-  (`crates/worker/src/runner.rs:2201`). A failure falls back with only a `warn!` and the same device
-  label. The blocking engines take no timeout or cancel.
-- **Do:** Refuse unimplemented presets or implement them. Pick the extension from the magic bytes.
-  Pass the task timeout. Report the provider. Fail when Blender was requested explicitly.
-- **Done when:** `quadruped` gives a non-biped skeleton or an error. An OBJ goes through Blender. The
-  result names the provider. A timeout returns within 1 s of expiry.
-
-### MESH-3: Attach the bridge to a running master
-
-- **Evidence:** Read.
-- **Problem:** `AgentGridBridge::new` takes an in-process `MasterHandle`
-  (`crates/agent_mesh/src/bridge.rs:29`). Mesh tasks therefore run on a second master with no workers
-  until someone points them at it. `grid_submit` overwrites tags, has no files or outputs, and has no
-  cancel. `parse_binary_data` reads hub-local paths that a peer names (`bridge.rs:857`).
-- **Do:** Add a `GridBackend` trait with in-process and `connect_master` versions, and
-  `--grid-connect <HOST>:8088`. Add placement, files, outputs, result and cancel. Remove the file
-  fallback. Document that workers must join.
-- **Done when:** A test with `CARGO_BIN_EXE_agent-mesh` runs `grid_submit` on a separately started
-  master.
 
 ### AND-1: Make the Android app build
 
@@ -1578,6 +1545,28 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** R2 has a dated record. Measure M1 of design 0056 is recorded for this repository
   on three workers with its script in `benchmarks/grid/`, or the status log states that the stop
   rule applied and the guide holds the recipe.
+- **Partial (2026-11-22, design 0103, prod/backlog-completion-wave3):** Implemented client-side sharded
+  runs and Rust `--build-once` across `crates/cli/src/shard.rs`, `cli_app/shard.rs`, `cli_app.rs`,
+  `mcp/shard.rs`, and `mcp.rs` (plus `docs/guides/sharded-runs.md` and `docs/reference.md`) with zero
+  wire or store changes on Protocol 10 / Store v4: `oxideswarm shard --count <N>` (`1..=256`, capped
+  at `32` concurrent handshakes) and MCP `shard` tool, `ListWorkers` pre-flight fast-fail,
+  `slots:`-weighted Smooth Weighted Round-Robin worker spreading, 1-based `OX_SHARD_INDEX` /
+  `OX_SHARD_TOTAL` env injection (overriding colliding `--env`), `--fail-fast` sibling cancellation,
+  symlink-safe `<output_dir>/<shard_slug>/` isolation (`ensure_non_symlink_cell_dir`), pure-`std`
+  `--junit-out` XML merging, and `--build-once` (one `cargo nextest archive` builder per distinct
+  `(os, arch)` producing an output `BlobFile` passed into shard `Task::inputs` via `--archive-file`
+  and `--workspace-remap .`, never `Task::workspace`), plus recipes for `cargo nextest`, `pytest`,
+  `jest`, and `go test` in `docs/guides/sharded-runs.md` and `benchmarks/grid/bench_shard_r2_m1.py`
+  (`test_bench_shard.py` `6/6`). Verified by unit tests (`11/11`), `crates/cli/tests/test_ax2_shard.rs`
+  (`8/8`, using a `/bin/sh` stub `cargo` for `--build-once`), `mcp_server_e2e` (`9/9`), and the dated
+  single-host loopback benchmark `benchmarks/grid/results/2026-11-22-r2-m1-macos-arm64-apple-m5.json`
+  (Apple M5, 10 host CPU cores, `725` unit tests across `1..=3` local workers on `127.0.0.1` — NOT
+  3 physical machines: Spike R2 achieved `51.26 %` savings `56.05 s -> 27.32 s`, clearing the `>= 30 %`
+  stop rule; Measure M1 achieved `27.76 s` median / `25.54 s` min vs `54.85 s` 1-worker median,
+  `0.5061x` median with `"target_met": false` against `<= 0.50x` under shared-CPU contention).
+  Remains `Partial | In` pending: (1) a 3-physical-machine Measure M1 record meeting `<= 0.50x`
+  (`"Done when"` / design `0056`), and (2) live `--build-once` verification with a real `cargo-nextest`
+  binary (absent on the macOS verification host) and cross-`(os, arch)` multi-machine workers.
 
 ### AX-3: Live output, `logs`, and MCP tasks
 
@@ -2556,3 +2545,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-22: MESH-2 Implemented (commits `ea3b5e0c`, `85a53f71`, `36a2d647`; text moved to archive): implemented `agent-mesh node --inbox-dir` with mandatory SHA-256 verification and atomic persistence (`persist_payload_atomic`), bounded `BoundedPayloadBuffer` and `ChunkReassembler` (configurable `ttl`), `agent-mesh data` ACK/NACK exit codes (`--timeout-ms`, `--payload-file`, `-` stdin), accurate `total_chunks`, live `sysinfo` / `ActiveCommandGuard` telemetry, and honest `/api/nodes` + `/api/status` state, verified by `mesh_data_delivery` (`7/7`), `test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `tests/test_wave2_e2e.py` (`F6` + Tiers 3–4).
 - 2026-11-22: Wave 2 E2E & CI hardening (commits `ec1c9be8`, `bd7bb644`, `36a2d647`, `3ffa6732`): added 73-test opaque-box suite `tests/test_wave2_e2e.py` (`73/73` PASS) wired into `.github/workflows/ci.yml` on Linux and macOS, plus Tier 5 deadline, symlink, and chunk edge-case hardening.
 - 2026-11-22: Recounted `docs/BACKLOG.md` Index summary header from the rows after Wave 2 (`FEAT-5` and `MESH-2` Implemented, `AX-1` Partial, `TEST-41` and `TEST-61` updated): 247 items, 175 Implemented, 24 Partial, 48 Planned, 0 Design only; 25 open items are In and 47 are Out.
+- 2026-11-22: AX-2 Partial ([design 0103](design/0103-ax2-sharded-runs.md), branch `prod/backlog-completion-wave3`): implemented `oxideswarm shard` (`--count 1..=256`, 1-based `OX_SHARD_INDEX`/`OX_SHARD_TOTAL`, `ListWorkers` pre-flight, `slots:` SWRR spreading, `--fail-fast`, symlink-safe `--output-dir`, `--junit-out` XML merge, `--build-once` via `Task::inputs`), MCP `shard`, `docs/guides/sharded-runs.md`, and `benchmarks/grid/bench_shard_r2_m1.py`; verified by `shard` unit tests (`11/11`), `crates/cli/tests/test_ax2_shard.rs` (`8/8`, using stub `cargo` for `--build-once`), `mcp_server_e2e` (`9/9`), `test_bench_shard.py` (`6/6`), and single-host loopback record `benchmarks/grid/results/2026-11-22-r2-m1-macos-arm64-apple-m5.json` (`127.0.0.1` on 10-core Apple M5, NOT 3 physical machines: Spike R2 `51.26 %` savings clearing the `30 %` stop rule; Measure M1 `0.5061x` median with `target_met: false` vs `<= 0.50x`). Stays `Partial | In` pending a 3-physical-machine Measure M1 run `<= 0.50x` and live real `cargo-nextest` / cross-`(os, arch)` `--build-once` execution.
+- 2026-11-22: MESH-3 Implemented ([design 0104](design/0104-mesh3-remote-master-bridge.md), pull requests 114, 132, branch `prod/backlog-completion-wave3`; text moved to archive): decoupled `AgentGridBridge` behind async `GridBackend` (`InProcessBackend` and `RemoteMasterBackend` directly atop `rusty_grid_core` TCP/P2P + OXS-AUTH v2/v3), added `agent-mesh hub --grid-connect <HOST:PORT>` (`OXIDE_GRID_CONNECT`, `--secret`/`--secret-file`/`--master-key`/`--relay-url`/`--insecure`), live `/api/nodes` `"grid"` `"online"`/`"offline"` status, caller tag preservation and `placement`, upfront `workspace` refusal, strict inline-only `files` (`StagedFile`, zero hub-local disk reads), `outputs` -> SHA-256 `artifacts`, `grid_result`/`grid_cancel`, `AgentMeshClient` helpers, and worker-join documentation; verified by `crates/agent_mesh/tests/grid_remote_master_e2e.rs` (`2/2` with `CARGO_BIN_EXE_agent-mesh` against separately started master and worker), `test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `test_agent_mesh_token_auth.py` (`7/7`).
+- 2026-11-22: 3D-2 Implemented ([design 0105](design/0105-3d2-vram-blender-routing.md), branch `prod/backlog-completion-wave3`; text moved to archive): wired `TaskView::requires_blender`, `WorkerAttrIndex::blender`, `RegisteredIndex::any_has_blender`, and `SchedulerConfig::required_vram_mb` preset defaults (`2048`/`4096`/`6144` MB for `fast`/`standard`/`high` when `--gpu` or `--quality high` applies on non-`Sdf` `Generative3D`, preserving CPU-only `Sdf` and non-GPU `fast`/`standard` `Auto`/`TripoSr` defaults per `BUG-3`) across `crates/master/src/{queue,worker_index,scheduler,reaper}.rs`, added non-blocking CLI `ListWorkers` preflight warnings in `crates/cli/src/cli_app/submit.rs`, and verified shared `rusty_grid_core::capabilities::resolve_blender_binary` delegation (`crates/worker/src/autorig/blender_provider.rs`), `crates/master/tests/test_3d2_routing.rs` (`4/4`), and `crates/cli/tests/test_3d2_routing.rs` (`4/4` with `--features 3d`).
+- 2026-11-22: 3D-3 Implemented ([design 0106](design/0106-3d3-honest-autorig-options.md), branch `prod/backlog-completion-wave3`; text moved to archive): validated `rig_preset` (`biped` 15 joints, `quadruped` 19 joints, `generic` 5 axial joints), `embed_animations` (`idle`, `walk`, `turnaround` with 97 keyframes in both Rust and `engines/autorig/blender_rig.py`), and `preferred_provider` (`None`/`builtin`, `auto`, `blender`, failing explicitly on `"blender"` error/absence) upfront in `TaskSpec::validate()`, worker, and `blender_rig.py`, added magic-byte `.glb`/`.gltf`/`.obj` detection with UTF-8 BOM/whitespace stripping, reported `"OxideSwarm-AutoRig-Blender"` vs `"OxideSwarm-AutoRig-Builtin"` in `TaskResult::device_name` and stdout, and wired task `timeout`, `child_pid`, and cooperative `cancel_rx` / `AtomicBool` stopping (`<= 1 s`) across Blender and Rust `autorig/*` and `gen3d/*` workloads; verified against real Blender 5.2.1 LTS plus `crates/worker/tests/test_3d3_autorig_options.rs` (`10/10`), `test_autorig_pipeline` (`15/15`), and `test_challenger_m3_blender_job_object` (`10/10`).
+- 2026-11-22: Recounted `docs/BACKLOG.md` Index summary header from the rows after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented; `AX-2` Partial): 247 items, 178 Implemented, 24 Partial, 45 Planned, 0 Design only; 25 open items are In and 44 are Out.
