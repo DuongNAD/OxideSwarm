@@ -318,3 +318,167 @@ async fn test_feat5_cli_worker_sigkill_and_sigterm_drain_resume() {
     w3.kill_and_wait();
     let _ = master.shutdown();
 }
+
+#[tokio::test]
+async fn test_feat5_cli_mixed_case_and_dot_slash_output_excludes_checkpoint_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_bin = setup_fake_pmset();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let w_sb = tmp.path().join("w_sb");
+    std::fs::create_dir_all(&w_sb).unwrap();
+
+    let isolation_arg = if rusty_grid_worker::verify_isolation_support(
+        rusty_grid_worker::IsolationLevel::Fs,
+        &w_sb,
+    )
+    .await
+    .is_ok()
+    {
+        "fs"
+    } else {
+        "off"
+    };
+
+    let blob_dir = tmp.path().join("master_blobs");
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_discovery_port(0)
+            .with_blob_store(&blob_dir, 64 * 1024 * 1024),
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master spawn");
+    let addr = master.server_addr().to_string();
+
+    let mut w_cmd = clean_cmd(&home, fake_bin.path());
+    w_cmd
+        .args([
+            "worker",
+            "--master",
+            &addr,
+            "--name",
+            "cli-case-w",
+            "--cores",
+            "2",
+            "--ram-mb",
+            "4096",
+            "--no-gpu",
+            "--no-blender",
+            "--no-cuda",
+            "--no-portal",
+            "--isolation",
+            isolation_arg,
+            "--sandbox-base-dir",
+            &w_sb.to_string_lossy(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut worker = ChildGuard::spawn(w_cmd);
+
+    assert!(
+        wait_for(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                master
+                    .list_workers()
+                    .await
+                    .map(|ws| !ws.is_empty())
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "cli-case-w must register"
+    );
+
+    // 1. Mixed-case and `./`-normalized wildcards must NOT leak checkpoint files.
+    let out_wild = tmp.path().join("out_wild");
+    std::fs::create_dir_all(&out_wild).unwrap();
+    let addr_1 = addr.clone();
+    let home_1 = home.clone();
+    let fake_1 = fake_bin.path().to_path_buf();
+    let out_wild_1 = out_wild.clone();
+    let res1 = tokio::task::spawn_blocking(move || {
+        let mut cmd = clean_cmd(&home_1, &fake_1);
+        cmd.args([
+            "submit",
+            "--master",
+            &addr_1,
+            "--wait",
+            "--output",
+            ".OXIDESWARM_CHECKPOINT/*",
+            "--output",
+            "./.Oxideswarm_Checkpoint/**",
+            "--output",
+            "out.txt",
+            "--output-dir",
+            &out_wild_1.to_string_lossy(),
+            "--",
+            "sh",
+            "-c",
+            "echo TOP_SECRET > \"$OXIDESWARM_CHECKPOINT_DIR/secret_cp.bin\"; mkdir -p \"$OXIDESWARM_CHECKPOINT_DIR/sub\"; echo NESTED > \"$OXIDESWARM_CHECKPOINT_DIR/sub/nested.bin\"; echo ok > out.txt",
+        ]);
+        cmd.output().expect("run submit 1")
+    })
+    .await
+    .unwrap();
+    let stdout1 = String::from_utf8_lossy(&res1.stdout);
+    let stderr1 = String::from_utf8_lossy(&res1.stderr);
+    assert!(
+        res1.status.success(),
+        "wildcard submit failed: stdout={stdout1} stderr={stderr1}"
+    );
+    assert!(out_wild.join("out.txt").is_file());
+    assert_eq!(
+        std::fs::read_dir(&out_wild).unwrap().count(),
+        1,
+        "only out.txt may be collected into {out_wild:?}"
+    );
+
+    // 2. Literal mixed-case & `./`-normalized `--output` targeting checkpoint dir must fail.
+    for literal in [
+        ".OXIDESWARM_CHECKPOINT/secret_cp.bin",
+        "./.Oxideswarm_Checkpoint/secret_cp.bin",
+    ] {
+        let addr_2 = addr.clone();
+        let home_2 = home.clone();
+        let fake_2 = fake_bin.path().to_path_buf();
+        let lit = literal.to_string();
+        let res2 = tokio::task::spawn_blocking(move || {
+            let mut cmd = clean_cmd(&home_2, &fake_2);
+            cmd.args([
+                "submit",
+                "--master",
+                &addr_2,
+                "--wait",
+                "--output",
+                &lit,
+                "--",
+                "sh",
+                "-c",
+                "echo TOP_SECRET > \"$OXIDESWARM_CHECKPOINT_DIR/secret_cp.bin\"",
+            ]);
+            cmd.output().expect("run submit 2")
+        })
+        .await
+        .unwrap();
+        let stdout2 = String::from_utf8_lossy(&res2.stdout);
+        let stderr2 = String::from_utf8_lossy(&res2.stderr);
+        assert!(
+            !res2.status.success(),
+            "literal '{literal}' must fail, got rc=0 stdout={stdout2} stderr={stderr2}"
+        );
+        let combined = format!("{stdout2}\n{stderr2}");
+        assert!(
+            combined.contains("reserved checkpoint directory"),
+            "literal '{literal}' must mention reserved checkpoint directory, got: {combined}"
+        );
+    }
+
+    worker.kill_and_wait();
+    let _ = master.shutdown();
+}

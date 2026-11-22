@@ -805,23 +805,29 @@ sleep 0.15
         cmd_res.error
     );
 
-    // 4. expected_outputs targeting .oxideswarm_checkpoint is rejected.
-    let mut bad_expected = Task::new(
-        TaskSpec::shell_script("echo x > \"$OXIDESWARM_CHECKPOINT_DIR/secret.txt\""),
-        TaskRequirements::generic(1, 30),
-    );
-    bad_expected.expected_outputs = vec![".oxideswarm_checkpoint/secret.txt".to_string()];
-    let bad_res = runner.execute_task(&bad_expected, None, None).await;
-    assert!(!bad_res.is_success());
-    assert!(
-        bad_res
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("reserved checkpoint directory"),
-        "{:?}",
-        bad_res.error
-    );
+    // 4. expected_outputs targeting .oxideswarm_checkpoint (including mixed-case & ./) is rejected.
+    for bad_path in [
+        ".oxideswarm_checkpoint/secret.txt",
+        ".OXIDESWARM_CHECKPOINT/secret.txt",
+        "./.Oxideswarm_Checkpoint/secret.txt",
+    ] {
+        let mut bad_expected = Task::new(
+            TaskSpec::shell_script("echo x > \"$OXIDESWARM_CHECKPOINT_DIR/secret.txt\""),
+            TaskRequirements::generic(1, 30),
+        );
+        bad_expected.expected_outputs = vec![bad_path.to_string()];
+        let bad_res = runner.execute_task(&bad_expected, None, None).await;
+        assert!(!bad_res.is_success(), "expected '{bad_path}' to fail");
+        assert!(
+            bad_res
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reserved checkpoint directory"),
+            "{bad_path}: {:?}",
+            bad_res.error
+        );
+    }
 
     // 5. Oversized checkpoint directory skips emission gracefully without failing the task.
     let oversize_task = Task::new(

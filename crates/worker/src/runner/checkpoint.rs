@@ -13,15 +13,17 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use rusty_grid_core::blob::{
-    fold_blob_path, open_regular_file_nofollow, validate_blob_path, BlobId,
-};
+#[cfg(not(unix))]
+use rusty_grid_core::blob::open_regular_file_nofollow;
+use rusty_grid_core::blob::{fold_blob_path, validate_blob_path, BlobId};
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{Bytes, CheckpointData, TaskId};
 
 use crate::sandbox::{
     is_real_owned_dir, normalize_relative_path_str, sanitize_relative_path, set_permissions,
 };
+#[cfg(unix)]
+use crate::sandbox::{PinnedDir, PinnedEntryKind};
 
 /// Reserved directory name inside task sandboxes (or workspace `tmp/`) holding process checkpoint state.
 pub(crate) const PROCESS_CHECKPOINT_DIR_NAME: &str = ".oxideswarm_checkpoint";
@@ -60,12 +62,18 @@ pub(crate) const DEFAULT_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_sec
 /// Minimum clamped poll interval so `tokio::time::interval` never panics on zero.
 pub(crate) const MIN_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Returns `true` if `rel` (canonical forward-slash relative path) is or lies under `.oxideswarm_checkpoint`.
+/// Returns `true` if `rel` (even with leading `./`, `.\`, or case variations on APFS/NTFS)
+/// targets or lies under `.oxideswarm_checkpoint`.
 pub(crate) fn is_reserved_checkpoint_rel(rel: &str) -> bool {
-    rel == PROCESS_CHECKPOINT_DIR_NAME
-        || rel
-            .strip_prefix(PROCESS_CHECKPOINT_DIR_NAME)
-            .is_some_and(|rest| rest.starts_with('/'))
+    let normalized = rel.trim().replace('\\', "/");
+    let first = normalized
+        .split('/')
+        .find(|seg| !seg.is_empty() && *seg != ".");
+    first.is_some_and(|seg| {
+        #[cfg(windows)]
+        let seg = seg.trim_end_matches([' ', '.']);
+        seg.eq_ignore_ascii_case(PROCESS_CHECKPOINT_DIR_NAME)
+    })
 }
 
 /// Canonical BLAKE3 digest of an empty checkpoint directory (`BlobId::of(&[]).0`).
@@ -94,7 +102,7 @@ impl fmt::Display for CheckpointError {
 
 impl std::error::Error for CheckpointError {}
 
-/// Runtime state carried into `execute_process_supervised_with_workspace` for periodic and final emission.
+/// Runtime state carried into `execute_process_supervised_with_checkpoint` for periodic and final emission.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessCheckpointCtx {
     pub(crate) task_id: TaskId,
@@ -257,33 +265,220 @@ pub(crate) fn pack_checkpoint_if_changed(
     Ok(Some((digest, Bytes::from(payload))))
 }
 
-/// Packs all safe regular files and leaf empty directories under `checkpoint_dir` into `OXCP1\x01`.
-pub(crate) fn pack_checkpoint_dir(
+fn push_bounded_file_entry(
+    rel: String,
+    file: std::fs::File,
+    meta: std::fs::Metadata,
+    entries: &mut Vec<PackedEntry>,
+    encoded_body_bytes: &mut usize,
+) -> Result<(), CheckpointError> {
+    if !meta.is_file() {
+        return Err(CheckpointError::UnsafeEntry(format!(
+            "entry '{rel}' is not a regular file"
+        )));
+    }
+
+    let meta_len = meta.len();
+    let entry_fixed = OXCP1_ENTRY_META_LEN.saturating_add(rel.len());
+    let max_body = MAX_PROCESS_CHECKPOINT_BYTES.saturating_sub(OXCP1_HEADER_LEN);
+    let remaining_for_data = max_body
+        .checked_sub(encoded_body_bytes.saturating_add(entry_fixed))
+        .ok_or_else(|| {
+            CheckpointError::LimitExceeded(format!(
+                "payload exceeds {MAX_PROCESS_CHECKPOINT_BYTES} bytes"
+            ))
+        })?;
+    if meta_len > remaining_for_data as u64 {
+        return Err(CheckpointError::LimitExceeded(format!(
+            "file '{rel}' ({meta_len} bytes) exceeds remaining checkpoint budget ({remaining_for_data} bytes)"
+        )));
+    }
+
+    let mut buf = Vec::with_capacity(meta_len as usize);
+    file.take(remaining_for_data as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| CheckpointError::Io(format!("cannot read '{rel}': {e}")))?;
+    if buf.len() > remaining_for_data {
+        return Err(CheckpointError::LimitExceeded(format!(
+            "file '{rel}' grew beyond {MAX_PROCESS_CHECKPOINT_BYTES}-byte limit while packing"
+        )));
+    }
+
+    *encoded_body_bytes = encoded_body_bytes
+        .checked_add(entry_fixed)
+        .and_then(|n| n.checked_add(buf.len()))
+        .ok_or_else(|| {
+            CheckpointError::LimitExceeded("checkpoint byte size overflow".to_string())
+        })?;
+
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+
+    entries.push(PackedEntry {
+        kind: ENTRY_KIND_FILE,
+        rel_path: rel,
+        executable,
+        data: buf,
+    });
+    Ok(())
+}
+
+fn push_empty_dir_entry(
+    rel_dir: String,
+    canon_root: &Path,
+    seen_folded: &mut HashSet<String>,
+    entries: &mut Vec<PackedEntry>,
+    encoded_body_bytes: &mut usize,
+) -> Result<(), CheckpointError> {
+    if entries.len() >= MAX_PROCESS_CHECKPOINT_FILES {
+        return Err(CheckpointError::LimitExceeded(format!(
+            "exceeds maximum of {MAX_PROCESS_CHECKPOINT_FILES} files"
+        )));
+    }
+    validate_checkpoint_rel_path(&rel_dir, canon_root, seen_folded)?;
+    let entry_bytes = OXCP1_ENTRY_META_LEN.saturating_add(rel_dir.len());
+    let max_body = MAX_PROCESS_CHECKPOINT_BYTES.saturating_sub(OXCP1_HEADER_LEN);
+    if encoded_body_bytes.saturating_add(entry_bytes) > max_body {
+        return Err(CheckpointError::LimitExceeded(format!(
+            "payload exceeds {MAX_PROCESS_CHECKPOINT_BYTES} bytes"
+        )));
+    }
+    *encoded_body_bytes += entry_bytes;
+    entries.push(PackedEntry {
+        kind: ENTRY_KIND_EMPTY_DIR,
+        rel_path: rel_dir,
+        executable: false,
+        data: Vec::new(),
+    });
+    Ok(())
+}
+
+#[cfg(unix)]
+fn collect_entries_pinned_unix(
     checkpoint_dir: &Path,
-) -> Result<([u8; 32], Vec<u8>), CheckpointError> {
-    let root_meta = std::fs::symlink_metadata(checkpoint_dir).map_err(|e| {
+    root_meta: &std::fs::Metadata,
+    canon_root: &Path,
+    entries: &mut Vec<PackedEntry>,
+    seen_folded: &mut HashSet<String>,
+    encoded_body_bytes: &mut usize,
+) -> Result<(), CheckpointError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root_dir = PinnedDir::open_root_nofollow(checkpoint_dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            CheckpointError::UnsafeEntry(format!(
+                "checkpoint root '{}' is a symlink or untrusted: {e}",
+                checkpoint_dir.display()
+            ))
+        } else {
+            CheckpointError::Io(format!(
+                "cannot open checkpoint directory '{}': {e}",
+                checkpoint_dir.display()
+            ))
+        }
+    })?;
+    let (dev, ino) = root_dir.dev_ino().map_err(|e| {
         CheckpointError::Io(format!(
-            "cannot stat checkpoint directory '{}': {e}",
+            "cannot inspect checkpoint directory '{}': {e}",
             checkpoint_dir.display()
         ))
     })?;
-    if !is_real_owned_dir(checkpoint_dir, &root_meta) {
+    if dev != root_meta.dev() || ino != root_meta.ino() {
         return Err(CheckpointError::UnsafeEntry(
-            "checkpoint root is a symlink, non-directory, or owned by another user".to_string(),
+            "checkpoint root changed concurrently during open".to_string(),
         ));
     }
-    let canon_root = checkpoint_dir.canonicalize().map_err(|e| {
-        CheckpointError::Io(format!(
-            "cannot canonicalize checkpoint directory '{}': {e}",
-            checkpoint_dir.display()
-        ))
-    })?;
 
-    let mut entries: Vec<PackedEntry> = Vec::new();
-    let mut seen_folded: HashSet<String> = HashSet::new();
-    let mut encoded_body_bytes: usize = 0;
+    let mut stack: Vec<(PinnedDir, String)> = vec![(root_dir, String::new())];
+    while let Some((dir_fd, rel_dir)) = stack.pop() {
+        let dir_entries = dir_fd.read_entries().map_err(|e| {
+            CheckpointError::Io(format!(
+                "cannot read checkpoint directory '{}': {e}",
+                if rel_dir.is_empty() { "." } else { &rel_dir }
+            ))
+        })?;
+        let had_children = !dir_entries.is_empty();
+        for entry in dir_entries {
+            let name = entry.name.to_str().ok_or_else(|| {
+                CheckpointError::UnsafeEntry("checkpoint entry name is not valid UTF-8".to_string())
+            })?;
+            let rel = if rel_dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel_dir}/{name}")
+            };
 
-    let mut stack: Vec<(PathBuf, String)> = vec![(canon_root.clone(), String::new())];
+            match entry.kind {
+                PinnedEntryKind::Symlink => {
+                    return Err(CheckpointError::UnsafeEntry(format!(
+                        "symbolic link '{rel}' is prohibited inside checkpoint directory"
+                    )));
+                }
+                PinnedEntryKind::Dir => {
+                    let sub_fd = dir_fd.open_dir_nofollow(&entry.name).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::InvalidInput {
+                            CheckpointError::UnsafeEntry(format!(
+                                "directory '{rel}' is a symlink or untrusted: {e}"
+                            ))
+                        } else {
+                            CheckpointError::Io(format!("cannot open directory '{rel}': {e}"))
+                        }
+                    })?;
+                    stack.push((sub_fd, rel));
+                }
+                PinnedEntryKind::File => {
+                    if entries.len() >= MAX_PROCESS_CHECKPOINT_FILES {
+                        return Err(CheckpointError::LimitExceeded(format!(
+                            "exceeds maximum of {MAX_PROCESS_CHECKPOINT_FILES} files"
+                        )));
+                    }
+                    validate_checkpoint_rel_path(&rel, canon_root, seen_folded)?;
+
+                    let (file, meta) = dir_fd.open_file_nofollow(&entry.name).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::InvalidInput {
+                            CheckpointError::UnsafeEntry(format!(
+                                "entry '{rel}' is a symlink or non-regular file: {e}"
+                            ))
+                        } else {
+                            CheckpointError::Io(format!("cannot open '{rel}': {e}"))
+                        }
+                    })?;
+                    push_bounded_file_entry(rel, file, meta, entries, encoded_body_bytes)?;
+                }
+                PinnedEntryKind::Other => {
+                    return Err(CheckpointError::UnsafeEntry(format!(
+                        "special file '{rel}' (FIFO, socket, or device) is prohibited inside checkpoint directory"
+                    )));
+                }
+            }
+        }
+
+        if !had_children && !rel_dir.is_empty() {
+            push_empty_dir_entry(
+                rel_dir,
+                canon_root,
+                seen_folded,
+                entries,
+                encoded_body_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn collect_entries_non_unix(
+    canon_root: &Path,
+    entries: &mut Vec<PackedEntry>,
+    seen_folded: &mut HashSet<String>,
+    encoded_body_bytes: &mut usize,
+) -> Result<(), CheckpointError> {
+    let mut stack: Vec<(PathBuf, String)> = vec![(canon_root.to_path_buf(), String::new())];
     while let Some((dir_path, rel_dir)) = stack.pop() {
         let dir_meta = std::fs::symlink_metadata(&dir_path).map_err(|e| {
             CheckpointError::Io(format!(
@@ -303,7 +498,7 @@ pub(crate) fn pack_checkpoint_dir(
                 dir_path.display()
             ))
         })?;
-        if !canon_dir.starts_with(&canon_root) {
+        if !canon_dir.starts_with(canon_root) {
             return Err(CheckpointError::UnsafeEntry(format!(
                 "checkpoint subdirectory '{}' escaped root",
                 dir_path.display()
@@ -362,7 +557,7 @@ pub(crate) fn pack_checkpoint_dir(
                         "exceeds maximum of {MAX_PROCESS_CHECKPOINT_FILES} files"
                     )));
                 }
-                validate_checkpoint_rel_path(&rel, &canon_root, &mut seen_folded)?;
+                validate_checkpoint_rel_path(&rel, canon_root, seen_folded)?;
 
                 let entry_path = entry.path();
                 let (file, meta) = open_regular_file_nofollow(&entry_path).map_err(|e| {
@@ -374,59 +569,7 @@ pub(crate) fn pack_checkpoint_dir(
                         CheckpointError::Io(format!("cannot open '{rel}': {e}"))
                     }
                 })?;
-                if !meta.is_file() {
-                    return Err(CheckpointError::UnsafeEntry(format!(
-                        "entry '{rel}' is not a regular file"
-                    )));
-                }
-
-                let meta_len = meta.len();
-                let entry_fixed = OXCP1_ENTRY_META_LEN.saturating_add(rel.len());
-                let max_body = MAX_PROCESS_CHECKPOINT_BYTES.saturating_sub(OXCP1_HEADER_LEN);
-                let remaining_for_data = max_body
-                    .checked_sub(encoded_body_bytes.saturating_add(entry_fixed))
-                    .ok_or_else(|| {
-                        CheckpointError::LimitExceeded(format!(
-                            "payload exceeds {MAX_PROCESS_CHECKPOINT_BYTES} bytes"
-                        ))
-                    })?;
-                if meta_len > remaining_for_data as u64 {
-                    return Err(CheckpointError::LimitExceeded(format!(
-                        "file '{rel}' ({meta_len} bytes) exceeds remaining checkpoint budget ({remaining_for_data} bytes)"
-                    )));
-                }
-
-                let mut buf = Vec::with_capacity(meta_len as usize);
-                file.take(remaining_for_data as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| CheckpointError::Io(format!("cannot read '{rel}': {e}")))?;
-                if buf.len() > remaining_for_data {
-                    return Err(CheckpointError::LimitExceeded(format!(
-                        "file '{rel}' grew beyond {MAX_PROCESS_CHECKPOINT_BYTES}-byte limit while packing"
-                    )));
-                }
-
-                encoded_body_bytes = encoded_body_bytes
-                    .checked_add(entry_fixed)
-                    .and_then(|n| n.checked_add(buf.len()))
-                    .ok_or_else(|| {
-                        CheckpointError::LimitExceeded("checkpoint byte size overflow".to_string())
-                    })?;
-
-                #[cfg(unix)]
-                let executable = {
-                    use std::os::unix::fs::PermissionsExt;
-                    (meta.permissions().mode() & 0o111) != 0
-                };
-                #[cfg(not(unix))]
-                let executable = false;
-
-                entries.push(PackedEntry {
-                    kind: ENTRY_KIND_FILE,
-                    rel_path: rel,
-                    executable,
-                    data: buf,
-                });
+                push_bounded_file_entry(rel, file, meta, entries, encoded_body_bytes)?;
             } else {
                 return Err(CheckpointError::UnsafeEntry(format!(
                     "special file '{rel}' (FIFO, socket, or device) is prohibited inside checkpoint directory"
@@ -435,28 +578,60 @@ pub(crate) fn pack_checkpoint_dir(
         }
 
         if !had_children && !rel_dir.is_empty() {
-            if entries.len() >= MAX_PROCESS_CHECKPOINT_FILES {
-                return Err(CheckpointError::LimitExceeded(format!(
-                    "exceeds maximum of {MAX_PROCESS_CHECKPOINT_FILES} files"
-                )));
-            }
-            validate_checkpoint_rel_path(&rel_dir, &canon_root, &mut seen_folded)?;
-            let entry_bytes = OXCP1_ENTRY_META_LEN.saturating_add(rel_dir.len());
-            let max_body = MAX_PROCESS_CHECKPOINT_BYTES.saturating_sub(OXCP1_HEADER_LEN);
-            if encoded_body_bytes.saturating_add(entry_bytes) > max_body {
-                return Err(CheckpointError::LimitExceeded(format!(
-                    "payload exceeds {MAX_PROCESS_CHECKPOINT_BYTES} bytes"
-                )));
-            }
-            encoded_body_bytes += entry_bytes;
-            entries.push(PackedEntry {
-                kind: ENTRY_KIND_EMPTY_DIR,
-                rel_path: rel_dir,
-                executable: false,
-                data: Vec::new(),
-            });
+            push_empty_dir_entry(
+                rel_dir,
+                canon_root,
+                seen_folded,
+                entries,
+                encoded_body_bytes,
+            )?;
         }
     }
+    Ok(())
+}
+
+/// Packs all safe regular files and leaf empty directories under `checkpoint_dir` into `OXCP1\x01`.
+pub(crate) fn pack_checkpoint_dir(
+    checkpoint_dir: &Path,
+) -> Result<([u8; 32], Vec<u8>), CheckpointError> {
+    let root_meta = std::fs::symlink_metadata(checkpoint_dir).map_err(|e| {
+        CheckpointError::Io(format!(
+            "cannot stat checkpoint directory '{}': {e}",
+            checkpoint_dir.display()
+        ))
+    })?;
+    if !is_real_owned_dir(checkpoint_dir, &root_meta) {
+        return Err(CheckpointError::UnsafeEntry(
+            "checkpoint root is a symlink, non-directory, or owned by another user".to_string(),
+        ));
+    }
+    let canon_root = checkpoint_dir.canonicalize().map_err(|e| {
+        CheckpointError::Io(format!(
+            "cannot canonicalize checkpoint directory '{}': {e}",
+            checkpoint_dir.display()
+        ))
+    })?;
+
+    let mut entries: Vec<PackedEntry> = Vec::new();
+    let mut seen_folded: HashSet<String> = HashSet::new();
+    let mut encoded_body_bytes: usize = 0;
+
+    #[cfg(unix)]
+    collect_entries_pinned_unix(
+        checkpoint_dir,
+        &root_meta,
+        &canon_root,
+        &mut entries,
+        &mut seen_folded,
+        &mut encoded_body_bytes,
+    )?;
+    #[cfg(not(unix))]
+    collect_entries_non_unix(
+        &canon_root,
+        &mut entries,
+        &mut seen_folded,
+        &mut encoded_body_bytes,
+    )?;
 
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
@@ -1135,5 +1310,71 @@ mod tests {
         .unwrap();
         assert_eq!(ctx1.next_sequence, 8);
         assert_eq!(ctx1.last_emitted_hash, d1);
+    }
+
+    #[test]
+    fn is_reserved_checkpoint_rel_case_insensitive_and_dot_slash_normalized() {
+        for blocked in [
+            ".oxideswarm_checkpoint",
+            ".oxideswarm_checkpoint/secret.bin",
+            ".OXIDESWARM_CHECKPOINT",
+            ".OXIDESWARM_CHECKPOINT/secret_cp.bin",
+            ".Oxideswarm_Checkpoint/sub/nested.bin",
+            "./.Oxideswarm_Checkpoint/secret_cp.bin",
+            "././.OXIDESWARM_CHECKPOINT/a.txt",
+            ".\\.Oxideswarm_Checkpoint\\secret_cp.bin",
+            "/.OXIDESWARM_CHECKPOINT/secret.bin",
+        ] {
+            assert!(
+                is_reserved_checkpoint_rel(blocked),
+                "expected '{blocked}' to be blocked"
+            );
+        }
+
+        for allowed in [
+            "",
+            ".",
+            ".oxideswarm_checkpoint_extra",
+            ".oxideswarm_checkpoint2/file.txt",
+            "out/.oxideswarm_checkpoint/file.txt",
+            "result.txt",
+        ] {
+            assert!(
+                !is_reserved_checkpoint_rel(allowed),
+                "expected '{allowed}' to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn fd_pinned_pack_rejects_symlinked_intermediate_dirs_and_handles_valid_entries() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("deep")).unwrap();
+        std::fs::write(outside.path().join("deep/secret.txt"), b"outside-secret").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let cp_dir = dir.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        prepare_checkpoint_dir(&cp_dir).unwrap();
+        std::fs::create_dir_all(cp_dir.join("real_sub/empty_leaf")).unwrap();
+        std::fs::write(cp_dir.join("real_sub/data.bin"), b"ok-bytes").unwrap();
+
+        // Valid tree with regular file + subdir + empty leaf dir packs cleanly.
+        let (_, payload) = pack_checkpoint_dir(&cp_dir).unwrap();
+        assert!(payload.starts_with(OXCP1_MAGIC));
+
+        // Symlinked intermediate directory inside checkpoint dir is rejected.
+        let link_sub = cp_dir.join("real_sub/escape_dir");
+        if crate::sandbox::try_create_test_symlink_dir(outside.path(), &link_sub) {
+            let err = pack_checkpoint_dir(&cp_dir).unwrap_err();
+            assert!(matches!(err, CheckpointError::UnsafeEntry(_)), "{err:?}");
+            let _ = std::fs::remove_file(&link_sub);
+        }
+
+        // Symlinked root checkpoint directory is also rejected.
+        let link_root = dir.path().join("symlink_cp_root");
+        if crate::sandbox::try_create_test_symlink_dir(outside.path(), &link_root) {
+            let err = pack_checkpoint_dir(&link_root).unwrap_err();
+            assert!(matches!(err, CheckpointError::UnsafeEntry(_)), "{err:?}");
+        }
     }
 }
