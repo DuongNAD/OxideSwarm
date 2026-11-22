@@ -19,7 +19,7 @@ use crate::secret_cmd::{announce_master_secret, decide_master_secret, SecretOpts
 
 use super::{
     resolve_auth_mode, resolve_p2p_minimal, resolve_relay_url, resolve_sourced_string,
-    resolve_state_dir_value, resolve_wire_codec, wait_for_worker_shutdown_signal, MasterArgs, MIB,
+    resolve_state_dir_value, resolve_wire_codec, MasterArgs, MIB,
 };
 
 /// Resolve `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` / `[master].max_active_mb`
@@ -237,6 +237,9 @@ async fn run_master_inner(
     secret_opts: SecretOpts,
     #[cfg(feature = "otel")] otel_handle: Option<rusty_grid_master::otel::OtlpExporterHandle>,
 ) -> ExitCode {
+    // Installed first, so a stop that arrives during start-up is handled as a clean shutdown
+    // once the master is up instead of killing it with the default action.
+    let shutdown_signals = super::ShutdownSignals::install();
     let master_cfg = config_file.as_ref().and_then(|c| c.master.clone());
 
     let rendezvous_url =
@@ -812,8 +815,8 @@ async fn run_master_inner(
         }
     }
 
-    // Await termination signal (SIGINT or SIGTERM on Unix)
-    wait_for_worker_shutdown_signal().await;
+    // Await termination signal (SIGINT or SIGTERM on Unix), including one sent during start-up.
+    shutdown_signals.wait().await;
     println!("\nRustyGrid Master shutting down...");
     let _ = handle.shutdown();
     #[cfg(feature = "otel")]

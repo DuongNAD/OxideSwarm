@@ -58,6 +58,7 @@ pub(crate) const MAX_PROCESS_CHECKPOINT_PATH_BYTES: usize = 4096;
 
 /// Maximum directory nesting below the checkpoint root; bounds the directory descriptors the
 /// Unix walk holds open at once.
+#[cfg(unix)]
 pub(crate) const MAX_PROCESS_CHECKPOINT_DEPTH: usize = 32;
 
 /// Default periodic scan interval for process-task checkpoint emission.
