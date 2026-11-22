@@ -391,9 +391,6 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
-    // A bare master (no secret, no token) with a loopback dashboard gets local access without a
-    // login; the library enforces that this never applies to a non-loopback dashboard.
-    server_config = server_config.with_implicit_local_dashboard(true);
 
     let max_retained_tasks = resolve_usize(
         args.max_retained_tasks,
@@ -575,6 +572,13 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
+    // A bare master (no secret, no token) with a loopback dashboard gets local access without a
+    // login; the library enforces that this never applies to a non-loopback dashboard. A
+    // members-only master reachable beyond loopback has no secret either, but it is not bare:
+    // local Admin there could mint invites, so only an explicit `--dev` opens its dashboard.
+    let cluster_exposed = !server_config.bind_addr.ip().is_loopback() || enable_p2p;
+    server_config =
+        server_config.with_implicit_local_dashboard(!cluster_exposed || auth_mode.allows_secret());
     let in_unisolated_unit_test =
         cfg!(test) && state_dir.is_none() && std::env::var_os("OXIDESWARM_HOME").is_none();
     let disable_v3_disk = in_unisolated_unit_test

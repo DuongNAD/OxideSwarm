@@ -2150,3 +2150,42 @@ async fn tier5_session_resume_hold_mid_speculative_secondary_disconnect() {
         Some(w_primary)
     );
 }
+
+#[tokio::test]
+async fn revoked_primary_checkpoint_is_dropped_when_speculative_copy_is_promoted() {
+    use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+
+    let queue = TaskQueue::new();
+    let w_primary = Uuid::new_v4();
+    let w_spec = Uuid::new_v4();
+    let task = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    )
+    .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+    let id = queue.submit(task).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id, w_primary, 10)])
+        .await;
+    queue
+        .mark_running_from(w_primary, Some(10), &id)
+        .await
+        .unwrap();
+    let checkpoint = CheckpointData::new(
+        1,
+        rusty_grid_core::task::Bytes::copy_from_slice(b"from-revoked-member"),
+    );
+    assert!(queue
+        .record_checkpoint_from(w_primary, Some(10), id, checkpoint)
+        .await
+        .unwrap());
+    assert!(queue.get_checkpoint(&id).await.is_some());
+    assert!(queue.try_start_speculative(id, w_spec, 20).await.is_some());
+
+    // The primary's member is revoked: the speculative copy is promoted, and the checkpoint the
+    // revoked member wrote must not survive for a later resume.
+    queue.handle_workers_revoked(&[w_primary], "revoked").await;
+    let after = queue.get_task(&id).await.unwrap();
+    assert_eq!(after.assigned_worker_id, Some(w_spec));
+    assert!(queue.get_checkpoint(&id).await.is_none());
+}

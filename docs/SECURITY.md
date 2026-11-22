@@ -154,7 +154,10 @@ Public routes on the dashboard listener (`8080/tcp`) that do not require a dashb
 Listener and bypass policy:
 
 1. **A bare loopback master** (`oxideswarm master`) serves its dashboard on `http://127.0.0.1:8080` for the
-   local user; if it asks for a token anyway, use the command above or start with `--dev`.
+   local user; if it asks for a token anyway, use the command above or start with `--dev`. A master in
+   `--auth members` mode that is reachable beyond loopback (or uses `--p2p`) has no cluster secret and gets no
+   such implicit access, because local Admin could mint invites: start it with `--dev` to use the local
+   dashboard.
 2. **The dashboard only listens on a non-loopback interface when `--web-ui-addr` says so explicitly**
    (for example `--web-ui-addr 0.0.0.0:8080` or `switch_role.sh master --dashboard-lan`). Binding the cluster port
    to `0.0.0.0` does not publish the dashboard.

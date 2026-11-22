@@ -9,6 +9,7 @@ use axum::{
     extract::{rejection::JsonRejection, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
+    Extension,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,12 +18,23 @@ use rusty_grid_core::noise_auth::{
 };
 use rusty_grid_core::GridError;
 
+use crate::auth::AuthIdentity;
 use crate::member_connections::ActiveMemberConnection;
 use crate::server::{revoke_member_with_teardown, run_member_store_blocking};
 
 use super::{json_error, WebUiState};
 
 const INVITE_PREFIX: &str = "oxs1-invite:";
+
+/// Name of the dashboard caller for the audit log: the token name, or `local` for the loopback
+/// bypass.
+fn actor(identity: &Option<Extension<AuthIdentity>>) -> &str {
+    match identity {
+        Some(Extension(id)) if id.is_bypassed => "local",
+        Some(Extension(id)) => id.name.as_str(),
+        None => "unknown",
+    }
+}
 const MAX_FIELD_LEN: usize = 2048;
 const DEFAULT_INVITE_EXPIRES_SECS: u64 = 24 * 3600;
 
@@ -248,6 +260,7 @@ pub(super) async fn api_get_members(State(state): State<WebUiState>) -> Response
 pub(super) async fn api_approve_member(
     State(state): State<WebUiState>,
     Path(target): Path<String>,
+    identity: Option<Extension<AuthIdentity>>,
     payload: Result<Json<ApproveMemberPayload>, JsonRejection>,
 ) -> Response {
     let payload = match parse_json(payload) {
@@ -275,7 +288,10 @@ pub(super) async fn api_approve_member(
     match run_member_store_blocking(move || members_store.approve_pending(&target, &formatted_code))
         .await
     {
-        Ok(entry) => (StatusCode::OK, Json(MemberDto::from(entry))).into_response(),
+        Ok(entry) => {
+            tracing::info!(actor = actor(&identity), member = %entry.id, name = %entry.name, "dashboard: member approved");
+            (StatusCode::OK, Json(MemberDto::from(entry))).into_response()
+        }
         Err(err) => map_member_store_error(err, "no pending"),
     }
 }
@@ -284,13 +300,18 @@ pub(super) async fn api_approve_member(
 pub(super) async fn api_reject_member(
     State(state): State<WebUiState>,
     Path(target): Path<String>,
+    identity: Option<Extension<AuthIdentity>>,
 ) -> Response {
-    match state.auth_ctx.members.reject_pending(&target) {
-        Ok(resolved_id) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "rejected": resolved_id })),
-        )
-            .into_response(),
+    let members_store = state.auth_ctx.members.clone();
+    match run_member_store_blocking(move || members_store.reject_pending(&target)).await {
+        Ok(resolved_id) => {
+            tracing::info!(actor = actor(&identity), pending = %resolved_id, "dashboard: enrollment rejected");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "rejected": resolved_id })),
+            )
+                .into_response()
+        }
         Err(err) => map_member_store_error(err, "no pending"),
     }
 }
@@ -300,6 +321,7 @@ pub(super) async fn api_reject_member(
 pub(super) async fn api_revoke_member(
     State(state): State<WebUiState>,
     Path(target): Path<String>,
+    identity: Option<Extension<AuthIdentity>>,
 ) -> Response {
     match revoke_member_with_teardown(
         target,
@@ -313,16 +335,19 @@ pub(super) async fn api_revoke_member(
     )
     .await
     {
-        Ok(outcome) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "member_id": outcome.member_id,
-                "name": outcome.name,
-                "disconnected_sessions": outcome.disconnected_sessions,
-                "revoked_workers": outcome.revoked_workers,
-            })),
-        )
-            .into_response(),
+        Ok(outcome) => {
+            tracing::info!(actor = actor(&identity), member = %outcome.member_id, "dashboard: member revoked");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "member_id": outcome.member_id,
+                    "name": outcome.name,
+                    "disconnected_sessions": outcome.disconnected_sessions,
+                    "revoked_workers": outcome.revoked_workers,
+                })),
+            )
+                .into_response()
+        }
         Err(err) => map_member_store_error(err, "no member"),
     }
 }
@@ -331,6 +356,7 @@ pub(super) async fn api_revoke_member(
 pub(super) async fn api_rename_member(
     State(state): State<WebUiState>,
     Path(target): Path<String>,
+    identity: Option<Extension<AuthIdentity>>,
     payload: Result<Json<RenameMemberPayload>, JsonRejection>,
 ) -> Response {
     let payload = match parse_json(payload) {
@@ -341,7 +367,10 @@ pub(super) async fn api_rename_member(
     match run_member_store_blocking(move || members_store.rename_member(&target, &payload.name))
         .await
     {
-        Ok(entry) => (StatusCode::OK, Json(MemberDto::from(entry))).into_response(),
+        Ok(entry) => {
+            tracing::info!(actor = actor(&identity), member = %entry.id, name = %entry.name, "dashboard: member renamed");
+            (StatusCode::OK, Json(MemberDto::from(entry))).into_response()
+        }
         Err(err) => map_member_store_error(err, "no member"),
     }
 }
@@ -358,6 +387,7 @@ pub(super) async fn api_list_invites(State(state): State<WebUiState>) -> Respons
 /// constraints.
 pub(super) async fn api_create_invite(
     State(state): State<WebUiState>,
+    identity: Option<Extension<AuthIdentity>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -462,6 +492,14 @@ pub(super) async fn api_create_invite(
         Ok(bytes) => bytes,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
+    tracing::info!(
+        actor = actor(&identity),
+        invite = %rec.invite_id,
+        roles = ?rec.roles,
+        max_uses = rec.max_uses,
+        require_approval = rec.require_approval,
+        "dashboard: invite created"
+    );
     let encoded_payload = base64url_encode(&json_bytes);
     let check = invite_payload_check_hex(&encoded_payload);
     let invite = format!("{INVITE_PREFIX}{encoded_payload}.{check}");
@@ -486,14 +524,18 @@ pub(super) async fn api_create_invite(
 pub(super) async fn api_revoke_invite(
     State(state): State<WebUiState>,
     Path(id): Path<String>,
+    identity: Option<Extension<AuthIdentity>>,
 ) -> Response {
     let members_store = state.auth_ctx.members.clone();
     match run_member_store_blocking(move || members_store.revoke_invite(&id)).await {
-        Ok(resolved_id) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "revoked": resolved_id })),
-        )
-            .into_response(),
+        Ok(resolved_id) => {
+            tracing::info!(actor = actor(&identity), invite = %resolved_id, "dashboard: invite revoked");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "revoked": resolved_id })),
+            )
+                .into_response()
+        }
         Err(err) => map_member_store_error(err, "no invite"),
     }
 }
