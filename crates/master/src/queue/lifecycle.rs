@@ -128,9 +128,30 @@ impl TaskQueue {
                 return Ok(false);
             }
 
-            if let Some(task_bytes) =
-                Self::checkpoint_exceeds_active_cap(entry, &checkpoint, active_bytes, max_active)
+            let is_large = checkpoint.delta_state.0.len() >= super::LARGE_CHECKPOINT_BYTES;
+            if is_large
+                && entry.last_large_checkpoint_at.is_some_and(|at| {
+                    now_instant.saturating_duration_since(at) < super::LARGE_CHECKPOINT_MIN_INTERVAL
+                })
             {
+                tracing::debug!(
+                    task_id = %task_id,
+                    bytes = checkpoint.delta_state.0.len(),
+                    "Dropping large checkpoint sent sooner than the per-task minimum interval"
+                );
+                return Ok(false);
+            }
+
+            // Checkpoints of running tasks may only use part of the active byte cap, so they
+            // can never take the room new submissions need.
+            let checkpoint_cap =
+                max_active.saturating_sub(max_active / super::CHECKPOINT_HEADROOM_DIVISOR);
+            if let Some(task_bytes) = Self::checkpoint_exceeds_active_cap(
+                entry,
+                &checkpoint,
+                active_bytes,
+                checkpoint_cap,
+            ) {
                 return Err(GridError::QueueByteLimitExceeded {
                     task_bytes,
                     in_use_bytes: active_bytes,
@@ -140,6 +161,9 @@ impl TaskQueue {
 
             let record_cp = has_store.then(|| checkpoint.clone());
             let applied = Self::apply_checkpoint(entry, checkpoint);
+            if applied && is_large {
+                entry.last_large_checkpoint_at = Some(now_instant);
+            }
             let ack = if applied {
                 inner.update_active_task(task_id);
                 let ack = if let Some(cp) = record_cp {

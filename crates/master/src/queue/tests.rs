@@ -2189,3 +2189,41 @@ async fn revoked_primary_checkpoint_is_dropped_when_speculative_copy_is_promoted
     assert_eq!(after.assigned_worker_id, Some(w_spec));
     assert!(queue.get_checkpoint(&id).await.is_none());
 }
+
+#[tokio::test]
+async fn large_checkpoints_are_rate_limited_and_leave_headroom_for_submissions() {
+    let queue = TaskQueue::new();
+    let worker = Uuid::new_v4();
+    let task = Task::new(
+        TaskSpec::command("sleep", vec!["60".into()]),
+        TaskRequirements::generic(1, 64),
+    );
+    let id = queue.submit(task).await.unwrap();
+    queue
+        .schedule_tasks_batch_in_sessions(&[(id, worker, 1)])
+        .await;
+    queue.mark_running_from(worker, Some(1), &id).await.unwrap();
+
+    let big = |seq: u64| {
+        CheckpointData::new(
+            seq,
+            rusty_grid_core::task::Bytes::from(vec![7u8; crate::queue::LARGE_CHECKPOINT_BYTES]),
+        )
+    };
+    assert!(queue
+        .record_checkpoint_from(worker, Some(1), id, big(1))
+        .await
+        .unwrap());
+    // A second large checkpoint right away is dropped, not stored or journaled.
+    assert!(!queue
+        .record_checkpoint_from(worker, Some(1), id, big(2))
+        .await
+        .unwrap());
+    assert_eq!(queue.get_checkpoint(&id).await.unwrap().sequence, 1);
+    // Small checkpoints are not rate limited.
+    let small = CheckpointData::new(3, rusty_grid_core::task::Bytes::copy_from_slice(b"ok"));
+    assert!(queue
+        .record_checkpoint_from(worker, Some(1), id, small)
+        .await
+        .unwrap());
+}

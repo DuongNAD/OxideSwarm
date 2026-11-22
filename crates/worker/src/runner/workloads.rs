@@ -26,7 +26,9 @@ use crate::workspace::WorkspaceError;
 #[cfg(feature = "3d")]
 use super::capture::read_output_file;
 use super::capture::{append_note, cancellation, check_cancelled_now};
-use super::checkpoint::{ProcessCheckpointCtx, PROCESS_CHECKPOINT_DIR_NAME};
+use super::checkpoint::{
+    capture_tx_for_isolation, ProcessCheckpointCtx, PROCESS_CHECKPOINT_DIR_NAME,
+};
 #[cfg(not(windows))]
 use super::supervise::resolve_default_shell;
 #[cfg(windows)]
@@ -317,12 +319,13 @@ impl TaskRunner {
         let cp_owned = checkpoint.cloned();
         let cp_task_id = task.id;
         let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_tx = capture_tx_for_isolation(checkpoint_tx, self.config.isolation);
         let cp_ctx = match tokio::task::spawn_blocking(move || {
             ProcessCheckpointCtx::prepare_and_restore(
                 cp_task_id,
                 cp_dir,
                 cp_owned.as_ref(),
-                checkpoint_tx,
+                cp_tx,
                 cp_poll,
             )
         })
@@ -489,12 +492,13 @@ impl TaskRunner {
         let cp_owned = checkpoint.cloned();
         let cp_task_id = task.id;
         let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_tx = capture_tx_for_isolation(checkpoint_tx, self.config.isolation);
         let cp_ctx = match tokio::task::spawn_blocking(move || {
             ProcessCheckpointCtx::prepare_and_restore(
                 cp_task_id,
                 cp_dir,
                 cp_owned.as_ref(),
-                checkpoint_tx,
+                cp_tx,
                 cp_poll,
             )
         })
@@ -689,12 +693,13 @@ impl TaskRunner {
         let cp_owned = checkpoint.cloned();
         let cp_task_id = task.id;
         let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_tx = capture_tx_for_isolation(checkpoint_tx, self.config.isolation);
         let cp_ctx = match tokio::task::spawn_blocking(move || {
             ProcessCheckpointCtx::prepare_and_restore(
                 cp_task_id,
                 cp_dir,
                 cp_owned.as_ref(),
-                checkpoint_tx,
+                cp_tx,
                 cp_poll,
             )
         })
