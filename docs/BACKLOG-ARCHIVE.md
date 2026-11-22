@@ -881,6 +881,31 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Done when:** A test connects the Rust client through a TLS-terminating proxy, and `cargo audit`
   passes.
 
+### MESH-2: Deliver mesh data to a consumer
+
+- **Evidence:** Read.
+- **Problem:** Nodes push payloads into an unbounded `Vec` that only tests read
+  (`crates/agent_mesh/src/client.rs:252`). `agent-mesh data` sleeps 200 ms and exits 0 without reading
+  the ACK (`crates/agent_mesh/src/main.rs:424`). `total_chunks` is always 1. Node status is always
+  `online`, and telemetry fields are placeholders.
+- **Do:** Add `agent-mesh node --inbox-dir` with a bounded buffer. Wait for the ACK and exit non-zero
+  on failure. Report real values, or remove the fields.
+- **Done when:** `agent-mesh data --to missing-node` exits non-zero. A payload appears on disk with a
+  verified hash.
+- **Implemented (2026-11-22, commits `ea3b5e0c`, `85a53f71`, `36a2d647`):** `agent-mesh node --inbox-dir <DIR>`
+  validates inbox directories via `validate_inbox_dir` (`crates/agent_mesh/src/client.rs`), reassembles multi-chunk
+  transfers (`DEFAULT_DATA_CHUNK_BYTES = 1 MiB`, bounded `ChunkReassembler` with configurable `ttl`), verifies
+  mandatory SHA-256 digests (`ring`), atomically writes verified payloads to disk (`persist_payload_atomic` via
+  `.tmp_<uuid>.part`, `sync_all`, and `rename`) into bounded `BoundedPayloadBuffer` (`256` entries / `64 MiB`), and
+  emits `DeliveryAck` or `DeliveryNack(ERR_PAYLOAD_CORRUPT | ERR_PERSIST_FAILED)`. `agent-mesh data --to <NODE>`
+  (`crates/agent_mesh/src/main.rs`, supporting `--payload`, `--payload-file <PATH>`, `-` stdin, and `--timeout-ms`)
+  awaits `DeliveryAck`/`DeliveryNack`/hub error/timeout and exits non-zero on failure or missing targets
+  (`ERR_NODE_NOT_FOUND` / `ERR_NODE_UNAVAILABLE`). `crates/agent_mesh/src/protocol.rs` and `hub.rs` compute accurate
+  `total_chunks`, live `sysinfo` + `ActiveCommandGuard` heartbeat telemetry, and honest `"online"` / `"stale"` /
+  `"offline"` node status and `/api/status` counts (`docs/reference.md` updated). Verified by
+  `crates/agent_mesh/tests/mesh_data_delivery.rs` (`7/7`), `cargo test -p agent_mesh --locked` (`124/124`),
+  `tests/test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `tests/test_wave2_e2e.py` (`F6` + Tiers 3–4).
+
 ### MODE-1: Make `ox-mode` report only what happened
 
 - **Evidence:** Read.
@@ -1007,6 +1032,30 @@ Each item below needs a design record before code.
   `connect_master` for every client.
 - **Done when:** An agent on one machine runs `cargo test -p rusty_grid_core --lib` over MCP on another
   machine at a commit that machine did not have. The second run reuses `target/`.
+
+### FEAT-5: Checkpoints for process tasks
+
+- **Evidence:** Read.
+- **Problem:** Checkpoints work for the `BuiltinTest` hash branch only
+  (`crates/worker/src/runner.rs:853-917`). `Command`, `ShellScript`, `RustCompilation` and
+  `GpuCompute` never receive one. The 3D tasks send progress as checkpoints.
+- **Do:** Add `OXIDESWARM_CHECKPOINT_DIR` in the sandbox, stored in capped `Checkpoint` frames and
+  restored before a re-run. Separate progress from state.
+- **Done when:** A `Command` test kills the worker, and a second worker finds the state file and skips
+  finished steps.
+- **Implemented (2026-11-22, design 0102, commits `a8a51357`, `06302c06`, `27cf8453`):** Added
+  `OXCP1\x01` in-band binary checkpoint encoding with BLAKE3 integrity verification
+  (`crates/worker/src/runner/checkpoint.rs`, capped at `12 MiB` / `4096` files, keeping `BuiltinTest`,
+  `Generative3D`, and `AutoRig` JSON payloads separate on Protocol 10 / Store v4), injected private
+  `$OXIDESWARM_CHECKPOINT_DIR` into `Command`, `ShellScript`, and `Workspace` sandboxes (including macOS
+  Seatbelt `--isolation fs|fs+net`), excluded checkpoint paths from `--output` (`**/*`),
+  `describe_sandbox_root`, and `expected_outputs` (`is_reserved_checkpoint_rel` + `fold_blob_path` for
+  ASCII and Unicode APFS equivalence in `crates/worker/src/staging.rs` and `runner/capture.rs`), hardened
+  pack/restore with `PinnedDir` `openat`/`O_NOFOLLOW` traversal (`crates/worker/src/sandbox.rs`), and wired
+  pre-spawn restore with `S + 1` sequence monotonicity, `1 s` periodic polling, final `SIGTERM`/cancel/timeout
+  emission, and a bounded `2 s` graceful worker shutdown drain (`crates/worker/src/client/session.rs`,
+  `docs/reference.md` updated). Verified by unit tests, `crates/worker/tests/test_feat5_process_checkpoints.rs`
+  (`5/5`), `crates/cli/tests/test_feat5_cli_e2e.rs` (`2/2`), and `tests/test_wave2_e2e.py` (`F5` + Tiers 3–4).
 
 ### FEAT-6: Master failover
 
