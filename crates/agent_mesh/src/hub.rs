@@ -30,8 +30,8 @@
 use crate::bridge::AgentGridBridge;
 use crate::protocol::{
     validate_node_id, AgentMeshEnvelope, NodeDescriptor, ERR_DUPLICATE_NODE_ID,
-    ERR_INVALID_NODE_ID, ERR_NODE_UNAVAILABLE, ERR_NOT_REGISTERED, ERR_SENDER_MISMATCH,
-    ERR_UNAUTHORIZED, MAX_NODE_ID_LEN,
+    ERR_INVALID_NODE_ID, ERR_NODE_NOT_FOUND, ERR_NODE_UNAVAILABLE, ERR_NOT_REGISTERED,
+    ERR_SENDER_MISMATCH, ERR_UNAUTHORIZED, MAX_NODE_ID_LEN,
 };
 use axum::{
     extract::{
@@ -47,7 +47,7 @@ use futures::{SinkExt, StreamExt};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -100,6 +100,9 @@ pub struct HubConfig {
     /// A connection that sent nothing (not even a pong) for this long is dropped, which also
     /// frees the node ids a half-open socket would otherwise hold forever.
     pub idle_timeout: Duration,
+    /// Time without a `Heartbeat` after which a connected node is reported as `"stale"` in
+    /// `/api/nodes` and `/api/status`.
+    pub heartbeat_stale_timeout: Duration,
 }
 
 impl Default for HubConfig {
@@ -113,6 +116,7 @@ impl Default for HubConfig {
             registration_timeout: Duration::from_secs(10),
             ping_interval: Duration::from_secs(15),
             idle_timeout: Duration::from_secs(60),
+            heartbeat_stale_timeout: Duration::from_secs(35),
         }
     }
 }
@@ -131,6 +135,7 @@ impl std::fmt::Debug for HubConfig {
             .field("registration_timeout", &self.registration_timeout)
             .field("ping_interval", &self.ping_interval)
             .field("idle_timeout", &self.idle_timeout)
+            .field("heartbeat_stale_timeout", &self.heartbeat_stale_timeout)
             .finish()
     }
 }
@@ -145,6 +150,12 @@ impl HubConfig {
     /// Allows a non-loopback listen address without a token.
     pub fn with_insecure_bind(mut self, allow: bool) -> Self {
         self.allow_insecure_bind = allow;
+        self
+    }
+
+    /// Sets the heartbeat staleness threshold reported by `/api/nodes` and `/api/status`.
+    pub fn with_heartbeat_stale_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_stale_timeout = timeout;
         self
     }
 }
@@ -220,6 +231,60 @@ impl Outbox {
     }
 }
 
+const MAX_INFLIGHT_DATA_ACKS: usize = 1024;
+
+#[derive(Default)]
+struct InflightDataTracker {
+    entries: HashMap<(String, String), String>,
+    order: VecDeque<(String, String)>,
+}
+
+impl InflightDataTracker {
+    fn record(&mut self, target: &str, corr_id: &str, from: &str) {
+        let key = (target.to_string(), corr_id.to_string());
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = from.to_string();
+            return;
+        }
+        while self.entries.len() >= MAX_INFLIGHT_DATA_ACKS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, from.to_string());
+    }
+
+    fn resolve(&mut self, target: &str, corr_id: &str) {
+        let key = (target.to_string(), corr_id.to_string());
+        if self.entries.remove(&key).is_some() {
+            self.order.retain(|k| k != &key);
+        }
+    }
+
+    fn take_for_targets(&mut self, targets: &[String]) -> Vec<(String, String, String)> {
+        if targets.is_empty() || self.entries.is_empty() {
+            return Vec::new();
+        }
+        let mut drained = Vec::new();
+        self.entries.retain(|(target, corr_id), sender| {
+            if targets.iter().any(|t| t == target) {
+                drained.push((target.clone(), corr_id.clone(), sender.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        if !drained.is_empty() {
+            self.order
+                .retain(|(target, _)| !targets.iter().any(|t| t == target));
+        }
+        drained
+    }
+}
+
 pub struct NodeSession {
     pub node_id: String,
     pub platform: String,
@@ -232,6 +297,18 @@ pub struct NodeSession {
     pub conn_id: u64,
 }
 
+impl NodeSession {
+    pub fn connection_status(&self, now_ms: u64, stale_ms: u64) -> &'static str {
+        if self.tx.is_dead() {
+            "offline"
+        } else if now_ms.saturating_sub(self.last_heartbeat) > stale_ms {
+            "stale"
+        } else {
+            "online"
+        }
+    }
+}
+
 pub struct HubState {
     pub nodes: RwLock<HashMap<String, NodeSession>>,
     pub stats: RwLock<HubStats>,
@@ -239,6 +316,8 @@ pub struct HubState {
     pub bridge: RwLock<Option<Arc<AgentGridBridge>>>,
     pub config: HubConfig,
     next_conn_id: AtomicU64,
+    bridge_attached_at_ms: AtomicU64,
+    inflight_data: RwLock<InflightDataTracker>,
 }
 
 impl Default for HubState {
@@ -260,10 +339,15 @@ impl HubState {
             bridge: RwLock::new(None),
             config,
             next_conn_id: AtomicU64::new(1),
+            bridge_attached_at_ms: AtomicU64::new(0),
+            inflight_data: RwLock::new(InflightDataTracker::default()),
         }
     }
 
     pub async fn get_catalog(&self) -> Vec<NodeDescriptor> {
+        let now = now_ms();
+        let stale_ms =
+            u64::try_from(self.config.heartbeat_stale_timeout.as_millis()).unwrap_or(u64::MAX);
         let mut catalog: Vec<NodeDescriptor> = {
             let nodes = self.nodes.read().await;
             nodes
@@ -272,19 +356,26 @@ impl HubState {
                     node_id: s.node_id.clone(),
                     platform: s.platform.clone(),
                     hostname: s.hostname.clone(),
-                    status: "online".to_string(),
+                    status: s.connection_status(now, stale_ms).to_string(),
                     capabilities: s.capabilities.clone(),
                     connected_at: s.connected_at,
                 })
                 .collect()
         };
 
-        if self.bridge.read().await.is_some() {
+        let bridge_opt = self.bridge.read().await.clone();
+        if let Some(bridge) = bridge_opt {
+            let grid_status = if bridge.master().queue_stats().await.is_ok() {
+                "online"
+            } else {
+                "offline"
+            };
+            let attached_at = self.bridge_attached_at_ms.load(Ordering::Relaxed);
             catalog.push(NodeDescriptor {
                 node_id: "grid".to_string(),
                 platform: "grid-supercomputer".to_string(),
                 hostname: "rusty-grid-master".to_string(),
-                status: "online".to_string(),
+                status: grid_status.to_string(),
                 capabilities: serde_json::json!({
                     "supported_commands": [
                         "grid_compute",
@@ -303,7 +394,7 @@ impl HubState {
                     "engine": "OxideSwarm Supercomputing Grid",
                     "layer": 1,
                 }),
-                connected_at: self.start_time.elapsed().as_secs(),
+                connected_at: if attached_at > 0 { attached_at } else { now },
             });
         }
 
@@ -319,7 +410,8 @@ impl HubState {
         }
     }
 
-    /// Drops every registration owned by connection `conn_id` (and only those).
+    /// Drops every registration owned by connection `conn_id` (and only those), and notifies any
+    /// senders with in-flight `DataPayload` transfers awaiting ACK from the dropped nodes.
     pub async fn remove_connection(&self, conn_id: u64) {
         let mut removed = Vec::new();
         {
@@ -333,8 +425,37 @@ impl HubState {
                 }
             });
         }
-        for id in removed {
+        if removed.is_empty() {
+            return;
+        }
+        for id in &removed {
             info!("Hub: Node disconnected -> '{}'", id);
+        }
+        let pending_nacks = self.inflight_data.write().await.take_for_targets(&removed);
+        if !pending_nacks.is_empty() {
+            let mut sent_nacks = 0usize;
+            for (target, corr_id, sender) in pending_nacks {
+                if let Some(sender_outbox) = self.outbox_of(&sender).await {
+                    let nack = AgentMeshEnvelope::new_delivery_nack(
+                        "hub",
+                        &sender,
+                        corr_id,
+                        ERR_NODE_UNAVAILABLE,
+                        format!(
+                            "Data target '{}' disconnected before acknowledging delivery.",
+                            clip(&target)
+                        ),
+                    );
+                    if let Ok(json) = nack.to_json_string() {
+                        if sender_outbox.push(Message::Text(json.into())).is_ok() {
+                            sent_nacks += 1;
+                        }
+                    }
+                }
+            }
+            if sent_nacks > 0 {
+                self.stats.write().await.delivered_nacks += sent_nacks;
+            }
         }
     }
 
@@ -380,6 +501,9 @@ impl AgentMeshHub {
 
     pub fn new_with_bridge(bridge: Arc<AgentGridBridge>) -> Self {
         let hub = Self::new();
+        hub.state
+            .bridge_attached_at_ms
+            .store(now_ms(), Ordering::Relaxed);
         if let Ok(mut b) = hub.state.bridge.try_write() {
             *b = Some(bridge);
         }
@@ -387,6 +511,9 @@ impl AgentMeshHub {
     }
 
     pub async fn attach_bridge(&self, bridge: Arc<AgentGridBridge>) {
+        self.state
+            .bridge_attached_at_ms
+            .store(now_ms(), Ordering::Relaxed);
         let mut b = self.state.bridge.write().await;
         *b = Some(bridge);
         info!("AgentGridBridge attached to AgentMeshHub");
@@ -1060,7 +1187,7 @@ impl Connection {
                             self.routing_nack(
                                 &from,
                                 &corr_id,
-                                "ERR_NODE_NOT_FOUND",
+                                ERR_NODE_NOT_FOUND,
                                 format!("Target node '{}' is not registered with the hub.", to),
                             )
                             .await;
@@ -1089,9 +1216,11 @@ impl Connection {
                 }
 
                 match self.deliver(to, raw_text).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        state.inflight_data.write().await.record(to, &corr_id, from);
+                    }
                     Err(PushError::Full) => {
-                        self.nack(
+                        self.routing_nack(
                             from,
                             &corr_id,
                             ERR_NODE_UNAVAILABLE,
@@ -1099,24 +1228,60 @@ impl Connection {
                                 "Data target '{}' is not keeping up and was disconnected.",
                                 clip(to)
                             ),
-                        );
+                        )
+                        .await;
                     }
                     Err(PushError::Closed) => {
                         warn!("Hub: Data payload target '{}' not found!", clip(to));
-                        self.nack(
+                        self.routing_nack(
                             from,
                             &corr_id,
-                            "ERR_NODE_NOT_FOUND",
+                            ERR_NODE_NOT_FOUND,
                             format!("Data target '{}' not found.", to),
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            AgentMeshEnvelope::DeliveryAck {
+                ref from,
+                ref to,
+                ref status,
+                ..
+            } => {
+                if status != "target_forwarded" {
+                    state.inflight_data.write().await.resolve(from, &corr_id);
+                    if to != "hub" {
+                        state.stats.write().await.delivered_acks += 1;
+                    }
+                }
+                if to != "hub" {
+                    if let Err(err) = self.deliver(to, raw_text).await {
+                        warn!(
+                            "Hub: Failed to forward DeliveryAck ({}) to '{}': {:?}",
+                            clip(&corr_id),
+                            clip(to),
+                            err
                         );
                     }
                 }
             }
 
-            AgentMeshEnvelope::DeliveryAck { ref to, .. }
-            | AgentMeshEnvelope::DeliveryNack { ref to, .. } => {
+            AgentMeshEnvelope::DeliveryNack {
+                ref from, ref to, ..
+            } => {
+                state.inflight_data.write().await.resolve(from, &corr_id);
                 if to != "hub" {
-                    let _ = self.deliver(to, raw_text).await;
+                    state.stats.write().await.delivered_nacks += 1;
+                    if let Err(err) = self.deliver(to, raw_text).await {
+                        warn!(
+                            "Hub: Failed to forward DeliveryNack ({}) to '{}': {:?}",
+                            clip(&corr_id),
+                            clip(to),
+                            err
+                        );
+                    }
                 }
             }
 
@@ -1351,13 +1516,41 @@ async fn api_status(State(state): State<Arc<HubState>>, headers: HeaderMap, uri:
         return forbidden_host();
     }
     let stats = state.stats.read().await.clone();
-    let node_count = state.nodes.read().await.len();
+    let now = now_ms();
+    let stale_ms =
+        u64::try_from(state.config.heartbeat_stale_timeout.as_millis()).unwrap_or(u64::MAX);
+    let (connected_nodes, online_nodes, stale_nodes, offline_nodes) = {
+        let nodes = state.nodes.read().await;
+        let mut connected = 0usize;
+        let mut online = 0usize;
+        let mut stale = 0usize;
+        let mut offline = 0usize;
+        for s in nodes.values() {
+            match s.connection_status(now, stale_ms) {
+                "online" => {
+                    connected += 1;
+                    online += 1;
+                }
+                "stale" => {
+                    connected += 1;
+                    stale += 1;
+                }
+                _ => {
+                    offline += 1;
+                }
+            }
+        }
+        (connected, online, stale, offline)
+    };
     let uptime_s = state.start_time.elapsed().as_secs();
 
     Json(serde_json::json!({
         "status": "online",
         "uptime_seconds": uptime_s,
-        "connected_nodes": node_count,
+        "connected_nodes": connected_nodes,
+        "online_nodes": online_nodes,
+        "stale_nodes": stale_nodes,
+        "offline_nodes": offline_nodes,
         "stats": stats,
     }))
     .into_response()
@@ -1636,5 +1829,113 @@ mod tests {
         let cfg = HubConfig::default().with_auth_token("super-secret-value");
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("super-secret-value"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn test_hub_catalog_and_status_honest_online_stale_and_disconnect() {
+        use crate::client::AgentMeshClient;
+
+        let cfg = HubConfig::default().with_heartbeat_stale_timeout(Duration::from_millis(120));
+        let hub = AgentMeshHub::with_config(cfg);
+        let port = hub.start("127.0.0.1:0").await.expect("start hub");
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+        let client = AgentMeshClient::new(&ws_url, "telemetry-node", "macos");
+        client.connect().await.expect("connect");
+
+        let catalog_fresh = hub.state().get_catalog().await;
+        assert_eq!(catalog_fresh.len(), 1);
+        assert_eq!(catalog_fresh[0].status, "online");
+
+        // Wait past heartbeat_stale_timeout without sending a heartbeat.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let catalog_stale = hub.state().get_catalog().await;
+        assert_eq!(catalog_stale.len(), 1);
+        assert_eq!(catalog_stale[0].status, "stale");
+
+        // Send a fresh heartbeat; status must return to "online".
+        client
+            .send_envelope(AgentMeshEnvelope::Heartbeat {
+                version: "1.0".to_string(),
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                from: "telemetry-node".to_string(),
+                to: "hub".to_string(),
+                cpu_usage_pct: Some(12.5),
+                memory_free_mb: Some(1024),
+                active_commands: Some(1),
+                timestamp: now_ms(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let catalog_recovered = hub.state().get_catalog().await;
+        assert_eq!(catalog_recovered[0].status, "online");
+
+        // Disconnecting removes the node cleanly from the catalog.
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(hub.state().get_catalog().await.is_empty());
+
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_hub_midflight_disconnect_emits_delivery_nack() {
+        use crate::client::AgentMeshClient;
+        use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMsg};
+
+        let hub = AgentMeshHub::new();
+        let port = hub.start("127.0.0.1:0").await.expect("start hub");
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+        // Connect a raw WS receiver that reads the DataPayload and immediately closes without ACK.
+        let (mut raw_ws, _) = connect_async(&ws_url).await.unwrap();
+        let reg = AgentMeshEnvelope::NodeRegistration {
+            version: "1.0".to_string(),
+            correlation_id: "reg-silent-drop".to_string(),
+            from: "drop-target".to_string(),
+            to: "hub".to_string(),
+            platform: "linux".to_string(),
+            hostname: "h".to_string(),
+            capabilities: Value::Null,
+            token: None,
+            timestamp: now_ms(),
+        };
+        raw_ws
+            .send(WsMsg::Text(reg.to_json_string().unwrap()))
+            .await
+            .unwrap();
+        let _ack = raw_ws.next().await;
+
+        let sender = AgentMeshClient::new(&ws_url, "midflight-sender", "macos");
+        sender.connect().await.unwrap();
+
+        let sender_handle = tokio::spawn(async move {
+            let res = sender
+                .send_data_payload_with_ack("drop-target", b"hello-drop", Some(5000))
+                .await;
+            sender.close().await;
+            res
+        });
+
+        // Wait for raw_ws to receive the DataPayload, then drop it without sending DeliveryAck.
+        let msg = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(msg.to_text().unwrap().contains("DataPayload"));
+        drop(raw_ws);
+
+        let err = sender_handle
+            .await
+            .unwrap()
+            .expect_err("mid-flight disconnect must return DeliveryNack error");
+        assert!(err.to_string().contains(ERR_NODE_UNAVAILABLE), "{err}");
+
+        let stats = hub.state().stats.read().await.clone();
+        assert!(stats.delivered_nacks >= 1);
+
+        hub.stop().await;
     }
 }

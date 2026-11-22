@@ -455,11 +455,14 @@ export OXIDE_MESH_TOKEN="$(openssl rand -hex 24)"
 # 3. Connect an agent node (Windows / Mac / Linux / Android); every command below reads OXIDE_MESH_TOKEN:
 ./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos
 python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 --platform android
+# To persist verified incoming data payloads atomically to disk, add --inbox-dir:
+./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos --inbox-dir ./mesh-inbox
 # To disable shell command execution on untrusted nodes, add --no-shell:
 ./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos --no-shell
 
-# 4. Route a command from any node or terminal:
+# 4. Route a command or verified data payload from any node or terminal:
 ./target/release/agent-mesh send --hub ws://127.0.0.1:8090/ws --to node-android-3 --command shell_exec --args '{"cmd": "uname -m"}'
+./target/release/agent-mesh data --hub ws://127.0.0.1:8090/ws --to node-mac-1 --payload "hello-mesh" --timeout-ms 10000
 
 # 5. Query the online nodes catalog:
 ./target/release/agent-mesh list --hub ws://127.0.0.1:8090/ws
@@ -786,10 +789,10 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | Subcommand | Flags | Description |
 | :--- | :--- | :--- |
 | `agent-mesh hub` | `-l` / `--listen <ADDR>` (default `127.0.0.1:8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--insecure`, `--grid-master [<ADDR>]` (`OXIDE_GRID_MASTER`), `--secret <SECRET>` (`OXIDESWARM_SECRET`), `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`) | Start the WebSocket/HTTP Agent Mesh Relay Hub (and optional co-hosted Grid Master when `--grid-master` is passed) |
-| `agent-mesh node` (alias `agent`) | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`; supports `wss://`), `--id <ID>`, `--platform <PLATFORM>`, `--no-shell`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Connect a persistent agent mesh node to the hub |
+| `agent-mesh node` (alias `agent`) | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`; supports `wss://`), `--id <ID>`, `--platform <PLATFORM>`, `--no-shell`, `--inbox-dir <DIR>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Connect a persistent agent mesh node to the hub (when `--inbox-dir <DIR>` is set, validates the directory upfront and atomically persists SHA-256-verified single/multi-chunk `DataPayload` bytes before sending `DeliveryAck`, replying `DeliveryNack` on corruption or write error) |
 | `agent-mesh send` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `-c` / `--command <CMD>`, `-a` / `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Dispatch a structured command to a mesh node via the hub |
 | `agent-mesh list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Query the catalog of active nodes connected to the hub |
-| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload with SHA-256 verification to a target node |
+| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>`, `--timeout-ms <MS>` (default `10000`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload with SHA-256 verification to a target node, wait for `DeliveryAck`/`DeliveryNack`, print the correlation ID and SHA-256 on success, and exit non-zero on missing node, disconnect, `DeliveryNack`, or timeout |
 
 ### Network port topology
 

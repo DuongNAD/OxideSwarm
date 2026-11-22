@@ -96,6 +96,13 @@ pub enum Commands {
         /// Disable shell command execution (refuse shell_exec)
         #[arg(long)]
         no_shell: bool,
+
+        /// Directory where verified incoming DataPayload bytes are persisted atomically
+        #[arg(
+            long,
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        inbox_dir: Option<PathBuf>,
     },
 
     /// Send a structured command to a specific node
@@ -179,6 +186,10 @@ pub enum Commands {
         /// Raw data string to transmit
         #[arg(long)]
         payload: String,
+
+        /// Delivery acknowledgement timeout in milliseconds
+        #[arg(long, default_value = "10000")]
+        timeout_ms: u64,
 
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
@@ -395,11 +406,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             tls_ca,
             no_shell,
+            inbox_dir,
         } => {
             let host_os = std::env::consts::OS.to_string();
             let hostname = sysinfo::System::host_name().unwrap_or_else(|| "device".to_string());
             let node_id = id.unwrap_or_else(|| format!("node-{}-{}", host_os, hostname));
             let plat = platform.unwrap_or(host_os);
+
+            let canonical_inbox = match inbox_dir {
+                Some(ref dir) => Some(agent_mesh::validate_inbox_dir(dir)?),
+                None => None,
+            };
 
             println!("========================================================");
             println!("   OxideSwarm Cross-Platform Agent Node Client          ");
@@ -410,11 +427,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if no_shell {
                 println!("Shell:    disabled (--no-shell active)");
             }
+            if let Some(ref dir) = canonical_inbox {
+                println!("Inbox:    {}", dir.display());
+            }
             println!();
 
             let mut client = build_client(&hub, &node_id, &plat, token, tls_ca);
             if no_shell {
                 client = client.with_no_shell(true);
+            }
+            if let Some(dir) = canonical_inbox {
+                client = client.with_inbox_dir(dir);
             }
             client.validate_tls_config()?;
             client.run_daemon().await;
@@ -510,21 +533,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             from,
             to,
             payload,
+            timeout_ms,
             token,
             tls_ca,
         } => {
             let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
 
             println!("[DATA] Transmitting {} bytes to '{}'...", payload.len(), to);
-            let (corr_id, hash) = client.send_data_payload(&to, payload.as_bytes()).await?;
-            println!("[DATA] Transmission sent! Correlation ID: {}", corr_id);
-            println!("[DATA] SHA-256 Checksum: {}", hash);
-
-            // Wait brief moment for ACK
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            client.close().await;
+            match client
+                .send_data_payload_with_ack(&to, payload.as_bytes(), Some(timeout_ms))
+                .await
+            {
+                Ok(receipt) => {
+                    println!(
+                        "[DATA] Delivery verified! Correlation ID: {}",
+                        receipt.correlation_id
+                    );
+                    println!("[DATA] SHA-256 Checksum: {}", receipt.sha256);
+                    println!("[DATA] Chunks: {}", receipt.total_chunks);
+                    println!(
+                        "[DATA] Responder: {} ({})",
+                        receipt.responder, receipt.status
+                    );
+                    client.close().await;
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Data delivery to '{}' failed: {}", to, e);
+                    client.close().await;
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
@@ -703,5 +742,50 @@ mod tests {
                 .contains("failed to read TLS CA certificate file"),
             "unexpected error: {err_ws}"
         );
+    }
+
+    #[test]
+    fn node_inbox_dir_and_data_timeout_flags_parse() {
+        let node_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--id",
+            "consumer-1",
+            "--inbox-dir",
+            "/tmp/mesh-inbox",
+        ])
+        .unwrap();
+        match node_cli.command {
+            Commands::Node { id, inbox_dir, .. } => {
+                assert_eq!(id.as_deref(), Some("consumer-1"));
+                assert_eq!(inbox_dir.as_deref(), Some(Path::new("/tmp/mesh-inbox")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let data_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload",
+            "abc",
+            "--timeout-ms",
+            "4321",
+        ])
+        .unwrap();
+        match data_cli.command {
+            Commands::Data {
+                to,
+                payload,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(to, "consumer-1");
+                assert_eq!(payload, "abc");
+                assert_eq!(timeout_ms, 4321);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
