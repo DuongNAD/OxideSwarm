@@ -1357,10 +1357,12 @@ fn f2_t1_feat9_d6_benchmark_only_in_project_and_readme() {
 }
 
 #[test]
-fn f2_t1_backlog_header_recount_exact_247_rows() {
+fn f2_t1_backlog_header_recount_matches_rows() {
+    // The newest recount line of the Index header must match the rows; the number of rows itself
+    // grows with every new item, so it is not pinned.
     let b = fs::read_to_string(root().join("docs/BACKLOG.md")).unwrap();
     let rows = backlog_rows(&b);
-    assert_eq!(rows.len(), 247);
+    assert!(rows.len() >= 247, "BACKLOG Index lost rows: {}", rows.len());
     let cnt = |st: &str| rows.iter().filter(|r| r.1 == st).count();
     let open = |ln: &str| {
         rows.iter()
@@ -1368,7 +1370,8 @@ fn f2_t1_backlog_header_recount_exact_247_rows() {
             .count()
     };
     let want = format!(
-        "247 items, {} Implemented, {} Partial and {} Planned; {} open items are In and {} are Out",
+        "{} items, {} Implemented, {} Partial and {} Planned; {} open items are In and {} are Out",
+        rows.len(),
         cnt("Implemented"),
         cnt("Partial"),
         cnt("Planned"),
@@ -2937,9 +2940,14 @@ fn s5a_release_readiness_hygiene_and_skew_baseline_e2e() {
                 .contains("### Release skew")
     );
     assert!(mode_run(p, &["test", "size", "--json"]).status.success());
-    assert_eq!(
-        backlog_rows(&fs::read_to_string(root().join("docs/BACKLOG.md")).unwrap()).len(),
-        247
+    let backlog = fs::read_to_string(root().join("docs/BACKLOG.md")).unwrap();
+    let rows = backlog_rows(&backlog).len();
+    assert!(
+        backlog
+            .lines()
+            .rfind(|l| l.contains("Recounted on") && l.contains("items,"))
+            .is_some_and(|l| l.contains(&format!("{rows} items,"))),
+        "the newest BACKLOG recount line must name {rows} items"
     );
     for rel in ["Cargo.lock", "fuzz/Cargo.lock"] {
         assert!(lock_pkgs(&root().join(rel))
