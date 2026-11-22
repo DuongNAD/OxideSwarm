@@ -29,9 +29,11 @@
 
 use crate::bridge::AgentGridBridge;
 use crate::protocol::{
-    validate_node_id, AgentMeshEnvelope, NodeDescriptor, ERR_DUPLICATE_NODE_ID,
-    ERR_INVALID_NODE_ID, ERR_NODE_NOT_FOUND, ERR_NODE_UNAVAILABLE, ERR_NOT_REGISTERED,
-    ERR_SENDER_MISMATCH, ERR_UNAUTHORIZED, MAX_NODE_ID_LEN,
+    max_chunk_json_bytes, validate_node_id, AgentMeshEnvelope, NodeDescriptor,
+    ACK_STATUS_CHUNK_RECEIVED, ACK_STATUS_TARGET_FORWARDED, DATA_CHUNK_WINDOW,
+    DEFAULT_DATA_CHUNK_BYTES, ERR_DUPLICATE_NODE_ID, ERR_INVALID_NODE_ID, ERR_NODE_NOT_FOUND,
+    ERR_NODE_UNAVAILABLE, ERR_NOT_REGISTERED, ERR_SENDER_MISMATCH, ERR_UNAUTHORIZED,
+    MAX_NODE_ID_LEN,
 };
 use axum::{
     extract::{
@@ -69,6 +71,16 @@ pub const DEFAULT_MAX_QUEUED_MESSAGES: usize = 1024;
 pub const DEFAULT_MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 /// Default largest WebSocket message the hub accepts (and the Python client's `max_size`).
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+// Design 0107 D3: a sender keeps at most `DATA_CHUNK_WINDOW` chunks unacknowledged, so one data
+// transfer, however large, queues at most this many bytes for its consumer. It must fit in half of
+// the default per-connection queue (leaving the other half for a second transfer and for commands),
+// and one chunk must fit in a single WebSocket message.
+const _: () = assert!(
+    DATA_CHUNK_WINDOW * max_chunk_json_bytes(DEFAULT_DATA_CHUNK_BYTES)
+        <= DEFAULT_MAX_QUEUED_BYTES / 2
+);
+const _: () = assert!(max_chunk_json_bytes(DEFAULT_DATA_CHUNK_BYTES) <= DEFAULT_MAX_MESSAGE_BYTES);
 /// Most node ids one socket may register.
 pub const MAX_NODE_IDS_PER_SOCKET: usize = 16;
 
@@ -231,45 +243,93 @@ impl Outbox {
     }
 }
 
-const MAX_INFLIGHT_DATA_ACKS: usize = 1024;
+/// Most data transfers one sender may have awaiting a final ACK/NACK in the hub's table. A sender
+/// past it loses its own oldest entries, never another sender's (design 0107 D5).
+const MAX_INFLIGHT_DATA_PER_SENDER: usize = 256;
+/// Most entries in the whole table; past it the sender with the most entries loses its oldest.
+const MAX_INFLIGHT_DATA_TOTAL: usize = 16 * 1024;
 
+/// Data transfers the hub forwarded and whose target has not answered with a final ACK or a NACK
+/// yet, so the sender can be told when the target disconnects. An entry is keyed by target,
+/// correlation id *and* sender: a correlation id reused by another sender is its own entry and
+/// cannot redirect the first sender's NACK.
 #[derive(Default)]
 struct InflightDataTracker {
-    entries: HashMap<(String, String), String>,
-    order: VecDeque<(String, String)>,
+    /// (target, correlation id, sender).
+    entries: std::collections::HashSet<(String, String, String)>,
+    /// Per sender, its (target, correlation id) pairs in arrival order.
+    per_sender: HashMap<String, VecDeque<(String, String)>>,
 }
 
 impl InflightDataTracker {
-    fn record(&mut self, target: &str, corr_id: &str, from: &str) {
-        let key = (target.to_string(), corr_id.to_string());
-        if let Some(existing) = self.entries.get_mut(&key) {
-            *existing = from.to_string();
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn evict_oldest_of(&mut self, sender: &str) {
+        let Some(queue) = self.per_sender.get_mut(sender) else {
+            return;
+        };
+        if let Some((target, corr_id)) = queue.pop_front() {
+            self.entries.remove(&(target, corr_id, sender.to_string()));
+        }
+        if queue.is_empty() {
+            self.per_sender.remove(sender);
+        }
+    }
+
+    fn record(&mut self, target: &str, corr_id: &str, sender: &str) {
+        let key = (target.to_string(), corr_id.to_string(), sender.to_string());
+        if self.entries.contains(&key) {
             return;
         }
-        while self.entries.len() >= MAX_INFLIGHT_DATA_ACKS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            } else {
+        while self
+            .per_sender
+            .get(sender)
+            .is_some_and(|q| q.len() >= MAX_INFLIGHT_DATA_PER_SENDER)
+        {
+            self.evict_oldest_of(sender);
+        }
+        while self.entries.len() >= MAX_INFLIGHT_DATA_TOTAL {
+            let Some(largest) = self
+                .per_sender
+                .iter()
+                .max_by_key(|(_, q)| q.len())
+                .map(|(s, _)| s.clone())
+            else {
                 break;
+            };
+            self.evict_oldest_of(&largest);
+        }
+        self.per_sender
+            .entry(sender.to_string())
+            .or_default()
+            .push_back((target.to_string(), corr_id.to_string()));
+        self.entries.insert(key);
+    }
+
+    /// The target `target` answered transfer `corr_id` of `sender` for good.
+    fn resolve(&mut self, target: &str, corr_id: &str, sender: &str) {
+        let key = (target.to_string(), corr_id.to_string(), sender.to_string());
+        if !self.entries.remove(&key) {
+            return;
+        }
+        if let Some(queue) = self.per_sender.get_mut(sender) {
+            queue.retain(|(t, c)| !(t == target && c == corr_id));
+            if queue.is_empty() {
+                self.per_sender.remove(sender);
             }
         }
-        self.order.push_back(key.clone());
-        self.entries.insert(key, from.to_string());
     }
 
-    fn resolve(&mut self, target: &str, corr_id: &str) {
-        let key = (target.to_string(), corr_id.to_string());
-        if self.entries.remove(&key).is_some() {
-            self.order.retain(|k| k != &key);
-        }
-    }
-
+    /// Removes and returns every (target, correlation id, sender) whose target is in `targets`.
     fn take_for_targets(&mut self, targets: &[String]) -> Vec<(String, String, String)> {
         if targets.is_empty() || self.entries.is_empty() {
             return Vec::new();
         }
         let mut drained = Vec::new();
-        self.entries.retain(|(target, corr_id), sender| {
+        self.entries.retain(|(target, corr_id, sender)| {
             if targets.iter().any(|t| t == target) {
                 drained.push((target.clone(), corr_id.clone(), sender.clone()));
                 false
@@ -278,8 +338,10 @@ impl InflightDataTracker {
             }
         });
         if !drained.is_empty() {
-            self.order
-                .retain(|(target, _)| !targets.iter().any(|t| t == target));
+            self.per_sender.retain(|_, queue| {
+                queue.retain(|(target, _)| !targets.iter().any(|t| t == target));
+                !queue.is_empty()
+            });
         }
         drained
     }
@@ -345,7 +407,13 @@ impl HubState {
     }
 
     pub async fn get_catalog(&self) -> Vec<NodeDescriptor> {
-        let now = now_ms();
+        self.get_catalog_at(now_ms()).await
+    }
+
+    /// The node catalog as it stands at `now` (milliseconds since the Unix epoch): a node whose
+    /// last heartbeat is more than `heartbeat_stale_timeout` before `now` is `"stale"`. Tests pass
+    /// their own clock here instead of sleeping.
+    pub(crate) async fn get_catalog_at(&self, now: u64) -> Vec<NodeDescriptor> {
         let stale_ms =
             u64::try_from(self.config.heartbeat_stale_timeout.as_millis()).unwrap_or(u64::MAX);
         let mut catalog: Vec<NodeDescriptor> = {
@@ -1250,13 +1318,20 @@ impl Connection {
                 ref status,
                 ..
             } => {
-                if status != "target_forwarded" {
-                    state.inflight_data.write().await.resolve(from, &corr_id);
+                // `chunk_received` is flow control inside a transfer that is still open.
+                let is_final =
+                    status != ACK_STATUS_TARGET_FORWARDED && status != ACK_STATUS_CHUNK_RECEIVED;
+                if is_final {
+                    state
+                        .inflight_data
+                        .write()
+                        .await
+                        .resolve(from, &corr_id, to);
                 }
                 if to != "hub" {
                     match self.deliver(to, raw_text).await {
                         Ok(()) => {
-                            if status != "target_forwarded" {
+                            if is_final {
                                 state.stats.write().await.delivered_acks += 1;
                             }
                         }
@@ -1275,7 +1350,11 @@ impl Connection {
             AgentMeshEnvelope::DeliveryNack {
                 ref from, ref to, ..
             } => {
-                state.inflight_data.write().await.resolve(from, &corr_id);
+                state
+                    .inflight_data
+                    .write()
+                    .await
+                    .resolve(from, &corr_id, to);
                 if to != "hub" {
                     match self.deliver(to, raw_text).await {
                         Ok(()) => {
@@ -1839,29 +1918,68 @@ mod tests {
         assert!(!shown.contains("super-secret-value"), "{shown}");
     }
 
+    /// Polls `cond` until it holds; the 60 s bound only stops a hung test, it is not a timing claim.
+    async fn wait_until<F, Fut>(what: &str, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !cond().await {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_hub_catalog_and_status_honest_online_stale_and_disconnect() {
         use crate::client::AgentMeshClient;
 
-        let cfg = HubConfig::default().with_heartbeat_stale_timeout(Duration::from_millis(120));
+        // The stale window is checked against an explicit clock (`get_catalog_at`), so the test
+        // asserts states, not how fast a runner gets from one line to the next.
+        let stale = Duration::from_secs(30);
+        let stale_ms = stale.as_millis() as u64;
+        let cfg = HubConfig::default().with_heartbeat_stale_timeout(stale);
         let hub = AgentMeshHub::with_config(cfg);
         let port = hub.start("127.0.0.1:0").await.expect("start hub");
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
 
         let client = AgentMeshClient::new(&ws_url, "telemetry-node", "macos");
         client.connect().await.expect("connect");
+        let state = hub.state();
+        let last_heartbeat = |state: Arc<HubState>| async move {
+            state
+                .nodes
+                .read()
+                .await
+                .get("telemetry-node")
+                .map(|s| s.last_heartbeat)
+        };
+        let registered_at = last_heartbeat(state.clone())
+            .await
+            .expect("node registered");
 
-        let catalog_fresh = hub.state().get_catalog().await;
-        assert_eq!(catalog_fresh.len(), 1);
-        assert_eq!(catalog_fresh[0].status, "online");
+        // Right after registration and up to the end of the window the node is online ...
+        let fresh = state.get_catalog_at(registered_at).await;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].status, "online");
+        let edge = state.get_catalog_at(registered_at + stale_ms).await;
+        assert_eq!(edge[0].status, "online");
+        // ... and one millisecond past it, without a heartbeat, it is stale.
+        let late = state.get_catalog_at(registered_at + stale_ms + 1).await;
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].status, "stale");
 
-        // Wait past heartbeat_stale_timeout without sending a heartbeat.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let catalog_stale = hub.state().get_catalog().await;
-        assert_eq!(catalog_stale.len(), 1);
-        assert_eq!(catalog_stale[0].status, "stale");
-
-        // Send a fresh heartbeat; status must return to "online".
+        // Age the recorded heartbeat, then send a fresh one: the hub must record it, after which
+        // the node is online again at the time of that heartbeat.
+        state
+            .nodes
+            .write()
+            .await
+            .get_mut("telemetry-node")
+            .unwrap()
+            .last_heartbeat = 0;
+        assert_eq!(state.get_catalog_at(registered_at).await[0].status, "stale");
         client
             .send_envelope(AgentMeshEnvelope::Heartbeat {
                 version: "1.0".to_string(),
@@ -1875,16 +1993,57 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let catalog_recovered = hub.state().get_catalog().await;
-        assert_eq!(catalog_recovered[0].status, "online");
+        wait_until("the heartbeat to be recorded", || {
+            let state = state.clone();
+            async move { last_heartbeat(state).await.is_some_and(|hb| hb > 0) }
+        })
+        .await;
+        let heartbeat_at = last_heartbeat(state.clone()).await.unwrap();
+        assert_eq!(state.get_catalog_at(heartbeat_at).await[0].status, "online");
 
-        // Disconnecting removes the node cleanly from the catalog.
+        // Disconnecting removes the node from the catalog.
         client.close().await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(hub.state().get_catalog().await.is_empty());
+        wait_until("the node to leave the catalog", || {
+            let state = state.clone();
+            async move { state.get_catalog().await.is_empty() }
+        })
+        .await;
 
         hub.stop().await;
+    }
+
+    #[test]
+    fn test_inflight_tracker_is_bounded_per_sender_and_keyed_by_sender() {
+        let mut tracker = InflightDataTracker::default();
+
+        // A flooding sender only ever pushes out its own oldest entries.
+        tracker.record("victim-target", "corr-honest", "honest-sender");
+        for i in 0..(MAX_INFLIGHT_DATA_PER_SENDER * 3) {
+            tracker.record("t", &format!("flood-{i}"), "flooder");
+        }
+        assert_eq!(tracker.len(), MAX_INFLIGHT_DATA_PER_SENDER + 1);
+        assert!(tracker.entries.contains(&(
+            "victim-target".to_string(),
+            "corr-honest".to_string(),
+            "honest-sender".to_string()
+        )));
+
+        // A correlation id reused by another sender is a separate entry: the NACK for the honest
+        // transfer still goes to the honest sender when the target goes away.
+        tracker.record("victim-target", "corr-honest", "hijacker");
+        // An ACK from the target to the hijacker resolves only the hijacker's entry.
+        tracker.resolve("victim-target", "corr-honest", "hijacker");
+        let drained = tracker.take_for_targets(&["victim-target".to_string()]);
+        assert_eq!(
+            drained,
+            vec![(
+                "victim-target".to_string(),
+                "corr-honest".to_string(),
+                "honest-sender".to_string()
+            )]
+        );
+        assert_eq!(tracker.len(), MAX_INFLIGHT_DATA_PER_SENDER);
+        assert!(!tracker.per_sender.contains_key("honest-sender"));
     }
 
     #[tokio::test]
@@ -1989,7 +2148,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The hub handles one socket's frames in order: once it answered this query it has
+        // handled the ACK and the NACK above.
+        sender.query_node_list(Some(60_000)).await.unwrap();
         let after = hub.state().stats.read().await.clone();
         assert_eq!(after.delivered_acks, before.delivered_acks);
         assert_eq!(after.delivered_nacks, before.delivered_nacks);
