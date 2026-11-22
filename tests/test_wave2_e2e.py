@@ -1415,12 +1415,6 @@ def _wait_inbox_for_bytes(
     )
 
 
-def _cpu_burner_worker(stop_ev: threading.Event) -> None:
-    x = 1
-    while not stop_ev.is_set():
-        x = (x * 1664525 + 1013904223) & 0xFFFFFFFF
-
-
 def _hardlink_test_script() -> str:
     return (
         'ln "$T_SECRET" "$RUSTY_GRID_SANDBOX_DIR/linked" 2>/dev/null '
@@ -2028,6 +2022,26 @@ class Tier1FeatureCoverageTests(Wave2E2ETestBase):
         cells = _extract_matrix_cells(json.loads(text))
         self.assertEqual(len(cells), expected_cells)
         self.assertEqual(len({_cell_worker(c) for c in cells}), expected_cells)
+
+        # Also exercise runtime MCP object-form matrix ({"tag": [...], "env:...": [...]}).
+        obj_resp = mcp.call_tool(
+            "submit",
+            {
+                "type": "shell",
+                "script": 'echo "MODE=$MODE CELL=$OXIDESWARM_MATRIX_CELL"',
+                "matrix": {"tag": ["row-1", "row-2"], "env:MODE": ["fast", "slow"]},
+                "wait": True,
+            },
+        )
+        obj_err, obj_text = _mcp_tool_text(obj_resp)
+        self.assertFalse(obj_err, obj_text)
+        obj_cells = _extract_matrix_cells(json.loads(obj_text))
+        self.assertEqual(len(obj_cells), 4)
+        for c in obj_cells:
+            self.assertEqual(c.get("exit_code"), 0, c)
+        obj_stdouts = "\n".join(_cell_stdout(c) for c in obj_cells)
+        self.assertIn("MODE=fast", obj_stdouts)
+        self.assertIn("MODE=slow", obj_stdouts)
         mcp.close_stdin()
 
     def test_t1_f4_04_mcp_submit_workspace_and_matrix(self) -> None:
@@ -2319,12 +2333,29 @@ class Tier1FeatureCoverageTests(Wave2E2ETestBase):
 
         status = http_get_json(f"{hub.http_url}/api/status")
         self.assertIsInstance(status, dict)
-        # Disconnecting node must remove/update it honestly in /api/nodes.
+        self.assertEqual(status.get("connected_nodes"), 1, status)
+        self.assertEqual(status.get("online_nodes"), 1, status)
+        stats = status.get("stats")
+        self.assertIsInstance(stats, dict, status)
+        for stat_key in ("routed_data", "delivered_acks", "delivered_nacks"):
+            self.assertIn(stat_key, stats, status)
+            self.assertIsInstance(stats[stat_key], int, status)
+            self.assertGreaterEqual(stats[stat_key], 0, status)
+
+        # Disconnecting node must remove/update it honestly in /api/nodes and /api/status.
         node.stop(sig=signal.SIGTERM, timeout=5.0)
 
         def _node_gone() -> bool:
             cur = http_get_json(f"{hub.http_url}/api/nodes")
-            return all(n["node_id"] != "consumer-04" or n.get("status") != "online" for n in cur)
+            cur_status = http_get_json(f"{hub.http_url}/api/status")
+            nodes_clear = all(
+                n["node_id"] != "consumer-04" or n.get("status") != "online" for n in cur
+            )
+            return (
+                nodes_clear
+                and cur_status.get("connected_nodes") == 0
+                and cur_status.get("online_nodes") == 0
+            )
 
         _wait_until(_node_gone, timeout=5.0, desc="disconnected node status update")
 
@@ -2381,14 +2412,33 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         if sys.platform == "darwin":
             self.ox.start_worker(master.listen_addr, name="w-50x-fs", isolation="fs", tags=["m-fs"])
 
-        stop_ev = threading.Event()
-        burners = [
-            threading.Thread(target=_cpu_burner_worker, args=(stop_ev,), daemon=True)
-            for _ in range(4)
-        ]
-        for b in burners:
-            b.start()
-        self.env.add_cleanup(stop_ev.set)
+        burners: list[subprocess.Popen[str]] = []
+
+        def _cleanup_burners() -> None:
+            for p in burners:
+                if p.poll() is None:
+                    try:
+                        p.terminate()
+                        p.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            p.kill()
+                            p.wait(timeout=2.0)
+                        except Exception:
+                            pass
+
+        self.env.add_cleanup(_cleanup_burners)
+        burner_code = "x = 1\nwhile True:\n    x = (x * 1664525 + 1013904223) & 0xFFFFFFFF\n"
+        for _ in range(4):
+            burners.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", burner_code],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            )
 
         try:
             for i in range(50):
@@ -2426,9 +2476,7 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
                     self.assertNotIn(secret_val, fs_data["stdout"])
                     self.assertIn("END", fs_data["stdout"])
         finally:
-            stop_ev.set()
-            for b in burners:
-                b.join(timeout=1.0)
+            _cleanup_burners()
 
     def test_t2_f1_02_fs_isolation_denies_nested_subdir_and_symlink_escape(self) -> None:
         self._require_darwin_for_seatbelt()
@@ -2479,6 +2527,9 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
             timeout=10.0,
         )
         self.assertNotEqual(r_cli.returncode, 0)
+        cli_err = (r_cli.stderr + "\n" + r_cli.stdout).lower()
+        self.assertIn("--isolation", cli_err, r_cli.stderr)
+        self.assertIn("--secret", cli_err, r_cli.stderr)
 
         r_env = self.env.run_cmd(
             [
@@ -2493,6 +2544,9 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
             timeout=10.0,
         )
         self.assertNotEqual(r_env.returncode, 0)
+        env_err = (r_env.stderr + "\n" + r_env.stdout).lower()
+        self.assertIn("--isolation", env_err, r_env.stderr)
+        self.assertIn("oxideswarm_secret", env_err, r_env.stderr)
 
     def test_t2_f1_04_same_fs_temp_layout_verifies_real_hardlink_control(self) -> None:
         secret_file = self.env.home / "samefs_secret.txt"
@@ -2632,6 +2686,58 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         self.assertEqual(len(marker.read_text(encoding="utf-8").splitlines()), 1)
 
     def test_t2_f2_03_worker_reconnect_within_resume_hold_vs_expired_hold(self) -> None:
+        # Branch 1: Within-hold reconnect preserves session without failover re-execution.
+        state_dir_in = self.env.root / "f2_t2_state_03_in"
+        m_in1 = self.ox.start_master(
+            name="m-in1",
+            state_dir=state_dir_in,
+            heartbeat_interval_secs=1,
+            heartbeat_timeout_secs=3,
+            reaper_interval_secs=1,
+            session_resume_hold_secs=15,
+        )
+        self.ox.start_worker(m_in1.listen_addr, name="w-in-hold", isolation="off")
+        marker_in = self.env.root / "marker_hold_in.log"
+        gate_in = self.env.root / "gate_hold_in"
+        done_in = self.env.root / "done_hold_in"
+        sub_in = self.ox.submit_cli(
+            m_in1.listen_addr,
+            [
+                "--type", "shell",
+                "--max-retries", "2",
+                "--json",
+                "--command", _gated_marker_script(marker_in, gate_in, done_in),
+            ],
+        )
+        self.assertEqual(sub_in.returncode, 0, sub_in.stderr)
+        tid_in = json.loads(sub_in.stdout)["task_id"]
+        _wait_until(
+            lambda: marker_in.is_file() and len(marker_in.read_text().splitlines()) >= 1,
+            timeout=10.0,
+            desc="within-hold task started",
+        )
+        gate_in.write_text("go\n", encoding="utf-8")
+        _wait_until(done_in.is_file, timeout=10.0, interval=0.002, desc="within-hold done")
+        self.assertEqual(m_in1.proc.stop(sig=signal.SIGTERM, timeout=10.0), 0)
+
+        m_in2 = self.ox.start_master(
+            name="m-in2",
+            listen=m_in1.listen_addr,
+            state_dir=state_dir_in,
+            heartbeat_interval_secs=1,
+            heartbeat_timeout_secs=3,
+            reaper_interval_secs=1,
+            session_resume_hold_secs=15,
+        )
+        self.ox.start_worker(m_in2.listen_addr, name="w-in-spare", isolation="off")
+        res_in = self.ox.result_cli(m_in2.listen_addr, tid_in, wait=True, json_out=True, timeout=20.0)
+        self.assertEqual(res_in.returncode, 0, res_in.stderr)
+        self.assertEqual(json.loads(res_in.stdout)["exit_code"], 0)
+        time.sleep(0.25)
+        self.assertEqual(len(marker_in.read_text(encoding="utf-8").splitlines()), 1)
+        m_in2.proc.stop(sig=signal.SIGTERM, timeout=10.0)
+
+        # Branch 2: Expired-hold failover when worker is SIGKILLed and hold (2s) expires.
         m = self.ox.start_master(
             heartbeat_interval_secs=1,
             heartbeat_timeout_secs=3,
@@ -2668,6 +2774,7 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(json.loads(res.stdout)["exit_code"], 0)
         self.assertTrue(done.is_file())
+        self.assertEqual(len(marker.read_text(encoding="utf-8").splitlines()), 2)
 
     def test_t2_f2_04_max_retries_zero_restart_does_not_double_run_completed_task(self) -> None:
         state_dir = self.env.root / "f2_t2_state_04"
@@ -2777,12 +2884,44 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
             timeout=15.0,
         )
         self.assertNotEqual(res.returncode, 0)
-        self.assertLess(res.elapsed_s, 10.0, "Unplaced cell hung instead of failing pre-flight")
+        self.assertLess(res.elapsed_s, 5.0, "Unplaced cell hung instead of failing pre-flight")
         cells = _extract_matrix_cells(json.loads(res.stdout))
         self.assertEqual(len(cells), 2)
         unplaced = [c for c in cells if _cell_is_unplaced(c)]
         self.assertEqual(len(unplaced), 1, f"Expected 1 unplaced cell: {cells!r}")
         self.assertIn("cell-missing", _cell_label_text(unplaced[0]))
+        placeable = [c for c in cells if not _cell_is_unplaced(c)]
+        self.assertEqual(len(placeable), 1, f"Expected 1 placeable cell: {cells!r}")
+        self.assertEqual(placeable[0].get("exit_code"), 0, placeable[0])
+
+        # 0-placeable matrix must exit < 5.0s and skip input blob upload completely.
+        skip_dir = self.env.work / "skip_upload_inputs"
+        skip_dir.mkdir()
+        (skip_dir / "payload.bin").write_bytes(b"Z" * 16384)
+        assert master.dashboard_port is not None
+        metrics_url = f"http://127.0.0.1:{master.dashboard_port}/metrics"
+        _, before_txt = http_get_text(metrics_url)
+        before_objs = parse_prom_metric(before_txt, "oxideswarm_blob_store_objects") or 0.0
+
+        res_zero = self.ox.submit_cli(
+            master.listen_addr,
+            [
+                "--matrix", "tag=nope-1,nope-2",
+                "--input", f"{skip_dir}:in",
+                "--json",
+                "--timeout-secs", "30",
+                "--command", "echo", "--", "never_runs",
+            ],
+            timeout=15.0,
+        )
+        self.assertNotEqual(res_zero.returncode, 0)
+        self.assertLess(res_zero.elapsed_s, 5.0, "0-placeable matrix hung")
+        zero_cells = _extract_matrix_cells(json.loads(res_zero.stdout))
+        self.assertEqual(len(zero_cells), 2)
+        self.assertTrue(all(_cell_is_unplaced(c) for c in zero_cells), zero_cells)
+        _, after_txt = http_get_text(metrics_url)
+        after_objs = parse_prom_metric(after_txt, "oxideswarm_blob_store_objects") or 0.0
+        self.assertEqual(after_objs - before_objs, 0.0, "0-placeable matrix uploaded blobs")
 
     def test_t2_f3_02_partial_cell_failure_exits_nonzero_with_per_cell_codes(self) -> None:
         master = self.ox.start_master()
@@ -2918,18 +3057,22 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
             timeout=15.0,
         )
         elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 10.0, "MCP unplaced cell hung")
+        self.assertLess(elapsed, 5.0, f"MCP unplaced cell hung ({elapsed:.2f}s)")
         is_err, text = _mcp_tool_text(resp)
-        try:
-            cells = _extract_matrix_cells(json.loads(text))
-            self.assertTrue(any(_cell_is_unplaced(c) for c in cells), f"No unplaced cell: {cells!r}")
-        except json.JSONDecodeError:
-            self.assertTrue(is_err)
-            self.assertIn("unplaced", text.lower())
+        self.assertTrue(is_err, f"Expected isError=true on unplaced cell: {resp!r}")
+        cells = _extract_matrix_cells(json.loads(text))
+        self.assertEqual(len(cells), 2)
+        unplaced = [c for c in cells if _cell_is_unplaced(c)]
+        self.assertEqual(len(unplaced), 1, f"Expected 1 unplaced cell: {cells!r}")
+        self.assertIn("mu-missing", _cell_label_text(unplaced[0]))
+        placeable = [c for c in cells if not _cell_is_unplaced(c)]
+        self.assertEqual(len(placeable), 1, f"Expected 1 placeable cell: {cells!r}")
+        self.assertEqual(placeable[0].get("exit_code"), 0, placeable[0])
         mcp.close_stdin()
 
     def test_t2_f4_02_mcp_invalid_matrix_schema_returns_error_and_server_stays_alive(self) -> None:
         master = self.ox.start_master()
+        self.ox.start_worker(master.listen_addr, name="w-rec-mcp", tags=["rec-ok"])
         mcp = McpClient(self.env, master.listen_addr)
         mcp.initialize()
 
@@ -2941,6 +3084,7 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
             ["env:BAD=KEY=1"],
             ["iso=off"],
             ["tag=a=b"],
+            [123],
         ):
             resp = mcp.call_tool(
                 "submit",
@@ -2953,10 +3097,27 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
                 },
                 timeout=10.0,
             )
-            if "error" in resp:
-                self.assertEqual(resp["error"].get("code"), -32602, resp)
-            else:
-                self.assertTrue(resp["result"].get("isError"), f"Expected error for {bad_matrix!r}: {resp}")
+            self.assertIn("error", resp, f"Expected JSON-RPC -32602 for {bad_matrix!r}: {resp!r}")
+            self.assertEqual(resp["error"].get("code"), -32602, resp)
+
+        # Verify full tool recovery with a valid submit call + ping after -32602 errors.
+        ok_resp = mcp.call_tool(
+            "submit",
+            {
+                "type": "command",
+                "command": "echo",
+                "args": ["MCP_RECOVERED"],
+                "matrix": ["tag=rec-ok"],
+                "wait": True,
+            },
+            timeout=15.0,
+        )
+        ok_err, ok_text = _mcp_tool_text(ok_resp)
+        self.assertFalse(ok_err, ok_text)
+        ok_cells = _extract_matrix_cells(json.loads(ok_text))
+        self.assertEqual(len(ok_cells), 1)
+        self.assertEqual(ok_cells[0].get("exit_code"), 0, ok_cells[0])
+        self.assertIn("MCP_RECOVERED", _cell_stdout(ok_cells[0]))
 
         pong = mcp.ping()
         self.assertEqual(pong.get("result"), {})
@@ -2989,7 +3150,7 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         cells = _extract_matrix_cells(json.loads(text))
         codes = sorted(c.get("exit_code") for c in cells)
         self.assertEqual(codes, [0, 9])
-        self.assertTrue(is_err or 9 in codes)
+        self.assertTrue(is_err, f"Expected isError=true on partial failure: {resp!r}")
         self.assertEqual(mcp.ping().get("result"), {})
         mcp.close_stdin()
 
@@ -3184,6 +3345,7 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         self.assertIn("EMPTY_CP_COUNT=0", data["stdout"])
 
     def test_t2_f5_04_oversized_checkpoint_handled_without_crashing_worker_or_master(self) -> None:
+        # Sub-check 1: Master --max-active-mb 1 rejects 2 MiB checkpoint without crashing.
         master = self.ox.start_master(
             max_active_mb=1,
             session_resume_hold_secs=0,
@@ -3193,24 +3355,41 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         )
         w1 = self.ox.start_worker(master.listen_addr, name="w-ovs-1", isolation="off")
         big_ready = self.env.root / "ovs_ready"
+        attempt_log = self.env.root / "ovs_attempts.log"
+        ovs_probe = self.env.root / "ovs_probe.txt"
 
         script = (
             'set -e\n'
-            'if [ -f "$OXIDESWARM_CHECKPOINT_DIR/huge.bin" ]; then echo RESUMED; exit 0; fi\n'
+            f'echo "ATTEMPT" >> "{attempt_log}"\n'
+            f'if [ $(wc -l < "{attempt_log}") -ge 2 ]; then\n'
+            '  if [ ! -f "$OXIDESWARM_CHECKPOINT_DIR/huge.bin" ]; then\n'
+            f'    echo "OVERSIZED_NOT_RESTORED" > "{ovs_probe}"\n'
+            '    echo "OVERSIZED_NOT_RESTORED"\n'
+            '    exit 0\n'
+            '  fi\n'
+            f'  echo "UNEXPECTED_RESTORED" > "{ovs_probe}"\n'
+            '  exit 2\n'
+            'fi\n'
             'dd if=/dev/zero of="$OXIDESWARM_CHECKPOINT_DIR/huge.bin" bs=1048576 count=2 2>/dev/null\n'
             f'touch "{big_ready}"\n'
             'sleep 30\n'
         )
         sub_proc = self.ox.submit_cli_popen(
             master.listen_addr,
-            ["--type", "shell", "--max-retries", "1", "--timeout-secs", "12", "--wait", "--json", "--command", script],
+            ["--type", "shell", "--max-retries", "2", "--wait", "--json", "--command", script],
         )
         _wait_until(big_ready.is_file, timeout=15.0, desc="oversized cp written")
-        time.sleep(3.0)
+        time.sleep(3.5)
         w1.proc.stop(sig=signal.SIGKILL, timeout=5.0)
         w2 = self.ox.start_worker(master.listen_addr, name="w-ovs-2", isolation="off")
 
-        sub_proc.wait(timeout=25.0)
+        sub_rc = sub_proc.wait(timeout=30.0)
+        self.assertEqual(sub_rc, 0, sub_proc.logs())
+        self.assertEqual(json.loads("\n".join(sub_proc.stdout_lines))["exit_code"], 0)
+        self.assertTrue(ovs_probe.is_file(), sub_proc.logs())
+        self.assertEqual(ovs_probe.read_text(encoding="utf-8").strip(), "OVERSIZED_NOT_RESTORED")
+        self.assertEqual(len(attempt_log.read_text(encoding="utf-8").splitlines()), 2)
+
         # Master and w2 must remain alive and healthy after oversized checkpoint rejection/drop.
         self.assertIsNone(master.proc.poll(), master.proc.logs())
         self.assertIsNone(w2.proc.poll(), w2.proc.logs())
@@ -3221,7 +3400,38 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         self.assertEqual(health_res.returncode, 0, health_res.stderr)
         self.assertIn("STILL_ALIVE", json.loads(health_res.stdout)["stdout"])
 
+        # Sub-check 2: Worker MAX_PROCESS_CHECKPOINT_BYTES (12 MiB) cap without --max-active-mb 1.
+        master_12m = self.ox.start_master(name="m-12m")
+        w_12m = self.ox.start_worker(master_12m.listen_addr, name="w-12m", isolation="off")
+        res_13m = self.ox.submit_cli(
+            master_12m.listen_addr,
+            [
+                "--type", "shell",
+                "--wait", "--json",
+                "--command",
+                'dd if=/dev/zero of="$OXIDESWARM_CHECKPOINT_DIR/too_big_13m.bin" bs=1048576 count=13 2>/dev/null && sleep 1.5 && echo "WORKER_13M_DONE"',
+            ],
+            timeout=30.0,
+        )
+        self.assertEqual(res_13m.returncode, 0, res_13m.stderr)
+        data_13m = json.loads(res_13m.stdout)
+        self.assertEqual(data_13m["exit_code"], 0, data_13m)
+        self.assertIn("WORKER_13M_DONE", data_13m["stdout"])
+        self.assertIsNone(master_12m.proc.poll(), master_12m.proc.logs())
+        self.assertIsNone(w_12m.proc.poll(), w_12m.proc.logs())
+        health_12m = self.ox.submit_cli(
+            master_12m.listen_addr,
+            ["--type", "command", "--wait", "--json", "--command", "echo", "--", "STILL_ALIVE_12M"],
+        )
+        self.assertEqual(health_12m.returncode, 0, health_12m.stderr)
+        self.assertIn("STILL_ALIVE_12M", json.loads(health_12m.stdout)["stdout"])
+
     def test_t2_f5_05_binary_nul_nested_checkpoint_roundtrip_and_non_oxcp1_isolation(self) -> None:
+        """Verifies binary/NUL/nested checkpoint files and literal `OXCP1` filename roundtrip.
+
+        Wire-level rejection of non-`OXCP1` `CheckpointData.delta_state` payloads (e.g., 3D/BuiltinTest
+        JSON progress) is enforced in Rust crate tests (`test_feat5_process_checkpoints.rs`).
+        """
         master = self.ox.start_master(
             session_resume_hold_secs=0,
             heartbeat_interval_secs=1,
@@ -3290,6 +3500,32 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         )
         rc = node.wait(timeout=10.0)
         self.assertNotEqual(rc, 0, node.logs())
+
+        # Symlink --inbox-dir (both without and with trailing slash) must be rejected at startup.
+        real_dir = self.env.root / "real_inbox_target"
+        real_dir.mkdir()
+        sym_inbox = self.env.root / "sym_inbox"
+        sym_inbox.symlink_to(real_dir)
+
+        for suffix, node_id in (("", "sym-inbox-node"), ("/", "sym-inbox-slash-node")):
+            r_sym = self.env.run_cmd(
+                [
+                    self.mesh.bin,
+                    "node",
+                    "--hub",
+                    hub.ws_url,
+                    "--id",
+                    node_id,
+                    "--inbox-dir",
+                    f"{sym_inbox}{suffix}",
+                ],
+                timeout=10.0,
+            )
+            self.assertNotEqual(
+                r_sym.returncode,
+                0,
+                f"Expected symlink --inbox-dir ({suffix!r}) rejection: {r_sym.stdout}\n{r_sym.stderr}",
+            )
 
     def test_t2_f6_03_readonly_inbox_dir_triggers_nack_and_nonzero_exit(self) -> None:
         if os.geteuid() == 0:
@@ -3384,28 +3620,30 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
         self.env.add_cleanup(ws.close)
         ws.register("ws-corrupt-sender")
 
-        # 1) Corrupted SHA-256 must return DeliveryNack and leave zero corrupt file on disk.
+        # 1) Corrupted SHA-256 must return DeliveryNack with ERR_PAYLOAD_CORRUPT and zero corrupt file on disk.
         bad_payload = b"corrupt-checksum-bytes"
         corr_bad = ws.send_data_payload(
             "burst-consumer", bad_payload, checksum_override="0" * 64
         )
         nack = ws.recv_until(lambda m: m.get("correlation_id") == corr_bad, timeout=8.0)
         self.assertEqual(nack["type"], "DeliveryNack", nack)
+        self.assertEqual(nack.get("error_code"), "ERR_PAYLOAD_CORRUPT", nack)
         self.assertEqual(_collect_inbox_payloads(inbox), [])
 
-        # 2) Concurrent 20-message burst + 256 KiB payload must all ACK and persist bit-for-bit.
+        # 2) Concurrent 265-message burst (> 256 buffer cap) including 256 KiB payload must all ACK & persist.
         expected_blobs: list[bytes] = [
-            f"burst-{i:02d}-".encode() + os.urandom(128) for i in range(20)
+            f"burst-{i:03d}-".encode() + os.urandom(64) for i in range(264)
         ]
         large_blob = b"L" * (256 * 1024)
         expected_blobs.append(large_blob)
+        self.assertEqual(len(expected_blobs), 265)
 
         corrs: set[str] = set()
         for blob in expected_blobs:
             corrs.add(ws.send_data_payload("burst-consumer", blob))
 
         acks = 0
-        deadline = time.monotonic() + 15.0
+        deadline = time.monotonic() + 25.0
         while acks < len(corrs) and time.monotonic() < deadline:
             msg = ws.recv_json(timeout=max(0.5, deadline - time.monotonic()))
             if msg.get("correlation_id") in corrs:
@@ -3417,7 +3655,8 @@ class Tier2BoundaryCornerTests(Wave2E2ETestBase):
             on_disk = {data for _, data in _collect_inbox_payloads(inbox)}
             return all(b in on_disk for b in expected_blobs)
 
-        _wait_until(_all_persisted, timeout=10.0, desc="all burst payloads on disk")
+        _wait_until(_all_persisted, timeout=15.0, desc="all 265 burst payloads on disk")
+        self.assertFalse(any(p.name.startswith(".tmp_") for p in inbox.iterdir()))
 
 
 # ===========================================================================
@@ -3471,11 +3710,13 @@ class Tier3CrossFeatureTests(Wave2E2ETestBase):
         script = (
             'set -e\n'
             'CP="$OXIDESWARM_CHECKPOINT_DIR/state"\n'
-            'if [ -f "$CP" ]; then echo "CELL_RESUMED" >> "' + str(trace_a) + '"; echo OK_RESUME; exit 0; fi\n'
-            'echo "CELL_STEP1" >> "' + str(trace_a) + '"\n'
+            f'if [ -f "$CP" ]; then echo "CELL_RESUMED" >> "{trace_a}"; echo OK_RESUME; exit 0; fi\n'
+            f'echo "CELL_STEP1" >> "{trace_a}"\n'
             'echo "DONE1" > "$CP"\n'
-            f'if [ ! -f "{cp_flag}" ]; then touch "{cp_flag}"; sleep 30; fi\n'
-            'echo OK_FAST\n'
+            'case "$OXIDESWARM_MATRIX_CELL" in\n'
+            f'  *lane-a*) touch "{cp_flag}"; sleep 30 ;;\n'
+            '  *) echo OK_FAST ;;\n'
+            'esac\n'
         )
         sub_proc = self.ox.submit_cli_popen(
             master.listen_addr,
@@ -3498,7 +3739,18 @@ class Tier3CrossFeatureTests(Wave2E2ETestBase):
         cells = _extract_matrix_cells(json.loads("\n".join(sub_proc.stdout_lines)))
         self.assertEqual(len(cells), 2)
         for c in cells:
-            self.assertEqual(c.get("exit_code"), 0)
+            self.assertEqual(c.get("exit_code"), 0, c)
+
+        lane_a = next(c for c in cells if "lane-a" in _cell_label_text(c))
+        lane_b = next(c for c in cells if "lane-b" in _cell_label_text(c))
+        self.assertIn("OK_RESUME", _cell_stdout(lane_a), lane_a)
+        self.assertIn("OK_FAST", _cell_stdout(lane_b), lane_b)
+
+        trace_text = trace_a.read_text(encoding="utf-8")
+        trace_lines = trace_text.splitlines()
+        self.assertIn("CELL_RESUMED", trace_text, trace_lines)
+        self.assertEqual(trace_lines.count("CELL_STEP1"), 2, trace_lines)
+        self.assertEqual(trace_lines.count("CELL_RESUMED"), 1, trace_lines)
 
     def test_t3_03_feat5_checkpoint_inside_test61_fs_isolation_sandbox(self) -> None:
         self._require_darwin_for_seatbelt()
@@ -3645,7 +3897,9 @@ class Tier3CrossFeatureTests(Wave2E2ETestBase):
         for c in cells:
             self.assertEqual(c.get("exit_code"), 0)
         saved_files = list(out_dir.rglob("out_report.txt"))
-        self.assertGreaterEqual(len(saved_files), 1)
+        self.assertEqual(len(saved_files), 2, saved_files)
+        for sf in saved_files:
+            self.assertEqual(sf.read_text(encoding="utf-8"), "seed-data")
         mcp.close_stdin()
 
     def test_t3_06_mesh2_and_oxideswarm_cohosted_ephemeral_ports_and_auth(self) -> None:
@@ -3720,14 +3974,65 @@ class Tier3CrossFeatureTests(Wave2E2ETestBase):
             heartbeat_interval_secs=1,
             session_resume_hold_secs=30,
         )
+
+        # Wait for all 3 workers to reconnect to restarted master m2.
+        def _all_reconnected() -> bool:
+            try:
+                ws = self.ox.workers_json(m2.listen_addr)
+                connected = [w for w in ws if "state:connected" in w.get("tags", [])]
+                return len(connected) == 3
+            except Exception:
+                return False
+
+        _wait_until(_all_reconnected, timeout=15.0, desc="3 workers reconnected to m2")
+
+        # Wait for m2 status --json to reflect all 3 completed tasks with 0 failures.
+        def _m2_completed() -> Optional[dict[str, Any]]:
+            st = self.ox.status_cli(m2.listen_addr, json_out=True)
+            if st.returncode != 0:
+                return None
+            info = json.loads(st.stdout)
+            if info.get("completed_tasks") == 3:
+                return info
+            return None
+
+        m2_status = _wait_until(_m2_completed, timeout=15.0, desc="m2 completed_tasks == 3")
+        self.assertEqual(m2_status.get("completed_tasks"), 3, m2_status)
+        self.assertEqual(m2_status.get("failed_tasks"), 0, m2_status)
+        self.assertEqual(m2_status.get("total_tasks"), 3, m2_status)
+
         rc = sub_proc.wait(timeout=30.0)
-        # Depending on whether CLI reconnects or checks result, cells must still total 3 executions.
-        _ = m2
-        time.sleep(0.35)
-        self.assertEqual(len(marker.read_text(encoding="utf-8").splitlines()), 3)
+        cells = _extract_matrix_cells(json.loads("\n".join(sub_proc.stdout_lines)))
+        self.assertEqual(len(cells), 3, cells)
         if rc == 0:
-            cells = _extract_matrix_cells(json.loads("\n".join(sub_proc.stdout_lines)))
-            self.assertEqual(len(cells), 3)
+            for c in cells:
+                self.assertEqual(c.get("exit_code"), 0, c)
+        else:
+            # submit --matrix waits on m1 without auto-reconnect; if m1 exited before
+            # forwarding TaskCompleted, cells must only show connection drop, never task failure.
+            for c in cells:
+                if c.get("exit_code") is not None:
+                    self.assertEqual(c.get("exit_code"), 0, c)
+                else:
+                    err = str(c.get("error", "")).lower()
+                    self.assertTrue(
+                        "closed the connection" in err or "communication error" in err,
+                        f"Unexpected non-disconnect cell failure: {c!r}",
+                    )
+
+        # Unconditionally verify all 3 matrix cell task_ids on m2 via result_cli.
+        for c in cells:
+            tid = c.get("task_id")
+            self.assertTrue(tid, f"Missing task_id on matrix cell: {c!r}")
+            res = self.ox.result_cli(m2.listen_addr, str(tid), wait=True, json_out=True)
+            self.assertEqual(res.returncode, 0, f"m2 result failed for {tid}: {res.stderr}")
+            rdata = json.loads(res.stdout)
+            self.assertEqual(rdata.get("exit_code"), 0, rdata)
+            self.assertIn("MX_GATED_OK", rdata.get("stdout", ""), rdata)
+
+        time.sleep(0.35)
+        marker_lines = marker.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(marker_lines), 3, f"Double execution detected: {marker_lines!r}")
 
 
 # ===========================================================================
