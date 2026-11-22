@@ -1256,11 +1256,11 @@ f 4 5 8
 
 fn build_raw_glb_for_test(json_val: &Value, bin: &[u8]) -> Vec<u8> {
     let mut json_bytes = serde_json::to_vec(json_val).unwrap();
-    while json_bytes.len() % 4 != 0 {
+    while !json_bytes.len().is_multiple_of(4) {
         json_bytes.push(b' ');
     }
     let mut bin_padded = bin.to_vec();
-    while bin_padded.len() % 4 != 0 {
+    while !bin_padded.len().is_multiple_of(4) {
         bin_padded.push(0);
     }
     let total_len = 12 + 8 + json_bytes.len() + 8 + bin_padded.len();
