@@ -1,6 +1,9 @@
 //! Opaque-box Tier-5 adversarial hardening E2E suite for OxideSwarm (M5 Phase 2).
 //! Exercises compiled `oxideswarm` / `rusty-grid` binaries, raw wire JSON framing, HTTP/1.1
 //! dashboard APIs, and Unix PTY `join` races with zero internal Rust library imports.
+//!
+//! The PTY and signal scenarios are `#[cfg(unix)]`; on Windows the helpers they use are unused.
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
 
 use std::collections::BTreeMap;
 use std::fs;

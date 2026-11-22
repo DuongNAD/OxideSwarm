@@ -2,6 +2,10 @@
 //! Exercises compiled binaries (`oxideswarm`, `rusty-grid`, `ox-mode`), HTTP/1.1 + JSON
 //! dashboard APIs, stdio JSON-RPC (`mcp`), lockfile/doc invariants, and process exit codes
 //! with zero internal Rust library imports and zero `Cargo.toml` modifications.
+//!
+//! Several scenarios need Unix process control (SIGTERM, `#!/bin/sh` fakes) and keep their body
+//! under `#[cfg(unix)]`; on Windows the helpers they use are then unused.
+#![cfg_attr(not(unix), allow(unused_imports, unused_variables, dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1598,6 +1602,8 @@ fn f3_t2_release_skew_rejects_bogus_flag() {
     );
 }
 
+// release_skew.py and its fake `#!/bin/sh` binaries run on ubuntu-latest only.
+#[cfg(unix)]
 #[test]
 fn f3_t2_release_skew_rejects_non_executable_bin() {
     let h = home();
@@ -1631,6 +1637,8 @@ fn f3_t2_release_skew_rejects_missing_or_invalid_protocol_rs() {
     }
 }
 
+// release_skew.py and its fake `#!/bin/sh` binaries run on ubuntu-latest only.
+#[cfg(unix)]
 #[test]
 fn f3_t2_release_skew_detects_broken_binary() {
     let h = home();
@@ -1640,7 +1648,6 @@ fn f3_t2_release_skew_detects_broken_binary() {
         format!("#!/bin/sh\n[ \"$1\" = master ] && exec \"{BIN_OX}\" \"$@\"\nexit 1\n"),
     )
     .unwrap();
-    #[cfg(unix)]
     fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let args = [
         "scripts/release_skew.py",

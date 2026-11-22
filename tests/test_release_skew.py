@@ -461,6 +461,7 @@ class ReleaseSkewCiWorkflowTests(unittest.TestCase):
             finally:
                 pair.cleanup()
 
+    @unittest.skipIf(os.name == "nt", "uses a #!/bin/sh fake binary; release_skew.py runs on ubuntu-latest")
     def test_release_skew_nonexistent_release_tag_fails_cleanly(self):
         with tempfile.TemporaryDirectory() as tmp:
             bad_bin = os.path.join(tmp, "oxideswarm")
