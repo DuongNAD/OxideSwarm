@@ -179,7 +179,8 @@ fn preset_vram_high_skips_2gb_4gb_6143mb_and_preserves_bug3_cpu_defaults() {
     );
 
     // `triposr` with quality="high" (even without --gpu/--vram-mb) requires 6144 MB.
-    for eng in [Some("triposr")] {
+    {
+        let eng = Some("triposr");
         let t_high = gen3d_task(eng, "high", TaskRequirements::generic(2, 60));
         assert_eq!(config.required_vram_mb(&t_high), 6144);
         let report = WorkloadScheduler::matchmake(&config, std::slice::from_ref(&t_high), &cluster);
