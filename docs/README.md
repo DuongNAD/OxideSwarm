@@ -124,6 +124,7 @@ before adding or changing a document.
 | [design/0099-scheduler-backpressure-visibility.md](design/0099-scheduler-backpressure-visibility.md) | Implemented: emit a transition-triggered master warning once per change of the connected busy-worker set when queued tasks skip with `AllEligibleWorkersSaturated` above `max_host_cpu_pct` (`SCHED-5`) | Contributors |
 | [design/0101-matrix-fanout.md](design/0101-matrix-fanout.md) | Implemented: client-side matrix fan-out for `oxideswarm submit --matrix` and MCP `submit` (`AX-1`) | Contributors |
 | [design/0102-process-task-checkpoints.md](design/0102-process-task-checkpoints.md) | Implemented: `OXCP1` in-band checkpoints and `$OXIDESWARM_CHECKPOINT_DIR` for process tasks (`FEAT-5`) | Contributors |
+| [design/0107-mesh2-verified-delivery.md](design/0107-mesh2-verified-delivery.md) | Implemented: verified, paced Agent Mesh data delivery with inbox quotas (`MESH-2`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md) | The text of every Implemented backlog item, under the phase headings of the backlog (DOC-11); the Index of BACKLOG.md lists every item | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |

@@ -1,6 +1,6 @@
 # 0107: Agent Mesh verified data delivery (MESH-2)
 
-Status: Implemented (branch `claude/wave2-mesh2-fixes`)
+Status: Implemented
 Created: 2026-11-22    Updated: 2026-11-22
 
 ## Summary
