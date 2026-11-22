@@ -1486,6 +1486,11 @@ impl TaskQueue {
             if let Some(tasks) = inner.worker_assignments.get_mut(worker_id) {
                 tasks.remove(&task_id);
             }
+            // A revoked member's checkpoint is dropped whether the task is requeued or promoted
+            // to its speculative copy: the copy may fail later and must not resume from it.
+            if revoked && entry.task.latest_checkpoint.take().is_some() {
+                dropped_checkpoints += 1;
+            }
             if let Some(spec) = entry.speculative.take() {
                 entry.assigned_worker_id = Some(spec.worker_id);
                 entry.assigned_session = Some(spec.session_id);
@@ -1510,9 +1515,6 @@ impl TaskQueue {
             }
 
             affected.push(task_id);
-            if revoked && entry.task.latest_checkpoint.take().is_some() {
-                dropped_checkpoints += 1;
-            }
 
             if hold_for_resume {
                 let hold_until = now_instant + hold_duration;

@@ -736,8 +736,10 @@ where
 }
 
 /// Resolves a target identifier by exact ID, unique hex ID prefix (`>= 4` hex chars), or finally
-/// unique exact `name`. Exact IDs and ID prefixes take precedence so a crafted name cannot shadow
-/// an ID prefix.
+/// unique exact `name`. An exact ID always wins. An ID prefix that is also the exact name of a
+/// *different* entry is refused as ambiguous: names are chosen by joiners and may be hex, so
+/// neither reading may silently win (a crafted name cannot redirect an ID, and an admin who
+/// typed a name never revokes the entry whose ID happens to start with it).
 fn resolve_id_prefix_or_name<'a, I>(target: &str, items: I, kind: &str) -> GridResult<String>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -748,7 +750,16 @@ where
     }
     let all: Vec<(&'a str, &'a str)> = items.into_iter().collect();
     match resolve_id_or_prefix_typed(q, all.iter().map(|(id, _)| *id)) {
-        Ok(id) => return Ok(id),
+        Ok(id) => {
+            let named_other = all.iter().any(|(other, name)| *name == q && *other != id);
+            if id != q && named_other {
+                return Err(GridError::Config(format!(
+                    "ambiguous {kind} target '{q}': it is an ID prefix and the name of another \
+                     entry; specify the full ID instead"
+                )));
+            }
+            return Ok(id);
+        }
         Err(IdLookupError::Ambiguous(count)) => {
             return Err(GridError::Config(format!(
                 "ambiguous {kind} ID prefix '{q}'; matches {count} entries"
@@ -2695,6 +2706,29 @@ impl MemberStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_id_prefix_or_name_refuses_a_prefix_that_is_another_entrys_name() {
+        let a = "beef0123456789abcdef0123456789ab";
+        let b = "cafe0123456789abcdef0123456789ab";
+        let items = [(a, "laptop"), (b, "beef")];
+        // "beef" is a prefix of `a` and the name of `b`: neither reading may win.
+        let err = resolve_id_prefix_or_name("beef", items, "member").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        // The full ID, a prefix that names nobody, and a plain name still resolve.
+        assert_eq!(resolve_id_prefix_or_name(a, items, "member").unwrap(), a);
+        assert_eq!(
+            resolve_id_prefix_or_name("cafe", items, "member").unwrap(),
+            b
+        );
+        assert_eq!(
+            resolve_id_prefix_or_name("laptop", items, "member").unwrap(),
+            a
+        );
+        // A name equal to the prefix of its own ID is not ambiguous.
+        let own = [(a, "beef")];
+        assert_eq!(resolve_id_prefix_or_name("beef", own, "member").unwrap(), a);
+    }
     use rusty_grid_core::noise_auth::{compute_enroll_proof, NodeKeypair};
 
     #[test]
@@ -4970,13 +5004,23 @@ mod non_member_claim_tests {
         );
         assert_eq!(store.list_members().len(), 2);
 
-        // Control: an unambiguous 4-hex prefix still takes precedence over a matching name.
+        // A unique 4-hex prefix that is also another member's name is refused too: neither the
+        // ID reading nor the name reading may win silently. The full ID still works.
         let unique_prefix = pk_a.member_id()[..4].to_string();
         let uniq_store = MemberStore::from_entries(vec![
             MemberEntry::new("target-by-id", pk_a, vec![MemberRole::Worker]),
             MemberEntry::new(&unique_prefix, pk_shadower, vec![MemberRole::Worker]),
         ]);
-        let renamed = uniq_store.rename_member(&unique_prefix, "id-won").unwrap();
+        let err = uniq_store
+            .rename_member(&unique_prefix, "id-won")
+            .unwrap_err();
+        assert!(
+            matches!(&err, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous target error, got {err:?}"
+        );
+        let renamed = uniq_store
+            .rename_member(&pk_a.member_id(), "id-won")
+            .unwrap();
         assert_eq!(renamed.id, pk_a.member_id());
         assert_eq!(renamed.name, "id-won");
     }
