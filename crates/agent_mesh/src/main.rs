@@ -136,6 +136,24 @@ pub enum Commands {
             value_parser = OsStringValueParser::new().map(PathBuf::from)
         )]
         inbox_dir: Option<PathBuf>,
+
+        /// Most MiB the files in --inbox-dir may hold; a payload that does not fit is refused
+        /// with DeliveryNack(ERR_INBOX_FULL)
+        #[arg(
+            long,
+            default_value_t = agent_mesh::DEFAULT_INBOX_MAX_BYTES / (1024 * 1024),
+            value_parser = clap::value_parser!(u64).range(1..=(u64::MAX / (1024 * 1024)))
+        )]
+        inbox_max_mb: u64,
+
+        /// Most files --inbox-dir may hold; past it payloads are refused with
+        /// DeliveryNack(ERR_INBOX_FULL)
+        #[arg(
+            long,
+            default_value_t = agent_mesh::DEFAULT_INBOX_MAX_FILES as u64,
+            value_parser = clap::value_parser!(u64).range(1..=(u32::MAX as u64))
+        )]
+        inbox_max_files: u64,
     },
 
     /// Send a structured command to a specific node
@@ -232,7 +250,8 @@ pub enum Commands {
         )]
         payload_file: Option<PathBuf>,
 
-        /// Delivery acknowledgement timeout in milliseconds
+        /// Longest wait in milliseconds for the target's next acknowledgement (of a chunk, or of
+        /// the whole payload); a large transfer may take longer in total
         #[arg(long, default_value = "10000")]
         timeout_ms: u64,
 
@@ -641,6 +660,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tls_ca,
             no_shell,
             inbox_dir,
+            inbox_max_mb,
+            inbox_max_files,
         } => {
             let host_os = std::env::consts::OS.to_string();
             let hostname = sysinfo::System::host_name().unwrap_or_else(|| "device".to_string());
@@ -662,7 +683,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Shell:    disabled (--no-shell active)");
             }
             if let Some(ref dir) = canonical_inbox {
-                println!("Inbox:    {}", dir.display());
+                println!(
+                    "Inbox:    {} (quota {} MiB, {} files)",
+                    dir.display(),
+                    inbox_max_mb,
+                    inbox_max_files
+                );
             }
             println!();
 
@@ -671,7 +697,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 client = client.with_no_shell(true);
             }
             if let Some(dir) = canonical_inbox {
-                client = client.with_inbox_dir(dir);
+                client = client.with_inbox_dir(dir).with_inbox_quota(
+                    inbox_max_mb.saturating_mul(1024 * 1024),
+                    usize::try_from(inbox_max_files).unwrap_or(usize::MAX),
+                );
             }
             client.validate_tls_config()?;
             client.run_daemon().await;
@@ -992,11 +1021,48 @@ mod tests {
         ])
         .unwrap();
         match node_cli.command {
-            Commands::Node { id, inbox_dir, .. } => {
+            Commands::Node {
+                id,
+                inbox_dir,
+                inbox_max_mb,
+                inbox_max_files,
+                ..
+            } => {
                 assert_eq!(id.as_deref(), Some("consumer-1"));
                 assert_eq!(inbox_dir.as_deref(), Some(Path::new("/tmp/mesh-inbox")));
+                assert_eq!(inbox_max_mb, 1024);
+                assert_eq!(inbox_max_files, 10_000);
             }
             other => panic!("unexpected {other:?}"),
+        }
+
+        let quota_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--inbox-dir",
+            "/tmp/mesh-inbox",
+            "--inbox-max-mb",
+            "5",
+            "--inbox-max-files",
+            "7",
+        ])
+        .unwrap();
+        match quota_cli.command {
+            Commands::Node {
+                inbox_max_mb,
+                inbox_max_files,
+                ..
+            } => {
+                assert_eq!(inbox_max_mb, 5);
+                assert_eq!(inbox_max_files, 7);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        for zero in ["--inbox-max-mb", "--inbox-max-files"] {
+            assert!(
+                Cli::try_parse_from(["agent-mesh", "node", zero, "0"]).is_err(),
+                "{zero} 0 must be refused"
+            );
         }
 
         let data_cli = Cli::try_parse_from([

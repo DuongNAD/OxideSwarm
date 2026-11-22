@@ -15,7 +15,8 @@
 
 use agent_mesh::{
     compute_sha256, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig,
-    DEFAULT_DATA_CHUNK_BYTES, ERR_NODE_NOT_FOUND, ERR_PAYLOAD_CORRUPT,
+    ACK_STATUS_CHUNK_RECEIVED, ACK_STATUS_DATA_VERIFIED, DATA_CHUNK_WINDOW,
+    DEFAULT_DATA_CHUNK_BYTES, ERR_INBOX_FULL, ERR_NODE_NOT_FOUND, ERR_PAYLOAD_CORRUPT,
 };
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -63,6 +64,67 @@ async fn wait_for_node_registered(http_base: &str, node_id: &str) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+type RawWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Next envelope on a raw WebSocket peer (60 s guard against a hung test).
+async fn next_envelope(ws: &mut RawWs) -> AgentMeshEnvelope {
+    use futures::StreamExt;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(60), ws.next())
+            .await
+            .expect("no frame within 60 s")
+            .expect("socket closed")
+            .expect("socket error");
+        if let Ok(text) = frame.to_text() {
+            if text.is_empty() {
+                continue;
+            }
+            return AgentMeshEnvelope::from_json_str(text).expect("valid envelope");
+        }
+    }
+}
+
+/// Next reply on a raw sender socket that is not per-chunk flow control (`chunk_received`).
+async fn next_final_reply(ws: &mut RawWs) -> AgentMeshEnvelope {
+    loop {
+        let env = next_envelope(ws).await;
+        match env {
+            AgentMeshEnvelope::DeliveryAck { ref status, .. }
+                if status == ACK_STATUS_CHUNK_RECEIVED => {}
+            other => return other,
+        }
+    }
+}
+
+/// Opens a raw WebSocket to the hub and registers it as `node_id`.
+async fn raw_node(ws_url: &str, node_id: &str) -> RawWs {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::protocol::Message as WsMsg;
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let reg = serde_json::json!({
+        "type": "NodeRegistration",
+        "correlation_id": format!("reg-{node_id}"),
+        "from": node_id,
+        "to": "hub",
+        "platform": "linux",
+    });
+    ws.send(WsMsg::Text(reg.to_string())).await.unwrap();
+    match next_envelope(&mut ws).await {
+        AgentMeshEnvelope::NodeRegistrationAck { .. } => {}
+        other => panic!("registration of {node_id} failed: {other:?}"),
+    }
+    ws
+}
+
+async fn raw_send(ws: &mut RawWs, env: &AgentMeshEnvelope) {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::protocol::Message as WsMsg;
+    ws.send(WsMsg::Text(env.to_json_string().unwrap()))
+        .await
+        .unwrap();
 }
 
 fn spawn_hub_process() -> (ChildGuard, u16, String, String) {
@@ -167,8 +229,7 @@ fn test_node_cli_rejects_regular_file_and_symlink_inbox_dir_at_startup() {
 async fn test_data_cli_missing_target_exits_nonzero_and_happy_path_persists_to_inbox() {
     let (_hub_guard, _port, ws_url, http_base) = spawn_hub_process();
 
-    // 1. Missing node must exit non-zero promptly.
-    let start = Instant::now();
+    // 1. Missing node must exit non-zero with the hub's NACK, not by running out its timeout.
     let missing_out = Command::new(agent_mesh_bin())
         .args([
             "data",
@@ -181,7 +242,7 @@ async fn test_data_cli_missing_target_exits_nonzero_and_happy_path_persists_to_i
             "--payload",
             "should-fail",
             "--timeout-ms",
-            "5000",
+            "60000",
         ])
         .output()
         .expect("run agent-mesh data");
@@ -189,15 +250,14 @@ async fn test_data_cli_missing_target_exits_nonzero_and_happy_path_persists_to_i
         !missing_out.status.success(),
         "agent-mesh data --to missing-node must exit non-zero"
     );
-    assert!(
-        start.elapsed() < Duration::from_secs(4),
-        "missing-node rejection took too long: {:?}",
-        start.elapsed()
-    );
     let missing_err = String::from_utf8_lossy(&missing_out.stderr);
     assert!(
         missing_err.contains(ERR_NODE_NOT_FOUND),
         "expected ERR_NODE_NOT_FOUND in stderr, got: {missing_err}"
+    );
+    assert!(
+        !missing_err.contains("Timed out"),
+        "the refusal must come from the hub's NACK, not from the timeout: {missing_err}"
     );
 
     // 2. Start consumer node with --inbox-dir and verify CLI data round-trip.
@@ -454,17 +514,27 @@ async fn test_bounded_received_payloads_and_honest_api_telemetry() {
 
     sender.close().await;
     receiver.close().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let nodes_after: Vec<serde_json::Value> = http
-        .get(format!("{http_base}/api/nodes"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(nodes_after.is_empty());
+    // The hub notices the closes asynchronously: poll (the bound only stops a hung test).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let nodes_after: Vec<serde_json::Value> = http
+            .get(format!("{http_base}/api/nodes"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if nodes_after.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nodes still listed after close: {nodes_after:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     hub.stop().await;
 }
@@ -531,12 +601,7 @@ async fn test_corrupt_checksum_nack_and_binary_bytes_e2e() {
             .await
             .unwrap();
     }
-    let reply_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let reply_env = AgentMeshEnvelope::from_json_str(reply_frame.to_text().unwrap()).unwrap();
+    let reply_env = next_final_reply(&mut raw_ws).await;
     match reply_env {
         AgentMeshEnvelope::DeliveryNack {
             correlation_id,
@@ -770,12 +835,7 @@ async fn test_chunk_edge_cases_duplicate_seq_inconsistent_total_and_oob_seq() {
         .await
         .unwrap();
 
-    let ack_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let ack_env = AgentMeshEnvelope::from_json_str(ack_frame.to_text().unwrap()).unwrap();
+    let ack_env = next_final_reply(&mut raw_ws).await;
     match ack_env {
         AgentMeshEnvelope::DeliveryAck {
             correlation_id,
@@ -813,13 +873,7 @@ async fn test_chunk_edge_cases_duplicate_seq_inconsistent_total_and_oob_seq() {
             .await
             .unwrap();
     }
-    let nack_total_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let nack_total_env =
-        AgentMeshEnvelope::from_json_str(nack_total_frame.to_text().unwrap()).unwrap();
+    let nack_total_env = next_final_reply(&mut raw_ws).await;
     match nack_total_env {
         AgentMeshEnvelope::DeliveryNack {
             correlation_id,
@@ -849,12 +903,7 @@ async fn test_chunk_edge_cases_duplicate_seq_inconsistent_total_and_oob_seq() {
         .send(WsMsg::Text(oob_chunks[1].to_json_string().unwrap()))
         .await
         .unwrap();
-    let nack_oob_frame = tokio::time::timeout(Duration::from_secs(3), raw_ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let nack_oob_env = AgentMeshEnvelope::from_json_str(nack_oob_frame.to_text().unwrap()).unwrap();
+    let nack_oob_env = next_final_reply(&mut raw_ws).await;
     match nack_oob_env {
         AgentMeshEnvelope::DeliveryNack {
             correlation_id,
@@ -875,4 +924,365 @@ async fn test_chunk_edge_cases_duplicate_seq_inconsistent_total_and_oob_seq() {
     let _ = raw_ws.close(None).await;
     consumer.close().await;
     hub.stop().await;
+}
+
+fn data_payload_parts(env: &AgentMeshEnvelope) -> (String, String, u32, u32) {
+    match env {
+        AgentMeshEnvelope::DataPayload {
+            correlation_id,
+            from,
+            sequence_number,
+            total_chunks,
+            ..
+        } => (
+            correlation_id.clone(),
+            from.clone(),
+            *sequence_number,
+            *total_chunks,
+        ),
+        other => panic!("expected DataPayload, got {other:?}"),
+    }
+}
+
+/// Item 1 of the MESH-2 review (design 0107 D2): the sender accepts only acknowledgements from the
+/// target. A third node that learned the correlation id can neither confirm nor fail the transfer.
+#[tokio::test]
+async fn test_sender_ignores_acks_and_nacks_from_a_node_other_than_the_target() {
+    let hub = AgentMeshHub::new();
+    let port = hub.start("127.0.0.1:0").await.expect("start hub");
+    let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+    let mut target = raw_node(&ws_url, "honest-target").await;
+    let impostor = AgentMeshClient::new(&ws_url, "impostor", "linux");
+    impostor.connect().await.unwrap();
+    let sender = std::sync::Arc::new(AgentMeshClient::new(&ws_url, "ack-sender", "macos"));
+    sender.connect().await.unwrap();
+
+    // Case A: a forged "verified" ACK, then the target's NACK. The transfer must fail.
+    let s = sender.clone();
+    let task_a = tokio::spawn(async move {
+        s.send_data_payload_with_ack("honest-target", b"payload-a", Some(60_000))
+            .await
+    });
+    let (corr_a, from_a, _, _) = data_payload_parts(&next_envelope(&mut target).await);
+    assert_eq!(from_a, "ack-sender");
+    impostor
+        .send_envelope(AgentMeshEnvelope::new_delivery_ack(
+            "impostor",
+            "ack-sender",
+            &corr_a,
+            ACK_STATUS_DATA_VERIFIED,
+        ))
+        .await
+        .unwrap();
+    // The hub handles one socket's frames in order, so once the impostor's query is answered the
+    // forged ACK is already in the sender's queue, ahead of the target's NACK below.
+    impostor.query_node_list(Some(60_000)).await.unwrap();
+    raw_send(
+        &mut target,
+        &AgentMeshEnvelope::new_delivery_nack(
+            "honest-target",
+            "ack-sender",
+            &corr_a,
+            ERR_PAYLOAD_CORRUPT,
+            "refused by the real target",
+        ),
+    )
+    .await;
+    let err = task_a
+        .await
+        .unwrap()
+        .expect_err("a forged ACK from another node must not confirm delivery");
+    assert!(err.to_string().contains(ERR_PAYLOAD_CORRUPT), "{err}");
+
+    // Case B: a forged NACK, then the target's verified ACK. The transfer must succeed.
+    let s = sender.clone();
+    let task_b = tokio::spawn(async move {
+        s.send_data_payload_with_ack("honest-target", b"payload-b", Some(60_000))
+            .await
+    });
+    let (corr_b, _, _, _) = data_payload_parts(&next_envelope(&mut target).await);
+    impostor
+        .send_envelope(AgentMeshEnvelope::new_delivery_nack(
+            "impostor",
+            "ack-sender",
+            &corr_b,
+            ERR_PAYLOAD_CORRUPT,
+            "forged refusal",
+        ))
+        .await
+        .unwrap();
+    impostor.query_node_list(Some(60_000)).await.unwrap();
+    raw_send(
+        &mut target,
+        &AgentMeshEnvelope::new_delivery_ack(
+            "honest-target",
+            "ack-sender",
+            &corr_b,
+            ACK_STATUS_DATA_VERIFIED,
+        ),
+    )
+    .await;
+    let receipt = task_b
+        .await
+        .unwrap()
+        .expect("a forged NACK from another node must not fail the transfer");
+    assert_eq!(receipt.responder, "honest-target");
+    assert_eq!(receipt.status, ACK_STATUS_DATA_VERIFIED);
+
+    sender.close().await;
+    impostor.close().await;
+    hub.stop().await;
+}
+
+/// Item 1 of the MESH-2 review: a consumer that answers the first chunk with
+/// `data_received_verified` (as the old Python node did for every chunk) has not verified the
+/// payload, and the sender must not report delivery.
+#[tokio::test]
+async fn test_sender_refuses_a_receipt_that_does_not_cover_every_chunk() {
+    let hub = AgentMeshHub::new();
+    let port = hub.start("127.0.0.1:0").await.expect("start hub");
+    let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+    let sender = std::sync::Arc::new(AgentMeshClient::new(&ws_url, "chunk-sender", "macos"));
+    sender.connect().await.unwrap();
+
+    // One fresh target per round, so chunks still in flight from one round never reach the next.
+    for total in [2usize, 3] {
+        let target_id = format!("per-chunk-acker-{total}");
+        let mut target = raw_node(&ws_url, &target_id).await;
+        let payload = vec![b'z'; 4 * total];
+        let s = sender.clone();
+        let to = target_id.clone();
+        let task = tokio::spawn(async move {
+            s.send_data_payload_chunked_with_ack(&to, &payload, 4, Some(60_000))
+                .await
+        });
+        let (corr, _, seq, chunks) = data_payload_parts(&next_envelope(&mut target).await);
+        assert_eq!((seq, chunks as usize), (0, total));
+        raw_send(
+            &mut target,
+            &AgentMeshEnvelope::new_delivery_ack(
+                &target_id,
+                "chunk-sender",
+                &corr,
+                ACK_STATUS_DATA_VERIFIED,
+            ),
+        )
+        .await;
+        let err = task
+            .await
+            .unwrap()
+            .expect_err("a receipt for chunk 0 is not a receipt for the payload");
+        let msg = err.to_string();
+        assert!(msg.contains("confirmed"), "{total} chunks: {msg}");
+    }
+
+    sender.close().await;
+    hub.stop().await;
+}
+
+/// Item 3 of the MESH-2 review (design 0107 D3): the sender keeps at most `DATA_CHUNK_WINDOW`
+/// chunks unacknowledged, so a slow consumer cannot be pushed past the hub's queue.
+#[tokio::test]
+async fn test_sender_paces_chunks_by_the_consumers_acknowledgements() {
+    let hub = AgentMeshHub::new();
+    let port = hub.start("127.0.0.1:0").await.expect("start hub");
+    let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+    let mut consumer = raw_node(&ws_url, "slow-consumer").await;
+    let sender = AgentMeshClient::new(&ws_url, "paced-sender", "macos");
+    sender.connect().await.unwrap();
+
+    let total = DATA_CHUNK_WINDOW + 3;
+    let payload: Vec<u8> = (0..(8 * total)).map(|i| i as u8).collect();
+    let expected_sha = compute_sha256(&payload);
+    let task = tokio::spawn(async move {
+        let res = sender
+            .send_data_payload_chunked_with_ack("slow-consumer", &payload, 8, Some(60_000))
+            .await;
+        sender.close().await;
+        res
+    });
+
+    let mut acked = 0usize;
+    let mut next_seq = 0usize;
+    let mut corr = String::new();
+    while next_seq < total {
+        // Take the whole window the sender is allowed to have in flight.
+        while next_seq < acked + DATA_CHUNK_WINDOW && next_seq < total {
+            let (c, _, seq, _) = data_payload_parts(&next_envelope(&mut consumer).await);
+            assert_eq!(seq as usize, next_seq);
+            corr = c;
+            next_seq += 1;
+        }
+        if next_seq < total {
+            // The window is full: nothing more may arrive until a chunk is acknowledged. (A
+            // correct sender passes this however slow the runner is.)
+            let extra = tokio::time::timeout(
+                Duration::from_millis(300),
+                futures::StreamExt::next(&mut consumer),
+            )
+            .await;
+            assert!(
+                extra.is_err(),
+                "sender exceeded the window of {DATA_CHUNK_WINDOW}: {extra:?}"
+            );
+        }
+        // Acknowledge one chunk (never the last one: it gets the final receipt).
+        if acked < total - 1 {
+            raw_send(
+                &mut consumer,
+                &AgentMeshEnvelope::new_delivery_ack(
+                    "slow-consumer",
+                    "paced-sender",
+                    &corr,
+                    ACK_STATUS_CHUNK_RECEIVED,
+                ),
+            )
+            .await;
+            acked += 1;
+        }
+    }
+    while acked < total - 1 {
+        raw_send(
+            &mut consumer,
+            &AgentMeshEnvelope::new_delivery_ack(
+                "slow-consumer",
+                "paced-sender",
+                &corr,
+                ACK_STATUS_CHUNK_RECEIVED,
+            ),
+        )
+        .await;
+        acked += 1;
+    }
+    raw_send(
+        &mut consumer,
+        &AgentMeshEnvelope::new_delivery_ack(
+            "slow-consumer",
+            "paced-sender",
+            &corr,
+            ACK_STATUS_DATA_VERIFIED,
+        ),
+    )
+    .await;
+    let receipt = task.await.unwrap().expect("paced transfer succeeds");
+    assert_eq!(receipt.total_chunks as usize, total);
+    assert_eq!(receipt.sha256, expected_sha);
+
+    hub.stop().await;
+}
+
+/// Item 3 of the MESH-2 review: a transfer much larger than the consumer's hub queue goes through,
+/// because only the window is ever queued. The chunks are all NUL bytes, the worst JSON expansion.
+#[tokio::test]
+async fn test_transfer_larger_than_the_hub_queue_is_delivered() {
+    let chunk = 64 * 1024;
+    let cfg = HubConfig {
+        max_queued_bytes: DATA_CHUNK_WINDOW * agent_mesh::max_chunk_json_bytes(chunk) + 64 * 1024,
+        ..HubConfig::default()
+    };
+    let hub = AgentMeshHub::with_config(cfg);
+    let port = hub.start("127.0.0.1:0").await.expect("start hub");
+    let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+    let consumer = AgentMeshClient::new(&ws_url, "queue-consumer", "linux");
+    let sender = AgentMeshClient::new(&ws_url, "queue-sender", "macos");
+    consumer.connect().await.unwrap();
+    sender.connect().await.unwrap();
+
+    let payload = vec![0u8; chunk * 24];
+    let receipt = sender
+        .send_data_payload_chunked_with_ack("queue-consumer", &payload, chunk, Some(60_000))
+        .await
+        .expect("a paced transfer must not get the consumer kicked");
+    assert_eq!(receipt.total_chunks, 24);
+    assert!(consumer.is_connected(), "consumer was disconnected");
+    let received = consumer.received_data_payloads().await;
+    assert_eq!(received.len(), 1);
+
+    sender.close().await;
+    consumer.close().await;
+    hub.stop().await;
+}
+
+/// Item 2 of the MESH-2 review: `--inbox-max-files` / `--inbox-max-mb` refuse payloads with
+/// `ERR_INBOX_FULL` and the sender CLI exits non-zero.
+#[tokio::test]
+async fn test_inbox_quota_flags_refuse_payloads_with_err_inbox_full() {
+    let (_hub_guard, _port, ws_url, http_base) = spawn_hub_process();
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("quota-inbox");
+    let _consumer_guard = ChildGuard::new(
+        Command::new(agent_mesh_bin())
+            .args([
+                "node",
+                "--hub",
+                &ws_url,
+                "--id",
+                "quota-consumer",
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--inbox-max-files",
+                "1",
+                "--inbox-max-mb",
+                "1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn quota consumer"),
+    );
+    wait_for_node_registered(&http_base, "quota-consumer").await;
+
+    let send = |payload: &str| {
+        Command::new(agent_mesh_bin())
+            .args([
+                "data",
+                "--hub",
+                &ws_url,
+                "--from",
+                "quota-sender",
+                "--to",
+                "quota-consumer",
+                "--payload",
+                payload,
+                "--timeout-ms",
+                "60000",
+            ])
+            .output()
+            .expect("run agent-mesh data")
+    };
+    let first = send("fits");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = send("does-not-fit");
+    assert!(!second.status.success(), "the second file must be refused");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains(ERR_INBOX_FULL), "{stderr}");
+    assert!(stderr.contains("--inbox-max-files"), "{stderr}");
+
+    let names: Vec<String> = std::fs::read_dir(&inbox)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(inbox.join(&names[0]))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "inbox file mode {mode:o}");
+        let dir_mode = std::fs::metadata(&inbox).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "created inbox dir mode {dir_mode:o}");
+    }
 }

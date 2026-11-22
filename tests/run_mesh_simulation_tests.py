@@ -27,6 +27,9 @@ binary (for Rust hub interop tests, run `python tests/test_agent_mesh_rust_hub_c
 4. Runs Suite 4: Python SHA-256 Asset Tamper Detection & Burst Routing (test_challenger_m4_python_tampering.py)
    - Single-bit-flip SHA-256 tamper rejection in `OxideAgentNode.extract_and_verify_asset`
    - Deeply nested output directory creation and 10-client concurrent correlation routing
+5. Runs Suite 5: Python node verified chunk delivery (test_agent_mesh_python_node_chunks.py, design 0107)
+   - Multi-chunk reassembly, chunk_received flow-control ACKs, one data_received_verified receipt
+   - NACK on missing/wrong checksums; bounded ChunkReassembler (size, count, bytes, expiry)
 """
 
 import asyncio
@@ -47,11 +50,13 @@ try:
     from test_agent_mesh_data_loss import run_data_loss_tests
     from test_sec6_mesh_sandbox import run_sec6_tests
     from test_challenger_m4_python_tampering import run_python_tampering_tests
+    from test_agent_mesh_python_node_chunks import run_python_node_chunk_tests
 except ImportError:
     from tests.test_agent_mesh_simulation import run_simulation_tests
     from tests.test_agent_mesh_data_loss import run_data_loss_tests
     from tests.test_sec6_mesh_sandbox import run_sec6_tests
     from tests.test_challenger_m4_python_tampering import run_python_tampering_tests
+    from tests.test_agent_mesh_python_node_chunks import run_python_node_chunk_tests
 
 
 def report_suite_exception(number, exc):
@@ -140,6 +145,20 @@ async def main_async():
         suite4_passed = False
     suite4_duration = time.time() - suite4_start
     results.append(("Suite 4: Python SHA-256 Tampering & Burst Routing", suite4_passed, suite4_duration))
+
+    # --------------------------------------------------------------------------
+    # Suite 5: Python node verified chunk delivery (design 0107)
+    # --------------------------------------------------------------------------
+    print("\n>>> Executing Suite 5: Python Node Verified Chunk Delivery")
+    suite5_start = time.time()
+    suite5_passed = False
+    try:
+        suite5_passed = await run_python_node_chunk_tests()
+    except Exception as e:
+        report_suite_exception(5, e)
+        suite5_passed = False
+    suite5_duration = time.time() - suite5_start
+    results.append(("Suite 5: Python Node Verified Chunk Delivery", suite5_passed, suite5_duration))
 
     total_duration = time.time() - overall_start
 

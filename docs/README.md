@@ -129,6 +129,7 @@ before adding or changing a document.
 | [design/0104-mesh3-remote-master-bridge.md](design/0104-mesh3-remote-master-bridge.md) | Implemented: `GridBackend` trait, `agent-mesh hub --grid-connect` remote Master bridge, placement/tags, inline `files`/`outputs`, `grid_result`, and `grid_cancel` (`MESH-3`) | Contributors |
 | [design/0105-3d2-vram-blender-routing.md](design/0105-3d2-vram-blender-routing.md) | Implemented: master scheduler `has_blender` capability routing and preset `required_vram_mb` defaults (`3D-2`) | Contributors |
 | [design/0106-3d3-honest-autorig-options.md](design/0106-3d3-honest-autorig-options.md) | Implemented: honest AutoRig `rig_preset`/`embed_animations`/`preferred_provider` validation, distinct skeletons, magic-byte `.glb`/`.gltf`/`.obj` detection, and `<=1 s` timeout/cancellation (`3D-3`) | Contributors |
+| [design/0107-mesh2-verified-delivery.md](design/0107-mesh2-verified-delivery.md) | Implemented: verified, paced Agent Mesh data delivery with inbox quotas (`MESH-2`) | Contributors |
 | [BACKLOG.md](BACKLOG.md) | Open work in execution order, each item with files and a check | Coding agents, contributors |
 | [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md) | The text of every Implemented backlog item, under the phase headings of the backlog (DOC-11); the Index of BACKLOG.md lists every item | Coding agents, contributors |
 | [ROADMAP.md](ROADMAP.md) | Direction after the backlog: the purpose, the core (phases A to D) and the later work, what waits, and the owner's decisions | Owner, contributors |
