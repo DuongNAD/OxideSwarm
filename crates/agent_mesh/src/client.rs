@@ -152,6 +152,8 @@ const MAX_PENDING_ASSEMBLIES: usize = 64;
 const MAX_CHUNKS_PER_TRANSFER: u32 = 1024;
 /// Maximum reassembled payload size accepted by a client (64 MiB).
 const MAX_ASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum aggregate payload bytes buffered across all in-flight reassemblies (128 MiB).
+const MAX_TOTAL_REASSEMBLER_BYTES: usize = 128 * 1024 * 1024;
 /// Time-to-live for incomplete multi-chunk transfers before eviction.
 const CHUNK_ASSEMBLY_TTL: Duration = Duration::from_secs(60);
 
@@ -234,22 +236,75 @@ struct ChunkAssembly {
     chunks: HashMap<u32, Vec<u8>>,
     total_bytes: usize,
     updated_at: Instant,
+    seq_order: u64,
 }
 
 struct ChunkReassembler {
     inflight: HashMap<(String, String), ChunkAssembly>,
+    total_inflight_bytes: usize,
+    next_seq_order: u64,
+    max_pending_assemblies: usize,
+    max_assembled_bytes: usize,
+    max_total_bytes: usize,
 }
 
 impl ChunkReassembler {
     fn new() -> Self {
+        Self::with_limits(
+            MAX_PENDING_ASSEMBLIES,
+            MAX_ASSEMBLED_BYTES,
+            MAX_TOTAL_REASSEMBLER_BYTES,
+        )
+    }
+
+    fn with_limits(
+        max_pending_assemblies: usize,
+        max_assembled_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Self {
         Self {
             inflight: HashMap::new(),
+            total_inflight_bytes: 0,
+            next_seq_order: 0,
+            max_pending_assemblies,
+            max_assembled_bytes,
+            max_total_bytes,
+        }
+    }
+
+    fn remove_assembly(&mut self, key: &(String, String)) -> Option<ChunkAssembly> {
+        let removed = self.inflight.remove(key)?;
+        self.total_inflight_bytes = self
+            .total_inflight_bytes
+            .saturating_sub(removed.total_bytes);
+        Some(removed)
+    }
+
+    fn evict_oldest_fifo(&mut self, exclude_key: Option<&(String, String)>) -> bool {
+        let oldest_key = self
+            .inflight
+            .iter()
+            .filter(|(k, _)| exclude_key != Some(*k))
+            .min_by_key(|(_, v)| v.seq_order)
+            .map(|(k, _)| k.clone());
+        if let Some(k) = oldest_key {
+            self.remove_assembly(&k);
+            true
+        } else {
+            false
         }
     }
 
     fn prune_expired(&mut self, now: Instant) {
-        self.inflight
-            .retain(|_, asm| now.saturating_duration_since(asm.updated_at) <= CHUNK_ASSEMBLY_TTL);
+        let mut removed_bytes = 0usize;
+        self.inflight.retain(|_, asm| {
+            let keep = now.saturating_duration_since(asm.updated_at) <= CHUNK_ASSEMBLY_TTL;
+            if !keep {
+                removed_bytes = removed_bytes.saturating_add(asm.total_bytes);
+            }
+            keep
+        });
+        self.total_inflight_bytes = self.total_inflight_bytes.saturating_sub(removed_bytes);
     }
 
     fn insert_chunk(
@@ -264,20 +319,27 @@ impl ChunkReassembler {
         let now = Instant::now();
         self.prune_expired(now);
 
+        if bytes.len() > self.max_assembled_bytes || bytes.len() > self.max_total_bytes {
+            let key = (from.to_string(), corr_id.to_string());
+            self.remove_assembly(&key);
+            return Err(format!(
+                "Chunk size {} exceeds cap of {} bytes",
+                bytes.len(),
+                self.max_assembled_bytes.min(self.max_total_bytes)
+            ));
+        }
+
         let key = (from.to_string(), corr_id.to_string());
         if !self.inflight.contains_key(&key) {
-            while self.inflight.len() >= MAX_PENDING_ASSEMBLIES {
-                if let Some(oldest_key) = self
-                    .inflight
-                    .iter()
-                    .min_by_key(|(_, v)| v.updated_at)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.inflight.remove(&oldest_key);
-                } else {
+            while self.inflight.len() >= self.max_pending_assemblies
+                || self.total_inflight_bytes.saturating_add(bytes.len()) > self.max_total_bytes
+            {
+                if !self.evict_oldest_fifo(None) {
                     break;
                 }
             }
+            let seq_order = self.next_seq_order;
+            self.next_seq_order = self.next_seq_order.saturating_add(1);
             self.inflight.insert(
                 key.clone(),
                 ChunkAssembly {
@@ -286,57 +348,105 @@ impl ChunkReassembler {
                     chunks: HashMap::new(),
                     total_bytes: 0,
                     updated_at: now,
+                    seq_order,
                 },
             );
         }
 
-        let asm = self
-            .inflight
-            .get_mut(&key)
-            .expect("assembly inserted immediately above");
+        let (expected_chunks, prev_len, new_total_bytes, seq_mismatch, sha_mismatch, set_sha) = {
+            let asm = self
+                .inflight
+                .get(&key)
+                .expect("assembly inserted immediately above");
 
-        if asm.total_chunks != total_chunks {
-            let expected_chunks = asm.total_chunks;
-            self.inflight.remove(&key);
+            let seq_mismatch = asm.total_chunks != total_chunks;
+            let mut sha_mismatch = false;
+            let mut set_sha = false;
+            if let Some(new_sha) = expected_total_sha256 {
+                if let Some(ref existing_sha) = asm.expected_total_sha256 {
+                    if !existing_sha.eq_ignore_ascii_case(new_sha) {
+                        sha_mismatch = true;
+                    }
+                } else {
+                    set_sha = true;
+                }
+            }
+            let prev_len = asm.chunks.get(&seq).map_or(0, Vec::len);
+            let new_total_bytes = asm
+                .total_bytes
+                .saturating_sub(prev_len)
+                .saturating_add(bytes.len());
+            (
+                asm.total_chunks,
+                prev_len,
+                new_total_bytes,
+                seq_mismatch,
+                sha_mismatch,
+                set_sha,
+            )
+        };
+
+        if seq_mismatch {
+            self.remove_assembly(&key);
             return Err(format!(
                 "Inconsistent total_chunks in multi-chunk transfer (expected {expected_chunks}, got {total_chunks})"
             ));
         }
 
-        if let Some(new_sha) = expected_total_sha256 {
-            if let Some(ref existing_sha) = asm.expected_total_sha256 {
-                if !existing_sha.eq_ignore_ascii_case(new_sha) {
-                    self.inflight.remove(&key);
-                    return Err("Inconsistent total_sha256 in multi-chunk transfer".to_string());
-                }
-            } else {
-                asm.expected_total_sha256 = Some(new_sha.to_string());
-            }
+        if sha_mismatch {
+            self.remove_assembly(&key);
+            return Err("Inconsistent total_sha256 in multi-chunk transfer".to_string());
         }
 
-        let prev_len = asm.chunks.get(&seq).map_or(0, Vec::len);
-        let new_total_bytes = asm
-            .total_bytes
-            .saturating_sub(prev_len)
-            .saturating_add(bytes.len());
-        if new_total_bytes > MAX_ASSEMBLED_BYTES {
-            self.inflight.remove(&key);
+        if new_total_bytes > self.max_assembled_bytes {
+            self.remove_assembly(&key);
             return Err(format!(
-                "Assembled payload size {new_total_bytes} exceeds cap of {MAX_ASSEMBLED_BYTES} bytes"
+                "Assembled payload size {new_total_bytes} exceeds cap of {} bytes",
+                self.max_assembled_bytes
             ));
         }
 
-        asm.total_bytes = new_total_bytes;
-        asm.updated_at = now;
-        asm.chunks.insert(seq, bytes);
+        // Evict oldest *other* in-flight assemblies FIFO before exceeding aggregate cap.
+        while self
+            .total_inflight_bytes
+            .saturating_sub(prev_len)
+            .saturating_add(bytes.len())
+            > self.max_total_bytes
+        {
+            if !self.evict_oldest_fifo(Some(&key)) {
+                self.remove_assembly(&key);
+                return Err(format!(
+                    "Aggregate reassembler buffer cap of {} bytes exceeded",
+                    self.max_total_bytes
+                ));
+            }
+        }
 
-        if asm.chunks.len() < total_chunks as usize {
+        let new_bytes_len = bytes.len();
+        let is_complete = {
+            let asm = self
+                .inflight
+                .get_mut(&key)
+                .expect("assembly retained while evicting others");
+            if set_sha {
+                asm.expected_total_sha256 = expected_total_sha256.map(str::to_string);
+            }
+            asm.total_bytes = new_total_bytes;
+            asm.updated_at = now;
+            asm.chunks.insert(seq, bytes);
+            asm.chunks.len() >= total_chunks as usize
+        };
+        self.total_inflight_bytes = self
+            .total_inflight_bytes
+            .saturating_sub(prev_len)
+            .saturating_add(new_bytes_len);
+
+        if !is_complete {
             return Ok(None);
         }
 
         let mut completed = self
-            .inflight
-            .remove(&key)
+            .remove_assembly(&key)
             .expect("assembly present before completion");
         let mut assembled = Vec::with_capacity(completed.total_bytes);
         for idx in 0..total_chunks {
@@ -370,7 +480,13 @@ pub fn validate_inbox_dir(
     if path.as_os_str().is_empty() {
         return Err("inbox directory path must not be empty".into());
     }
-    match std::fs::symlink_metadata(path) {
+    // Strip trailing path separators (and trailing `/.`) while preserving root `/` so POSIX
+    // `lstat` inspects the symlink itself rather than dereferencing `/path/to/symlink/`.
+    let inspect_path = path.components().as_path();
+    if inspect_path.as_os_str().is_empty() {
+        return Err("inbox directory path must not be empty".into());
+    }
+    match std::fs::symlink_metadata(inspect_path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
                 return Err(
@@ -386,7 +502,7 @@ pub fn validate_inbox_dir(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path).map_err(|err| {
+            std::fs::create_dir_all(inspect_path).map_err(|err| {
                 format!(
                     "failed to create inbox directory '{}': {err}",
                     path.display()
@@ -402,7 +518,7 @@ pub fn validate_inbox_dir(
         }
     }
 
-    let canonical = std::fs::canonicalize(path).map_err(|e| {
+    let canonical = std::fs::canonicalize(inspect_path).map_err(|e| {
         format!(
             "failed to canonicalize inbox directory '{}': {e}",
             path.display()
@@ -1140,7 +1256,9 @@ impl AgentMeshClient {
                                 }
 
                                 // 6. Buffer in bounded memory queue & send DeliveryAck.
-                                received_list.write().await.push(completed_envelope.clone());
+                                // Only DeliveryAck/DeliveryNack should resolve `pending_map`
+                                // (so self-targeted `from == to` waits for the verified ACK).
+                                received_list.write().await.push(completed_envelope);
 
                                 let ack = AgentMeshEnvelope::new_delivery_ack(
                                     client_node_id.clone(),
@@ -1150,12 +1268,6 @@ impl AgentMeshClient {
                                 );
                                 if let Ok(json_str) = ack.to_json_string() {
                                     let _ = out_tx.send(WsMessage::Text(json_str));
-                                }
-
-                                if let Some(sender_channel) =
-                                    pending_map.write().await.remove(&corr_id)
-                                {
-                                    let _ = sender_channel.send(completed_envelope);
                                 }
                             }
 
@@ -2211,7 +2323,32 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
             std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
             let link_err = validate_inbox_dir(&link_dir).expect_err("symlink must be rejected");
             assert!(link_err.to_string().contains("symlink"), "{link_err}");
+
+            // Trailing path separator(s) on a symlink must still be rejected as a symlink.
+            let trailing_link = PathBuf::from(format!("{}/", link_dir.display()));
+            let trailing_err = validate_inbox_dir(&trailing_link)
+                .expect_err("trailing-slash symlink must be rejected");
+            assert!(
+                trailing_err.to_string().contains("symlink"),
+                "{trailing_err}"
+            );
+
+            let multi_trailing_link = PathBuf::from(format!("{}///", link_dir.display()));
+            let multi_err = validate_inbox_dir(&multi_trailing_link)
+                .expect_err("multi-trailing-slash symlink must be rejected");
+            assert!(multi_err.to_string().contains("symlink"), "{multi_err}");
+
+            // Broken symlink with trailing slash must also be rejected as a symlink.
+            let broken_link = tmp.path().join("broken_link");
+            std::os::unix::fs::symlink(tmp.path().join("does-not-exist"), &broken_link).unwrap();
+            let broken_trailing = PathBuf::from(format!("{}/", broken_link.display()));
+            let broken_err = validate_inbox_dir(&broken_trailing)
+                .expect_err("broken trailing-slash symlink must be rejected");
+            assert!(broken_err.to_string().contains("symlink"), "{broken_err}");
         }
+
+        // Root `/` normalization keeps `/` intact.
+        assert_eq!(Path::new("/").components().as_path(), Path::new("/"));
 
         let new_dir = tmp.path().join("nested").join("inbox");
         let validated = validate_inbox_dir(&new_dir).expect("new dir should be created");
@@ -2391,8 +2528,62 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
             .expect_err("missing target must fail");
         assert!(err.to_string().contains("ERR_NODE_NOT_FOUND"), "{err}");
 
+        // 5. Self-delivery (from == to) resolves with DeliveryAck instead of DataPayload.
+        let self_receipt = consumer
+            .send_data_payload_with_ack("consumer", b"self-loop-payload", Some(3000))
+            .await
+            .expect("self-targeted send_data_payload_with_ack must succeed");
+        assert_eq!(self_receipt.responder, "consumer");
+        assert_eq!(self_receipt.status, "data_received_verified");
+        assert_eq!(self_receipt.sha256, compute_sha256(b"self-loop-payload"));
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 2);
+
         sender.close().await;
         consumer.close().await;
         hub.stop().await;
+    }
+
+    #[test]
+    fn test_chunk_reassembler_aggregate_byte_cap_evicts_oldest_fifo() {
+        // Allow up to 10 assemblies, 100 bytes per assembly, and 120 bytes aggregate across all.
+        let mut reassembler = ChunkReassembler::with_limits(10, 100, 120);
+
+        // Insert incomplete 50-byte chunk 0 for transfers "t1" and "t2" (total = 100 <= 120).
+        assert!(reassembler
+            .insert_chunk("peer", "t1", 0, 2, None, vec![b'1'; 50])
+            .unwrap()
+            .is_none());
+        assert!(reassembler
+            .insert_chunk("peer", "t2", 0, 2, None, vec![b'2'; 50])
+            .unwrap()
+            .is_none());
+        assert_eq!(reassembler.inflight.len(), 2);
+        assert_eq!(reassembler.total_inflight_bytes, 100);
+
+        // Inserting "t3" (50 bytes) would hit 150 > 120, so oldest "t1" must be evicted FIFO.
+        assert!(reassembler
+            .insert_chunk("peer", "t3", 0, 2, None, vec![b'3'; 50])
+            .unwrap()
+            .is_none());
+        assert!(!reassembler
+            .inflight
+            .contains_key(&("peer".to_string(), "t1".to_string())));
+        assert!(reassembler
+            .inflight
+            .contains_key(&("peer".to_string(), "t2".to_string())));
+        assert!(reassembler
+            .inflight
+            .contains_key(&("peer".to_string(), "t3".to_string())));
+        assert_eq!(reassembler.total_inflight_bytes, 100);
+
+        // Adding chunk 1 (40 bytes) to "t3" would reach 140 > 120, so oldest remaining "t2"
+        // is evicted FIFO and "t3" completes cleanly, returning total_inflight_bytes to 0.
+        let assembled = reassembler
+            .insert_chunk("peer", "t3", 1, 2, None, vec![b'4'; 40])
+            .unwrap()
+            .expect("t3 should complete after second chunk");
+        assert_eq!(assembled.bytes.len(), 90);
+        assert!(reassembler.inflight.is_empty());
+        assert_eq!(reassembler.total_inflight_bytes, 0);
     }
 }

@@ -463,6 +463,7 @@ python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 -
 # 4. Route a command or verified data payload from any node or terminal:
 ./target/release/agent-mesh send --hub ws://127.0.0.1:8090/ws --to node-android-3 --command shell_exec --args '{"cmd": "uname -m"}'
 ./target/release/agent-mesh data --hub ws://127.0.0.1:8090/ws --to node-mac-1 --payload "hello-mesh" --timeout-ms 10000
+./target/release/agent-mesh data --hub ws://127.0.0.1:8090/ws --to node-mac-1 --payload-file ./artifact.bin --timeout-ms 10000   # use `-` for stdin
 
 # 5. Query the online nodes catalog:
 ./target/release/agent-mesh list --hub ws://127.0.0.1:8090/ws
@@ -792,7 +793,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `agent-mesh node` (alias `agent`) | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`; supports `wss://`), `--id <ID>`, `--platform <PLATFORM>`, `--no-shell`, `--inbox-dir <DIR>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Connect a persistent agent mesh node to the hub (when `--inbox-dir <DIR>` is set, validates the directory upfront and atomically persists SHA-256-verified single/multi-chunk `DataPayload` bytes before sending `DeliveryAck`, replying `DeliveryNack` on corruption or write error) |
 | `agent-mesh send` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `-c` / `--command <CMD>`, `-a` / `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Dispatch a structured command to a mesh node via the hub |
 | `agent-mesh list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Query the catalog of active nodes connected to the hub |
-| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>`, `--timeout-ms <MS>` (default `10000`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload with SHA-256 verification to a target node, wait for `DeliveryAck`/`DeliveryNack`, print the correlation ID and SHA-256 on success, and exit non-zero on missing node, disconnect, `DeliveryNack`, or timeout |
+| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>` / `--payload-file <PATH>` (`-` for stdin), `--timeout-ms <MS>` (default `10000`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload (inline UTF-8 via `--payload` or arbitrary binary / multi-chunk bytes via `--payload-file <PATH>`, including `-` for raw stdin) with SHA-256 verification to a target node, wait for `DeliveryAck`/`DeliveryNack`, print the correlation ID and SHA-256 on success, and exit non-zero on missing node, disconnect, `DeliveryNack`, or timeout |
 
 ### Network port topology
 

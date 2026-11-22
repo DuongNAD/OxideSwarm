@@ -184,8 +184,20 @@ pub enum Commands {
         to: String,
 
         /// Raw data string to transmit
-        #[arg(long)]
-        payload: String,
+        #[arg(
+            long,
+            required_unless_present = "payload_file",
+            conflicts_with = "payload_file"
+        )]
+        payload: Option<String>,
+
+        /// Path to a file containing raw payload bytes to transmit (use '-' to read from stdin)
+        #[arg(
+            long,
+            conflicts_with = "payload",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        payload_file: Option<PathBuf>,
 
         /// Delivery acknowledgement timeout in milliseconds
         #[arg(long, default_value = "10000")]
@@ -215,6 +227,32 @@ fn client_token(token: Option<String>) -> Option<String> {
 /// An unset or empty `--tls-ca` / `OXIDE_MESH_TLS_CA` means "no custom CA file".
 fn client_tls_ca(tls_ca: Option<PathBuf>) -> Option<PathBuf> {
     tls_ca.filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Loads raw bytes for `agent-mesh data` from either `--payload` or `--payload-file` (`-` for stdin).
+fn read_data_payload_bytes(
+    payload: Option<String>,
+    payload_file: Option<&Path>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    match (payload, payload_file) {
+        (Some(text), None) => Ok(text.into_bytes()),
+        (None, Some(path)) => {
+            if path == Path::new("-") {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("failed to read data payload from stdin: {e}"))?;
+                Ok(buf)
+            } else {
+                std::fs::read(path).map_err(|e| {
+                    format!("failed to read data payload file '{}': {e}", path.display()).into()
+                })
+            }
+        }
+        (Some(_), Some(_)) => Err("cannot pass both --payload and --payload-file".into()),
+        (None, None) => Err("either --payload or --payload-file must be provided".into()),
+    }
 }
 
 /// Builds a client for `hub_url`, presenting `token` and `tls_ca` if provided.
@@ -533,16 +571,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             from,
             to,
             payload,
+            payload_file,
             timeout_ms,
             token,
             tls_ca,
         } => {
+            let bytes = read_data_payload_bytes(payload, payload_file.as_deref())?;
             let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
 
-            println!("[DATA] Transmitting {} bytes to '{}'...", payload.len(), to);
+            println!("[DATA] Transmitting {} bytes to '{}'...", bytes.len(), to);
             match client
-                .send_data_payload_with_ack(&to, payload.as_bytes(), Some(timeout_ms))
+                .send_data_payload_with_ack(&to, &bytes, Some(timeout_ms))
                 .await
             {
                 Ok(receipt) => {
@@ -778,14 +818,105 @@ mod tests {
             Commands::Data {
                 to,
                 payload,
+                payload_file,
                 timeout_ms,
                 ..
             } => {
                 assert_eq!(to, "consumer-1");
-                assert_eq!(payload, "abc");
+                assert_eq!(payload.as_deref(), Some("abc"));
+                assert!(payload_file.is_none());
                 assert_eq!(timeout_ms, 4321);
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn data_command_payload_file_and_mutual_exclusion_parse() {
+        // 1. --payload-file <PATH> parses cleanly without --payload.
+        let file_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload-file",
+            "/tmp/payload.bin",
+        ])
+        .unwrap();
+        match file_cli.command {
+            Commands::Data {
+                to,
+                payload,
+                payload_file,
+                ..
+            } => {
+                assert_eq!(to, "consumer-1");
+                assert!(payload.is_none());
+                assert_eq!(payload_file.as_deref(), Some(Path::new("/tmp/payload.bin")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. --payload-file - (stdin) parses cleanly.
+        let stdin_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload-file",
+            "-",
+        ])
+        .unwrap();
+        match stdin_cli.command {
+            Commands::Data {
+                payload,
+                payload_file,
+                ..
+            } => {
+                assert!(payload.is_none());
+                assert_eq!(payload_file.as_deref(), Some(Path::new("-")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 3. Passing both --payload and --payload-file must be rejected.
+        let conflict_err = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload",
+            "inline",
+            "--payload-file",
+            "/tmp/payload.bin",
+        ])
+        .expect_err("--payload and --payload-file must conflict");
+        assert_eq!(
+            conflict_err.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+
+        // 4. Passing neither --payload nor --payload-file must be rejected.
+        let missing_err = Cli::try_parse_from(["agent-mesh", "data", "--to", "consumer-1"])
+            .expect_err("data command must require either --payload or --payload-file");
+        assert_eq!(
+            missing_err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // 5. read_data_payload_bytes reads raw binary bytes from disk without UTF-8 conversion.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("raw.bin");
+        let raw_bytes = vec![0x00, 0x80, 0xff, 0xfe, 0x41, 0x00];
+        std::fs::write(&bin_path, &raw_bytes).unwrap();
+        assert_eq!(
+            read_data_payload_bytes(None, Some(&bin_path)).unwrap(),
+            raw_bytes
+        );
+        assert_eq!(
+            read_data_payload_bytes(Some("hello".to_string()), None).unwrap(),
+            b"hello"
+        );
+        assert!(read_data_payload_bytes(None, Some(&dir.path().join("missing.bin"))).is_err());
     }
 }

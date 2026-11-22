@@ -1237,7 +1237,7 @@ impl Connection {
                             from,
                             &corr_id,
                             ERR_NODE_NOT_FOUND,
-                            format!("Data target '{}' not found.", to),
+                            format!("Data target '{}' not found.", clip(to)),
                         )
                         .await;
                     }
@@ -1252,18 +1252,22 @@ impl Connection {
             } => {
                 if status != "target_forwarded" {
                     state.inflight_data.write().await.resolve(from, &corr_id);
-                    if to != "hub" {
-                        state.stats.write().await.delivered_acks += 1;
-                    }
                 }
                 if to != "hub" {
-                    if let Err(err) = self.deliver(to, raw_text).await {
-                        warn!(
-                            "Hub: Failed to forward DeliveryAck ({}) to '{}': {:?}",
-                            clip(&corr_id),
-                            clip(to),
-                            err
-                        );
+                    match self.deliver(to, raw_text).await {
+                        Ok(()) => {
+                            if status != "target_forwarded" {
+                                state.stats.write().await.delivered_acks += 1;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Hub: Failed to forward DeliveryAck ({}) to '{}': {:?}",
+                                clip(&corr_id),
+                                clip(to),
+                                err
+                            );
+                        }
                     }
                 }
             }
@@ -1273,14 +1277,18 @@ impl Connection {
             } => {
                 state.inflight_data.write().await.resolve(from, &corr_id);
                 if to != "hub" {
-                    state.stats.write().await.delivered_nacks += 1;
-                    if let Err(err) = self.deliver(to, raw_text).await {
-                        warn!(
-                            "Hub: Failed to forward DeliveryNack ({}) to '{}': {:?}",
-                            clip(&corr_id),
-                            clip(to),
-                            err
-                        );
+                    match self.deliver(to, raw_text).await {
+                        Ok(()) => {
+                            state.stats.write().await.delivered_nacks += 1;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Hub: Failed to forward DeliveryNack ({}) to '{}': {:?}",
+                                clip(&corr_id),
+                                clip(to),
+                                err
+                            );
+                        }
                     }
                 }
             }
@@ -1936,6 +1944,57 @@ mod tests {
         let stats = hub.state().stats.read().await.clone();
         assert!(stats.delivered_nacks >= 1);
 
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_hub_clips_missing_data_target_and_counts_only_delivered_acks_nacks() {
+        use crate::client::AgentMeshClient;
+
+        let hub = AgentMeshHub::new();
+        let port = hub.start("127.0.0.1:0").await.expect("start hub");
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+
+        let sender = AgentMeshClient::new(&ws_url, "clip-sender", "macos");
+        sender.connect().await.unwrap();
+
+        // 1. Long target name (>64 chars) with control char must be clipped in NACK reason.
+        let long_target = format!("{}Z\x07tail", "x".repeat(80));
+        let err = sender
+            .send_data_payload_with_ack(&long_target, b"hi", Some(3000))
+            .await
+            .expect_err("missing long target must NACK");
+        let msg = err.to_string();
+        assert!(msg.contains(ERR_NODE_NOT_FOUND), "{msg}");
+        assert!(!msg.contains("tail"), "reason must be clipped: {msg}");
+
+        // 2. DeliveryAck/DeliveryNack addressed to an absent node must NOT increment delivered stats.
+        let before = hub.state().stats.read().await.clone();
+        sender
+            .send_envelope(AgentMeshEnvelope::new_delivery_ack(
+                "clip-sender",
+                "absent-peer",
+                "corr-absent-ack",
+                "data_received_verified",
+            ))
+            .await
+            .unwrap();
+        sender
+            .send_envelope(AgentMeshEnvelope::new_delivery_nack(
+                "clip-sender",
+                "absent-peer",
+                "corr-absent-nack",
+                crate::ERR_PAYLOAD_CORRUPT,
+                "bad",
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = hub.state().stats.read().await.clone();
+        assert_eq!(after.delivered_acks, before.delivered_acks);
+        assert_eq!(after.delivered_nacks, before.delivered_nacks);
+
+        sender.close().await;
         hub.stop().await;
     }
 }

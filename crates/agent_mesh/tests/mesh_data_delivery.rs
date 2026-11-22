@@ -562,3 +562,162 @@ async fn test_corrupt_checksum_nack_and_binary_bytes_e2e() {
     consumer.close().await;
     hub.stop().await;
 }
+
+#[tokio::test]
+async fn test_data_cli_payload_file_binary_stdin_and_multichunk() {
+    use std::io::Write;
+
+    let (_hub_guard, _port, ws_url, http_base) = spawn_hub_process();
+    let tmp = tempfile::tempdir().unwrap();
+    let inbox = tmp.path().join("file-consumer-inbox");
+
+    let _consumer_guard = ChildGuard::new(
+        Command::new(agent_mesh_bin())
+            .args([
+                "node",
+                "--hub",
+                &ws_url,
+                "--id",
+                "file-consumer",
+                "--platform",
+                "macos",
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn consumer node"),
+    );
+    wait_for_node_registered(&http_base, "file-consumer").await;
+
+    // 1. Binary payload containing NUL (0x00), 0x80, and 0xFF via --payload-file.
+    let bin_bytes: Vec<u8> = [0x00u8, 0x80, 0xff, 0xfe, 0x01, 0x42].repeat(16);
+    let bin_sha = compute_sha256(&bin_bytes);
+    let bin_path = tmp.path().join("binary_payload.bin");
+    std::fs::write(&bin_path, &bin_bytes).unwrap();
+
+    let bin_out = Command::new(agent_mesh_bin())
+        .args([
+            "data",
+            "--hub",
+            &ws_url,
+            "--from",
+            "cli-bin-sender",
+            "--to",
+            "file-consumer",
+            "--payload-file",
+            bin_path.to_str().unwrap(),
+            "--timeout-ms",
+            "5000",
+        ])
+        .output()
+        .expect("run agent-mesh data --payload-file binary");
+    assert!(
+        bin_out.status.success(),
+        "binary --payload-file failed: stderr={}",
+        String::from_utf8_lossy(&bin_out.stderr)
+    );
+    let bin_stdout = String::from_utf8_lossy(&bin_out.stdout);
+    assert!(
+        bin_stdout.contains("Correlation ID:")
+            && bin_stdout.contains(&bin_sha)
+            && bin_stdout.contains("Chunks: 1"),
+        "unexpected binary stdout: {bin_stdout}"
+    );
+
+    // 2. >1 MiB multi-chunk binary payload via --payload-file (exceeds macOS ARG_MAX).
+    let multi_bytes: Vec<u8> = (0..(DEFAULT_DATA_CHUNK_BYTES + 16_384))
+        .map(|i| (i % 256) as u8)
+        .collect();
+    let multi_sha = compute_sha256(&multi_bytes);
+    let multi_path = tmp.path().join("multichunk_payload.bin");
+    std::fs::write(&multi_path, &multi_bytes).unwrap();
+
+    let multi_out = Command::new(agent_mesh_bin())
+        .args([
+            "data",
+            "--hub",
+            &ws_url,
+            "--from",
+            "cli-multi-sender",
+            "--to",
+            "file-consumer",
+            "--payload-file",
+            multi_path.to_str().unwrap(),
+            "--timeout-ms",
+            "15000",
+        ])
+        .output()
+        .expect("run agent-mesh data --payload-file >1MiB");
+    assert!(
+        multi_out.status.success(),
+        ">1 MiB --payload-file failed: stderr={}",
+        String::from_utf8_lossy(&multi_out.stderr)
+    );
+    let multi_stdout = String::from_utf8_lossy(&multi_out.stdout);
+    assert!(
+        multi_stdout.contains("Correlation ID:")
+            && multi_stdout.contains(&multi_sha)
+            && multi_stdout.contains("Chunks: 2"),
+        "unexpected multi-chunk stdout: {multi_stdout}"
+    );
+
+    // 3. Raw binary payload piped over stdin via `--payload-file -`.
+    let stdin_bytes: Vec<u8> = b"\x00\x80\xffraw-stdin-bytes\xfe\x00\xff".to_vec();
+    let stdin_sha = compute_sha256(&stdin_bytes);
+    let mut stdin_child = Command::new(agent_mesh_bin())
+        .args([
+            "data",
+            "--hub",
+            &ws_url,
+            "--from",
+            "cli-stdin-sender",
+            "--to",
+            "file-consumer",
+            "--payload-file",
+            "-",
+            "--timeout-ms",
+            "5000",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agent-mesh data --payload-file -");
+    {
+        let mut stdin_pipe = stdin_child.stdin.take().expect("stdin pipe");
+        stdin_pipe.write_all(&stdin_bytes).unwrap();
+    }
+    let stdin_out = stdin_child.wait_with_output().unwrap();
+    assert!(
+        stdin_out.status.success(),
+        "stdin --payload-file - failed: stderr={}",
+        String::from_utf8_lossy(&stdin_out.stderr)
+    );
+    let stdin_stdout = String::from_utf8_lossy(&stdin_out.stdout);
+    assert!(
+        stdin_stdout.contains("Correlation ID:")
+            && stdin_stdout.contains(&stdin_sha)
+            && stdin_stdout.contains("Chunks: 1"),
+        "unexpected stdin stdout: {stdin_stdout}"
+    );
+
+    // 4. Verify exact persisted bytes on disk (zero .tmp* leftovers).
+    let entries: Vec<_> = std::fs::read_dir(&inbox)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(entries.len(), 3, "expected 3 persisted files in inbox");
+    let mut persisted_by_sha: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.starts_with(".tmp_"), "unexpected temp file {name}");
+        let raw = std::fs::read(entry.path()).unwrap();
+        persisted_by_sha.insert(compute_sha256(&raw), raw);
+    }
+    assert_eq!(persisted_by_sha.get(&bin_sha), Some(&bin_bytes));
+    assert_eq!(persisted_by_sha.get(&multi_sha), Some(&multi_bytes));
+    assert_eq!(persisted_by_sha.get(&stdin_sha), Some(&stdin_bytes));
+}
