@@ -317,6 +317,10 @@ async fn test_verify_task_runner_autorig_execution_with_blender() {
         result.exit_code,
         result.error
     );
+    assert_eq!(
+        result.device_name.as_deref(),
+        Some("OxideSwarm-AutoRig-Blender")
+    );
 
     assert!(
         result.asset_bytes.is_some(),
@@ -458,21 +462,31 @@ async fn test_graceful_fallback_when_blender_path_is_invalid_or_missing() {
     );
 
     let input_mesh = generate_test_glb_mesh();
-    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+    let auto_spec = AutoRigSpec::new(Bytes::from(input_mesh.clone()), "biped")
         .with_animations(vec!["idle".to_string(), "walk".to_string()])
-        .with_provider("blender");
+        .with_provider("auto");
 
     let (runner, _dir) = create_test_runner();
     let t0 = Instant::now();
-    // Must NOT panic or fail, but cleanly fallback to built-in pure-Rust rigging pipeline
-    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec, |_, _, _| {}).await;
+    // "auto" must cleanly fallback to built-in pure-Rust rigging pipeline when Blender is missing
+    let result = auto_rig_mesh_async(&runner, TaskId::new(), &auto_spec, |_, _, _| {}).await;
     let elapsed = t0.elapsed();
     println!("Fallback execution completed in {:?}", elapsed);
 
     assert!(
         result.is_ok(),
-        "auto_rig_mesh_async should cleanly fallback to built-in engine, but returned: {:?}",
+        "auto_rig_mesh_async with provider='auto' should cleanly fallback to built-in engine, but returned: {:?}",
         result.err()
+    );
+
+    // Explicit "blender" must refuse to fall back when Blender is missing
+    let strict_spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+        .with_animations(vec!["idle".to_string(), "walk".to_string()])
+        .with_provider("blender");
+    let strict_res = auto_rig_mesh_async(&runner, TaskId::new(), &strict_spec, |_, _, _| {}).await;
+    assert!(
+        strict_res.is_err(),
+        "Explicit preferred_provider='blender' must return Err when Blender is missing"
     );
 
     let glb_bytes = result.unwrap();
@@ -520,7 +534,10 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
     let _env = ScopedEnvVar::set("BLENDER_PATH", &env_fake_blender).await;
 
     let input_mesh = generate_test_glb_mesh();
-    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+    let auto_spec = AutoRigSpec::new(Bytes::from(input_mesh.clone()), "biped")
+        .with_animations(vec!["idle".to_string()])
+        .with_provider("auto");
+    let strict_spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
         .with_animations(vec!["idle".to_string()])
         .with_provider("blender");
 
@@ -546,19 +563,38 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
         "stale RunnerConfig.blender_path must resolve to None"
     );
 
-    let direct_res = auto_rig_mesh_async(&stale_runner, TaskId::new(), &spec, |_, _, _| {}).await;
-    assert!(direct_res.is_ok(), "stale flag must fallback cleanly");
+    let direct_res =
+        auto_rig_mesh_async(&stale_runner, TaskId::new(), &auto_spec, |_, _, _| {}).await;
+    assert!(
+        direct_res.is_ok(),
+        "stale flag with 'auto' must fallback cleanly"
+    );
     assert!(
         !env_marker.exists(),
         "stale --blender-path in auto_rig_mesh_async must NOT invoke fallback BLENDER_PATH binary"
     );
 
+    let strict_stale_res =
+        auto_rig_mesh_async(&stale_runner, TaskId::new(), &strict_spec, |_, _, _| {}).await;
+    assert!(
+        strict_stale_res.is_err(),
+        "stale --blender-path with explicit 'blender' must fail explicitly"
+    );
+    assert!(
+        !env_marker.exists(),
+        "stale --blender-path with explicit 'blender' must NOT invoke fallback BLENDER_PATH binary"
+    );
+
     let task = Task::new(
-        TaskSpec::AutoRig(spec.clone()),
+        TaskSpec::AutoRig(auto_spec.clone()),
         TaskRequirements::generic(1, 30),
     );
     let task_res = stale_runner.execute_task(&task, None, None).await;
     assert_eq!(task_res.exit_code, 0);
+    assert_eq!(
+        task_res.device_name.as_deref(),
+        Some("OxideSwarm-AutoRig-Builtin")
+    );
     assert!(
         !env_marker.exists(),
         "stale --blender-path in TaskRunner::execute_task must NOT invoke fallback BLENDER_PATH binary"
@@ -586,7 +622,7 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
         "valid RunnerConfig.blender_path must resolve to the flag path"
     );
 
-    let _ = auto_rig_mesh_async(&valid_runner, TaskId::new(), &spec, |_, _, _| {}).await;
+    let _ = auto_rig_mesh_async(&valid_runner, TaskId::new(), &auto_spec, |_, _, _| {}).await;
     assert!(
         flag_marker.exists(),
         "valid --blender-path in auto_rig_mesh_async must invoke the flag binary"
@@ -597,9 +633,16 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
     );
 
     std::fs::remove_file(&flag_marker).expect("remove flag_marker");
-    let task2 = Task::new(TaskSpec::AutoRig(spec), TaskRequirements::generic(1, 30));
+    let task2 = Task::new(
+        TaskSpec::AutoRig(auto_spec),
+        TaskRequirements::generic(1, 30),
+    );
     let task2_res = valid_runner.execute_task(&task2, None, None).await;
     assert_eq!(task2_res.exit_code, 0);
+    assert_eq!(
+        task2_res.device_name.as_deref(),
+        Some("OxideSwarm-AutoRig-Builtin")
+    );
     assert!(
         flag_marker.exists(),
         "valid --blender-path in TaskRunner::execute_task must invoke the flag binary"
@@ -608,6 +651,19 @@ async fn test_runner_and_capabilities_honor_stale_and_valid_blender_path_flag() 
         !env_marker.exists(),
         "valid --blender-path in TaskRunner::execute_task must take precedence over BLENDER_PATH"
     );
+
+    std::fs::remove_file(&flag_marker).expect("remove flag_marker");
+    let strict_task2 = Task::new(
+        TaskSpec::AutoRig(strict_spec),
+        TaskRequirements::generic(1, 30),
+    );
+    let strict_task2_res = valid_runner.execute_task(&strict_task2, None, None).await;
+    assert_ne!(strict_task2_res.exit_code, 0);
+    assert!(
+        flag_marker.exists(),
+        "explicit 'blender' in TaskRunner::execute_task must invoke the flag binary before failing"
+    );
+    assert!(!env_marker.exists());
 }
 
 fn create_crashing_fake_blender(
@@ -662,14 +718,14 @@ async fn test_graceful_fallback_when_blender_binary_crashes() {
     let _env = ScopedEnvVar::set("BLENDER_PATH", &fake_blender).await;
 
     let input_mesh = generate_test_glb_mesh();
-    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+    let auto_spec = AutoRigSpec::new(Bytes::from(input_mesh.clone()), "biped")
         .with_animations(vec!["idle".to_string()])
-        .with_provider("blender");
+        .with_provider("auto");
 
     let (runner, _dir) = create_test_runner();
     let t0 = Instant::now();
-    // Must gracefully catch failure and fallback to built-in pure-Rust engine
-    let result = auto_rig_mesh_async(&runner, TaskId::new(), &spec, |_, _, _| {}).await;
+    // "auto" must gracefully catch failure and fallback to built-in pure-Rust engine
+    let result = auto_rig_mesh_async(&runner, TaskId::new(), &auto_spec, |_, _, _| {}).await;
     let elapsed = t0.elapsed();
     println!("Crash fallback completed in {:?}", elapsed);
 
@@ -679,7 +735,7 @@ async fn test_graceful_fallback_when_blender_binary_crashes() {
     );
     assert!(
         result.is_ok(),
-        "auto_rig_mesh_async failed to fallback after Blender crash: {:?}",
+        "auto_rig_mesh_async with 'auto' failed to fallback after Blender crash: {:?}",
         result.err()
     );
 
@@ -687,6 +743,16 @@ async fn test_graceful_fallback_when_blender_binary_crashes() {
     assert!(glb_bytes.len() > 2000);
     let gltf_json = validate_and_parse_glb(&glb_bytes);
     assert!(gltf_json.get("skins").is_some());
+
+    // Explicit "blender" must propagate error instead of falling back
+    let strict_spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+        .with_animations(vec!["idle".to_string()])
+        .with_provider("blender");
+    let strict_res = auto_rig_mesh_async(&runner, TaskId::new(), &strict_spec, |_, _, _| {}).await;
+    assert!(
+        strict_res.is_err(),
+        "Explicit preferred_provider='blender' must fail when Blender crashes"
+    );
 }
 
 #[tokio::test]
@@ -700,13 +766,13 @@ async fn test_graceful_fallback_via_task_runner_on_blender_failure() {
     let _env = ScopedEnvVar::set("BLENDER_PATH", &fake_blender).await;
 
     let input_mesh = generate_test_glb_mesh();
-    let spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+    let auto_spec = AutoRigSpec::new(Bytes::from(input_mesh.clone()), "biped")
         .with_animations(vec!["idle".to_string()])
-        .with_provider("blender");
+        .with_provider("auto");
 
     let mut requirements = TaskRequirements::default();
     requirements.timeout_secs = 30;
-    let task = Task::new(TaskSpec::AutoRig(spec), requirements);
+    let task = Task::new(TaskSpec::AutoRig(auto_spec), requirements.clone());
 
     let result = runner
         .execute_task_with_checkpoint(&task, None, None, None, None)
@@ -718,12 +784,27 @@ async fn test_graceful_fallback_via_task_runner_on_blender_failure() {
     );
     assert!(
         result.is_success(),
-        "TaskRunner should succeed via fallback when Blender fails: {:?}",
+        "TaskRunner with 'auto' should succeed via fallback when Blender fails: {:?}",
         result.error
+    );
+    assert_eq!(
+        result.device_name.as_deref(),
+        Some("OxideSwarm-AutoRig-Builtin")
     );
     assert!(result.asset_bytes.is_some());
     let glb = result.asset_bytes.unwrap();
     assert_eq!(&glb.as_bytes()[0..4], b"glTF");
+
+    // Explicit "blender" must fail cleanly on TaskRunner
+    let strict_spec = AutoRigSpec::new(Bytes::from(input_mesh), "biped")
+        .with_animations(vec!["idle".to_string()])
+        .with_provider("blender");
+    let strict_task = Task::new(TaskSpec::AutoRig(strict_spec), requirements);
+    let strict_res = runner
+        .execute_task_with_checkpoint(&strict_task, None, None, None, None)
+        .await;
+    assert!(!strict_res.is_success());
+    assert_ne!(strict_res.exit_code, 0);
 }
 
 #[test]

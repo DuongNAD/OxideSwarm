@@ -4,14 +4,23 @@
 //! 50-slab vertical slicing, and extraction of 15 anatomical skeletal joints.
 
 use super::math::{eigen_decomposition_3x3, Vec3};
-use super::types::{AnatomicalLandmarks, RigPreset};
+use super::types::{AnatomicalLandmarks, QuadrupedLandmarks, RigPreset};
 use crate::gen3d::types::RawMesh;
 
 /// Analyzes mesh geometry and extracts 3D anatomical landmarks using PCA alignment.
-pub fn extract_landmarks(
+pub fn extract_landmarks(mesh: &RawMesh, preset: RigPreset) -> Result<AnatomicalLandmarks, String> {
+    extract_landmarks_cancellable(mesh, preset, &|| false)
+}
+
+/// Analyzes mesh geometry and extracts 3D anatomical landmarks with cooperative cancellation.
+pub fn extract_landmarks_cancellable(
     mesh: &RawMesh,
-    _preset: RigPreset,
+    preset: RigPreset,
+    should_stop: &dyn Fn() -> bool,
 ) -> Result<AnatomicalLandmarks, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     if mesh.positions.len() < 8 {
         return Err(
             "Mesh has insufficient vertices for landmark extraction (minimum 8 required)"
@@ -38,7 +47,10 @@ pub fn extract_landmarks(
     let mut c12 = 0.0f32;
     let mut c22 = 0.0f32;
 
-    for p in &mesh.positions {
+    for (idx, p) in mesh.positions.iter().enumerate() {
+        if idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let dx = p[0] - centroid.x;
         let dy = p[1] - centroid.y;
         let dz = p[2] - centroid.z;
@@ -72,12 +84,18 @@ pub fn extract_landmarks(
     }
 
     let other_indices: Vec<usize> = (0..3).filter(|&idx| idx != up_idx).collect();
-    let (lat_idx, _depth_idx) =
-        if eigen.eigenvalues[other_indices[0]] >= eigen.eigenvalues[other_indices[1]] {
+    let (lat_idx, _depth_idx) = if preset == RigPreset::Quadruped {
+        // Quadrupeds are typically longer front-to-back than wide; map smaller horizontal variance to lateral X.
+        if eigen.eigenvalues[other_indices[0]] <= eigen.eigenvalues[other_indices[1]] {
             (other_indices[0], other_indices[1])
         } else {
             (other_indices[1], other_indices[0])
-        };
+        }
+    } else if eigen.eigenvalues[other_indices[0]] >= eigen.eigenvalues[other_indices[1]] {
+        (other_indices[0], other_indices[1])
+    } else {
+        (other_indices[1], other_indices[0])
+    };
 
     let mut axis_y = eigen.eigenvectors[up_idx];
     let mut axis_x = eigen.eigenvectors[lat_idx];
@@ -121,7 +139,10 @@ pub fn extract_landmarks(
     let mut min_pos = [f32::INFINITY; 3];
     let mut max_pos = [f32::NEG_INFINITY; 3];
 
-    for p in &mesh.positions {
+    for (idx, p) in mesh.positions.iter().enumerate() {
+        if idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let dp = Vec3::new(p[0] - centroid.x, p[1] - centroid.y, p[2] - centroid.z);
         let xc = dp.dot(axis_x);
         let yc = dp.dot(axis_y);
@@ -150,10 +171,14 @@ pub fn extract_landmarks(
     let step = (canonical_positions.len() / sample_count).max(1);
     let mut sym_err_acc = 0.0f32;
 
-    for i in (0..canonical_positions.len())
+    for (outer_step, i) in (0..canonical_positions.len())
         .step_by(step)
         .take(sample_count)
+        .enumerate()
     {
+        if outer_step % 32 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let p = canonical_positions[i];
         let p_refl = [2.0 * center_x - p[0], p[1], p[2]];
         let mut min_d = f32::INFINITY;
@@ -184,7 +209,10 @@ pub fn extract_landmarks(
     let mut slice_left_count = [0usize; K];
     let mut slice_right_count = [0usize; K];
 
-    for p in &canonical_positions {
+    for (idx, p) in canonical_positions.iter().enumerate() {
+        if idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let rel_y = (p[1] - min_pos[1]).clamp(0.0, height - 1e-4);
         let k = ((rel_y / delta_y) as usize).min(K - 1);
         slice_counts[k] += 1;
@@ -252,6 +280,68 @@ pub fn extract_landmarks(
     let to_world =
         |cx: f32, cy: f32, cz: f32| -> Vec3 { centroid + axis_x * cx + axis_y * cy + axis_z * cz };
 
+    let quadruped = if preset == RigPreset::Quadruped {
+        let y_base = min_pos[1];
+        let leg_x = (0.18 * width).max(0.05 * height);
+        let z_hind = min_pos[2] + 0.24 * depth;
+        let z_front = min_pos[2] + 0.70 * depth;
+        Some(QuadrupedLandmarks {
+            pelvis: to_world(center_x, y_base + 0.56 * height, min_pos[2] + 0.25 * depth),
+            spine: to_world(center_x, y_base + 0.60 * height, min_pos[2] + 0.46 * depth),
+            chest: to_world(center_x, y_base + 0.62 * height, min_pos[2] + 0.68 * depth),
+            neck: to_world(center_x, y_base + 0.76 * height, min_pos[2] + 0.80 * depth),
+            head: to_world(center_x, y_base + 0.88 * height, min_pos[2] + 0.92 * depth),
+            tail_base: to_world(center_x, y_base + 0.58 * height, min_pos[2] + 0.14 * depth),
+            tail_tip: to_world(center_x, y_base + 0.48 * height, min_pos[2] + 0.02 * depth),
+            hind_hip_l: to_world(center_x - leg_x, y_base + 0.54 * height, z_hind),
+            hind_knee_l: to_world(
+                center_x - leg_x,
+                y_base + 0.30 * height,
+                z_hind - 0.04 * depth,
+            ),
+            hind_ankle_l: to_world(
+                center_x - leg_x,
+                y_base + 0.06 * height,
+                z_hind + 0.02 * depth,
+            ),
+            hind_hip_r: to_world(center_x + leg_x, y_base + 0.54 * height, z_hind),
+            hind_knee_r: to_world(
+                center_x + leg_x,
+                y_base + 0.30 * height,
+                z_hind - 0.04 * depth,
+            ),
+            hind_ankle_r: to_world(
+                center_x + leg_x,
+                y_base + 0.06 * height,
+                z_hind + 0.02 * depth,
+            ),
+            front_shoulder_l: to_world(center_x - leg_x, y_base + 0.56 * height, z_front),
+            front_elbow_l: to_world(
+                center_x - leg_x,
+                y_base + 0.31 * height,
+                z_front - 0.03 * depth,
+            ),
+            front_wrist_l: to_world(
+                center_x - leg_x,
+                y_base + 0.06 * height,
+                z_front + 0.02 * depth,
+            ),
+            front_shoulder_r: to_world(center_x + leg_x, y_base + 0.56 * height, z_front),
+            front_elbow_r: to_world(
+                center_x + leg_x,
+                y_base + 0.31 * height,
+                z_front - 0.03 * depth,
+            ),
+            front_wrist_r: to_world(
+                center_x + leg_x,
+                y_base + 0.06 * height,
+                z_front + 0.02 * depth,
+            ),
+        })
+    } else {
+        None
+    };
+
     Ok(AnatomicalLandmarks {
         height,
         width,
@@ -275,5 +365,6 @@ pub fn extract_landmarks(
         shoulder_r: to_world(center_x + arm_x_offset, y_chest, center_z),
         elbow_r: to_world(center_x + elbow_x_offset, y_elbow, elbow_prebend_z),
         wrist_r: to_world(center_x + wrist_x_offset, y_wrist, center_z),
+        quadruped,
     })
 }

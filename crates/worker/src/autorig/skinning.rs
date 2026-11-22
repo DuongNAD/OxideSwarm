@@ -37,6 +37,19 @@ pub fn compute_skin_weights(
     bones: &[BoneSegment],
     config: &SkinningConfig,
 ) -> Result<SkinWeights, String> {
+    compute_skin_weights_cancellable(mesh, bones, config, &|| false)
+}
+
+/// Computes glTF 2.0 compliant skin weights with cooperative cancellation polling.
+pub fn compute_skin_weights_cancellable(
+    mesh: &RawMesh,
+    bones: &[BoneSegment],
+    config: &SkinningConfig,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<SkinWeights, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let num_verts = mesh.positions.len();
     if num_verts == 0 {
         return Err("Cannot compute skin weights on empty mesh".to_string());
@@ -51,21 +64,30 @@ pub fn compute_skin_weights(
     let center_x = (min_bb[0] + max_bb[0]) * 0.5;
 
     // 1. Build mesh edge adjacency graph for surface geodesic calculations
-    let adj = build_mesh_adjacency(num_verts, &mesh.indices);
+    let adj = build_mesh_adjacency_cancellable(num_verts, &mesh.indices, should_stop)?;
 
     // 2. Identify bone surface anchors on mesh (nearest vertex to bone midpoint)
-    let anchors: Vec<usize> = bones
-        .iter()
-        .map(|b| {
-            let mid = (b.start + b.end) * 0.5;
-            find_nearest_vertex(&mesh.positions, mid)
-        })
-        .collect();
+    let mut anchors = Vec::with_capacity(bones.len());
+    for b in bones {
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
+        let mid = (b.start + b.end) * 0.5;
+        anchors.push(find_nearest_vertex(&mesh.positions, mid));
+    }
 
     // 3. Multi-source Dijkstra geodesic surface flood for each bone
     let mut geo_dist: Vec<Vec<f32>> = Vec::with_capacity(bones.len());
     for &anchor in &anchors {
-        geo_dist.push(dijkstra_shortest_paths(anchor, &adj, &mesh.positions));
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
+        geo_dist.push(dijkstra_shortest_paths_cancellable(
+            anchor,
+            &adj,
+            &mesh.positions,
+            should_stop,
+        )?);
     }
 
     let mut out_joints = Vec::with_capacity(num_verts);
@@ -78,6 +100,9 @@ pub fn compute_skin_weights(
     let mut raw_weights = vec![0.0f32; bones.len()];
 
     for (v_idx, p_arr) in mesh.positions.iter().enumerate() {
+        if v_idx % 512 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let v = Vec3::from_array(*p_arr);
 
         for (b_idx, b) in bones.iter().enumerate() {
@@ -235,9 +260,16 @@ impl PartialOrd for DijkstraEntry {
     }
 }
 
-fn build_mesh_adjacency(num_verts: usize, indices: &[u32]) -> Vec<Vec<usize>> {
+fn build_mesh_adjacency_cancellable(
+    num_verts: usize,
+    indices: &[u32],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<Vec<Vec<usize>>, String> {
     let mut adj = vec![Vec::with_capacity(6); num_verts];
-    for tri in indices.chunks_exact(3) {
+    for (tri_idx, tri) in indices.chunks_exact(3).enumerate() {
+        if tri_idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let i0 = tri[0] as usize;
         let i1 = tri[1] as usize;
         let i2 = tri[2] as usize;
@@ -251,11 +283,14 @@ fn build_mesh_adjacency(num_verts: usize, indices: &[u32]) -> Vec<Vec<usize>> {
         }
     }
     // Deduplicate neighbors
-    for neighbors in &mut adj {
+    for (v_idx, neighbors) in adj.iter_mut().enumerate() {
+        if v_idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         neighbors.sort_unstable();
         neighbors.dedup();
     }
-    adj
+    Ok(adj)
 }
 
 fn find_nearest_vertex(positions: &[[f32; 3]], point: Vec3) -> usize {
@@ -274,9 +309,14 @@ fn find_nearest_vertex(positions: &[[f32; 3]], point: Vec3) -> usize {
     best_idx
 }
 
-fn dijkstra_shortest_paths(start: usize, adj: &[Vec<usize>], positions: &[[f32; 3]]) -> Vec<f32> {
+fn dijkstra_shortest_paths_cancellable(
+    start: usize,
+    adj: &[Vec<usize>],
+    positions: &[[f32; 3]],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<Vec<f32>, String> {
     if start >= adj.len() {
-        return vec![f32::INFINITY; adj.len()];
+        return Ok(vec![f32::INFINITY; adj.len()]);
     }
 
     let mut dist = vec![f32::INFINITY; adj.len()];
@@ -288,7 +328,12 @@ fn dijkstra_shortest_paths(start: usize, adj: &[Vec<usize>], positions: &[[f32; 
         cost: 0.0,
     });
 
+    let mut pops = 0usize;
     while let Some(DijkstraEntry { vertex, cost }) = heap.pop() {
+        pops += 1;
+        if pops.is_multiple_of(1024) && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         if cost > dist[vertex] {
             continue;
         }
@@ -313,5 +358,5 @@ fn dijkstra_shortest_paths(start: usize, adj: &[Vec<usize>], positions: &[[f32; 
             }
         }
     }
-    dist
+    Ok(dist)
 }
