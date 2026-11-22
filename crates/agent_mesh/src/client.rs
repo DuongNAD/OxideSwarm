@@ -3,20 +3,22 @@
 //! Provides connection management, node registration, periodic heartbeats,
 //! remote command execution, data transmission, and request/response correlation.
 
+use crate::delivery::{persist_payload_atomic, DataConsumer, DataVerdict, InboxQuota};
+pub use crate::delivery::{validate_inbox_dir, DEFAULT_INBOX_MAX_BYTES, DEFAULT_INBOX_MAX_FILES};
 use crate::executor::CommandExecutor;
 use crate::protocol::{
     compute_sha256, verify_sha256, AgentMeshEnvelope, CorrelationId, NodeDescriptor,
-    DEFAULT_DATA_CHUNK_BYTES, ERR_DUPLICATE_NODE_ID, ERR_INVALID_NODE_ID, ERR_PAYLOAD_CORRUPT,
+    ACK_STATUS_CHUNK_RECEIVED, ACK_STATUS_DATA_VERIFIED, ACK_STATUS_TARGET_FORWARDED,
+    DATA_CHUNK_WINDOW, DEFAULT_DATA_CHUNK_BYTES, ERR_DUPLICATE_NODE_ID, ERR_INVALID_NODE_ID,
     ERR_PERSIST_FAILED, ERR_UNAUTHORIZED,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_rustls::rustls::pki_types::CertificateDer;
@@ -146,17 +148,6 @@ pub const DEFAULT_MAX_RECEIVED_PAYLOADS: usize = 256;
 /// Default maximum total payload bytes retained in memory in `received_payloads` (64 MiB).
 pub const DEFAULT_MAX_RECEIVED_BYTES: usize = 64 * 1024 * 1024;
 
-/// Maximum concurrent in-flight multi-chunk reassemblies tracked per client connection.
-const MAX_PENDING_ASSEMBLIES: usize = 64;
-/// Maximum number of chunks accepted for a single multi-chunk transfer.
-const MAX_CHUNKS_PER_TRANSFER: u32 = 1024;
-/// Maximum reassembled payload size accepted by a client (64 MiB).
-const MAX_ASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
-/// Maximum aggregate payload bytes buffered across all in-flight reassemblies (128 MiB).
-const MAX_TOTAL_REASSEMBLER_BYTES: usize = 128 * 1024 * 1024;
-/// Time-to-live for incomplete multi-chunk transfers before eviction.
-const CHUNK_ASSEMBLY_TTL: Duration = Duration::from_secs(60);
-
 /// Delivery acknowledgement receipt returned by `AgentMeshClient::send_data_payload_with_ack`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataDeliveryReceipt {
@@ -165,6 +156,29 @@ pub struct DataDeliveryReceipt {
     pub total_chunks: u32,
     pub responder: String,
     pub status: String,
+}
+
+type TransferMap = Arc<Mutex<HashMap<CorrelationId, mpsc::UnboundedSender<AgentMeshEnvelope>>>>;
+
+/// Removes an outgoing transfer from the client's table however the send ends.
+struct TransferRegistration {
+    transfers: TransferMap,
+    correlation_id: String,
+}
+
+impl Drop for TransferRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.transfers.lock() {
+            map.remove(&self.correlation_id);
+        }
+    }
+}
+
+/// What one acknowledgement envelope means to the sender of a data transfer.
+enum TransferEvent {
+    ChunkAcked,
+    Verified(String),
+    Refused(String),
 }
 
 #[derive(Debug)]
@@ -225,252 +239,6 @@ impl BoundedPayloadBuffer {
     }
 }
 
-struct ReassembledPayload {
-    bytes: Vec<u8>,
-    expected_total_sha256: Option<String>,
-}
-
-struct ChunkAssembly {
-    total_chunks: u32,
-    expected_total_sha256: Option<String>,
-    chunks: HashMap<u32, Vec<u8>>,
-    total_bytes: usize,
-    updated_at: Instant,
-    seq_order: u64,
-}
-
-struct ChunkReassembler {
-    inflight: HashMap<(String, String), ChunkAssembly>,
-    total_inflight_bytes: usize,
-    next_seq_order: u64,
-    max_pending_assemblies: usize,
-    max_assembled_bytes: usize,
-    max_total_bytes: usize,
-    ttl: Duration,
-}
-
-impl ChunkReassembler {
-    fn new() -> Self {
-        Self::with_limits(
-            MAX_PENDING_ASSEMBLIES,
-            MAX_ASSEMBLED_BYTES,
-            MAX_TOTAL_REASSEMBLER_BYTES,
-        )
-    }
-
-    fn with_limits(
-        max_pending_assemblies: usize,
-        max_assembled_bytes: usize,
-        max_total_bytes: usize,
-    ) -> Self {
-        Self {
-            inflight: HashMap::new(),
-            total_inflight_bytes: 0,
-            next_seq_order: 0,
-            max_pending_assemblies,
-            max_assembled_bytes,
-            max_total_bytes,
-            ttl: CHUNK_ASSEMBLY_TTL,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
-        self
-    }
-
-    fn remove_assembly(&mut self, key: &(String, String)) -> Option<ChunkAssembly> {
-        let removed = self.inflight.remove(key)?;
-        self.total_inflight_bytes = self
-            .total_inflight_bytes
-            .saturating_sub(removed.total_bytes);
-        Some(removed)
-    }
-
-    fn evict_oldest_fifo(&mut self, exclude_key: Option<&(String, String)>) -> bool {
-        let oldest_key = self
-            .inflight
-            .iter()
-            .filter(|(k, _)| exclude_key != Some(*k))
-            .min_by_key(|(_, v)| v.seq_order)
-            .map(|(k, _)| k.clone());
-        if let Some(k) = oldest_key {
-            self.remove_assembly(&k);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn prune_expired(&mut self, now: Instant) {
-        let ttl = self.ttl;
-        let mut removed_bytes = 0usize;
-        self.inflight.retain(|_, asm| {
-            let keep = now.saturating_duration_since(asm.updated_at) <= ttl;
-            if !keep {
-                removed_bytes = removed_bytes.saturating_add(asm.total_bytes);
-            }
-            keep
-        });
-        self.total_inflight_bytes = self.total_inflight_bytes.saturating_sub(removed_bytes);
-    }
-
-    fn insert_chunk(
-        &mut self,
-        from: &str,
-        corr_id: &str,
-        seq: u32,
-        total_chunks: u32,
-        expected_total_sha256: Option<&str>,
-        bytes: Vec<u8>,
-    ) -> Result<Option<ReassembledPayload>, String> {
-        let now = Instant::now();
-        self.prune_expired(now);
-
-        if bytes.len() > self.max_assembled_bytes || bytes.len() > self.max_total_bytes {
-            let key = (from.to_string(), corr_id.to_string());
-            self.remove_assembly(&key);
-            return Err(format!(
-                "Chunk size {} exceeds cap of {} bytes",
-                bytes.len(),
-                self.max_assembled_bytes.min(self.max_total_bytes)
-            ));
-        }
-
-        let key = (from.to_string(), corr_id.to_string());
-        if !self.inflight.contains_key(&key) {
-            while self.inflight.len() >= self.max_pending_assemblies
-                || self.total_inflight_bytes.saturating_add(bytes.len()) > self.max_total_bytes
-            {
-                if !self.evict_oldest_fifo(None) {
-                    break;
-                }
-            }
-            let seq_order = self.next_seq_order;
-            self.next_seq_order = self.next_seq_order.saturating_add(1);
-            self.inflight.insert(
-                key.clone(),
-                ChunkAssembly {
-                    total_chunks,
-                    expected_total_sha256: expected_total_sha256.map(str::to_string),
-                    chunks: HashMap::new(),
-                    total_bytes: 0,
-                    updated_at: now,
-                    seq_order,
-                },
-            );
-        }
-
-        let (expected_chunks, prev_len, new_total_bytes, seq_mismatch, sha_mismatch, set_sha) = {
-            let asm = self
-                .inflight
-                .get(&key)
-                .expect("assembly inserted immediately above");
-
-            let seq_mismatch = asm.total_chunks != total_chunks;
-            let mut sha_mismatch = false;
-            let mut set_sha = false;
-            if let Some(new_sha) = expected_total_sha256 {
-                if let Some(ref existing_sha) = asm.expected_total_sha256 {
-                    if !existing_sha.eq_ignore_ascii_case(new_sha) {
-                        sha_mismatch = true;
-                    }
-                } else {
-                    set_sha = true;
-                }
-            }
-            let prev_len = asm.chunks.get(&seq).map_or(0, Vec::len);
-            let new_total_bytes = asm
-                .total_bytes
-                .saturating_sub(prev_len)
-                .saturating_add(bytes.len());
-            (
-                asm.total_chunks,
-                prev_len,
-                new_total_bytes,
-                seq_mismatch,
-                sha_mismatch,
-                set_sha,
-            )
-        };
-
-        if seq_mismatch {
-            self.remove_assembly(&key);
-            return Err(format!(
-                "Inconsistent total_chunks in multi-chunk transfer (expected {expected_chunks}, got {total_chunks})"
-            ));
-        }
-
-        if sha_mismatch {
-            self.remove_assembly(&key);
-            return Err("Inconsistent total_sha256 in multi-chunk transfer".to_string());
-        }
-
-        if new_total_bytes > self.max_assembled_bytes {
-            self.remove_assembly(&key);
-            return Err(format!(
-                "Assembled payload size {new_total_bytes} exceeds cap of {} bytes",
-                self.max_assembled_bytes
-            ));
-        }
-
-        // Evict oldest *other* in-flight assemblies FIFO before exceeding aggregate cap.
-        while self
-            .total_inflight_bytes
-            .saturating_sub(prev_len)
-            .saturating_add(bytes.len())
-            > self.max_total_bytes
-        {
-            if !self.evict_oldest_fifo(Some(&key)) {
-                self.remove_assembly(&key);
-                return Err(format!(
-                    "Aggregate reassembler buffer cap of {} bytes exceeded",
-                    self.max_total_bytes
-                ));
-            }
-        }
-
-        let new_bytes_len = bytes.len();
-        let is_complete = {
-            let asm = self
-                .inflight
-                .get_mut(&key)
-                .expect("assembly retained while evicting others");
-            if set_sha {
-                asm.expected_total_sha256 = expected_total_sha256.map(str::to_string);
-            }
-            asm.total_bytes = new_total_bytes;
-            asm.updated_at = now;
-            asm.chunks.insert(seq, bytes);
-            asm.chunks.len() >= total_chunks as usize
-        };
-        self.total_inflight_bytes = self
-            .total_inflight_bytes
-            .saturating_sub(prev_len)
-            .saturating_add(new_bytes_len);
-
-        if !is_complete {
-            return Ok(None);
-        }
-
-        let mut completed = self
-            .remove_assembly(&key)
-            .expect("assembly present before completion");
-        let mut assembled = Vec::with_capacity(completed.total_bytes);
-        for idx in 0..total_chunks {
-            let Some(part) = completed.chunks.remove(&idx) else {
-                return Err(format!("Missing chunk {idx} during reassembly"));
-            };
-            assembled.extend_from_slice(&part);
-        }
-        Ok(Some(ReassembledPayload {
-            bytes: assembled,
-            expected_total_sha256: completed.expected_total_sha256,
-        }))
-    }
-}
-
 struct ActiveCommandGuard(Arc<AtomicUsize>);
 
 impl Drop for ActiveCommandGuard {
@@ -479,183 +247,68 @@ impl Drop for ActiveCommandGuard {
     }
 }
 
-/// Validates and canonicalizes an `--inbox-dir` path before accepting incoming payloads.
-///
-/// Rejects empty paths, symlinks, and non-directory entries (such as regular files). Creates the
-/// directory if it does not yet exist, then returns its canonical path.
-pub fn validate_inbox_dir(
-    path: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    if path.as_os_str().is_empty() {
-        return Err("inbox directory path must not be empty".into());
-    }
-    // Strip trailing path separators (and trailing `/.`) while preserving root `/` so POSIX
-    // `lstat` inspects the symlink itself rather than dereferencing `/path/to/symlink/`.
-    let inspect_path = path.components().as_path();
-    if inspect_path.as_os_str().is_empty() {
-        return Err("inbox directory path must not be empty".into());
-    }
-    match std::fs::symlink_metadata(inspect_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(
-                    format!("inbox directory '{}' must not be a symlink", path.display()).into(),
-                );
+/// Waits for the next acknowledgement of an outgoing data transfer that counts: a `DeliveryAck`
+/// from `target` (`chunk_received` or `data_received_verified`), or a `DeliveryNack` from `target`
+/// or from the hub. Envelopes from any other node are logged and ignored, so a third node that
+/// reuses the correlation id can neither confirm nor fail the transfer.
+async fn next_transfer_event(
+    acks: &mut mpsc::UnboundedReceiver<AgentMeshEnvelope>,
+    target: &str,
+    wait: Duration,
+) -> Result<TransferEvent, Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let envelope = match tokio::time::timeout(wait, acks.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                return Err("Connection closed while awaiting data delivery acknowledgement".into())
             }
-            if !meta.is_dir() {
+            Err(_) => {
                 return Err(format!(
-                    "inbox directory '{}' exists and is not a directory",
-                    path.display()
+                    "Timed out waiting for data delivery acknowledgement after {} ms",
+                    wait.as_millis()
                 )
-                .into());
+                .into())
             }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(inspect_path).map_err(|err| {
-                format!(
-                    "failed to create inbox directory '{}': {err}",
-                    path.display()
-                )
-            })?;
-        }
-        Err(e) => {
-            return Err(format!(
-                "failed to inspect inbox directory '{}': {e}",
-                path.display()
-            )
-            .into());
-        }
-    }
-
-    let canonical = std::fs::canonicalize(inspect_path).map_err(|e| {
-        format!(
-            "failed to canonicalize inbox directory '{}': {e}",
-            path.display()
-        )
-    })?;
-    let canon_meta = std::fs::symlink_metadata(&canonical).map_err(|e| {
-        format!(
-            "failed to inspect canonical inbox directory '{}': {e}",
-            canonical.display()
-        )
-    })?;
-    if canon_meta.file_type().is_symlink() || !canon_meta.is_dir() {
-        return Err(format!(
-            "canonical inbox directory '{}' is not a valid directory",
-            canonical.display()
-        )
-        .into());
-    }
-    Ok(canonical)
-}
-
-fn sanitize_filename_component(raw: &str, max_len: usize) -> String {
-    let filtered: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(max_len)
-        .collect();
-    let collapsed = filtered.replace("..", "_");
-    let trimmed = collapsed.trim_matches('.');
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        "payload".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn persist_payload_atomic(
-    inbox_dir: &Path,
-    corr_id: &str,
-    timestamp_ms: u64,
-    metadata: Option<&HashMap<String, String>>,
-    bytes: &[u8],
-) -> Result<PathBuf, String> {
-    let dir_meta = std::fs::symlink_metadata(inbox_dir).map_err(|e| {
-        format!(
-            "inbox directory '{}' inaccessible: {e}",
-            inbox_dir.display()
-        )
-    })?;
-    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
-        return Err(format!(
-            "inbox directory '{}' is not a real directory",
-            inbox_dir.display()
-        ));
-    }
-
-    let safe_corr = sanitize_filename_component(corr_id, 64);
-    let suffix_hint = metadata
-        .and_then(|m| m.get("filename"))
-        .map(|f| sanitize_filename_component(f, 48));
-
-    let base_name = match suffix_hint {
-        Some(ref hint) => format!("{timestamp_ms}_{safe_corr}_{hint}.bin"),
-        None => format!("{timestamp_ms}_{safe_corr}.bin"),
-    };
-
-    let mut final_name = base_name;
-    let mut final_path = inbox_dir.join(&final_name);
-    if std::fs::symlink_metadata(&final_path).is_ok() {
-        let uniq = &uuid::Uuid::new_v4().to_string()[..8];
-        final_name = match suffix_hint {
-            Some(ref hint) => format!("{timestamp_ms}_{safe_corr}_{hint}_{uniq}.bin"),
-            None => format!("{timestamp_ms}_{safe_corr}_{uniq}.bin"),
         };
-        final_path = inbox_dir.join(&final_name);
-    }
-
-    let mut comps = Path::new(&final_name).components();
-    if !matches!(comps.next(), Some(Component::Normal(_)))
-        || comps.next().is_some()
-        || final_path.parent() != Some(inbox_dir)
-    {
-        return Err("resolved inbox filename failed path-traversal check".to_string());
-    }
-
-    if let Ok(existing_meta) = std::fs::symlink_metadata(&final_path) {
-        if existing_meta.file_type().is_symlink() {
-            return Err("refusing to overwrite symlink in inbox directory".to_string());
+        match envelope {
+            AgentMeshEnvelope::DeliveryAck { from, status, .. } => {
+                if from != target {
+                    warn!(
+                        responder = %from,
+                        target = %target,
+                        "Ignoring a data DeliveryAck that does not come from the target node"
+                    );
+                    continue;
+                }
+                if status == ACK_STATUS_CHUNK_RECEIVED {
+                    return Ok(TransferEvent::ChunkAcked);
+                }
+                if status == ACK_STATUS_DATA_VERIFIED {
+                    return Ok(TransferEvent::Verified(status));
+                }
+                // `target_forwarded` and unknown statuses say nothing about verification.
+            }
+            AgentMeshEnvelope::DeliveryNack {
+                from,
+                error_code,
+                reason,
+                ..
+            } => {
+                if from != target && from != "hub" {
+                    warn!(
+                        responder = %from,
+                        target = %target,
+                        "Ignoring a data DeliveryNack that comes from neither the target nor the hub"
+                    );
+                    continue;
+                }
+                return Ok(TransferEvent::Refused(format!(
+                    "Data delivery rejected ({error_code}): {reason}"
+                )));
+            }
+            _ => {}
         }
     }
-
-    let tmp_name = format!(".tmp_{}.part", uuid::Uuid::new_v4());
-    let tmp_path = inbox_dir.join(&tmp_name);
-    if tmp_path.parent() != Some(inbox_dir) {
-        return Err("resolved temp filename escaped inbox directory".to_string());
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .map_err(|e| format!("failed to create temp inbox file: {e}"))?;
-
-    let write_res = (|| -> std::io::Result<()> {
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    drop(file);
-
-    if let Err(e) = write_res {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("failed to write inbox file: {e}"));
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("failed to finalize inbox file: {e}"));
-    }
-
-    Ok(final_path)
 }
 
 pub struct AgentMeshClient {
@@ -667,8 +320,12 @@ pub struct AgentMeshClient {
     tls_ca_bytes: Option<Vec<u8>>,
     tls_ca_file: Option<PathBuf>,
     inbox_dir: Option<PathBuf>,
+    inbox_quota: InboxQuota,
     tx: Arc<RwLock<Option<mpsc::UnboundedSender<WsMessage>>>>,
     pending: Arc<RwLock<HashMap<CorrelationId, oneshot::Sender<AgentMeshEnvelope>>>>,
+    /// Outgoing data transfers awaiting `DeliveryAck` / `DeliveryNack` envelopes: every one for
+    /// the correlation id is passed on (chunk flow control, then the final verdict).
+    transfers: TransferMap,
     received_payloads: Arc<RwLock<BoundedPayloadBuffer>>,
     executed_count: Arc<AtomicUsize>,
     active_commands: Arc<AtomicUsize>,
@@ -692,8 +349,10 @@ impl AgentMeshClient {
             tls_ca_bytes: None,
             tls_ca_file: None,
             inbox_dir: None,
+            inbox_quota: InboxQuota::default(),
             tx: Arc::new(RwLock::new(None)),
             pending: Arc::new(RwLock::new(HashMap::new())),
+            transfers: Arc::new(Mutex::new(HashMap::new())),
             received_payloads: Arc::new(RwLock::new(BoundedPayloadBuffer::new(
                 DEFAULT_MAX_RECEIVED_PAYLOADS,
                 DEFAULT_MAX_RECEIVED_BYTES,
@@ -709,6 +368,17 @@ impl AgentMeshClient {
     /// atomically before sending `DeliveryAck`.
     pub fn with_inbox_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.inbox_dir = Some(dir.into());
+        self
+    }
+
+    /// Limits what this node writes into its inbox directory (`--inbox-max-mb`,
+    /// `--inbox-max-files`): a payload that would exceed either is refused with
+    /// `DeliveryNack(ERR_INBOX_FULL)`.
+    pub fn with_inbox_quota(mut self, max_bytes: u64, max_files: usize) -> Self {
+        self.inbox_quota = InboxQuota {
+            max_bytes,
+            max_files,
+        };
         self
     }
 
@@ -965,10 +635,12 @@ impl AgentMeshClient {
         let running_flag = self.running.clone();
         let no_shell = self.no_shell;
         let inbox_dir_opt = validated_inbox_dir;
+        let inbox_quota = self.inbox_quota;
+        let transfer_map = self.transfers.clone();
         let mut reg_waiter = Some(reg_tx);
 
         tokio::spawn(async move {
-            let mut reassembler = ChunkReassembler::new();
+            let mut consumer = DataConsumer::new();
             while let Some(msg_res) = ws_read.next().await {
                 let msg = match msg_res {
                     Ok(m) => m,
@@ -1059,229 +731,109 @@ impl AgentMeshClient {
                             }
 
                             AgentMeshEnvelope::DataPayload {
-                                ref version,
                                 ref from,
-                                ref to,
-                                ref payload_type,
-                                sequence_number,
-                                total_chunks,
-                                ref data,
-                                ref checksum_sha256,
-                                ref payload,
                                 ref metadata,
                                 timestamp,
                                 ..
                             } => {
+                                let reply = |env: AgentMeshEnvelope| {
+                                    if let Ok(json_str) = env.to_json_string() {
+                                        let _ = out_tx.send(WsMessage::Text(json_str));
+                                    }
+                                };
                                 let send_nack = |code: &str, reason: String| {
-                                    let nack = AgentMeshEnvelope::new_delivery_nack(
+                                    reply(AgentMeshEnvelope::new_delivery_nack(
                                         client_node_id.clone(),
                                         from,
                                         corr_id.clone(),
                                         code,
                                         reason,
-                                    );
-                                    if let Ok(json_str) = nack.to_json_string() {
-                                        let _ = out_tx.send(WsMessage::Text(json_str));
-                                    }
+                                    ));
                                 };
 
-                                // 1. Strictly decode payload bytes (no silent char truncation).
-                                let raw_bytes: Vec<u8> = if let Some(ref d) = data {
-                                    let mut decoded = Vec::with_capacity(d.len());
-                                    let mut bad_char = false;
-                                    for c in d.chars() {
-                                        match u8::try_from(u32::from(c)) {
-                                            Ok(b) => decoded.push(b),
-                                            Err(_) => {
-                                                bad_char = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if bad_char {
-                                        send_nack(
-                                            ERR_PAYLOAD_CORRUPT,
-                                            "Data payload contains non-Latin-1 code points"
-                                                .to_string(),
-                                        );
+                                // Verify the chunk, and for the last one the whole payload.
+                                let (final_bytes, completed_envelope) = match consumer
+                                    .accept(&envelope, Instant::now())
+                                {
+                                    DataVerdict::Dropped => continue,
+                                    DataVerdict::Rejected { code, reason } => {
+                                        send_nack(code, reason);
                                         continue;
                                     }
-                                    decoded
-                                } else if let Some(ref p) = payload {
-                                    match serde_json::to_vec(p) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            send_nack(
-                                                ERR_PAYLOAD_CORRUPT,
-                                                format!("Failed to encode JSON payload: {e}"),
-                                            );
-                                            continue;
-                                        }
+                                    DataVerdict::ChunkAccepted => {
+                                        // Flow control for the sender, not a receipt.
+                                        reply(AgentMeshEnvelope::new_delivery_ack(
+                                            client_node_id.clone(),
+                                            from,
+                                            corr_id.clone(),
+                                            ACK_STATUS_CHUNK_RECEIVED,
+                                        ));
+                                        continue;
                                     }
-                                } else {
-                                    send_nack(
-                                        ERR_PAYLOAD_CORRUPT,
-                                        "Missing data payload".to_string(),
-                                    );
-                                    continue;
+                                    DataVerdict::Complete { bytes, envelope } => (bytes, envelope),
                                 };
 
-                                // 2. Require and verify SHA-256 checksum before buffering/persisting.
-                                let Some(ref claimed_sha) = checksum_sha256 else {
-                                    send_nack(
-                                        ERR_PAYLOAD_CORRUPT,
-                                        "Missing SHA-256 checksum".to_string(),
-                                    );
-                                    continue;
-                                };
-                                if !verify_sha256(&raw_bytes, claimed_sha) {
-                                    send_nack(
-                                        ERR_PAYLOAD_CORRUPT,
-                                        "SHA-256 checksum mismatch".to_string(),
-                                    );
-                                    continue;
-                                }
-
-                                // 3. Validate chunk sequence metadata.
-                                let effective_total = if total_chunks == 0 && sequence_number == 0 {
-                                    1
-                                } else {
-                                    total_chunks
-                                };
-                                if effective_total == 0
-                                    || sequence_number >= effective_total
-                                    || effective_total > MAX_CHUNKS_PER_TRANSFER
-                                {
-                                    send_nack(
-                                        ERR_PAYLOAD_CORRUPT,
-                                        format!(
-                                            "Invalid chunk metadata: sequence_number={sequence_number}, total_chunks={total_chunks}"
-                                        ),
-                                    );
-                                    continue;
-                                }
-
-                                let total_sha_hint = metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("total_sha256"))
-                                    .map(String::as_str);
-
-                                // 4. Reassemble multi-chunk transfers if needed.
-                                let (final_bytes, completed_envelope) = if effective_total == 1 {
-                                    if let Some(expected_total) = total_sha_hint {
-                                        if !verify_sha256(&raw_bytes, expected_total) {
-                                            send_nack(
-                                                ERR_PAYLOAD_CORRUPT,
-                                                "Payload total_sha256 mismatch".to_string(),
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    (raw_bytes, envelope.clone())
-                                } else {
-                                    match reassembler.insert_chunk(
-                                        from,
-                                        &corr_id,
-                                        sequence_number,
-                                        effective_total,
-                                        total_sha_hint,
-                                        raw_bytes,
-                                    ) {
-                                        Ok(None) => continue,
-                                        Ok(Some(ReassembledPayload {
-                                            bytes: assembled,
-                                            expected_total_sha256: expected_total,
-                                        })) => {
-                                            if let Some(ref total_sha) = expected_total {
-                                                if !verify_sha256(&assembled, total_sha) {
-                                                    send_nack(
-                                                        ERR_PAYLOAD_CORRUPT,
-                                                        "Assembled payload SHA-256 mismatch"
-                                                            .to_string(),
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                            let assembled_hash = compute_sha256(&assembled);
-                                            let assembled_text: String =
-                                                assembled.iter().map(|&b| b as char).collect();
-                                            let assembled_env = AgentMeshEnvelope::DataPayload {
-                                                version: version.clone(),
-                                                correlation_id: corr_id.clone(),
-                                                from: from.clone(),
-                                                to: to.clone(),
-                                                payload_type: payload_type.clone(),
-                                                sequence_number: 0,
-                                                total_chunks: effective_total,
-                                                chunk_size_bytes: assembled.len(),
-                                                data: Some(assembled_text),
-                                                checksum_sha256: Some(assembled_hash),
-                                                payload: None,
-                                                metadata: metadata.clone(),
-                                                timestamp,
-                                            };
-                                            (assembled, assembled_env)
-                                        }
-                                        Err(reason) => {
-                                            send_nack(ERR_PAYLOAD_CORRUPT, reason);
-                                            continue;
-                                        }
-                                    }
-                                };
-
-                                // 5. Persist atomically to --inbox-dir if configured BEFORE ACK.
+                                // Persist atomically to --inbox-dir (under its quota) BEFORE the ACK.
                                 if let Some(ref dir) = inbox_dir_opt {
                                     let dir_clone = dir.clone();
                                     let corr_clone = corr_id.clone();
                                     let meta_clone = metadata.clone();
-                                    let bytes_clone = final_bytes;
                                     let persist_res = tokio::task::spawn_blocking(move || {
                                         persist_payload_atomic(
                                             &dir_clone,
+                                            inbox_quota,
                                             &corr_clone,
                                             timestamp,
                                             meta_clone.as_ref(),
-                                            &bytes_clone,
+                                            &final_bytes,
                                         )
                                     })
                                     .await;
 
-                                    match persist_res {
-                                        Ok(Ok(_saved_path)) => {}
-                                        Ok(Err(err_msg)) => {
-                                            send_nack(ERR_PERSIST_FAILED, err_msg);
-                                            continue;
-                                        }
-                                        Err(join_err) => {
-                                            send_nack(
-                                                ERR_PERSIST_FAILED,
-                                                format!(
-                                                    "Inbox persistence task failed: {join_err}"
-                                                ),
-                                            );
-                                            continue;
-                                        }
+                                    let refusal = match persist_res {
+                                        Ok(Ok(_saved_path)) => None,
+                                        Ok(Err(err)) => Some((err.code, err.reason)),
+                                        Err(join_err) => Some((
+                                            ERR_PERSIST_FAILED,
+                                            format!("Inbox persistence task failed: {join_err}"),
+                                        )),
+                                    };
+                                    if let Some((code, reason)) = refusal {
+                                        consumer.refuse(from, &corr_id);
+                                        send_nack(code, reason);
+                                        continue;
                                     }
                                 }
 
-                                // 6. Buffer in bounded memory queue & send DeliveryAck.
-                                // Only DeliveryAck/DeliveryNack should resolve `pending_map`
-                                // (so self-targeted `from == to` waits for the verified ACK).
-                                received_list.write().await.push(completed_envelope);
-
-                                let ack = AgentMeshEnvelope::new_delivery_ack(
+                                // Buffer in the bounded memory queue, then send the receipt that
+                                // covers the whole payload.
+                                received_list.write().await.push(*completed_envelope);
+                                reply(AgentMeshEnvelope::new_delivery_ack(
                                     client_node_id.clone(),
                                     from,
                                     corr_id.clone(),
-                                    "data_received_verified",
-                                );
-                                if let Ok(json_str) = ack.to_json_string() {
-                                    let _ = out_tx.send(WsMessage::Text(json_str));
-                                }
+                                    ACK_STATUS_DATA_VERIFIED,
+                                ));
                             }
 
-                            AgentMeshEnvelope::DeliveryAck { ref status, .. } => {
-                                if status != "target_forwarded" {
+                            AgentMeshEnvelope::DeliveryAck { .. }
+                            | AgentMeshEnvelope::DeliveryNack { .. } => {
+                                // Our own data transfers see every ACK/NACK of their id.
+                                let transfer = transfer_map
+                                    .lock()
+                                    .ok()
+                                    .and_then(|map| map.get(&corr_id).cloned());
+                                if let Some(transfer) = transfer {
+                                    let _ = transfer.send(envelope);
+                                    continue;
+                                }
+                                let is_intermediate = matches!(
+                                    envelope,
+                                    AgentMeshEnvelope::DeliveryAck { ref status, .. }
+                                        if status == ACK_STATUS_TARGET_FORWARDED
+                                            || status == ACK_STATUS_CHUNK_RECEIVED
+                                );
+                                if !is_intermediate {
                                     if let Some(sender_channel) =
                                         pending_map.write().await.remove(&corr_id)
                                     {
@@ -1291,7 +843,6 @@ impl AgentMeshClient {
                             }
 
                             AgentMeshEnvelope::CommandResponse { .. }
-                            | AgentMeshEnvelope::DeliveryNack { .. }
                             | AgentMeshEnvelope::NodeListResponse { .. }
                             | AgentMeshEnvelope::NodeRegistrationAck { .. } => {
                                 if let Some(sender_channel) =
@@ -1313,6 +864,10 @@ impl AgentMeshClient {
             }
             running_flag.store(false, Ordering::SeqCst);
             pending_map.write().await.clear();
+            // Dropping the channels tells every outgoing transfer that the connection is gone.
+            if let Ok(mut map) = transfer_map.lock() {
+                map.clear();
+            }
         });
 
         match tokio::time::timeout(REGISTRATION_TIMEOUT, reg_rx).await {
@@ -1373,13 +928,21 @@ impl AgentMeshClient {
         Ok(res)
     }
 
-    /// Transmits a data payload (with SHA-256 verification) to a target node without waiting
-    /// for a delivery acknowledgement. Automatically chunks payloads above `DEFAULT_DATA_CHUNK_BYTES`.
+    /// Transmits a data payload (with SHA-256 verification) to a target node. A payload of one
+    /// chunk (up to `DEFAULT_DATA_CHUNK_BYTES`) is sent without waiting for the acknowledgement.
+    /// A larger payload has to be paced by the target's chunk acknowledgements (design 0107 D3),
+    /// so it goes through `send_data_payload_with_ack` and returns once the target verified it.
     pub async fn send_data_payload(
         &self,
         target_id: &str,
         data_bytes: &[u8],
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        if data_bytes.len() > DEFAULT_DATA_CHUNK_BYTES {
+            let receipt = self
+                .send_data_payload_with_ack(target_id, data_bytes, None)
+                .await?;
+            return Ok((receipt.correlation_id, receipt.sha256));
+        }
         let (envelopes, corr_id, hash) = AgentMeshEnvelope::new_data_payload_chunks(
             &self.node_id,
             target_id,
@@ -1410,7 +973,15 @@ impl AgentMeshClient {
     }
 
     /// Transmits a data payload using an explicit chunk size limit and awaits consumer
-    /// verification (`DeliveryAck`) or hub/consumer rejection (`DeliveryNack`).
+    /// verification (`DeliveryAck(data_received_verified)`) or hub/consumer rejection
+    /// (`DeliveryNack`).
+    ///
+    /// At most `DATA_CHUNK_WINDOW` chunks are unacknowledged at any time: the next chunk goes out
+    /// only after the consumer acknowledged an earlier one with `DeliveryAck(chunk_received)`
+    /// (design 0107 D3), so a transfer never fills the hub's queue for the consumer. Only
+    /// acknowledgements whose `from` is `target_id` count (a `DeliveryNack` from the hub counts as
+    /// well); any other is ignored. `timeout_ms` bounds each wait for the next acknowledgement,
+    /// not the whole transfer.
     pub async fn send_data_payload_chunked_with_ack(
         &self,
         target_id: &str,
@@ -1424,44 +995,63 @@ impl AgentMeshClient {
             data_bytes,
             max_chunk_bytes,
         );
-        let total_chunks = envelopes.len() as u32;
+        let envelopes_len = envelopes.len();
+        let total_chunks = u32::try_from(envelopes_len).unwrap_or(u32::MAX);
+        let wait = Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1));
 
-        let (rx_tx, rx_fut) = oneshot::channel::<AgentMeshEnvelope>();
-        self.pending.write().await.insert(corr_id.clone(), rx_tx);
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<AgentMeshEnvelope>();
+        self.transfers
+            .lock()
+            .map_err(|_| "data transfer table is poisoned")?
+            .insert(corr_id.clone(), ack_tx);
+        let _registration = TransferRegistration {
+            transfers: self.transfers.clone(),
+            correlation_id: corr_id.clone(),
+        };
 
-        for env in envelopes {
-            if let Err(e) = self.send_envelope(env).await {
-                self.pending.write().await.remove(&corr_id);
-                return Err(e);
+        let mut chunks_acked = 0usize;
+        // `sent` = chunks already sent before `env`.
+        for (sent, env) in envelopes.into_iter().enumerate() {
+            while sent.saturating_sub(chunks_acked) >= DATA_CHUNK_WINDOW {
+                match next_transfer_event(&mut ack_rx, target_id, wait).await? {
+                    TransferEvent::ChunkAcked => chunks_acked += 1,
+                    TransferEvent::Verified(_) => {
+                        return Err(format!(
+                            "'{target_id}' confirmed the whole payload after only {sent} of {total_chunks} chunks were sent"
+                        )
+                        .into());
+                    }
+                    TransferEvent::Refused(msg) => return Err(msg.into()),
+                }
             }
+            self.send_envelope(env).await?;
         }
 
-        let wait_ms = timeout_ms.unwrap_or(10_000).max(1);
-        match tokio::time::timeout(Duration::from_millis(wait_ms), rx_fut).await {
-            Ok(Ok(AgentMeshEnvelope::DeliveryAck { from, status, .. })) => {
-                Ok(DataDeliveryReceipt {
-                    correlation_id: corr_id,
-                    sha256,
-                    total_chunks,
-                    responder: from,
-                    status,
-                })
-            }
-            Ok(Ok(AgentMeshEnvelope::DeliveryNack {
-                error_code, reason, ..
-            })) => Err(format!("Data delivery rejected ({error_code}): {reason}").into()),
-            Ok(Ok(other)) => {
-                Err(format!("Unexpected delivery response: {}", other.msg_type()).into())
-            }
-            Ok(Err(_)) => {
-                Err("Connection closed while awaiting data delivery acknowledgement".into())
-            }
-            Err(_) => {
-                self.pending.write().await.remove(&corr_id);
-                Err(format!(
-                    "Timed out waiting for data delivery acknowledgement after {wait_ms} ms"
-                )
-                .into())
+        loop {
+            match next_transfer_event(&mut ack_rx, target_id, wait).await? {
+                // Acks of chunks still in the window when the last chunk went out.
+                TransferEvent::ChunkAcked => chunks_acked += 1,
+                TransferEvent::Verified(status) => {
+                    // The consumer acknowledges every chunk but the last with `chunk_received`
+                    // before the receipt for the whole payload, on one socket and so in order. A
+                    // receipt that overtakes them covers only part of the payload (a consumer
+                    // that does not reassemble), so it is no proof of delivery.
+                    let expected_chunk_acks = envelopes_len.saturating_sub(1);
+                    if chunks_acked != expected_chunk_acks {
+                        return Err(format!(
+                            "'{target_id}' confirmed the payload after acknowledging {chunks_acked} of {expected_chunk_acks} earlier chunks; it does not reassemble chunked payloads"
+                        )
+                        .into());
+                    }
+                    return Ok(DataDeliveryReceipt {
+                        correlation_id: corr_id,
+                        sha256,
+                        total_chunks,
+                        responder: target_id.to_string(),
+                        status,
+                    });
+                }
+                TransferEvent::Refused(msg) => return Err(msg.into()),
             }
         }
     }
@@ -1810,7 +1400,9 @@ impl AgentMeshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery::validate_inbox_dir;
     use crate::hub::AgentMeshHub;
+    use crate::protocol::ERR_PAYLOAD_CORRUPT;
 
     #[test]
     fn test_cleartext_token_warning_predicate() {
@@ -2311,87 +1903,6 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         assert!(!is_transient_ws_connect_error(&refused));
     }
 
-    #[test]
-    fn test_validate_inbox_dir_rejects_file_empty_and_symlink() {
-        assert!(validate_inbox_dir(Path::new("")).is_err());
-
-        let tmp = tempfile::tempdir().unwrap();
-        let file_path = tmp.path().join("not-a-dir.txt");
-        std::fs::write(&file_path, b"hello").unwrap();
-        let file_err = validate_inbox_dir(&file_path).expect_err("regular file must be rejected");
-        assert!(
-            file_err.to_string().contains("not a directory"),
-            "{file_err}"
-        );
-
-        #[cfg(unix)]
-        {
-            let real_dir = tmp.path().join("real");
-            std::fs::create_dir(&real_dir).unwrap();
-            let link_dir = tmp.path().join("link_inbox");
-            std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
-            let link_err = validate_inbox_dir(&link_dir).expect_err("symlink must be rejected");
-            assert!(link_err.to_string().contains("symlink"), "{link_err}");
-
-            // Trailing path separator(s) on a symlink must still be rejected as a symlink.
-            let trailing_link = PathBuf::from(format!("{}/", link_dir.display()));
-            let trailing_err = validate_inbox_dir(&trailing_link)
-                .expect_err("trailing-slash symlink must be rejected");
-            assert!(
-                trailing_err.to_string().contains("symlink"),
-                "{trailing_err}"
-            );
-
-            let multi_trailing_link = PathBuf::from(format!("{}///", link_dir.display()));
-            let multi_err = validate_inbox_dir(&multi_trailing_link)
-                .expect_err("multi-trailing-slash symlink must be rejected");
-            assert!(multi_err.to_string().contains("symlink"), "{multi_err}");
-
-            // Broken symlink with trailing slash must also be rejected as a symlink.
-            let broken_link = tmp.path().join("broken_link");
-            std::os::unix::fs::symlink(tmp.path().join("does-not-exist"), &broken_link).unwrap();
-            let broken_trailing = PathBuf::from(format!("{}/", broken_link.display()));
-            let broken_err = validate_inbox_dir(&broken_trailing)
-                .expect_err("broken trailing-slash symlink must be rejected");
-            assert!(broken_err.to_string().contains("symlink"), "{broken_err}");
-        }
-
-        // Root `/` normalization keeps `/` intact.
-        assert_eq!(Path::new("/").components().as_path(), Path::new("/"));
-
-        let new_dir = tmp.path().join("nested").join("inbox");
-        let validated = validate_inbox_dir(&new_dir).expect("new dir should be created");
-        assert!(validated.is_dir());
-    }
-
-    #[test]
-    fn test_persist_payload_atomic_traversal_binary_and_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let inbox = validate_inbox_dir(tmp.path().join("inbox").as_path()).unwrap();
-
-        let mut meta = HashMap::new();
-        meta.insert("filename".to_string(), "../../etc/passwd".to_string());
-        let binary = b"\x00\x01\x80\xffhello\xfe";
-        let saved_bin =
-            persist_payload_atomic(&inbox, "../evil/corr", 12345, Some(&meta), binary).unwrap();
-        assert_eq!(saved_bin.parent(), Some(inbox.as_path()));
-        assert_eq!(std::fs::read(&saved_bin).unwrap(), binary);
-
-        let saved_empty = persist_payload_atomic(&inbox, "empty-corr", 12346, None, b"").unwrap();
-        assert_eq!(saved_empty.parent(), Some(inbox.as_path()));
-        assert_eq!(std::fs::read(&saved_empty).unwrap(), b"");
-
-        // Ensure no hidden .tmp_* files remain
-        let entries: Vec<_> = std::fs::read_dir(&inbox)
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(entries.len(), 2);
-        for e in entries {
-            assert!(!e.file_name().to_string_lossy().starts_with(".tmp_"));
-        }
-    }
-
     #[tokio::test]
     async fn test_bounded_received_payloads_cap() {
         let hub = AgentMeshHub::new();
@@ -2550,99 +2061,5 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         sender.close().await;
         consumer.close().await;
         hub.stop().await;
-    }
-
-    #[test]
-    fn test_chunk_reassembler_aggregate_byte_cap_evicts_oldest_fifo() {
-        // Allow up to 10 assemblies, 100 bytes per assembly, and 120 bytes aggregate across all.
-        let mut reassembler = ChunkReassembler::with_limits(10, 100, 120);
-
-        // Insert incomplete 50-byte chunk 0 for transfers "t1" and "t2" (total = 100 <= 120).
-        assert!(reassembler
-            .insert_chunk("peer", "t1", 0, 2, None, vec![b'1'; 50])
-            .unwrap()
-            .is_none());
-        assert!(reassembler
-            .insert_chunk("peer", "t2", 0, 2, None, vec![b'2'; 50])
-            .unwrap()
-            .is_none());
-        assert_eq!(reassembler.inflight.len(), 2);
-        assert_eq!(reassembler.total_inflight_bytes, 100);
-
-        // Inserting "t3" (50 bytes) would hit 150 > 120, so oldest "t1" must be evicted FIFO.
-        assert!(reassembler
-            .insert_chunk("peer", "t3", 0, 2, None, vec![b'3'; 50])
-            .unwrap()
-            .is_none());
-        assert!(!reassembler
-            .inflight
-            .contains_key(&("peer".to_string(), "t1".to_string())));
-        assert!(reassembler
-            .inflight
-            .contains_key(&("peer".to_string(), "t2".to_string())));
-        assert!(reassembler
-            .inflight
-            .contains_key(&("peer".to_string(), "t3".to_string())));
-        assert_eq!(reassembler.total_inflight_bytes, 100);
-
-        // Adding chunk 1 (40 bytes) to "t3" would reach 140 > 120, so oldest remaining "t2"
-        // is evicted FIFO and "t3" completes cleanly, returning total_inflight_bytes to 0.
-        let assembled = reassembler
-            .insert_chunk("peer", "t3", 1, 2, None, vec![b'4'; 40])
-            .unwrap()
-            .expect("t3 should complete after second chunk");
-        assert_eq!(assembled.bytes.len(), 90);
-        assert!(reassembler.inflight.is_empty());
-        assert_eq!(reassembler.total_inflight_bytes, 0);
-    }
-
-    #[test]
-    fn test_chunk_reassembler_prune_expired_ttl() {
-        let mut reassembler = ChunkReassembler::new().with_ttl(Duration::from_millis(20));
-
-        // Insert incomplete chunk 0 for "stale" (32 bytes).
-        assert!(reassembler
-            .insert_chunk("peer", "stale", 0, 2, None, vec![b's'; 32])
-            .unwrap()
-            .is_none());
-        assert_eq!(reassembler.inflight.len(), 1);
-        assert_eq!(reassembler.total_inflight_bytes, 32);
-
-        // Before TTL elapses, prune_expired must retain the assembly.
-        reassembler.prune_expired(Instant::now());
-        assert_eq!(reassembler.inflight.len(), 1);
-        assert_eq!(reassembler.total_inflight_bytes, 32);
-
-        // Sleep past the 20ms TTL, then insert a fresh chunk; insert_chunk calls prune_expired
-        // and must drop the expired "stale" assembly and reclaim its 32 bytes.
-        std::thread::sleep(Duration::from_millis(35));
-        assert!(reassembler
-            .insert_chunk("peer", "fresh", 0, 2, None, vec![b'f'; 16])
-            .unwrap()
-            .is_none());
-        assert!(!reassembler
-            .inflight
-            .contains_key(&("peer".to_string(), "stale".to_string())));
-        assert!(reassembler
-            .inflight
-            .contains_key(&("peer".to_string(), "fresh".to_string())));
-        assert_eq!(reassembler.inflight.len(), 1);
-        assert_eq!(reassembler.total_inflight_bytes, 16);
-
-        // Sending chunk 1 for "stale" after expiry starts a new assembly rather than completing
-        // with the expired chunk 0.
-        assert!(reassembler
-            .insert_chunk("peer", "stale", 1, 2, None, vec![b'x'; 8])
-            .unwrap()
-            .is_none());
-        assert_eq!(reassembler.total_inflight_bytes, 24);
-
-        // Direct prune_expired with a timestamp past TTL clears everything and zeroes byte count.
-        let future = Instant::now()
-            .checked_add(Duration::from_millis(35))
-            .unwrap();
-        reassembler.prune_expired(future);
-        assert!(reassembler.inflight.is_empty());
-        assert_eq!(reassembler.total_inflight_bytes, 0);
     }
 }

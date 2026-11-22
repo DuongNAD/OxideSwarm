@@ -24,6 +24,28 @@ pub const ERR_NODE_UNAVAILABLE: &str = "ERR_NODE_UNAVAILABLE";
 pub const ERR_NODE_NOT_FOUND: &str = "ERR_NODE_NOT_FOUND";
 pub const ERR_PAYLOAD_CORRUPT: &str = "ERR_PAYLOAD_CORRUPT";
 pub const ERR_PERSIST_FAILED: &str = "ERR_PERSIST_FAILED";
+/// A consumer refused a `DataPayload` because its `--inbox-dir` quota (bytes or files) is used up.
+pub const ERR_INBOX_FULL: &str = "ERR_INBOX_FULL";
+
+/// `DeliveryAck` status a consumer sends for each verified chunk of a multi-chunk transfer that is
+/// not complete yet. It is flow control for the sender (design 0107 D3), never a delivery receipt.
+pub const ACK_STATUS_CHUNK_RECEIVED: &str = "chunk_received";
+/// `DeliveryAck` status a consumer sends once the whole payload (every chunk) matched its SHA-256
+/// and, with `--inbox-dir`, was persisted. Only this status completes a data transfer.
+pub const ACK_STATUS_DATA_VERIFIED: &str = "data_received_verified";
+/// `DeliveryAck` status the hub sends when it queued a command for its target.
+pub const ACK_STATUS_TARGET_FORWARDED: &str = "target_forwarded";
+
+/// Most chunks of one transfer a sender keeps unacknowledged (design 0107 D3). Together with
+/// `max_chunk_json_bytes` it bounds what one transfer can put into the hub's queue for the consumer.
+pub const DATA_CHUNK_WINDOW: usize = 2;
+
+/// Upper bound of the JSON text of one `DataPayload` carrying `chunk_bytes` raw bytes: each byte is
+/// one Latin-1 character, which JSON writes in at most 6 bytes (`\u00XX` for control characters),
+/// plus a fixed allowance for the envelope fields.
+pub const fn max_chunk_json_bytes(chunk_bytes: usize) -> usize {
+    chunk_bytes.saturating_mul(6).saturating_add(4096)
+}
 
 /// Default chunk size threshold (1 MiB) above which `DataPayload` transfers split into multiple
 /// ordered chunks. Kept above 256 KiB so single-chunk transfers up to 256 KiB and Python
