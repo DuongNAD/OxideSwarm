@@ -758,6 +758,10 @@ mod output_stat_error_tests {
             ".OXIDESWARM_CHECKPOINT/secret.txt",
             "./.Oxideswarm_Checkpoint/secret.txt",
             ".\\.Oxideswarm_Checkpoint\\secret.txt",
+            ".oxideswarm_chec\u{212a}point/secret.txt",
+            "./.oxideswarm_chec\u{212a}point/secret.txt",
+            ".oxide\u{017f}warm_checkpoint/secret.txt",
+            ".\\.oxide\u{017f}warm_checkpoint\\secret.txt",
         ] {
             let err = runner
                 .harvest_output_artifacts_from_dir(

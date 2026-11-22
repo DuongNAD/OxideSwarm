@@ -85,9 +85,10 @@ pub use capture::read_bounded_stream;
 #[cfg(any(feature = "3d", test))]
 pub(crate) use capture::read_output_file;
 pub(crate) use capture::{append_note, cancellation, check_cancelled_now};
+#[cfg(test)]
+pub(crate) use checkpoint::PROCESS_CHECKPOINT_DIR_NAME;
 pub(crate) use checkpoint::{
     is_reserved_checkpoint_rel, DEFAULT_CHECKPOINT_POLL_INTERVAL, MIN_CHECKPOINT_POLL_INTERVAL,
-    PROCESS_CHECKPOINT_DIR_NAME,
 };
 #[allow(unused_imports)]
 pub(crate) use supervise::WorkspaceProcessCtx;

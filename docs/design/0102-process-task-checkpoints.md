@@ -47,7 +47,7 @@ Process workloads (`Command`, `ShellScript`, and `Workspace` tasks) receive a pr
 ### D3: `--output` & artifact exclusion (`crates/worker/src/staging.rs`, `crates/worker/src/runner/capture.rs`)
 
 - `staging::walk` skips `.oxideswarm_checkpoint` (never descending or collecting files, even under `--output '**/*'`).
-- `is_reserved_checkpoint_rel` normalizes leading `./` / `.\` segments and compares the first path segment ASCII case-insensitively (`eq_ignore_ascii_case`), preventing bypasses on case-insensitive APFS/NTFS volumes. `staging::collect_outputs_inner` refuses literal patterns targeting `.oxideswarm_checkpoint` and skips wildcard patterns prefixed with it; `staging::describe_sandbox_root` omits `.oxideswarm_checkpoint` case-insensitively from missing-output diagnostics.
+- `is_reserved_checkpoint_rel` normalizes leading `./` / `.\` segments and compares the first path segment ASCII case-insensitively (`eq_ignore_ascii_case`) plus Unicode case/NFD-folded via `fold_blob_path` for non-ASCII segments (blocking e.g. `U+212A` `K` and `U+017F` `ſ` on APFS/NTFS), preventing bypasses on case-insensitive APFS/NTFS volumes. `staging::collect_outputs_inner` refuses literal patterns targeting `.oxideswarm_checkpoint` and skips wildcard patterns prefixed with it; `staging::describe_sandbox_root` uses `is_reserved_checkpoint_rel` to omit `.oxideswarm_checkpoint` (and its case/Unicode-folded variants) from missing-output diagnostics.
 - `capture::harvest_output_artifacts_from_dir` rejects `expected_outputs` entries targeting `.oxideswarm_checkpoint` (including mixed-case and `./` forms).
 
 ### D4: Pre-spawn restore, periodic polling, final emission & graceful drain

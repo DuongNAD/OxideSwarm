@@ -62,8 +62,8 @@ pub(crate) const DEFAULT_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_sec
 /// Minimum clamped poll interval so `tokio::time::interval` never panics on zero.
 pub(crate) const MIN_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Returns `true` if `rel` (even with leading `./`, `.\`, or case variations on APFS/NTFS)
-/// targets or lies under `.oxideswarm_checkpoint`.
+/// Returns `true` if `rel` (even with leading `./`, `.\`, or ASCII/Unicode case-folding
+/// variations on APFS/NTFS) targets or lies under `.oxideswarm_checkpoint`.
 pub(crate) fn is_reserved_checkpoint_rel(rel: &str) -> bool {
     let normalized = rel.trim().replace('\\', "/");
     let first = normalized
@@ -73,6 +73,7 @@ pub(crate) fn is_reserved_checkpoint_rel(rel: &str) -> bool {
         #[cfg(windows)]
         let seg = seg.trim_end_matches([' ', '.']);
         seg.eq_ignore_ascii_case(PROCESS_CHECKPOINT_DIR_NAME)
+            || (!seg.is_ascii() && fold_blob_path(seg) == PROCESS_CHECKPOINT_DIR_NAME)
     })
 }
 
@@ -1324,6 +1325,15 @@ mod tests {
             "././.OXIDESWARM_CHECKPOINT/a.txt",
             ".\\.Oxideswarm_Checkpoint\\secret_cp.bin",
             "/.OXIDESWARM_CHECKPOINT/secret.bin",
+            ".oxideswarm_chec\u{212a}point",
+            ".oxideswarm_chec\u{212a}point/*",
+            ".oxideswarm_chec\u{212a}point/secret_cp.bin",
+            "./.oxideswarm_chec\u{212a}point/secret_cp.bin",
+            "/.oxideswarm_chec\u{212a}point/secret.bin",
+            ".oxide\u{017f}warm_checkpoint",
+            ".oxide\u{017f}warm_checkpoint/*",
+            ".oxide\u{017f}warm_checkpoint/secret_cp.bin",
+            ".\\.oxide\u{017f}warm_checkpoint\\sub\\nested.bin",
         ] {
             assert!(
                 is_reserved_checkpoint_rel(blocked),

@@ -395,7 +395,7 @@ async fn test_feat5_cli_mixed_case_and_dot_slash_output_excludes_checkpoint_dir(
         "cli-case-w must register"
     );
 
-    // 1. Mixed-case and `./`-normalized wildcards must NOT leak checkpoint files.
+    // 1. Mixed-case, Unicode case-folded, and `./`-normalized wildcards must NOT leak checkpoint files.
     let out_wild = tmp.path().join("out_wild");
     std::fs::create_dir_all(&out_wild).unwrap();
     let addr_1 = addr.clone();
@@ -413,6 +413,10 @@ async fn test_feat5_cli_mixed_case_and_dot_slash_output_excludes_checkpoint_dir(
             ".OXIDESWARM_CHECKPOINT/*",
             "--output",
             "./.Oxideswarm_Checkpoint/**",
+            "--output",
+            ".oxideswarm_chec\u{212a}point/*",
+            "--output",
+            ".oxide\u{017f}warm_checkpoint/*",
             "--output",
             "out.txt",
             "--output-dir",
@@ -439,10 +443,13 @@ async fn test_feat5_cli_mixed_case_and_dot_slash_output_excludes_checkpoint_dir(
         "only out.txt may be collected into {out_wild:?}"
     );
 
-    // 2. Literal mixed-case & `./`-normalized `--output` targeting checkpoint dir must fail.
+    // 2. Literal mixed-case, Unicode case-folded, & `./`-normalized `--output` targeting checkpoint dir must fail.
     for literal in [
         ".OXIDESWARM_CHECKPOINT/secret_cp.bin",
         "./.Oxideswarm_Checkpoint/secret_cp.bin",
+        ".oxideswarm_chec\u{212a}point/secret_cp.bin",
+        "./.oxideswarm_chec\u{212a}point/secret_cp.bin",
+        ".oxide\u{017f}warm_checkpoint/secret_cp.bin",
     ] {
         let addr_2 = addr.clone();
         let home_2 = home.clone();
