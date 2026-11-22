@@ -178,6 +178,8 @@ Recounted on 2026-11-21 after LV-10 (steps 1–3) and PROTO-5 Partial: 247 items
 Recounted on 2026-11-21 after SCHED-5 Implemented (plus SCHED-4c and SCHED-4d implemented while SCHED-4 stays Partial pending live 2-machine hardware batch): 247 items, 173 Implemented, 23 Partial and 51 Planned; 25 open items are In and 49 are Out.
 Recounted on 2026-11-22 after Wave 2 (`FEAT-5` and `MESH-2` Implemented and archived, `AX-1` Partial, `TEST-41` and `TEST-61` updated): 247 items, 175 Implemented, 24 Partial and 48 Planned; 25 open items are In and 47 are Out.
 Recounted on 2026-11-22 after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented and archived; `AX-2` Partial): 247 items, 178 Implemented, 24 Partial and 45 Planned; 25 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-85 was added (TEST-56 loses its `Line` value now that pull request 361 is merged): 248 items, 178 Implemented, 24 Partial and 46 Planned; 26 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-23, TEST-61, SEC-16 and CI-1 were closed on the owner's delegation: 248 items, 182 Implemented, 20 Partial and 46 Planned; 22 open items are In and 44 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -228,10 +230,10 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented |  | 181 |
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
-| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
+| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Implemented |  | 305, 357 |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374, (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | In | (design 0065) |
-| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Partial | In | 382 (open), (design 0065) |
+| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Partial | In | 382, (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Implemented |  | 283, 358 (open) |
@@ -261,7 +263,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
-| TEST-56 | Cut the time of `workspace tests (windows-latest)` without losing coverage | P1 | S | TEST-29 |  | Implemented | In | 361 (open) |
+| TEST-56 | Cut the time of `workspace tests (windows-latest)` without losing coverage | P1 | S | TEST-29 |  | Implemented |  | 361 |
 | TEST-58 | Find why the keep_sandboxes sweep test fails on macOS | P2 | S |  |  | Implemented |  | 366 (open) |
 | TEST-57 | m2 capability stress test: wait for reconnects by condition, not a fixed 1.8 s window | P2 | S |  |  | Implemented |  | 365 (open) |
 | TEST-59 | Zero-duration task test: drop the 100 ms wall-clock window | P2 | S |  |  | Implemented |  | 365 (open) |
@@ -271,7 +273,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-64 | worker lib process_tree_tests: wait for partial stdout by condition before cancelling | P2 | S |  |  | Implemented |  | 388 (open) |
 | TEST-65 | test_sec5_hardened_runner: condition waits for short-task pipe EOF and setsid survivor kill | P2 | S |  |  | Implemented |  | 388 (open) |
 | TEST-66 | worker_cluster_auth: drop wall-clock upper bounds on handshake timeout and shutdown tests | P2 | S |  |  | Implemented |  | 387 (open) |
-| TEST-61 | macOS: hard-link isolation test control printed empty stdout | P2 | S |  |  | Partial | In | 392 |
+| TEST-61 | macOS: hard-link isolation test control printed empty stdout | P2 | S |  |  | Implemented |  | 392 |
 | TEST-67 | Campaign driver tests flake on Windows log appends and macOS 0.2 s submit timeout | P1 | S |  |  | Implemented |  | 394 (open) |
 | TEST-79 | scale1_simulated_worker: widen 5-20 s burst, reconnect, and drain deadlines to 60 s | P2 | S |  |  | Implemented |  | 401 (open) |
 | TEST-78 | rendezvous_discovery_e2e: widen 10-30 s command and registration deadlines to 60 s | P2 | S |  |  | Implemented |  | 400 (open) |
@@ -279,12 +281,13 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-77 | e2e_cluster: widen 3-5 s worker and wait_task deadlines to 60 s | P2 | S |  |  | Implemented |  | 399 (open) |
 | TEST-73 | m4_scheduling: prove batch concurrency with a barrier and drop 1.2 s / 1.5 s wall-clock windows | P2 | S |  |  | Implemented |  | 397 (open) |
 | TEST-68 | gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines | P2 | S |  |  | Implemented |  | 396 (open) |
-| TEST-69 | Windows AppContainer isolation tests wait too briefly under load | P1 | S |  |  | Partial | In | 403 (open) |
+| TEST-69 | Windows AppContainer isolation tests wait too briefly under load | P1 | S |  |  | Partial | In | 403 |
 | TEST-80 | test_sec5_hardened_runner: drop 5 s wall-clock upper bounds in oversized sparse output test | P2 | S |  |  | Implemented |  | 402 (open) |
 | TEST-81 | Test masters keep 85 % host-CPU backpressure, stalling queued tasks under load | P1 | M |  |  | Implemented |  | 404 (open) |
 | TEST-82 | `rusty_grid_worker`: replace wall-clock upper bounds and bound `scale1` status queries | P2 | M |  |  | Implemented |  | 405 (open) |
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
-| TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 (open) |
+| TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
+| TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -381,7 +384,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented |  | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
 | PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Partial | Out | (design 0083) |
-| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
+| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Implemented |  | 358 |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
@@ -398,7 +401,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-33 | macOS: the lifeline supervisor closes descriptors one by one up to the soft limit for every task | P2 | S |  |  | Implemented |  | 367 (open) |
 | BUG-34 | Clean up leftover blob-cache `.part` files of a killed worker without breaking shared sandbox bases | P2 | S |  |  | Implemented |  | 391 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
-| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Implemented |  | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Implemented |  | 323, 325, 331, (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | study kit ready (PR 393), (design 0059) |
@@ -447,66 +450,6 @@ These items remove ways to lose data or to run code without authorisation.
 ## Phase 2: make the tests trustworthy
 
 The full suite must pass on a clean machine before CI can require it.
-
-### TEST-23: Find why `master_restart_recovery` loses `out.txt` on Windows
-
-- **Evidence:** CI run `42817398752`, job `129833857865`, "workspace tests (windows-latest)", on
-  pull request 206 at `e1fcf70` (2026-11-10). That pull request changes only `docs/`.
-  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` panicked at
-  `tests/master_restart_recovery.rs:575` with "t_run must succeed". The result of `t_run` had
-  `exit_code: 1`, an empty `stdout`, `execution_time_ms: 746`, no outputs, and the error
-  "Output files: the task did not produce 'out.txt'". The same job passed on `master` `0354b28`,
-  on the two earlier heads of the pull request (`0266d8e`, `7af1f4d`) and on the rerun of the
-  failed job (attempt 2). Linux and macOS passed in the same run. Seen once.
-- **Problem:** The cause is not known. In the test, `t_run` starts on `w1` under the first master
-  and waits for a gate file. The first master shuts down, a second one starts on the same address
-  and `--state-dir`, `w1` reconnects, and the second master adopts `t_run` as Running. The test
-  then writes the gate file and expects `t_run` to finish with the declared output `out.txt`.
-  On Windows the task is the PowerShell command built by `gated_marker_task`, which writes the
-  file with `[System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY)` and the relative name
-  `out.txt`. Two explanations fit the message, and neither has been tested:
-  1. The test is at fault: the PowerShell command ends without writing the file where the worker
-     looks for it (the Unix variant uses a shell redirect, the Windows one a .NET call).
-  2. The product is at fault: after the worker is adopted by a restarted master, output
-     collection reads the sandbox before the file is there, or reads another sandbox. That would
-     be a defect in the recovery path of FEAT-1, not in the test.
-- **Do:**
-  1. On Windows, run `cargo test -p rusty_grid_master --test master_restart_recovery --locked`
-     in a loop under CPU load until it fails, and keep the worker and master logs of each run.
-  2. For a failing run, record the exit code of PowerShell itself, the sandbox path the worker
-     collected from, whether `out.txt` exists anywhere under the sandbox base, how many lines
-     the marker file holds, and the time from assignment to the gate file (compare it with
-     `execution_time_ms`).
-  3. If the test is at fault, change only the test, and keep every assertion. If the product is
-     at fault, follow rule 4: add a test that fails without the fix, then fix the product.
-- **Done when:** The cause is written in the status log, and the test passes 50 times in a row
-  on Windows under CPU load. If production code changed, a regression test covers the cause.
-
-- **Note (2026-11-16):** The failed result narrows the search. The worker sets `exit_code` 1
-  only when a process that exited 0 misses a declared output, and it appends its note to the
-  process's own stderr (`crates/worker/src/runner.rs:1776-1786` and `append_note` at `0354b28`).
-  The result held that note and nothing else, and `error` held only the output message. So
-  PowerShell ran the whole script, exited 0 and printed nothing: no command in it failed. Either
-  `$env:OUT_FILE` was empty in that run, or `WriteAllText` wrote `out.txt` relative to a .NET
-  current directory other than the directory the worker read. 746 ms is short for a run that spans
-  PowerShell start-up, a master restart and a reconnect, and a second run of `t_run` that started
-  after the gate was written would fit it. Step 6 of the test cannot tell the two apart: adoption
-  and a new assignment to `w1` both show `Running` with `active_tasks == 1`. A failing run should
-  therefore also record the number of `run` lines in the marker file (two means a second run), the
-  worker log line "Task assigned again while its previous run is still active"
-  (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
-  `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
-
-- **Lead (2026-11-17, pull request 288):** looping the whole `master_restart_recovery` binary on macOS under CPU load
-  (140 runs), `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` failed 9 times
-  ("uploading output files to the master failed: blob transfer failed: the connection to the master ended") and
-  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` once (`out.txt: No such file or
-  directory`, then "Output files: cannot read the task sandbox": the task sandbox was gone). Unverified hypothesis: the
-  tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
-  takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
-
-- **Implemented (2026-11-17, pull request 305, [design 0091](design/0091-restart-recovery-races.md)), Partial:** On macOS, with eight copies of the tests in parallel and twenty busy loops, the unchanged code failed `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` 3 times in 192 runs ("the connection to the master ended"). The cause is not the shared sandbox base: when the connection ended during the upload of a finished task's outputs, the worker overwrote the buffered result with the failure of that upload, and the resume sent the failure. The worker now keeps the buffered result when the session ended (0 failures in 128 runs of the same two tests). Separately, a real race in the sandbox lock was found and fixed: `open_and_try_lock_task` could keep a lock on a lock file that a sweep had just unlinked, after which a second opener could lock a fresh file, so a sweep could remove the sandbox of a running task (`sandbox::tests::test_task_lock_taken_on_an_unlinked_file_is_not_kept` fails without the fix). That race was reproduced with a hook, not in the loops, so it is not shown to be the cause of the `out.txt` failure on Windows or of the one "sandbox gone" run seen in the lead. Looping the whole binary with the fix (48 runs, twelve busy loops) showed no `out.txt` or upload failure, only two 5-second `wait_for` timeouts in other steps under that load. TEST-23 stays open until the Windows job has passed 50 runs in a row; the Windows cause is still unknown.
-- **Partial (2026-11-19, pull request 357):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1`) in 200 completed runs (0 failures) of `cargo test -p rusty_grid_master --test master_restart_recovery --locked` under 12 busy loops on 20 logical cores (about 60 %): batch 1 passed 50/50 at `979ec2c` in 1,689.1 s; an earlier 24-spinner attempt stalled on run 51 (0 runs completed, 0 failures) before pausing for BENCH-8, and a restarted batch-2 attempt with 12 spinners was stopped at 18:28:25Z for BENCH-8 after 0 completed runs (0 failures); batches 2 to 4 then ran 150 unbroken consecutive runs (3 batches of 50) at `b079dc3` in 1,429.0 s, 1,302.1 s and 1,309.0 s (5,729.2 s across the 4 measured batches; 0 `out.txt` failures and 0 test failures). The 200 passed runs therefore span the BENCH-8 interruption and two commits (`979ec2c` and `b079dc3`, whose diff touched no `crates/master`, `crates/worker` or `tests/master_restart_recovery.rs` files; 150 runs are unbroken on `b079dc3`). Running 24 normal-priority CPU spinners on 20 logical cores starved the worker's default `BELOW_NORMAL_PRIORITY_CLASS` child task processes and stalled progress without producing an `out.txt` failure, whereas 12 busy loops on 20 logical cores (about 60 %) allowed child tasks to schedule. Because zero runs failed in 200 completed loops, no Windows cause is guessed here.
 
 ### TEST-24: Test large transfers between machines
 
@@ -636,14 +579,25 @@ The full suite must pass on a clean machine before CI can require it.
   Static checks in `tests/test_endurance_harness.py` (`EnduranceCiWorkflowTests`) verify trigger,
   pins, commands, and upload step. Stays Partial until green on two scheduled runs.
 
-### TEST-61: macOS: hard-link isolation test control printed empty stdout
+### TEST-85: Windows: the `submit --type compile` runtime test times out after 60 s
 
-- **Evidence:** Failed once on `macos-latest` in pull request 380 (docs-only commit `ad915a9b`, run `44537862155` attempt 1, job `135607992314`, 2026-11-19 ~14:23 UTC; attempt 2 passed): `macos::test_a_hard_link_to_a_secret_does_not_expose_its_content` (`crates/worker/tests/test_feat3_os_isolation.rs:1757`) panicked at its `--isolation off` control step 45 ms after the binary started with `the control must read the linked secret: ` and empty stdout (not even `END`).
-- **Problem:** The control task printed nothing at all even under `--isolation off`, and the assertion omitted `exit_code`, `error`, `execution_time_ms`, and `stderr`, leaving unknown whether the process exited non-zero, failed to spawn, failed sandbox setup, or hit an fd/pipe race after `BUG-33` (pull request 367, `close_open_fds_macos`).
-- **Do:** Capture full `TaskResult` diagnostics when the control prints empty stdout; loop the test (50 runs) and its binary (20 runs) with and without 6 CPU busy loops; prove whether `BUG-33`'s `close_open_fds_macos` path can race with the task's stdout pipe or spawn; fix any defect or harden diagnostics the `TEST-60` way.
-- **Done when:** `BUG-33` pipe/spawn safety is proven, diagnostics capture any future failure, and the root cause is fixed or left for the owner's decision after non-reproduction under loaded loops.
-- **Partial (2026-11-19, pull request 392):** Not reproduced locally on Apple M5 (10 cores, private `HOME`, `origin/master` `8641b67d`): `0/140` failures across `50/50` alone unloaded (`49.15 s`), `50/50` alone under 6 Python busy loops (`77.32 s`), `20/20` full `test_feat3_os_isolation` unloaded (`547.76 s`), and `20/20` full `test_feat3_os_isolation` under 6 busy loops (`628.09 s`), plus `5/5` in the 5 full loaded workspace runs on `origin/master`. Proof on `BUG-33` (`crates/worker/src/process_tree.rs`): `close_open_fds_macos(&[read_raw])` runs solely inside the double-forked `setsid()` grandchild `child_c` (separate OS PID and XNU descriptor table), skips `read_raw` via `fd_is_kept`, and closes only `child_c`'s inherited duplicates, so it cannot close or alter `child_a`'s stdout write end or the worker's pipe read end; a new 128-spawn 8-worker multithreaded stress test (`process_tree::tests::test_concurrent_short_spawns_preserve_piped_stdout_under_supervisor_fd_close`, with 64 extra `FD_CLOEXEC` descriptors open) passes `128/128` exact stdout captures. Fixes landed: (1) `PreparedUnix::drop` (`crates/worker/src/process_tree.rs`, sharing `imp::dismiss_lifeline` with `TreeInner::kill_and_release_once`) writes `b"0"` before closing `lifeline_write` when dropped unattached (e.g., failed spawn after `pre_exec` forked `child_c`), preventing an orphan supervisor from running `killpg` and a process-table sweep (`test_prepared_unix_drop_dismisses_lifeline_without_attach`); (2) `read_into_capture` (`crates/worker/src/runner/capture.rs`) warns on non-`EINTR` stream read errors; (3) `format_result_diag` (`crates/worker/tests/test_feat3_os_isolation.rs`) reports `exit_code`, `error`, `execution_time_ms`, `stdout`, and `stderr` on `test_a_hard_link_to_a_secret_does_not_expose_its_content` and sibling control assertions. Post-fix verification on `mac/test-61-hardlink-control-empty-stdout`: `process_tree` `23/23` (`2.20 s`), `runner::process_tree_tests` `13/13` (`2.08 s`), `test_feat3_os_isolation` `28/28` + `1` ignored (`27.02 s`), `test_sec5_hardened_runner` `11/11` (`2.58 s`), and under 6 Python busy loops `20/20` `process_tree::tests` (`50.59 s`, `0.98–2.07 s`) and `20/20` `test_a_hard_link_to_a_secret_does_not_expose_its_content` (`36.82 s`, `0.58–1.20 s`). Closing `TEST-61` without a reproduced cause (keeping diagnostics for any future CI hit) stays the owner's decision.
-- **Partial (2026-11-22, Wave 2 M1 verification of merged pull request 392 / `a7ce9e9d`):** Independently re-verified on macOS (`prod/backlog-completion-wave2`) with `154/154` hard-link isolation runs (`50/50` sequential + `80/80` parallel `8x10` + `24/24` under `1,150` inherited FDs, `0` empty-stdout flakes), `process_tree::tests` (`10/10` + `30/30` parallel + `8/8` under `1,150` inherited FDs, `0` orphans), `test_feat3_os_isolation` (`28/28` + `1` ignored), and `tests/test_wave2_e2e.py` (`F1` + Tiers 3–4). Stays `Partial | In` awaiting the owner's decision to close without a reproduced cause for the original pull request 380 CI hit.
+- **Evidence:** CI run `44747726996` (push of pull request 407 to `master`, 2026-11-20 13:49 UTC), job
+  `gpu-wgpu (windows-latest)` (`136327278116`), step `cargo test -p rusty_grid_cli --lib --features gpu-wgpu`:
+  `cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo`
+  (`crates/cli/src/cli_app/runtime_tests.rs`) printed "Timed out after 60s waiting for task ... to complete" and
+  panicked at the assertion "submit --type compile must succeed" (`ExitCode(1)`). 200 other tests of the step passed.
+  It is the last failing test on `master` before the Q80 streak counted from 2026-11-20.
+- **Problem:** The test builds a real crate with a local path dependency through `cargo` on a worker. A cold
+  `cargo build` on a hosted Windows runner can take longer than the 60 s wait of `submit`. The cause (a wait that is
+  too short, or a task that hangs) is not known.
+- **Do:**
+  1. Read the test and the wait it uses (`submit_args`, `run_submit_with_secret`, the `--wait` budget of `submit`).
+  2. On Windows, run the test alone and in the whole `rusty_grid_cli --lib --features gpu-wgpu` binary 20 times each,
+     the second set under 4 busy loops; record each task's `execution_time_ms` and whether `cargo` was still running
+     at the timeout.
+  3. If the task finishes but late, give the test a budget that cannot be the cause (at least 600 s), keep every
+     assertion, and print the time. If the task hangs, follow rule 4: a test that fails without the fix, then the fix.
+- **Done when:** The cause is written here, and the test passes 50 runs in a row on Windows under 4 busy loops.
 
 ## Phase 3: make the documents true
 
@@ -1260,36 +1214,6 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   and `CLAUDE.md` / `docs/reference.md` are updated); awaiting a live GitHub pull request CI run of
   `release skew (ubuntu-latest)` showing the `v0.3.0` table row per "Done when".
 
-### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
-
-- **Evidence:** Reproduced on the owner's Windows machine, 2026-11-16, `master` `3ecc926` (Windows
-  smoke test, finding F1). The worker exits with: "another account
-  (S-1-15-3-3557520199-3666692283-...) can rename, delete or re-permission ancestor directory
-  `AppData`". A read-only `icacls` shows two explicit entries for that SID, `(F)` and
-  `(OI)(CI)(IO)(F)`. It is not the `oxideswarm.toolchain` capability, which derives to
-  `S-1-15-3-1024-...`.
-- **Problem:** The worker's check is correct, but no `fs` worker can use any sandbox base below
-  `AppData`, the default `%TEMP%` included, and the worker unit tests fail under the default
-  `%TEMP%` there. Nobody knows what created the entry. A confined process that holds that
-  capability would have full control of everything that inherits from `AppData`.
-- **Do:**
-  1. Find what created the entry and whether any confined process holds that capability. Do not
-     change the ACL without the owner.
-  2. Decide whether the worker's error message should suggest a fix.
-- **Done when:** The cause is written here, and the owner has decided what to do with the entry.
-  This needs the owner's machine.
-- **Note (2026-11-18):** On the second Windows machine (a laptop), the foreign write grants on `%TEMP%`
-  come from the Codex CLI sandbox (its capability SIDs, recorded in `%USERPROFILE%\.codex\cap_sid`) and
-  from one deleted local account. No OxideSwarm SID appears on any inspected folder. OxideSwarm's only
-  capability SID (`DeriveCapabilitySidsFromName("oxideswarm.toolchain")`) has the sub-authority 1024,
-  which the SID of this item lacks, so that SID is not OxideSwarm's either.
-- **Partial (2026-11-19, pull request 358):** The cause is on record on both Windows machines. A read-only check on the
-  case machine matched the SID of this item to the AppContainer of the Claude Desktop app's MSIX package
-  (through the AppContainer mappings and `DeriveAppContainerSidFromAppContainerName`): it belongs to that
-  package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
-  `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
-  owner's decision of "Done when" (the entry itself is gone) and step 2.
-
 ### TEST-41: Find why a task finished during master shutdown can run twice
 
 - **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
@@ -1370,68 +1294,6 @@ Order:
 4. LV-15, after LV-5.
 
 Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it says otherwise.
-
-### CI-1: Keep runs for pushes on `master` from ending red or cancelled without a failing test
-
-- **Evidence:** Read through `gh run list --branch master --workflow CI --event push --limit 60` and
-  the job annotations (`gh api repos/<OWNER>/<REPO>/check-runs/<JOB_ID>/annotations`).
-  - Twelve runs of 2026-11-16 ended as cancelled (`43800093872` to `43889536272`). The annotation of
-    their jobs is "The run was canceled by" the owner's account. The workflow itself cancels only
-    runs for pull requests (`.github/workflows/ci.yml`, `concurrency`), so each was cancelled by
-    hand or by a session that uses the owner's `gh` login.
-  - Six runs of 2026-11-16 hold one or two cancelled macOS jobs (`43889143995`, `43894129643`,
-    `43914764615`, `43928207482`, `43952618376`, `43964491108`). The annotation is "The job was not
-    acquired by Runner of type hosted even after multiple attempts", beside a notice about capacity
-    for macOS arm64 runners. In the two runs read in detail (`43914764615`, `43964491108`) the jobs
-    waited 32 to 49 minutes and never got a runner. Five of the six runs count as failed with no
-    failed job.
-  - Two runs of 2026-11-17 failed with no failing test. In `44036878952` the job
-    `fuzz (tree_manifest)` could not download the pinned nightly toolchain. In `44034218213` the
-    test step of `workspace tests (windows-latest)` ended three minutes after the job started, with
-    exit code `-1073741502`.
-- **Problem:** The exit check of Q80 asks for seven days of runs for pushes in which no test fails.
-  A run that is red or cancelled for another reason has to be told apart by hand, and a cancelled
-  run tests nothing for its commit.
-- **Do:**
-  1. Add a rule to `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run
-     for a push on `master`. Say what to do instead when a newer push makes a run look
-     superfluous: leave it.
-  2. For a macOS job that was never acquired, rerun the failed jobs of that run on its current
-     head (`gh run rerun <RUN_ID> --failed`), and record the run in the status log. Do not change
-     the workflow for it.
-  3. In the `fuzz` job, make the toolchain step retry a failed download, with the options the
-     action offers or with a retry around the `rustup` call. Do not change the pinned date.
-  4. For exit code `-1073741502` in run `44034218213`, read the full log of the step and the
-     diagnostics step of TEST-29. Record what the first line with the code follows. If the step
-     never started `cargo`, it is a runner failure: say so and rerun. If a test binary returned
-     it, open an item for that test.
-  5. Add a script `scripts/ci_push_runs.py` (standard library and `gh` only) that prints, for the
-     last N days of runs for pushes on `master`, one line per run that is not green with its
-     class: failing test, job never acquired, cancelled by an account, or other. The exit check
-     of Q80 is then read from its output.
-- **Done when:** The guide has the rule of step 1. The script of step 5 has a test with recorded
-  JSON input (`tests/test_ci_push_runs.py`, standard library only) that CI runs on Linux, macOS
-  and Windows, and its output for 2026-11-16 names
-  twelve runs as cancelled by an account and six as holding a job that was never acquired. The
-  two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
-
-- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
-  coordinator (no code).
-  - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
-  - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
-    `dtolnay/rust-toolchain@master`, which then finds it installed. The date is unchanged.
-  - Step 4: the log of job `133873087335` (run `44034218213`) shows the step before it (`test_feat3_os_isolation`, 30 passed)
-    ending normally. The line `Process completed with exit code -1073741502` (`0xC0000142`, STATUS_DLL_INIT_FAILED) then
-    follows the start of the step `python scripts/ci_heartbeat.py ... cargo test --workspace` 31 ms after its header, with no output
-    of its own, and the diagnostics step after it (a fresh `pwsh`) fails with the same code. No `Running` line of a test
-    binary and no `cargo` output follow: `cargo` never started, so it is a runner failure (new processes could not initialise),
-    not a test. No test item is opened. Untested hypothesis: the isolation tests of the step before it create a private Desktop per
-    task and may leave the runner short of desktop heap. If the code comes back after `test_feat3_os_isolation`, open an item for that.
-  - Step 5: `scripts/ci_push_runs.py` and `tests/test_ci_push_runs.py` (13 tests over hand-made JSON; run by the `agent-bridge`
-    job on Linux, macOS and Windows). Real output for 2026-11-16: 12 runs `cancelled`, 5 `never acquired`, 5 `failing test`.
-    `43952618376` has a never-acquired macOS job and also a real failing Ubuntu test, so it counts under `failing test` (the
-    priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
-    test, 1 never acquired. The exit check of Q80 is read from its last line.
 
 ### ADOPT-1: A study of first use, in two rounds
 
@@ -2550,3 +2412,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-22: 3D-2 Implemented ([design 0105](design/0105-3d2-vram-blender-routing.md), branch `prod/backlog-completion-wave3`; text moved to archive): wired `TaskView::requires_blender`, `WorkerAttrIndex::blender`, `RegisteredIndex::any_has_blender`, and `SchedulerConfig::required_vram_mb` preset defaults (`2048`/`4096`/`6144` MB for `fast`/`standard`/`high` when `--gpu` or `--quality high` applies on non-`Sdf` `Generative3D`, preserving CPU-only `Sdf` and non-GPU `fast`/`standard` `Auto`/`TripoSr` defaults per `BUG-3`) across `crates/master/src/{queue,worker_index,scheduler,reaper}.rs`, added non-blocking CLI `ListWorkers` preflight warnings in `crates/cli/src/cli_app/submit.rs`, and verified shared `rusty_grid_core::capabilities::resolve_blender_binary` delegation (`crates/worker/src/autorig/blender_provider.rs`), `crates/master/tests/test_3d2_routing.rs` (`4/4`), and `crates/cli/tests/test_3d2_routing.rs` (`4/4` with `--features 3d`).
 - 2026-11-22: 3D-3 Implemented ([design 0106](design/0106-3d3-honest-autorig-options.md), branch `prod/backlog-completion-wave3`; text moved to archive): validated `rig_preset` (`biped` 15 joints, `quadruped` 19 joints, `generic` 5 axial joints), `embed_animations` (`idle`, `walk`, `turnaround` with 97 keyframes in both Rust and `engines/autorig/blender_rig.py`), and `preferred_provider` (`None`/`builtin`, `auto`, `blender`, failing explicitly on `"blender"` error/absence) upfront in `TaskSpec::validate()`, worker, and `blender_rig.py`, added magic-byte `.glb`/`.gltf`/`.obj` detection with UTF-8 BOM/whitespace stripping, reported `"OxideSwarm-AutoRig-Blender"` vs `"OxideSwarm-AutoRig-Builtin"` in `TaskResult::device_name` and stdout, and wired task `timeout`, `child_pid`, and cooperative `cancel_rx` / `AtomicBool` stopping (`<= 1 s`) across Blender and Rust `autorig/*` and `gen3d/*` workloads; verified against real Blender 5.2.1 LTS plus `crates/worker/tests/test_3d3_autorig_options.rs` (`10/10`), `test_autorig_pipeline` (`15/15`), and `test_challenger_m3_blender_job_object` (`10/10`).
 - 2026-11-22: Recounted `docs/BACKLOG.md` Index summary header from the rows after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented; `AX-2` Partial): 247 items, 178 Implemented, 24 Partial, 45 Planned, 0 Design only; 25 open items are In and 44 are Out.
+- 2026-11-22: Review fixes before merge (pull requests 410, 413 and 414): a members-only master off loopback no longer gives local processes dashboard Admin (SECURITY.md); a revoked member's checkpoint is dropped when its task is promoted to the speculative copy; FEAT-5 D5 to D7 of design 0102 (no checkpoint capture off Unix under `--isolation`, bounded Unix walk, master rate limit and headroom); MESH-2 verified and paced delivery ([design 0107](design/0107-mesh2-verified-delivery.md)); `auto` 3D tasks need no VRAM (design 0105); `prefer:worker=` is soft (design 0103 D7); MESH-3 catalog liveness is cached (design 0104 D5); a master stopped during start-up shuts down cleanly.
+- 2026-11-23: TEST-85 added (the Windows `submit --type compile` timeout of 2026-11-20). Stale "(open)" marks removed from the rows of TEST-24, TEST-26, TEST-56, TEST-69, TEST-84 and SEC-16, whose pull requests are merged. The prompts for the remaining stability work are in [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The id TEST-85 was not claimed through `agent_bridge.py claim` because the hub on Google Drive timed out; no pull request uses it.
+- 2026-11-23: The owner delegated the open decisions to Claude ("làm theo ý bạn"). TEST-23 and TEST-61 closed without a reproduced cause (their loops are recorded, diagnostics stay), SEC-16 closed with no ACL or code change, CI-1 closed with step 2 kept as a standing rule in prompt S5. TEST-41 stays Partial until the loops of prompt S3. Texts moved to the archive.

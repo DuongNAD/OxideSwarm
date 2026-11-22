@@ -544,6 +544,77 @@ The full suite must pass on a clean machine before CI can require it.
 - **Do:** Teach `contains_standalone_number` in `tests/workflow_modes_test.rs` to ignore `"4090"` when adjacent to ASCII hex digits, inside a hyphen-delimited UUID hex group (`-4090-`), or formatted as a JSON numeric value (`: 4090`) or unit-suffixed measurement (`4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`), while still matching standalone GPU model strings (`"gpu: geforce 4090 ti"`, `"nvidia rtx 4090"`, `"worker-gpu-rtx4090"`, `"4090"`).
 - **Done when:** `test_standalone_number_check_ignores_digits_inside_measurements` and `test_research_mode_distributed_and_report` pass in `cargo test -p rusty_grid_cli --test workflow_modes_test --locked`.
 
+### TEST-23: Find why `master_restart_recovery` loses `out.txt` on Windows
+
+- **Evidence:** CI run `42817398752`, job `129833857865`, "workspace tests (windows-latest)", on
+  pull request 206 at `e1fcf70` (2026-11-10). That pull request changes only `docs/`.
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` panicked at
+  `tests/master_restart_recovery.rs:575` with "t_run must succeed". The result of `t_run` had
+  `exit_code: 1`, an empty `stdout`, `execution_time_ms: 746`, no outputs, and the error
+  "Output files: the task did not produce 'out.txt'". The same job passed on `master` `0354b28`,
+  on the two earlier heads of the pull request (`0266d8e`, `7af1f4d`) and on the rerun of the
+  failed job (attempt 2). Linux and macOS passed in the same run. Seen once.
+- **Problem:** The cause is not known. In the test, `t_run` starts on `w1` under the first master
+  and waits for a gate file. The first master shuts down, a second one starts on the same address
+  and `--state-dir`, `w1` reconnects, and the second master adopts `t_run` as Running. The test
+  then writes the gate file and expects `t_run` to finish with the declared output `out.txt`.
+  On Windows the task is the PowerShell command built by `gated_marker_task`, which writes the
+  file with `[System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY)` and the relative name
+  `out.txt`. Two explanations fit the message, and neither has been tested:
+  1. The test is at fault: the PowerShell command ends without writing the file where the worker
+     looks for it (the Unix variant uses a shell redirect, the Windows one a .NET call).
+  2. The product is at fault: after the worker is adopted by a restarted master, output
+     collection reads the sandbox before the file is there, or reads another sandbox. That would
+     be a defect in the recovery path of FEAT-1, not in the test.
+- **Do:**
+  1. On Windows, run `cargo test -p rusty_grid_master --test master_restart_recovery --locked`
+     in a loop under CPU load until it fails, and keep the worker and master logs of each run.
+  2. For a failing run, record the exit code of PowerShell itself, the sandbox path the worker
+     collected from, whether `out.txt` exists anywhere under the sandbox base, how many lines
+     the marker file holds, and the time from assignment to the gate file (compare it with
+     `execution_time_ms`).
+  3. If the test is at fault, change only the test, and keep every assertion. If the product is
+     at fault, follow rule 4: add a test that fails without the fix, then fix the product.
+- **Done when:** The cause is written in the status log, and the test passes 50 times in a row
+  on Windows under CPU load. If production code changed, a regression test covers the cause.
+
+- **Note (2026-11-16):** The failed result narrows the search. The worker sets `exit_code` 1
+  only when a process that exited 0 misses a declared output, and it appends its note to the
+  process's own stderr (`crates/worker/src/runner.rs:1776-1786` and `append_note` at `0354b28`).
+  The result held that note and nothing else, and `error` held only the output message. So
+  PowerShell ran the whole script, exited 0 and printed nothing: no command in it failed. Either
+  `$env:OUT_FILE` was empty in that run, or `WriteAllText` wrote `out.txt` relative to a .NET
+  current directory other than the directory the worker read. 746 ms is short for a run that spans
+  PowerShell start-up, a master restart and a reconnect, and a second run of `t_run` that started
+  after the gate was written would fit it. Step 6 of the test cannot tell the two apart: adoption
+  and a new assignment to `w1` both show `Running` with `active_tasks == 1`. A failing run should
+  therefore also record the number of `run` lines in the marker file (two means a second run), the
+  worker log line "Task assigned again while its previous run is still active"
+  (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
+  `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
+
+- **Lead (2026-11-17, pull request 288):** looping the whole `master_restart_recovery` binary on macOS under CPU load
+  (140 runs), `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` failed 9 times
+  ("uploading output files to the master failed: blob transfer failed: the connection to the master ended") and
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` once (`out.txt: No such file or
+  directory`, then "Output files: cannot read the task sandbox": the task sandbox was gone). Unverified hypothesis: the
+  tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
+  takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
+
+- **Implemented (2026-11-17, pull request 305, [design 0091](design/0091-restart-recovery-races.md)), Partial:** On macOS, with eight copies of the tests in parallel and twenty busy loops, the unchanged code failed `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` 3 times in 192 runs ("the connection to the master ended"). The cause is not the shared sandbox base: when the connection ended during the upload of a finished task's outputs, the worker overwrote the buffered result with the failure of that upload, and the resume sent the failure. The worker now keeps the buffered result when the session ended (0 failures in 128 runs of the same two tests). Separately, a real race in the sandbox lock was found and fixed: `open_and_try_lock_task` could keep a lock on a lock file that a sweep had just unlinked, after which a second opener could lock a fresh file, so a sweep could remove the sandbox of a running task (`sandbox::tests::test_task_lock_taken_on_an_unlinked_file_is_not_kept` fails without the fix). That race was reproduced with a hook, not in the loops, so it is not shown to be the cause of the `out.txt` failure on Windows or of the one "sandbox gone" run seen in the lead. Looping the whole binary with the fix (48 runs, twelve busy loops) showed no `out.txt` or upload failure, only two 5-second `wait_for` timeouts in other steps under that load. TEST-23 stays open until the Windows job has passed 50 runs in a row; the Windows cause is still unknown.
+- **Partial (2026-11-19, pull request 357):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1`) in 200 completed runs (0 failures) of `cargo test -p rusty_grid_master --test master_restart_recovery --locked` under 12 busy loops on 20 logical cores (about 60 %): batch 1 passed 50/50 at `979ec2c` in 1,689.1 s; an earlier 24-spinner attempt stalled on run 51 (0 runs completed, 0 failures) before pausing for BENCH-8, and a restarted batch-2 attempt with 12 spinners was stopped at 18:28:25Z for BENCH-8 after 0 completed runs (0 failures); batches 2 to 4 then ran 150 unbroken consecutive runs (3 batches of 50) at `b079dc3` in 1,429.0 s, 1,302.1 s and 1,309.0 s (5,729.2 s across the 4 measured batches; 0 `out.txt` failures and 0 test failures). The 200 passed runs therefore span the BENCH-8 interruption and two commits (`979ec2c` and `b079dc3`, whose diff touched no `crates/master`, `crates/worker` or `tests/master_restart_recovery.rs` files; 150 runs are unbroken on `b079dc3`). Running 24 normal-priority CPU spinners on 20 logical cores starved the worker's default `BELOW_NORMAL_PRIORITY_CLASS` child task processes and stalled progress without producing an `out.txt` failure, whereas 12 busy loops on 20 logical cores (about 60 %) allowed child tasks to schedule. Because zero runs failed in 200 completed loops, no Windows cause is guessed here.
+- **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** "Done when" asks for the cause and 50 runs in a row on Windows under load. The loops are met (200 of 200 on Windows under load, pull request 357), the two races found on the way are fixed (pull request 305, design 0091), and the Windows failure of 2026-11-10 was never reproduced. Closed without a named Windows cause; the diagnostics stay. If `out.txt` is lost again, open a new item with the run and job ids.
+
+### TEST-61: macOS: hard-link isolation test control printed empty stdout
+
+- **Evidence:** Failed once on `macos-latest` in pull request 380 (docs-only commit `ad915a9b`, run `44537862155` attempt 1, job `135607992314`, 2026-11-19 ~14:23 UTC; attempt 2 passed): `macos::test_a_hard_link_to_a_secret_does_not_expose_its_content` (`crates/worker/tests/test_feat3_os_isolation.rs:1757`) panicked at its `--isolation off` control step 45 ms after the binary started with `the control must read the linked secret: ` and empty stdout (not even `END`).
+- **Problem:** The control task printed nothing at all even under `--isolation off`, and the assertion omitted `exit_code`, `error`, `execution_time_ms`, and `stderr`, leaving unknown whether the process exited non-zero, failed to spawn, failed sandbox setup, or hit an fd/pipe race after `BUG-33` (pull request 367, `close_open_fds_macos`).
+- **Do:** Capture full `TaskResult` diagnostics when the control prints empty stdout; loop the test (50 runs) and its binary (20 runs) with and without 6 CPU busy loops; prove whether `BUG-33`'s `close_open_fds_macos` path can race with the task's stdout pipe or spawn; fix any defect or harden diagnostics the `TEST-60` way.
+- **Done when:** `BUG-33` pipe/spawn safety is proven, diagnostics capture any future failure, and the root cause is fixed or left for the owner's decision after non-reproduction under loaded loops.
+- **Partial (2026-11-19, pull request 392):** Not reproduced locally on Apple M5 (10 cores, private `HOME`, `origin/master` `8641b67d`): `0/140` failures across `50/50` alone unloaded (`49.15 s`), `50/50` alone under 6 Python busy loops (`77.32 s`), `20/20` full `test_feat3_os_isolation` unloaded (`547.76 s`), and `20/20` full `test_feat3_os_isolation` under 6 busy loops (`628.09 s`), plus `5/5` in the 5 full loaded workspace runs on `origin/master`. Proof on `BUG-33` (`crates/worker/src/process_tree.rs`): `close_open_fds_macos(&[read_raw])` runs solely inside the double-forked `setsid()` grandchild `child_c` (separate OS PID and XNU descriptor table), skips `read_raw` via `fd_is_kept`, and closes only `child_c`'s inherited duplicates, so it cannot close or alter `child_a`'s stdout write end or the worker's pipe read end; a new 128-spawn 8-worker multithreaded stress test (`process_tree::tests::test_concurrent_short_spawns_preserve_piped_stdout_under_supervisor_fd_close`, with 64 extra `FD_CLOEXEC` descriptors open) passes `128/128` exact stdout captures. Fixes landed: (1) `PreparedUnix::drop` (`crates/worker/src/process_tree.rs`, sharing `imp::dismiss_lifeline` with `TreeInner::kill_and_release_once`) writes `b"0"` before closing `lifeline_write` when dropped unattached (e.g., failed spawn after `pre_exec` forked `child_c`), preventing an orphan supervisor from running `killpg` and a process-table sweep (`test_prepared_unix_drop_dismisses_lifeline_without_attach`); (2) `read_into_capture` (`crates/worker/src/runner/capture.rs`) warns on non-`EINTR` stream read errors; (3) `format_result_diag` (`crates/worker/tests/test_feat3_os_isolation.rs`) reports `exit_code`, `error`, `execution_time_ms`, `stdout`, and `stderr` on `test_a_hard_link_to_a_secret_does_not_expose_its_content` and sibling control assertions. Post-fix verification on `mac/test-61-hardlink-control-empty-stdout`: `process_tree` `23/23` (`2.20 s`), `runner::process_tree_tests` `13/13` (`2.08 s`), `test_feat3_os_isolation` `28/28` + `1` ignored (`27.02 s`), `test_sec5_hardened_runner` `11/11` (`2.58 s`), and under 6 Python busy loops `20/20` `process_tree::tests` (`50.59 s`, `0.98–2.07 s`) and `20/20` `test_a_hard_link_to_a_secret_does_not_expose_its_content` (`36.82 s`, `0.58–1.20 s`). Closing `TEST-61` without a reproduced cause (keeping diagnostics for any future CI hit) stays the owner's decision.
+- **Partial (2026-11-22, Wave 2 M1 verification of merged pull request 392 / `a7ce9e9d`):** Independently re-verified on macOS (`prod/backlog-completion-wave2`) with `154/154` hard-link isolation runs (`50/50` sequential + `80/80` parallel `8x10` + `24/24` under `1,150` inherited FDs, `0` empty-stdout flakes), `process_tree::tests` (`10/10` + `30/30` parallel + `8/8` under `1,150` inherited FDs, `0` orphans), `test_feat3_os_isolation` (`28/28` + `1` ignored), and `tests/test_wave2_e2e.py` (`F1` + Tiers 3–4). Stays `Partial | In` awaiting the owner's decision to close without a reproduced cause for the original pull request 380 CI hit.
+- **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** not reproduced in 294 runs on macOS (pull request 392 and the Wave 2 verification), with the spawn and pipe hardening of BUG-33 and the result diagnostics of `format_result_diag` in place. Closed without a reproduced cause; the diagnostics stay. A new empty-stdout failure gets a new item with its run and job ids.
+
 ## Phase 3: make the documents true
 
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
@@ -4060,6 +4131,37 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   verify bare-prefix exclusion under home CWD, assert refusal texts, exercise `PREPARE_LOCK` / handle /
   metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
 
+### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
+
+- **Evidence:** Reproduced on the owner's Windows machine, 2026-11-16, `master` `3ecc926` (Windows
+  smoke test, finding F1). The worker exits with: "another account
+  (S-1-15-3-3557520199-3666692283-...) can rename, delete or re-permission ancestor directory
+  `AppData`". A read-only `icacls` shows two explicit entries for that SID, `(F)` and
+  `(OI)(CI)(IO)(F)`. It is not the `oxideswarm.toolchain` capability, which derives to
+  `S-1-15-3-1024-...`.
+- **Problem:** The worker's check is correct, but no `fs` worker can use any sandbox base below
+  `AppData`, the default `%TEMP%` included, and the worker unit tests fail under the default
+  `%TEMP%` there. Nobody knows what created the entry. A confined process that holds that
+  capability would have full control of everything that inherits from `AppData`.
+- **Do:**
+  1. Find what created the entry and whether any confined process holds that capability. Do not
+     change the ACL without the owner.
+  2. Decide whether the worker's error message should suggest a fix.
+- **Done when:** The cause is written here, and the owner has decided what to do with the entry.
+  This needs the owner's machine.
+- **Note (2026-11-18):** On the second Windows machine (a laptop), the foreign write grants on `%TEMP%`
+  come from the Codex CLI sandbox (its capability SIDs, recorded in `%USERPROFILE%\.codex\cap_sid`) and
+  from one deleted local account. No OxideSwarm SID appears on any inspected folder. OxideSwarm's only
+  capability SID (`DeriveCapabilitySidsFromName("oxideswarm.toolchain")`) has the sub-authority 1024,
+  which the SID of this item lacks, so that SID is not OxideSwarm's either.
+- **Partial (2026-11-19, pull request 358):** The cause is on record on both Windows machines. A read-only check on the
+  case machine matched the SID of this item to the AppContainer of the Claude Desktop app's MSIX package
+  (through the AppContainer mappings and `DeriveAppContainerSidFromAppContainerName`): it belongs to that
+  package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
+  `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
+  owner's decision of "Done when" (the entry itself is gone) and step 2.
+- **Implemented (2026-11-23, decided by Claude on the owner's delegation of that day):** the cause is on record (the AppContainer of the Claude Desktop app's MSIX package, not OxideSwarm), and the entry is gone from `AppData`. Decisions: OxideSwarm changes no ACL it did not create; step 2, the worker's error message stays as it is, because it names the SID and the directory, which is what found the cause. No code change.
+
 ## Phase 13: the path to finished
 
 Added on 2026-11-17 from [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md),
@@ -4173,6 +4275,69 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   session did not record the submission), covers loopback CLI and MCP runs in
   `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
   `README.md`, `CHANGELOG.md`, `docs/guides/offload-cargo-test.md`, and `docs/design/0059-first-users.md`.
+
+### CI-1: Keep runs for pushes on `master` from ending red or cancelled without a failing test
+
+- **Evidence:** Read through `gh run list --branch master --workflow CI --event push --limit 60` and
+  the job annotations (`gh api repos/<OWNER>/<REPO>/check-runs/<JOB_ID>/annotations`).
+  - Twelve runs of 2026-11-16 ended as cancelled (`43800093872` to `43889536272`). The annotation of
+    their jobs is "The run was canceled by" the owner's account. The workflow itself cancels only
+    runs for pull requests (`.github/workflows/ci.yml`, `concurrency`), so each was cancelled by
+    hand or by a session that uses the owner's `gh` login.
+  - Six runs of 2026-11-16 hold one or two cancelled macOS jobs (`43889143995`, `43894129643`,
+    `43914764615`, `43928207482`, `43952618376`, `43964491108`). The annotation is "The job was not
+    acquired by Runner of type hosted even after multiple attempts", beside a notice about capacity
+    for macOS arm64 runners. In the two runs read in detail (`43914764615`, `43964491108`) the jobs
+    waited 32 to 49 minutes and never got a runner. Five of the six runs count as failed with no
+    failed job.
+  - Two runs of 2026-11-17 failed with no failing test. In `44036878952` the job
+    `fuzz (tree_manifest)` could not download the pinned nightly toolchain. In `44034218213` the
+    test step of `workspace tests (windows-latest)` ended three minutes after the job started, with
+    exit code `-1073741502`.
+- **Problem:** The exit check of Q80 asks for seven days of runs for pushes in which no test fails.
+  A run that is red or cancelled for another reason has to be told apart by hand, and a cancelled
+  run tests nothing for its commit.
+- **Do:**
+  1. Add a rule to `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run
+     for a push on `master`. Say what to do instead when a newer push makes a run look
+     superfluous: leave it.
+  2. For a macOS job that was never acquired, rerun the failed jobs of that run on its current
+     head (`gh run rerun <RUN_ID> --failed`), and record the run in the status log. Do not change
+     the workflow for it.
+  3. In the `fuzz` job, make the toolchain step retry a failed download, with the options the
+     action offers or with a retry around the `rustup` call. Do not change the pinned date.
+  4. For exit code `-1073741502` in run `44034218213`, read the full log of the step and the
+     diagnostics step of TEST-29. Record what the first line with the code follows. If the step
+     never started `cargo`, it is a runner failure: say so and rerun. If a test binary returned
+     it, open an item for that test.
+  5. Add a script `scripts/ci_push_runs.py` (standard library and `gh` only) that prints, for the
+     last N days of runs for pushes on `master`, one line per run that is not green with its
+     class: failing test, job never acquired, cancelled by an account, or other. The exit check
+     of Q80 is then read from its output.
+- **Done when:** The guide has the rule of step 1. The script of step 5 has a test with recorded
+  JSON input (`tests/test_ci_push_runs.py`, standard library only) that CI runs on Linux, macOS
+  and Windows, and its output for 2026-11-16 names
+  twelve runs as cancelled by an account and six as holding a job that was never acquired. The
+  two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
+
+- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
+  coordinator (no code).
+  - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
+  - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
+    `dtolnay/rust-toolchain@master`, which then finds it installed. The date is unchanged.
+  - Step 4: the log of job `133873087335` (run `44034218213`) shows the step before it (`test_feat3_os_isolation`, 30 passed)
+    ending normally. The line `Process completed with exit code -1073741502` (`0xC0000142`, STATUS_DLL_INIT_FAILED) then
+    follows the start of the step `python scripts/ci_heartbeat.py ... cargo test --workspace` 31 ms after its header, with no output
+    of its own, and the diagnostics step after it (a fresh `pwsh`) fails with the same code. No `Running` line of a test
+    binary and no `cargo` output follow: `cargo` never started, so it is a runner failure (new processes could not initialise),
+    not a test. No test item is opened. Untested hypothesis: the isolation tests of the step before it create a private Desktop per
+    task and may leave the runner short of desktop heap. If the code comes back after `test_feat3_os_isolation`, open an item for that.
+  - Step 5: `scripts/ci_push_runs.py` and `tests/test_ci_push_runs.py` (13 tests over hand-made JSON; run by the `agent-bridge`
+    job on Linux, macOS and Windows). Real output for 2026-11-16: 12 runs `cancelled`, 5 `never acquired`, 5 `failing test`.
+    `43952618376` has a never-acquired macOS job and also a real failing Ubuntu test, so it counts under `failing test` (the
+    priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
+    test, 1 never acquired. The exit check of Q80 is read from its last line.
+- **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** steps 1, 3, 4 and 5 are in pull request 306; step 2 (rerun a never-acquired macOS job on the current head, record it) is a standing rule and is now part of prompt S5 of [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The output for 2026-11-16 names 5 runs as never acquired, not 6, because run `43952618376` also holds a failing test and is counted under that class.
 
 ## Phase 15: coordination between agents
 
