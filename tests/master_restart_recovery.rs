@@ -1623,3 +1623,218 @@ async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_
     w1_handle.abort();
     master2.shutdown().expect("shutdown master2");
 }
+
+/// `TEST-41` Gap 2:
+/// When the Master shuts down via `shutdown_tx` *without* pre-closing the store, the worker
+/// receives `MasterMessage::Shutdown` and closes cleanly (`farewell = None`) instead of sending
+/// `WorkerMessage::Disconnecting`. Therefore the Master does not evacuate the running task
+/// (`evacuation_count == 0`), `master2` adopts it via `ResumeSession`, and the task runs once.
+#[tokio::test]
+async fn test_master_shutdown_via_watch_without_preclose_adopts_once_with_zero_evacuations() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    use rusty_grid_master::queue::{RetryPolicy, TaskQueue};
+    use rusty_grid_master::registry::WorkerRegistry;
+    use rusty_grid_master::scheduler::WorkloadScheduler;
+    use rusty_grid_master::WaiterMap;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("master-state");
+    let marker_path = dir.path().join("gap2.marker");
+    let gate_path = dir.path().join("gap2.gate");
+
+    let config1 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_state_dir(&state_dir)
+        .with_session_resume_hold(Duration::from_secs(30));
+
+    let registry1 = WorkerRegistry::new();
+    let queue1 = TaskQueue::with_retention_limits(
+        RetryPolicy::default(),
+        config1.max_queue_size,
+        config1.max_terminal_tasks,
+        config1.max_terminal_bytes,
+        config1.max_active_bytes,
+    );
+    let scheduler_notify1 = Arc::new(tokio::sync::Notify::new());
+    let waiters1: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+    let server1 = MasterServer::bind_full(
+        config1,
+        registry1.clone(),
+        queue1.clone(),
+        scheduler_notify1.clone(),
+        Arc::clone(&waiters1),
+    )
+    .await
+    .expect("bind_full master1");
+    let master_addr = server1.local_addr();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let srv_shutdown_rx = shutdown_rx.clone();
+    let server_task = tokio::spawn(async move { server1.run(srv_shutdown_rx).await });
+
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    let sched = Arc::new(
+        WorkloadScheduler::new(
+            sched_cfg,
+            registry1.clone(),
+            queue1.clone(),
+            scheduler_notify1.clone(),
+        )
+        .with_waiters(Arc::clone(&waiters1)),
+    );
+    let mut sched_shutdown_rx = shutdown_rx.clone();
+    let sched_trigger = scheduler_notify1.clone();
+    let sched_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sched.config().tick_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = sched_trigger.notified() => {
+                    if *sched_shutdown_rx.borrow() {
+                        break;
+                    }
+                    let _ = sched.schedule_once().await;
+                }
+                _ = ticker.tick() => {
+                    let _ = sched.schedule_once().await;
+                }
+                res = sched_shutdown_rx.changed() => {
+                    if res.is_err() || *sched_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let (w_tx, w_rx) = watch::channel(false);
+    let mut w1 = WorkerClient::for_testing(
+        master_addr.to_string(),
+        Some("gap2-w1".into()),
+        Some(1),
+        false,
+    );
+    w1.set_backoff_config(rusty_grid_worker::backoff::BackoffConfig {
+        initial: Duration::from_millis(50),
+        max: Duration::from_millis(150),
+        factor: 1.5,
+        jitter_ratio: 0.0,
+    });
+    let w1_id = w1.worker_id();
+    let wh = tokio::spawn(async move {
+        let _ = w1.run(w_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async { registry1.list_workers().await.len() == 1 }
+        )
+        .await,
+        "w1 must register on master1"
+    );
+
+    let tid = queue1
+        .submit(gated_marker_task(
+            &marker_path,
+            &gate_path,
+            None,
+            None,
+            Some(2),
+        ))
+        .await
+        .expect("submit gated task");
+    scheduler_notify1.notify_one();
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(15),
+            || async {
+                let running = queue1.get_state(&tid).await == Some(TaskState::Running);
+                let marked = std::fs::read_to_string(&marker_path)
+                    .map(|s| s.lines().count() == 1)
+                    .unwrap_or(false);
+                running && marked
+            }
+        )
+        .await,
+        "gated task must be Running with 1 marker line before watch shutdown"
+    );
+
+    // Fire `shutdown_tx` directly WITHOUT pre-closing `TaskStore` (`close_and_compact_store_sync`).
+    shutdown_tx.send(true).expect("send shutdown");
+    server_task
+        .await
+        .expect("server_task join")
+        .expect("server1 clean shutdown");
+    let _ = sched_task.await;
+    // Allow WorkerSession task (if still finishing disconnect cleanup) to complete before master2 binds.
+    assert!(
+        wait_for(
+            Duration::from_secs(2),
+            Duration::from_millis(15),
+            || async {
+                registry1.get_worker(w1_id).await.is_none_or(|w| {
+                    w.status == rusty_grid_master::registry::WorkerStatus::Disconnected
+                })
+            }
+        )
+        .await,
+        "w1 session must finish disconnecting on master1"
+    );
+
+    let config2 = ServerConfig::new(master_addr)
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_state_dir(&state_dir)
+        .with_session_resume_hold(Duration::from_secs(30));
+    let master2 = spawn_rebound_master(config2, Duration::from_secs(5)).await;
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master2
+                    .get_task_info(tid)
+                    .await
+                    .map(|i| i.state == TaskState::Running && i.assigned_worker_id == Some(w1_id))
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "master2 must adopt running task via ResumeSession"
+    );
+
+    std::fs::write(&gate_path, b"go").expect("write gate");
+    let res = master2
+        .wait_task(tid, Some(Duration::from_secs(10)))
+        .await
+        .expect("task completion on master2");
+    assert!(res.is_success(), "task failed: {res:?}");
+
+    let info = master2.get_task_info(tid).await.expect("task info");
+    assert_eq!(info.evacuation_count, 0, "must have zero evacuations");
+    assert_eq!(info.retry_count, 0, "must have zero retries");
+    assert_eq!(info.failover_count, 0, "must have zero failovers");
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "task must execute exactly once"
+    );
+
+    let _ = w_tx.send(true);
+    wh.abort();
+    master2.shutdown().expect("shutdown master2");
+}

@@ -718,17 +718,23 @@ async fn apply_task_result_inner(
                 let ack_registry = registry.clone();
                 let cold_queue = queue.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = ack.await {
-                        warn!(
-                            task_id = %task_id.0,
-                            error = %err,
-                            "Failed to sync TaskTerminal journal record for task result"
-                        );
-                    }
-                    if let Some(ack_token) = ack_token {
-                        ack_registry
-                            .send_result_ack(&worker_id, session_id, task_id, ack_token)
-                            .await;
+                    let durable_ok = match ack.await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                task_id = %task_id.0,
+                                error = %err,
+                                "Failed to sync TaskTerminal journal record for task result"
+                            );
+                            false
+                        }
+                    };
+                    if durable_ok {
+                        if let Some(ack_token) = ack_token {
+                            ack_registry
+                                .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                                .await;
+                        }
                     }
                     {
                         let mut lock = waiters.write().await;
@@ -741,10 +747,12 @@ async fn apply_task_result_inner(
                     cold_queue.spawn_cold_maintenance().await;
                 });
             } else {
-                if let Some(ack_token) = ack_token {
-                    registry
-                        .send_result_ack(&worker_id, session_id, task_id, ack_token)
-                        .await;
+                if !outcome.durability_failed {
+                    if let Some(ack_token) = ack_token {
+                        registry
+                            .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                            .await;
+                    }
                 }
                 {
                     let mut lock = waiters.write().await;
@@ -757,19 +765,26 @@ async fn apply_task_result_inner(
                 queue.spawn_cold_maintenance().await;
             }
         } else {
-            if let Some(ack) = durable_ack {
-                if let Err(err) = ack.await {
-                    warn!(
-                        task_id = %task_id.0,
-                        error = %err,
-                        "Failed to sync TaskTerminal journal record for task result"
-                    );
+            let durable_ok = match durable_ack {
+                Some(ack) => match ack.await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(
+                            task_id = %task_id.0,
+                            error = %err,
+                            "Failed to sync TaskTerminal journal record for task result"
+                        );
+                        false
+                    }
+                },
+                None => !outcome.durability_failed,
+            };
+            if durable_ok {
+                if let Some(ack_token) = ack_token {
+                    registry
+                        .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                        .await;
                 }
-            }
-            if let Some(ack_token) = ack_token {
-                registry
-                    .send_result_ack(&worker_id, session_id, task_id, ack_token)
-                    .await;
             }
             {
                 let mut lock = waiters.write().await;
@@ -782,18 +797,25 @@ async fn apply_task_result_inner(
             queue.spawn_cold_maintenance().await;
         }
     } else if let Some(ack_token) = ack_token {
-        if let Some(ack) = durable_ack {
-            if let Err(err) = ack.await {
-                warn!(
-                    task_id = %task_id.0,
-                    error = %err,
-                    "Failed to sync journal record for non-terminal task result"
-                );
-            }
+        let durable_ok = match durable_ack {
+            Some(ack) => match ack.await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(
+                        task_id = %task_id.0,
+                        error = %err,
+                        "Failed to sync journal record for non-terminal task result"
+                    );
+                    false
+                }
+            },
+            None => !outcome.durability_failed,
+        };
+        if durable_ok {
+            registry
+                .send_result_ack(&worker_id, session_id, task_id, ack_token)
+                .await;
         }
-        registry
-            .send_result_ack(&worker_id, session_id, task_id, ack_token)
-            .await;
     }
 
     // 4. Wake scheduler loop to assign pending tasks

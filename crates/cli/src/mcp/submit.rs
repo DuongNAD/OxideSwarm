@@ -399,7 +399,7 @@ fn escaped_char_bytes(ch: char) -> usize {
     }
 }
 
-fn escaped_str_bytes(s: &str) -> usize {
+pub(crate) fn escaped_str_bytes(s: &str) -> usize {
     s.chars().map(escaped_char_bytes).sum()
 }
 
@@ -431,7 +431,7 @@ fn take_tail_escaped(s: &str, max_escaped: usize) -> (&str, usize) {
     (&s[start_byte..], s.len() - start_byte)
 }
 
-fn split_stream_budgets(
+pub(crate) fn split_stream_budgets(
     stdout_need: usize,
     stderr_need: usize,
     max_output_bytes: usize,
@@ -1083,6 +1083,36 @@ pub(super) async fn tool_submit(
     if !output_globs.is_empty() {
         task = task.with_output_globs(output_globs);
     }
+
+    let submit_started = std::time::Instant::now();
+    if let Some(matrix_val) = args.get("matrix").filter(|v| !v.is_null()) {
+        let allow_env_axes = matches!(
+            task.spec,
+            TaskSpec::Command { .. } | TaskSpec::ShellScript { .. }
+        );
+        let max_output_bytes = args
+            .get("max_output_bytes")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_MCP_MAX_OUTPUT_BYTES);
+        return super::submit_matrix::run_mcp_matrix(
+            state,
+            args,
+            ctx,
+            matrix_val,
+            task,
+            &placement,
+            allow_env_axes,
+            prepared_inputs,
+            ws_uploads,
+            ws_meta,
+            wait_secs,
+            max_output_bytes,
+            submit_started,
+        )
+        .await;
+    }
+
     let task_id = task.id;
     let verify_template = verify.replicas.map(|_| task.clone());
     *ctx.submitted_task_id.lock().await = Some(task_id);
@@ -1091,8 +1121,6 @@ pub(super) async fn tool_submit(
         ctx.aborted_by_cancel = true;
         return ToolCallResult::error(format!("Task {task_id} cancelled by client"));
     }
-
-    let submit_started = std::time::Instant::now();
 
     let target_addr = match state.resolve_target_addr().await {
         Ok(addr) => addr,
@@ -1166,7 +1194,7 @@ pub(super) async fn tool_submit(
         }
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+    let deadline = crate::matrix::safe_deadline(Duration::from_secs(wait_secs));
     let preflight_timeout =
         Duration::from_millis(500).min(Duration::from_secs(wait_secs.max(1)) / 2);
     let warning = check_matching_worker_warning(

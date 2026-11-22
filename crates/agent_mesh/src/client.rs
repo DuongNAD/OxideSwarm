@@ -3,19 +3,23 @@
 //! Provides connection management, node registration, periodic heartbeats,
 //! remote command execution, data transmission, and request/response correlation.
 
+use crate::delivery::{persist_payload_atomic, DataConsumer, DataVerdict, InboxQuota};
+pub use crate::delivery::{validate_inbox_dir, DEFAULT_INBOX_MAX_BYTES, DEFAULT_INBOX_MAX_FILES};
 use crate::executor::CommandExecutor;
 use crate::protocol::{
     compute_sha256, verify_sha256, AgentMeshEnvelope, CorrelationId, NodeDescriptor,
-    ERR_DUPLICATE_NODE_ID, ERR_INVALID_NODE_ID, ERR_UNAUTHORIZED,
+    ACK_STATUS_CHUNK_RECEIVED, ACK_STATUS_DATA_VERIFIED, ACK_STATUS_TARGET_FORWARDED,
+    DATA_CHUNK_WINDOW, DEFAULT_DATA_CHUNK_BYTES, ERR_DUPLICATE_NODE_ID, ERR_INVALID_NODE_ID,
+    ERR_PERSIST_FAILED, ERR_UNAUTHORIZED,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_tungstenite::{
@@ -139,6 +143,174 @@ pub(crate) fn parse_certificates_pem_or_der(
     }
 }
 
+/// Default maximum number of received `DataPayload` envelopes retained in memory per client.
+pub const DEFAULT_MAX_RECEIVED_PAYLOADS: usize = 256;
+/// Default maximum total payload bytes retained in memory in `received_payloads` (64 MiB).
+pub const DEFAULT_MAX_RECEIVED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Delivery acknowledgement receipt returned by `AgentMeshClient::send_data_payload_with_ack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDeliveryReceipt {
+    pub correlation_id: String,
+    pub sha256: String,
+    pub total_chunks: u32,
+    pub responder: String,
+    pub status: String,
+}
+
+type TransferMap = Arc<Mutex<HashMap<CorrelationId, mpsc::UnboundedSender<AgentMeshEnvelope>>>>;
+
+/// Removes an outgoing transfer from the client's table however the send ends.
+struct TransferRegistration {
+    transfers: TransferMap,
+    correlation_id: String,
+}
+
+impl Drop for TransferRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.transfers.lock() {
+            map.remove(&self.correlation_id);
+        }
+    }
+}
+
+/// What one acknowledgement envelope means to the sender of a data transfer.
+enum TransferEvent {
+    ChunkAcked,
+    Verified(String),
+    Refused(String),
+}
+
+#[derive(Debug)]
+struct BoundedPayloadBuffer {
+    items: VecDeque<AgentMeshEnvelope>,
+    total_bytes: usize,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+impl BoundedPayloadBuffer {
+    fn new(max_items: usize, max_bytes: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            total_bytes: 0,
+            max_items,
+            max_bytes,
+        }
+    }
+
+    fn payload_bytes(env: &AgentMeshEnvelope) -> usize {
+        match env {
+            AgentMeshEnvelope::DataPayload {
+                data,
+                chunk_size_bytes,
+                payload,
+                ..
+            } => {
+                let d_len = data.as_ref().map_or(0, String::len).max(*chunk_size_bytes);
+                let p_len = payload.as_ref().map_or(0, |v| v.to_string().len());
+                d_len.saturating_add(p_len)
+            }
+            _ => 0,
+        }
+    }
+
+    fn push(&mut self, env: AgentMeshEnvelope) {
+        if self.max_items == 0 || self.max_bytes == 0 {
+            return;
+        }
+        let sz = Self::payload_bytes(&env);
+        if sz > self.max_bytes {
+            return;
+        }
+        while self.items.len() >= self.max_items
+            || (self.total_bytes.saturating_add(sz) > self.max_bytes && !self.items.is_empty())
+        {
+            if let Some(evicted) = self.items.pop_front() {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(Self::payload_bytes(&evicted));
+            } else {
+                break;
+            }
+        }
+        self.total_bytes = self.total_bytes.saturating_add(sz);
+        self.items.push_back(env);
+    }
+}
+
+struct ActiveCommandGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveCommandGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits for the next acknowledgement of an outgoing data transfer that counts: a `DeliveryAck`
+/// from `target` (`chunk_received` or `data_received_verified`), or a `DeliveryNack` from `target`
+/// or from the hub. Envelopes from any other node are logged and ignored, so a third node that
+/// reuses the correlation id can neither confirm nor fail the transfer.
+async fn next_transfer_event(
+    acks: &mut mpsc::UnboundedReceiver<AgentMeshEnvelope>,
+    target: &str,
+    wait: Duration,
+) -> Result<TransferEvent, Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let envelope = match tokio::time::timeout(wait, acks.recv()).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                return Err("Connection closed while awaiting data delivery acknowledgement".into())
+            }
+            Err(_) => {
+                return Err(format!(
+                    "Timed out waiting for data delivery acknowledgement after {} ms",
+                    wait.as_millis()
+                )
+                .into())
+            }
+        };
+        match envelope {
+            AgentMeshEnvelope::DeliveryAck { from, status, .. } => {
+                if from != target {
+                    warn!(
+                        responder = %from,
+                        target = %target,
+                        "Ignoring a data DeliveryAck that does not come from the target node"
+                    );
+                    continue;
+                }
+                if status == ACK_STATUS_CHUNK_RECEIVED {
+                    return Ok(TransferEvent::ChunkAcked);
+                }
+                if status == ACK_STATUS_DATA_VERIFIED {
+                    return Ok(TransferEvent::Verified(status));
+                }
+                // `target_forwarded` and unknown statuses say nothing about verification.
+            }
+            AgentMeshEnvelope::DeliveryNack {
+                from,
+                error_code,
+                reason,
+                ..
+            } => {
+                if from != target && from != "hub" {
+                    warn!(
+                        responder = %from,
+                        target = %target,
+                        "Ignoring a data DeliveryNack that comes from neither the target nor the hub"
+                    );
+                    continue;
+                }
+                return Ok(TransferEvent::Refused(format!(
+                    "Data delivery rejected ({error_code}): {reason}"
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct AgentMeshClient {
     hub_url: String,
     node_id: String,
@@ -147,10 +319,16 @@ pub struct AgentMeshClient {
     token: Option<String>,
     tls_ca_bytes: Option<Vec<u8>>,
     tls_ca_file: Option<PathBuf>,
+    inbox_dir: Option<PathBuf>,
+    inbox_quota: InboxQuota,
     tx: Arc<RwLock<Option<mpsc::UnboundedSender<WsMessage>>>>,
     pending: Arc<RwLock<HashMap<CorrelationId, oneshot::Sender<AgentMeshEnvelope>>>>,
-    received_payloads: Arc<RwLock<Vec<AgentMeshEnvelope>>>,
+    /// Outgoing data transfers awaiting `DeliveryAck` / `DeliveryNack` envelopes: every one for
+    /// the correlation id is passed on (chunk flow control, then the final verdict).
+    transfers: TransferMap,
+    received_payloads: Arc<RwLock<BoundedPayloadBuffer>>,
     executed_count: Arc<AtomicUsize>,
+    active_commands: Arc<AtomicUsize>,
     running: Arc<AtomicBool>,
     no_shell: bool,
 }
@@ -170,12 +348,63 @@ impl AgentMeshClient {
             token: None,
             tls_ca_bytes: None,
             tls_ca_file: None,
+            inbox_dir: None,
+            inbox_quota: InboxQuota::default(),
             tx: Arc::new(RwLock::new(None)),
             pending: Arc::new(RwLock::new(HashMap::new())),
-            received_payloads: Arc::new(RwLock::new(Vec::new())),
+            transfers: Arc::new(Mutex::new(HashMap::new())),
+            received_payloads: Arc::new(RwLock::new(BoundedPayloadBuffer::new(
+                DEFAULT_MAX_RECEIVED_PAYLOADS,
+                DEFAULT_MAX_RECEIVED_BYTES,
+            ))),
             executed_count: Arc::new(AtomicUsize::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             no_shell: false,
+        }
+    }
+
+    /// Configures an inbox directory where verified incoming `DataPayload` bytes are written
+    /// atomically before sending `DeliveryAck`.
+    pub fn with_inbox_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.inbox_dir = Some(dir.into());
+        self
+    }
+
+    /// Limits what this node writes into its inbox directory (`--inbox-max-mb`,
+    /// `--inbox-max-files`): a payload that would exceed either is refused with
+    /// `DeliveryNack(ERR_INBOX_FULL)`.
+    pub fn with_inbox_quota(mut self, max_bytes: u64, max_files: usize) -> Self {
+        self.inbox_quota = InboxQuota {
+            max_bytes,
+            max_files,
+        };
+        self
+    }
+
+    /// Configures the maximum number of received `DataPayload` envelopes retained in memory.
+    pub fn with_max_received_payloads(self, max_items: usize) -> Self {
+        if let Ok(mut buf) = self.received_payloads.try_write() {
+            buf.max_items = max_items;
+        }
+        self
+    }
+
+    /// Configures the maximum total bytes retained in `received_payloads` in memory.
+    pub fn with_max_received_bytes(self, max_bytes: usize) -> Self {
+        if let Ok(mut buf) = self.received_payloads.try_write() {
+            buf.max_bytes = max_bytes;
+        }
+        self
+    }
+
+    /// Validates the configured `--inbox-dir` (if any) and returns its canonical path.
+    pub fn validate_inbox_config(
+        &self,
+    ) -> Result<Option<PathBuf>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.inbox_dir {
+            Some(ref dir) => validate_inbox_dir(dir).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -222,8 +451,18 @@ impl AgentMeshClient {
         self.executed_count.load(Ordering::SeqCst)
     }
 
+    pub fn active_commands_count(&self) -> usize {
+        self.active_commands.load(Ordering::SeqCst)
+    }
+
     pub async fn received_data_payloads(&self) -> Vec<AgentMeshEnvelope> {
-        self.received_payloads.read().await.clone()
+        self.received_payloads
+            .read()
+            .await
+            .items
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Validates any configured custom TLS CA certificate file or bytes and verifies that the TLS
@@ -309,6 +548,7 @@ impl AgentMeshClient {
 
     /// Establishes the WebSocket connection to the Hub and spawns the read/write message pump.
     pub async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let validated_inbox_dir = self.validate_inbox_config()?;
         info!("Connecting to OxideRelay Hub at {}...", self.hub_url);
         if token_sent_in_clear_to_remote_host(&self.hub_url, self.token.is_some()) {
             warn!(
@@ -390,12 +630,17 @@ impl AgentMeshClient {
         let pending_map = self.pending.clone();
         let received_list = self.received_payloads.clone();
         let exec_counter = self.executed_count.clone();
+        let active_counter = self.active_commands.clone();
         let out_tx = outbound_tx.clone();
         let running_flag = self.running.clone();
         let no_shell = self.no_shell;
+        let inbox_dir_opt = validated_inbox_dir;
+        let inbox_quota = self.inbox_quota;
+        let transfer_map = self.transfers.clone();
         let mut reg_waiter = Some(reg_tx);
 
         tokio::spawn(async move {
+            let mut consumer = DataConsumer::new();
             while let Some(msg_res) = ws_read.next().await {
                 let msg = match msg_res {
                     Ok(m) => m,
@@ -447,6 +692,8 @@ impl AgentMeshClient {
                                 ..
                             } => {
                                 exec_counter.fetch_add(1, Ordering::SeqCst);
+                                active_counter.fetch_add(1, Ordering::SeqCst);
+                                let active_guard = ActiveCommandGuard(active_counter.clone());
                                 let sender = from.clone();
                                 let cmd = command.clone();
                                 let cmd_args = args.clone();
@@ -455,6 +702,7 @@ impl AgentMeshClient {
                                 let request_corr_id = corr_id.clone();
 
                                 tokio::spawn(async move {
+                                    let _guard = active_guard;
                                     info!(
                                         "[{}] Executing command '{}' from '{}'",
                                         node_id, cmd, sender
@@ -484,51 +732,108 @@ impl AgentMeshClient {
 
                             AgentMeshEnvelope::DataPayload {
                                 ref from,
-                                ref data,
-                                ref checksum_sha256,
+                                ref metadata,
+                                timestamp,
                                 ..
                             } => {
-                                received_list.write().await.push(envelope.clone());
-
-                                // Check payload integrity
-                                let valid = if let (Some(d), Some(hash)) = (data, checksum_sha256) {
-                                    let bytes: Vec<u8> = d.chars().map(|c| c as u8).collect();
-                                    verify_sha256(&bytes, hash)
-                                } else {
-                                    true
+                                let reply = |env: AgentMeshEnvelope| {
+                                    if let Ok(json_str) = env.to_json_string() {
+                                        let _ = out_tx.send(WsMessage::Text(json_str));
+                                    }
                                 };
-
-                                let reply_envelope = if valid {
-                                    AgentMeshEnvelope::new_delivery_ack(
+                                let send_nack = |code: &str, reason: String| {
+                                    reply(AgentMeshEnvelope::new_delivery_nack(
                                         client_node_id.clone(),
                                         from,
                                         corr_id.clone(),
-                                        "data_received_verified",
-                                    )
-                                } else {
-                                    AgentMeshEnvelope::new_delivery_nack(
-                                        client_node_id.clone(),
-                                        from,
-                                        corr_id.clone(),
-                                        "ERR_PAYLOAD_CORRUPT",
-                                        "SHA-256 checksum mismatch",
-                                    )
+                                        code,
+                                        reason,
+                                    ));
                                 };
 
-                                if let Ok(json_str) = reply_envelope.to_json_string() {
-                                    let _ = out_tx.send(WsMessage::Text(json_str));
-                                }
-
-                                // Resolve any local pending future matching correlation ID
-                                if let Some(sender_channel) =
-                                    pending_map.write().await.remove(&corr_id)
+                                // Verify the chunk, and for the last one the whole payload.
+                                let (final_bytes, completed_envelope) = match consumer
+                                    .accept(&envelope, Instant::now())
                                 {
-                                    let _ = sender_channel.send(envelope);
+                                    DataVerdict::Dropped => continue,
+                                    DataVerdict::Rejected { code, reason } => {
+                                        send_nack(code, reason);
+                                        continue;
+                                    }
+                                    DataVerdict::ChunkAccepted => {
+                                        // Flow control for the sender, not a receipt.
+                                        reply(AgentMeshEnvelope::new_delivery_ack(
+                                            client_node_id.clone(),
+                                            from,
+                                            corr_id.clone(),
+                                            ACK_STATUS_CHUNK_RECEIVED,
+                                        ));
+                                        continue;
+                                    }
+                                    DataVerdict::Complete { bytes, envelope } => (bytes, envelope),
+                                };
+
+                                // Persist atomically to --inbox-dir (under its quota) BEFORE the ACK.
+                                if let Some(ref dir) = inbox_dir_opt {
+                                    let dir_clone = dir.clone();
+                                    let corr_clone = corr_id.clone();
+                                    let meta_clone = metadata.clone();
+                                    let persist_res = tokio::task::spawn_blocking(move || {
+                                        persist_payload_atomic(
+                                            &dir_clone,
+                                            inbox_quota,
+                                            &corr_clone,
+                                            timestamp,
+                                            meta_clone.as_ref(),
+                                            &final_bytes,
+                                        )
+                                    })
+                                    .await;
+
+                                    let refusal = match persist_res {
+                                        Ok(Ok(_saved_path)) => None,
+                                        Ok(Err(err)) => Some((err.code, err.reason)),
+                                        Err(join_err) => Some((
+                                            ERR_PERSIST_FAILED,
+                                            format!("Inbox persistence task failed: {join_err}"),
+                                        )),
+                                    };
+                                    if let Some((code, reason)) = refusal {
+                                        consumer.refuse(from, &corr_id);
+                                        send_nack(code, reason);
+                                        continue;
+                                    }
                                 }
+
+                                // Buffer in the bounded memory queue, then send the receipt that
+                                // covers the whole payload.
+                                received_list.write().await.push(*completed_envelope);
+                                reply(AgentMeshEnvelope::new_delivery_ack(
+                                    client_node_id.clone(),
+                                    from,
+                                    corr_id.clone(),
+                                    ACK_STATUS_DATA_VERIFIED,
+                                ));
                             }
 
-                            AgentMeshEnvelope::DeliveryAck { ref status, .. } => {
-                                if status != "target_forwarded" {
+                            AgentMeshEnvelope::DeliveryAck { .. }
+                            | AgentMeshEnvelope::DeliveryNack { .. } => {
+                                // Our own data transfers see every ACK/NACK of their id.
+                                let transfer = transfer_map
+                                    .lock()
+                                    .ok()
+                                    .and_then(|map| map.get(&corr_id).cloned());
+                                if let Some(transfer) = transfer {
+                                    let _ = transfer.send(envelope);
+                                    continue;
+                                }
+                                let is_intermediate = matches!(
+                                    envelope,
+                                    AgentMeshEnvelope::DeliveryAck { ref status, .. }
+                                        if status == ACK_STATUS_TARGET_FORWARDED
+                                            || status == ACK_STATUS_CHUNK_RECEIVED
+                                );
+                                if !is_intermediate {
                                     if let Some(sender_channel) =
                                         pending_map.write().await.remove(&corr_id)
                                     {
@@ -538,7 +843,6 @@ impl AgentMeshClient {
                             }
 
                             AgentMeshEnvelope::CommandResponse { .. }
-                            | AgentMeshEnvelope::DeliveryNack { .. }
                             | AgentMeshEnvelope::NodeListResponse { .. }
                             | AgentMeshEnvelope::NodeRegistrationAck { .. } => {
                                 if let Some(sender_channel) =
@@ -559,6 +863,11 @@ impl AgentMeshClient {
                 }
             }
             running_flag.store(false, Ordering::SeqCst);
+            pending_map.write().await.clear();
+            // Dropping the channels tells every outgoing transfer that the connection is gone.
+            if let Ok(mut map) = transfer_map.lock() {
+                map.clear();
+            }
         });
 
         match tokio::time::timeout(REGISTRATION_TIMEOUT, reg_rx).await {
@@ -619,16 +928,132 @@ impl AgentMeshClient {
         Ok(res)
     }
 
-    /// Transmits a data payload (with SHA-256 verification) to a target node.
+    /// Transmits a data payload (with SHA-256 verification) to a target node. A payload of one
+    /// chunk (up to `DEFAULT_DATA_CHUNK_BYTES`) is sent without waiting for the acknowledgement.
+    /// A larger payload has to be paced by the target's chunk acknowledgements (design 0107 D3),
+    /// so it goes through `send_data_payload_with_ack` and returns once the target verified it.
     pub async fn send_data_payload(
         &self,
         target_id: &str,
         data_bytes: &[u8],
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        let (env, hash) = AgentMeshEnvelope::new_data_payload(&self.node_id, target_id, data_bytes);
-        let corr_id = env.correlation_id().to_string();
-        self.send_envelope(env).await?;
+        if data_bytes.len() > DEFAULT_DATA_CHUNK_BYTES {
+            let receipt = self
+                .send_data_payload_with_ack(target_id, data_bytes, None)
+                .await?;
+            return Ok((receipt.correlation_id, receipt.sha256));
+        }
+        let (envelopes, corr_id, hash) = AgentMeshEnvelope::new_data_payload_chunks(
+            &self.node_id,
+            target_id,
+            data_bytes,
+            DEFAULT_DATA_CHUNK_BYTES,
+        );
+        for env in envelopes {
+            self.send_envelope(env).await?;
+        }
         Ok((corr_id, hash))
+    }
+
+    /// Transmits a data payload (chunking automatically above `DEFAULT_DATA_CHUNK_BYTES`) and
+    /// awaits consumer verification (`DeliveryAck`) or hub/consumer rejection (`DeliveryNack`).
+    pub async fn send_data_payload_with_ack(
+        &self,
+        target_id: &str,
+        data_bytes: &[u8],
+        timeout_ms: Option<u64>,
+    ) -> Result<DataDeliveryReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        self.send_data_payload_chunked_with_ack(
+            target_id,
+            data_bytes,
+            DEFAULT_DATA_CHUNK_BYTES,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// Transmits a data payload using an explicit chunk size limit and awaits consumer
+    /// verification (`DeliveryAck(data_received_verified)`) or hub/consumer rejection
+    /// (`DeliveryNack`).
+    ///
+    /// At most `DATA_CHUNK_WINDOW` chunks are unacknowledged at any time: the next chunk goes out
+    /// only after the consumer acknowledged an earlier one with `DeliveryAck(chunk_received)`
+    /// (design 0107 D3), so a transfer never fills the hub's queue for the consumer. Only
+    /// acknowledgements whose `from` is `target_id` count (a `DeliveryNack` from the hub counts as
+    /// well); any other is ignored. `timeout_ms` bounds each wait for the next acknowledgement,
+    /// not the whole transfer.
+    pub async fn send_data_payload_chunked_with_ack(
+        &self,
+        target_id: &str,
+        data_bytes: &[u8],
+        max_chunk_bytes: usize,
+        timeout_ms: Option<u64>,
+    ) -> Result<DataDeliveryReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        let (envelopes, corr_id, sha256) = AgentMeshEnvelope::new_data_payload_chunks(
+            &self.node_id,
+            target_id,
+            data_bytes,
+            max_chunk_bytes,
+        );
+        let envelopes_len = envelopes.len();
+        let total_chunks = u32::try_from(envelopes_len).unwrap_or(u32::MAX);
+        let wait = Duration::from_millis(timeout_ms.unwrap_or(10_000).max(1));
+
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<AgentMeshEnvelope>();
+        self.transfers
+            .lock()
+            .map_err(|_| "data transfer table is poisoned")?
+            .insert(corr_id.clone(), ack_tx);
+        let _registration = TransferRegistration {
+            transfers: self.transfers.clone(),
+            correlation_id: corr_id.clone(),
+        };
+
+        let mut chunks_acked = 0usize;
+        // `sent` = chunks already sent before `env`.
+        for (sent, env) in envelopes.into_iter().enumerate() {
+            while sent.saturating_sub(chunks_acked) >= DATA_CHUNK_WINDOW {
+                match next_transfer_event(&mut ack_rx, target_id, wait).await? {
+                    TransferEvent::ChunkAcked => chunks_acked += 1,
+                    TransferEvent::Verified(_) => {
+                        return Err(format!(
+                            "'{target_id}' confirmed the whole payload after only {sent} of {total_chunks} chunks were sent"
+                        )
+                        .into());
+                    }
+                    TransferEvent::Refused(msg) => return Err(msg.into()),
+                }
+            }
+            self.send_envelope(env).await?;
+        }
+
+        loop {
+            match next_transfer_event(&mut ack_rx, target_id, wait).await? {
+                // Acks of chunks still in the window when the last chunk went out.
+                TransferEvent::ChunkAcked => chunks_acked += 1,
+                TransferEvent::Verified(status) => {
+                    // The consumer acknowledges every chunk but the last with `chunk_received`
+                    // before the receipt for the whole payload, on one socket and so in order. A
+                    // receipt that overtakes them covers only part of the payload (a consumer
+                    // that does not reassemble), so it is no proof of delivery.
+                    let expected_chunk_acks = envelopes_len.saturating_sub(1);
+                    if chunks_acked != expected_chunk_acks {
+                        return Err(format!(
+                            "'{target_id}' confirmed the payload after acknowledging {chunks_acked} of {expected_chunk_acks} earlier chunks; it does not reassemble chunked payloads"
+                        )
+                        .into());
+                    }
+                    return Ok(DataDeliveryReceipt {
+                        correlation_id: corr_id,
+                        sha256,
+                        total_chunks,
+                        responder: target_id.to_string(),
+                        status,
+                    });
+                }
+                TransferEvent::Refused(msg) => return Err(msg.into()),
+            }
+        }
     }
 
     /// Queries the Hub for the list of online nodes.
@@ -888,12 +1313,21 @@ impl AgentMeshClient {
     }
 
     /// Runs a long-lived agent node loop with automatic reconnection.
-    /// Validates TLS configuration upfront before entering the reconnect loop.
+    /// Validates TLS and inbox directory configuration upfront before entering the reconnect loop.
     pub async fn run_daemon(&self) {
         if let Err(e) = self.validate_tls_config() {
             tracing::error!("Invalid TLS configuration: {e}");
             return;
         }
+        if let Err(e) = self.validate_inbox_config() {
+            tracing::error!("Invalid inbox directory configuration: {e}");
+            return;
+        }
+        let mut sys = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::new()
+                .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
+                .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
+        );
         loop {
             if let Err(e) = self.connect().await {
                 let delay = match e.downcast_ref::<RegistrationRejected>() {
@@ -926,14 +1360,26 @@ impl AgentMeshClient {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             while self.is_connected() {
                 interval.tick().await;
+                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
+                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::new().with_ram());
+                let cpu_usage_pct = Some(sys.global_cpu_info().cpu_usage());
+                let avail_bytes = sys.available_memory();
+                let mem_bytes = if avail_bytes > 0 {
+                    avail_bytes
+                } else {
+                    sys.free_memory()
+                };
+                let memory_free_mb = Some(mem_bytes / (1024 * 1024));
+                let active_commands = Some(self.active_commands.load(Ordering::SeqCst));
+
                 let hb = AgentMeshEnvelope::Heartbeat {
                     version: "1.0".to_string(),
                     correlation_id: uuid::Uuid::new_v4().to_string(),
                     from: self.node_id.clone(),
                     to: "hub".to_string(),
-                    cpu_usage_pct: None,
-                    memory_free_mb: None,
-                    active_commands: Some(0),
+                    cpu_usage_pct,
+                    memory_free_mb,
+                    active_commands,
                     timestamp: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
@@ -954,7 +1400,9 @@ impl AgentMeshClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery::validate_inbox_dir;
     use crate::hub::AgentMeshHub;
+    use crate::protocol::ERR_PAYLOAD_CORRUPT;
 
     #[test]
     fn test_cleartext_token_warning_predicate() {
@@ -1453,5 +1901,165 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
             "refused",
         ));
         assert!(!is_transient_ws_connect_error(&refused));
+    }
+
+    #[tokio::test]
+    async fn test_bounded_received_payloads_cap() {
+        let hub = AgentMeshHub::new();
+        let port = hub.start("127.0.0.1:0").await.expect("Hub failed to start");
+        let hub_url = format!("ws://127.0.0.1:{}/ws", port);
+
+        let sender = AgentMeshClient::new(&hub_url, "bounded-sender", "macos");
+        let receiver = AgentMeshClient::new(&hub_url, "bounded-receiver", "linux")
+            .with_max_received_payloads(5);
+
+        sender.connect().await.unwrap();
+        receiver.connect().await.unwrap();
+
+        for i in 0..12u32 {
+            let msg = format!("pkt-{i:02}");
+            let receipt = sender
+                .send_data_payload_with_ack("bounded-receiver", msg.as_bytes(), Some(3000))
+                .await
+                .expect("send with ack");
+            assert_eq!(receipt.status, "data_received_verified");
+        }
+
+        let buffered = receiver.received_data_payloads().await;
+        assert_eq!(buffered.len(), 5);
+        let payloads: Vec<String> = buffered
+            .into_iter()
+            .map(|e| match e {
+                AgentMeshEnvelope::DataPayload { data, .. } => data.unwrap(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            payloads,
+            vec!["pkt-07", "pkt-08", "pkt-09", "pkt-10", "pkt-11"]
+        );
+
+        sender.close().await;
+        receiver.close().await;
+        hub.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_and_multi_chunk_data_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = validate_inbox_dir(&tmp.path().join("inbox")).unwrap();
+
+        let hub = AgentMeshHub::new();
+        let port = hub.start("127.0.0.1:0").await.expect("Hub failed to start");
+        let hub_url = format!("ws://127.0.0.1:{}/ws", port);
+
+        let consumer = AgentMeshClient::new(&hub_url, "consumer", "macos").with_inbox_dir(&inbox);
+        let sender = AgentMeshClient::new(&hub_url, "sender", "linux");
+        consumer.connect().await.unwrap();
+        sender.connect().await.unwrap();
+
+        // 1. Corrupted checksum must NACK and write nothing to inbox or received_payloads
+        let mut bad_env = AgentMeshEnvelope::new_data_payload("sender", "consumer", b"tampered").0;
+        let bad_corr = bad_env.correlation_id().to_string();
+        if let AgentMeshEnvelope::DataPayload {
+            ref mut checksum_sha256,
+            ..
+        } = bad_env
+        {
+            *checksum_sha256 = Some("0".repeat(64));
+        }
+        let (tx, rx) = oneshot::channel();
+        sender.pending.write().await.insert(bad_corr.clone(), tx);
+        sender.send_envelope(bad_env).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        match reply {
+            AgentMeshEnvelope::DeliveryNack { error_code, .. } => {
+                assert_eq!(error_code, ERR_PAYLOAD_CORRUPT);
+            }
+            other => panic!("Expected DeliveryNack, got {other:?}"),
+        }
+        assert!(consumer.received_data_payloads().await.is_empty());
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+
+        // 2. Non-Latin-1 code point must NACK and write nothing
+        let non_latin1 = serde_json::json!({
+            "type": "DataPayload",
+            "correlation_id": "bad-unicode",
+            "from": "sender",
+            "to": "consumer",
+            "data": "hello-\u{1F680}",
+            "checksum_sha256": compute_sha256("hello-\u{1F680}".as_bytes()),
+        });
+        let (tx2, rx2) = oneshot::channel();
+        sender
+            .pending
+            .write()
+            .await
+            .insert("bad-unicode".to_string(), tx2);
+        sender
+            .send_envelope(AgentMeshEnvelope::from_json_str(&non_latin1.to_string()).unwrap())
+            .await
+            .unwrap();
+        let reply2 = tokio::time::timeout(Duration::from_secs(3), rx2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            reply2,
+            AgentMeshEnvelope::DeliveryNack { ref error_code, .. } if error_code == ERR_PAYLOAD_CORRUPT
+        ));
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+
+        // 3. Multi-chunk out-of-order reassembly + atomic inbox write
+        let big_payload: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+        let (mut chunks, multi_corr, multi_sha) =
+            AgentMeshEnvelope::new_data_payload_chunks("sender", "consumer", &big_payload, 1024);
+        assert_eq!(chunks.len(), 5);
+        chunks.reverse(); // deliver chunks out-of-order [4, 3, 2, 1, 0]
+        let (tx3, rx3) = oneshot::channel();
+        sender.pending.write().await.insert(multi_corr.clone(), tx3);
+        for chunk in chunks {
+            sender.send_envelope(chunk).await.unwrap();
+        }
+        let reply3 = tokio::time::timeout(Duration::from_secs(5), rx3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            reply3,
+            AgentMeshEnvelope::DeliveryAck { ref status, .. } if status == "data_received_verified"
+        ));
+        let files: Vec<_> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1);
+        let disk_bytes = std::fs::read(files[0].path()).unwrap();
+        assert_eq!(disk_bytes, big_payload);
+        assert_eq!(compute_sha256(&disk_bytes), multi_sha);
+
+        // 4. send_data_payload_chunked_with_ack against missing target fails immediately
+        let err = sender
+            .send_data_payload_chunked_with_ack("missing-node", b"abc", 2, Some(3000))
+            .await
+            .expect_err("missing target must fail");
+        assert!(err.to_string().contains("ERR_NODE_NOT_FOUND"), "{err}");
+
+        // 5. Self-delivery (from == to) resolves with DeliveryAck instead of DataPayload.
+        let self_receipt = consumer
+            .send_data_payload_with_ack("consumer", b"self-loop-payload", Some(3000))
+            .await
+            .expect("self-targeted send_data_payload_with_ack must succeed");
+        assert_eq!(self_receipt.responder, "consumer");
+        assert_eq!(self_receipt.status, "data_received_verified");
+        assert_eq!(self_receipt.sha256, compute_sha256(b"self-loop-payload"));
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 2);
+
+        sender.close().await;
+        consumer.close().await;
+        hub.stop().await;
     }
 }

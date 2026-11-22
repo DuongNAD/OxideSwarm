@@ -20,6 +20,9 @@
   `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`.
 - **Moves files in and out.** `submit --input` sends files and directories, and `--output` brings
   back the files its patterns select. A file the other side already holds is not sent again.
+- **Fans out across a matrix.** `oxideswarm submit --matrix os=macos,windows,linux -- ...` runs one
+  task per cell across matching workers, detects unplaced cells upfront, and returns per-cell
+  outcomes ([flags](docs/reference.md#oxideswarm-submit-flags)).
 - **Works across networks.** On a LAN, workers connect to the master over TCP. With `master --p2p`,
   machines on other networks connect through NAT or a relay (iroh QUIC), with no router ports to
   open. Traffic beyond loopback is authenticated and encrypted.

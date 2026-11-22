@@ -413,7 +413,19 @@ pub struct TaskEntry {
     pub speculative: Option<SpeculativeAttempt>,
     /// True once a speculative copy has been launched for this task (at most one per task).
     pub speculative_spawned: bool,
+    /// When the master last accepted a checkpoint of at least [`LARGE_CHECKPOINT_BYTES`] for this
+    /// task (in memory only); large checkpoints are accepted at most once per
+    /// [`LARGE_CHECKPOINT_MIN_INTERVAL`] so one task cannot keep the journal compacting.
+    pub last_large_checkpoint_at: Option<Instant>,
 }
+
+/// Checkpoints at least this large are rate limited per task (design 0102 D7).
+pub const LARGE_CHECKPOINT_BYTES: usize = 1024 * 1024;
+/// Minimum time between two accepted large checkpoints of one task (design 0102 D7).
+pub const LARGE_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Checkpoints may grow the active bytes only up to `max - max / CHECKPOINT_HEADROOM_DIVISOR`, so
+/// running tasks' checkpoints can never take the room new submissions need (design 0102 D7).
+pub const CHECKPOINT_HEADROOM_DIVISOR: usize = 4;
 
 impl TaskEntry {
     pub fn to_info(&self) -> TaskInfo {
@@ -687,6 +699,9 @@ pub struct ResultOutcome {
     /// `(worker_id, session_id, session_live)` that must receive `MasterMessage::CancelTask` and
     /// have its dispatch released (`0060` D3).
     pub cancel_sibling: Option<(Uuid, Option<u64>, Option<Arc<AtomicBool>>)>,
+    /// True when the attached `TaskStore` failed to enqueue the durable journal record or had
+    /// already entered a failed state (so callers must not send `oxs:result-ack:<token>`).
+    pub durability_failed: bool,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.

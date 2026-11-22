@@ -655,6 +655,7 @@ impl TaskQueue {
                     requires_tree_v2,
                     speculative: None,
                     speculative_spawned: false,
+                    last_large_checkpoint_at: None,
                 };
 
                 let is_terminal = entry.state.is_terminal();

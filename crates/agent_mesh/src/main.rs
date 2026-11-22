@@ -96,6 +96,31 @@ pub enum Commands {
         /// Disable shell command execution (refuse shell_exec)
         #[arg(long)]
         no_shell: bool,
+
+        /// Directory where verified incoming DataPayload bytes are persisted atomically
+        #[arg(
+            long,
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        inbox_dir: Option<PathBuf>,
+
+        /// Most MiB the files in --inbox-dir may hold; a payload that does not fit is refused
+        /// with DeliveryNack(ERR_INBOX_FULL)
+        #[arg(
+            long,
+            default_value_t = agent_mesh::DEFAULT_INBOX_MAX_BYTES / (1024 * 1024),
+            value_parser = clap::value_parser!(u64).range(1..=(u64::MAX / (1024 * 1024)))
+        )]
+        inbox_max_mb: u64,
+
+        /// Most files --inbox-dir may hold; past it payloads are refused with
+        /// DeliveryNack(ERR_INBOX_FULL)
+        #[arg(
+            long,
+            default_value_t = agent_mesh::DEFAULT_INBOX_MAX_FILES as u64,
+            value_parser = clap::value_parser!(u64).range(1..=(u32::MAX as u64))
+        )]
+        inbox_max_files: u64,
     },
 
     /// Send a structured command to a specific node
@@ -177,8 +202,25 @@ pub enum Commands {
         to: String,
 
         /// Raw data string to transmit
-        #[arg(long)]
-        payload: String,
+        #[arg(
+            long,
+            required_unless_present = "payload_file",
+            conflicts_with = "payload_file"
+        )]
+        payload: Option<String>,
+
+        /// Path to a file containing raw payload bytes to transmit (use '-' to read from stdin)
+        #[arg(
+            long,
+            conflicts_with = "payload",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        payload_file: Option<PathBuf>,
+
+        /// Longest wait in milliseconds for the target's next acknowledgement (of a chunk, or of
+        /// the whole payload); a large transfer may take longer in total
+        #[arg(long, default_value = "10000")]
+        timeout_ms: u64,
 
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
@@ -204,6 +246,32 @@ fn client_token(token: Option<String>) -> Option<String> {
 /// An unset or empty `--tls-ca` / `OXIDE_MESH_TLS_CA` means "no custom CA file".
 fn client_tls_ca(tls_ca: Option<PathBuf>) -> Option<PathBuf> {
     tls_ca.filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Loads raw bytes for `agent-mesh data` from either `--payload` or `--payload-file` (`-` for stdin).
+fn read_data_payload_bytes(
+    payload: Option<String>,
+    payload_file: Option<&Path>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    match (payload, payload_file) {
+        (Some(text), None) => Ok(text.into_bytes()),
+        (None, Some(path)) => {
+            if path == Path::new("-") {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("failed to read data payload from stdin: {e}"))?;
+                Ok(buf)
+            } else {
+                std::fs::read(path).map_err(|e| {
+                    format!("failed to read data payload file '{}': {e}", path.display()).into()
+                })
+            }
+        }
+        (Some(_), Some(_)) => Err("cannot pass both --payload and --payload-file".into()),
+        (None, None) => Err("either --payload or --payload-file must be provided".into()),
+    }
 }
 
 /// Builds a client for `hub_url`, presenting `token` and `tls_ca` if provided.
@@ -395,11 +463,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             tls_ca,
             no_shell,
+            inbox_dir,
+            inbox_max_mb,
+            inbox_max_files,
         } => {
             let host_os = std::env::consts::OS.to_string();
             let hostname = sysinfo::System::host_name().unwrap_or_else(|| "device".to_string());
             let node_id = id.unwrap_or_else(|| format!("node-{}-{}", host_os, hostname));
             let plat = platform.unwrap_or(host_os);
+
+            let canonical_inbox = match inbox_dir {
+                Some(ref dir) => Some(agent_mesh::validate_inbox_dir(dir)?),
+                None => None,
+            };
 
             println!("========================================================");
             println!("   OxideSwarm Cross-Platform Agent Node Client          ");
@@ -410,11 +486,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if no_shell {
                 println!("Shell:    disabled (--no-shell active)");
             }
+            if let Some(ref dir) = canonical_inbox {
+                println!(
+                    "Inbox:    {} (quota {} MiB, {} files)",
+                    dir.display(),
+                    inbox_max_mb,
+                    inbox_max_files
+                );
+            }
             println!();
 
             let mut client = build_client(&hub, &node_id, &plat, token, tls_ca);
             if no_shell {
                 client = client.with_no_shell(true);
+            }
+            if let Some(dir) = canonical_inbox {
+                client = client.with_inbox_dir(dir).with_inbox_quota(
+                    inbox_max_mb.saturating_mul(1024 * 1024),
+                    usize::try_from(inbox_max_files).unwrap_or(usize::MAX),
+                );
             }
             client.validate_tls_config()?;
             client.run_daemon().await;
@@ -510,21 +600,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             from,
             to,
             payload,
+            payload_file,
+            timeout_ms,
             token,
             tls_ca,
         } => {
+            let bytes = read_data_payload_bytes(payload, payload_file.as_deref())?;
             let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
 
-            println!("[DATA] Transmitting {} bytes to '{}'...", payload.len(), to);
-            let (corr_id, hash) = client.send_data_payload(&to, payload.as_bytes()).await?;
-            println!("[DATA] Transmission sent! Correlation ID: {}", corr_id);
-            println!("[DATA] SHA-256 Checksum: {}", hash);
-
-            // Wait brief moment for ACK
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            client.close().await;
+            println!("[DATA] Transmitting {} bytes to '{}'...", bytes.len(), to);
+            match client
+                .send_data_payload_with_ack(&to, &bytes, Some(timeout_ms))
+                .await
+            {
+                Ok(receipt) => {
+                    println!(
+                        "[DATA] Delivery verified! Correlation ID: {}",
+                        receipt.correlation_id
+                    );
+                    println!("[DATA] SHA-256 Checksum: {}", receipt.sha256);
+                    println!("[DATA] Chunks: {}", receipt.total_chunks);
+                    println!(
+                        "[DATA] Responder: {} ({})",
+                        receipt.responder, receipt.status
+                    );
+                    client.close().await;
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Data delivery to '{}' failed: {}", to, e);
+                    client.close().await;
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
@@ -703,5 +811,178 @@ mod tests {
                 .contains("failed to read TLS CA certificate file"),
             "unexpected error: {err_ws}"
         );
+    }
+
+    #[test]
+    fn node_inbox_dir_and_data_timeout_flags_parse() {
+        let node_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--id",
+            "consumer-1",
+            "--inbox-dir",
+            "/tmp/mesh-inbox",
+        ])
+        .unwrap();
+        match node_cli.command {
+            Commands::Node {
+                id,
+                inbox_dir,
+                inbox_max_mb,
+                inbox_max_files,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("consumer-1"));
+                assert_eq!(inbox_dir.as_deref(), Some(Path::new("/tmp/mesh-inbox")));
+                assert_eq!(inbox_max_mb, 1024);
+                assert_eq!(inbox_max_files, 10_000);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let quota_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--inbox-dir",
+            "/tmp/mesh-inbox",
+            "--inbox-max-mb",
+            "5",
+            "--inbox-max-files",
+            "7",
+        ])
+        .unwrap();
+        match quota_cli.command {
+            Commands::Node {
+                inbox_max_mb,
+                inbox_max_files,
+                ..
+            } => {
+                assert_eq!(inbox_max_mb, 5);
+                assert_eq!(inbox_max_files, 7);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        for zero in ["--inbox-max-mb", "--inbox-max-files"] {
+            assert!(
+                Cli::try_parse_from(["agent-mesh", "node", zero, "0"]).is_err(),
+                "{zero} 0 must be refused"
+            );
+        }
+
+        let data_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload",
+            "abc",
+            "--timeout-ms",
+            "4321",
+        ])
+        .unwrap();
+        match data_cli.command {
+            Commands::Data {
+                to,
+                payload,
+                payload_file,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(to, "consumer-1");
+                assert_eq!(payload.as_deref(), Some("abc"));
+                assert!(payload_file.is_none());
+                assert_eq!(timeout_ms, 4321);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_command_payload_file_and_mutual_exclusion_parse() {
+        // 1. --payload-file <PATH> parses cleanly without --payload.
+        let file_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload-file",
+            "/tmp/payload.bin",
+        ])
+        .unwrap();
+        match file_cli.command {
+            Commands::Data {
+                to,
+                payload,
+                payload_file,
+                ..
+            } => {
+                assert_eq!(to, "consumer-1");
+                assert!(payload.is_none());
+                assert_eq!(payload_file.as_deref(), Some(Path::new("/tmp/payload.bin")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. --payload-file - (stdin) parses cleanly.
+        let stdin_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload-file",
+            "-",
+        ])
+        .unwrap();
+        match stdin_cli.command {
+            Commands::Data {
+                payload,
+                payload_file,
+                ..
+            } => {
+                assert!(payload.is_none());
+                assert_eq!(payload_file.as_deref(), Some(Path::new("-")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 3. Passing both --payload and --payload-file must be rejected.
+        let conflict_err = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload",
+            "inline",
+            "--payload-file",
+            "/tmp/payload.bin",
+        ])
+        .expect_err("--payload and --payload-file must conflict");
+        assert_eq!(
+            conflict_err.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+
+        // 4. Passing neither --payload nor --payload-file must be rejected.
+        let missing_err = Cli::try_parse_from(["agent-mesh", "data", "--to", "consumer-1"])
+            .expect_err("data command must require either --payload or --payload-file");
+        assert_eq!(
+            missing_err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // 5. read_data_payload_bytes reads raw binary bytes from disk without UTF-8 conversion.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("raw.bin");
+        let raw_bytes = vec![0x00, 0x80, 0xff, 0xfe, 0x41, 0x00];
+        std::fs::write(&bin_path, &raw_bytes).unwrap();
+        assert_eq!(
+            read_data_payload_bytes(None, Some(&bin_path)).unwrap(),
+            raw_bytes
+        );
+        assert_eq!(
+            read_data_payload_bytes(Some("hello".to_string()), None).unwrap(),
+            b"hello"
+        );
+        assert!(read_data_payload_bytes(None, Some(&dir.path().join("missing.bin"))).is_err());
     }
 }

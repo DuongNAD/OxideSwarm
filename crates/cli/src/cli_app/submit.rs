@@ -830,6 +830,42 @@ async fn run_submit_with_secret_inner(
         }
     };
 
+    let matrix_cells = if args.matrix.is_empty() {
+        None
+    } else {
+        if args.verify.is_some() {
+            eprintln!("--matrix cannot be combined with --verify");
+            return ExitCode::FAILURE;
+        }
+        if args.output.is_some() {
+            eprintln!(
+                "--matrix cannot be combined with -o/--output-asset; use --output and --output-dir"
+            );
+            return ExitCode::FAILURE;
+        }
+        let max_cells = args
+            .max_matrix_cells
+            .unwrap_or(crate::matrix::DEFAULT_MAX_MATRIX_CELLS);
+        let matrix_spec = match crate::matrix::MatrixSpec::parse(&args.matrix, max_cells) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let allow_env = matches!(
+            spec,
+            TaskSpec::Command { .. } | TaskSpec::ShellScript { .. }
+        );
+        match crate::matrix::expand_cells(&matrix_spec, &placement, allow_env) {
+            Ok(cells) => Some(cells),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
     // Inputs are hashed (and directories listed) before connecting, so a typo in a path never
     // reaches the master. When `--type compile` was given without `--source`, `args.inputs` was
     // already loaded into `TaskSpec::RustCompilation.source_files`.
@@ -966,6 +1002,48 @@ async fn run_submit_with_secret_inner(
 
     let had_secret = secret.is_some();
     let vram_mb = args.vram_mb.filter(|&v| v > 0);
+    let is_gpu = args.gpu
+        || vram_mb.is_some()
+        || args.task_type.eq_ignore_ascii_case("gpu")
+        || spec.requires_gpu();
+    let default_timeout_secs = if args.workspace.is_some() { 1800 } else { 60 };
+    let timeout_secs = resolve_u64(
+        args.timeout_secs,
+        &[],
+        submit_cfg.as_ref().and_then(|s| s.timeout_secs),
+        default_timeout_secs,
+    )
+    .max(1);
+    let requirements = TaskRequirements {
+        cpu_cores: args.cores.max(1),
+        ram_mb: args.ram_mb,
+        gpu_required: is_gpu,
+        timeout_secs,
+        max_retries: args.max_retries,
+        vram_mb,
+        extensions: Vec::new(),
+    };
+
+    if let Some(cells) = matrix_cells {
+        return run_matrix_submit(
+            &args,
+            cells,
+            spec,
+            placement,
+            requirements,
+            inputs,
+            workspace_ref,
+            workspace_scan,
+            output_globs,
+            &master_addr,
+            secret.as_ref(),
+            had_secret,
+            submit_started,
+            transport,
+        )
+        .await;
+    }
+
     // A constrained or workspace task nobody can take would wait silently; say so (it is still
     // submitted, a matching worker may connect later).
     if !placement.is_empty() || workspace_ref.is_some() || vram_mb.is_some() {
@@ -997,28 +1075,6 @@ async fn run_submit_with_secret_inner(
             }
         }
     }
-
-    let is_gpu = args.gpu
-        || vram_mb.is_some()
-        || args.task_type.eq_ignore_ascii_case("gpu")
-        || spec.requires_gpu();
-    let default_timeout_secs = if args.workspace.is_some() { 1800 } else { 60 };
-    let timeout_secs = resolve_u64(
-        args.timeout_secs,
-        &[],
-        submit_cfg.as_ref().and_then(|s| s.timeout_secs),
-        default_timeout_secs,
-    )
-    .max(1);
-    let requirements = TaskRequirements {
-        cpu_cores: args.cores.max(1),
-        ram_mb: args.ram_mb,
-        gpu_required: is_gpu,
-        timeout_secs,
-        max_retries: args.max_retries,
-        vram_mb,
-        extensions: Vec::new(),
-    };
 
     // Only the input blobs the master lacks are sent, on a connection of their own.
     let upload = if let Some(ref scan) = workspace_scan {
@@ -1426,5 +1482,295 @@ async fn run_submit_with_secret_inner(
             eprintln!("Unexpected master response: {other:?}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_matrix_submit(
+    args: &SubmitArgs,
+    cells: Vec<crate::matrix::MatrixCell>,
+    spec: TaskSpec,
+    placement: Placement,
+    requirements: TaskRequirements,
+    inputs: crate::blobs::PreparedInputs,
+    workspace_ref: Option<rusty_grid_core::task::WorkspaceRef>,
+    workspace_scan: Option<crate::blobs::WorkspaceScan>,
+    output_globs: Vec<String>,
+    master_addr: &str,
+    secret: Option<&rusty_grid_core::cluster_auth::ClusterSecret>,
+    _had_secret: bool,
+    submit_started: std::time::Instant,
+    mut transport: MessageTransport<GridStream>,
+) -> ExitCode {
+    let rpc_timeout = Duration::from_secs(requirements.timeout_secs.clamp(2, 10));
+    let workers = match tokio::time::timeout(
+        rpc_timeout,
+        fetch_workers(&mut transport, master_addr, secret.is_some()),
+    )
+    .await
+    {
+        Ok(Some(workers)) => workers,
+        Ok(None) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"error": "Failed to list connected workers from Master"})
+                );
+            }
+            return ExitCode::FAILURE;
+        }
+        Err(_) => {
+            let msg = format!(
+                "Timed out after {}s listing workers from Master",
+                rpc_timeout.as_secs()
+            );
+            eprintln!("{msg}");
+            if args.json {
+                println!("{}", serde_json::json!({"error": msg}));
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    transport.close().await;
+
+    let placeability =
+        crate::matrix::check_placeability(&cells, &workers, &requirements, workspace_ref.is_some());
+    let placeable_count = placeability.iter().filter(|r| r.is_none()).count();
+
+    let upload = if placeable_count == 0 {
+        None
+    } else if let Some(ref scan) = workspace_scan {
+        let uploaded = match crate::blobs::BlobConnection::connect(master_addr, secret).await {
+            Ok(connection) => crate::blobs::upload_inputs(&connection, &scan.prepared).await,
+            Err(e) => Err(e.to_string()),
+        };
+        match uploaded {
+            Ok(report) => {
+                if scan.prepared.skipped.is_empty() {
+                    eprintln!(
+                        "Workspace '{}': {} files ({}); sent {} of {} blobs ({}), {} already on the master",
+                        args.workspace.as_deref().unwrap_or(""),
+                        scan.prepared.files,
+                        rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                        report.uploaded,
+                        report.blobs,
+                        rusty_grid_worker::staging::human_bytes(report.bytes),
+                        report.blobs - report.uploaded
+                    );
+                } else {
+                    eprintln!(
+                        "Workspace '{}': {} files ({}), {} skipped ({}); sent {} of {} blobs ({}), {} already on the master",
+                        args.workspace.as_deref().unwrap_or(""),
+                        scan.prepared.files,
+                        rusty_grid_worker::staging::human_bytes(scan.prepared.bytes),
+                        scan.prepared.skipped.len(),
+                        scan.prepared.skipped.join("; "),
+                        report.uploaded,
+                        report.blobs,
+                        rusty_grid_worker::staging::human_bytes(report.bytes),
+                        report.blobs - report.uploaded
+                    );
+                }
+                Some(report)
+            }
+            Err(e) => {
+                eprintln!("Uploading the workspace files failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if inputs.inputs.is_empty() {
+        None
+    } else {
+        let uploaded = match crate::blobs::BlobConnection::connect(master_addr, secret).await {
+            Ok(connection) => crate::blobs::upload_inputs(&connection, &inputs).await,
+            Err(e) => Err(e.to_string()),
+        };
+        match uploaded {
+            Ok(report) => {
+                eprintln!(
+                    "Inputs: {} files ({}); sent {} of {} blobs ({}), {} already on the master",
+                    inputs.files,
+                    rusty_grid_worker::staging::human_bytes(inputs.bytes),
+                    report.uploaded,
+                    report.blobs,
+                    rusty_grid_worker::staging::human_bytes(report.bytes),
+                    report.blobs - report.uploaded
+                );
+                Some(report)
+            }
+            Err(e) => {
+                eprintln!("Uploading the input files failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let mut template = Task::new(spec, requirements.clone())
+        .with_placement(&placement)
+        .with_inputs(inputs.inputs)
+        .with_output_globs(output_globs);
+    if args.repeatable {
+        template
+            .tags
+            .push(rusty_grid_core::placement::OPT_REPEATABLE_TAG.to_string());
+    }
+    if let Some(ws) = workspace_ref {
+        template = template.with_workspace(ws);
+    }
+
+    let addr_arc = std::sync::Arc::new(master_addr.to_string());
+    let secret_arc = std::sync::Arc::new(secret.cloned());
+    let connect = std::sync::Arc::new(move || {
+        let addr = std::sync::Arc::clone(&addr_arc);
+        let sec = std::sync::Arc::clone(&secret_arc);
+        async move {
+            connect_master(&addr, sec.as_ref().as_ref())
+                .await
+                .map_err(|e| format!("could not connect to the master: {e}"))
+        }
+    });
+
+    let mut executions = crate::matrix::execute_matrix(
+        cells,
+        &workers,
+        placeability,
+        &template,
+        Duration::from_secs(requirements.timeout_secs),
+        None,
+        None,
+        connect,
+    )
+    .await;
+
+    let base_out_dir = args.output_dir.as_deref().unwrap_or(Path::new("."));
+    let any_outputs = executions
+        .iter()
+        .any(|e| e.result.as_ref().is_some_and(|r| !r.outputs.is_empty()));
+    if any_outputs {
+        match crate::blobs::BlobConnection::connect(master_addr, secret).await {
+            Ok(connection) => {
+                for exec in &mut executions {
+                    let Some(ref result) = exec.result else {
+                        continue;
+                    };
+                    if result.outputs.is_empty() {
+                        continue;
+                    }
+                    let cell_dir = match crate::matrix::ensure_non_symlink_cell_dir(
+                        base_out_dir,
+                        &exec.cell.slug,
+                    ) {
+                        Ok(dir) => dir,
+                        Err(e) => {
+                            eprintln!(
+                                "Downloading output files for cell '{}' failed: {e}",
+                                exec.cell.label
+                            );
+                            exec.download_error = Some(e);
+                            continue;
+                        }
+                    };
+                    match crate::blobs::download_outputs(&connection, &result.outputs, &cell_dir)
+                        .await
+                    {
+                        Ok(paths) => exec.saved_outputs = Some(paths),
+                        Err(e) => {
+                            eprintln!(
+                                "Downloading output files for cell '{}' failed: {e}",
+                                exec.cell.label
+                            );
+                            exec.download_error = Some(format!("output download failed: {e}"));
+                        }
+                    }
+                }
+                connection.close().await;
+            }
+            Err(e) => {
+                for exec in &mut executions {
+                    if exec.result.as_ref().is_some_and(|r| !r.outputs.is_empty()) {
+                        exec.download_error =
+                            Some(format!("failed to connect for output download: {e}"));
+                    }
+                }
+                eprintln!("Downloading matrix output files failed: {e}");
+            }
+        }
+    }
+
+    for exec in &mut executions {
+        let Some(ref result) = exec.result else {
+            continue;
+        };
+        if !result.artifacts.is_empty() {
+            let cell_dir =
+                match crate::matrix::ensure_non_symlink_cell_dir(base_out_dir, &exec.cell.slug) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!(
+                            "Saving artifacts for cell '{}' failed: {e}",
+                            exec.cell.label
+                        );
+                        exec.download_error.get_or_insert(e);
+                        continue;
+                    }
+                };
+            match crate::connect::save_output_artifacts(&result.artifacts, &cell_dir) {
+                Ok(paths) => exec.saved_artifacts = Some(paths),
+                Err(e) => {
+                    eprintln!(
+                        "Saving artifacts for cell '{}' failed: {e}",
+                        exec.cell.label
+                    );
+                    exec.download_error
+                        .get_or_insert_with(|| format!("artifact save failed: {e}"));
+                }
+            }
+        }
+    }
+
+    let workspace_summary = args.workspace.as_ref().map(|ws_name| {
+        let (files, skipped, skipped_entries) = match &workspace_scan {
+            Some(scan) => (
+                scan.prepared.files,
+                scan.prepared.skipped.len(),
+                scan.prepared.skipped.clone(),
+            ),
+            None => (0, 0, Vec::new()),
+        };
+        let uploaded_bytes = upload.as_ref().map_or(0, |u| u.bytes);
+        let mut ws = serde_json::json!({
+            "name": ws_name,
+            "files": files,
+            "uploaded_bytes": uploaded_bytes,
+            "skipped": skipped,
+        });
+        if !skipped_entries.is_empty() {
+            ws["skipped_entries"] = serde_json::json!(skipped_entries);
+        }
+        ws
+    });
+
+    let waited_ms = submit_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let report = crate::matrix::MatrixReport::from_executions(
+        executions,
+        waited_ms,
+        crate::matrix::DEFAULT_CELL_OUTPUT_BYTES,
+        upload,
+        workspace_summary,
+    );
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json()).unwrap()
+        );
+    } else {
+        println!("{}", report.text());
+    }
+
+    if report.any_failed() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }

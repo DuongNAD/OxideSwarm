@@ -665,3 +665,245 @@ async fn test_spawn_simulated_gpu_job_stops_when_stop_flag_raised() {
         panic!("expected Ok when stop flag stays false, got Err({err:?})");
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_process_task_checkpoint_periodic_cancel_restore_and_output_exclusion() {
+    let sandboxes = tempfile::tempdir().unwrap();
+    let cfg = RunnerConfig::new(SandboxConfig::new(sandboxes.path()))
+        .with_checkpoint_poll_interval(Duration::from_millis(50));
+    let runner = TaskRunner::new(Uuid::new_v4(), test_capabilities(false), cfg);
+
+    // 1. ShellScript writes a checkpoint file, ignores spoofed env var, writes a real output,
+    //    and gets cancelled so final emission also fires.
+    let mut env = HashMap::new();
+    env.insert(
+        "OXIDESWARM_CHECKPOINT_DIR".to_string(),
+        "/tmp/spoofed_cp_dir".to_string(),
+    );
+    let script = r#"
+set -e
+if [ -f "$OXIDESWARM_CHECKPOINT_DIR/step1.done" ]; then
+  echo "resumed_step2"
+  echo "final" > out.txt
+  exit 0
+fi
+echo "step1_payload" > "$OXIDESWARM_CHECKPOINT_DIR/step1.done"
+echo "secret_cp" > "$OXIDESWARM_CHECKPOINT_DIR/internal.bin"
+echo "waiting"
+sleep 5
+"#;
+    let mut task = Task::new(
+        TaskSpec::ShellScript {
+            script: script.to_string(),
+            interpreter: None,
+            env,
+        },
+        TaskRequirements::generic(1, 30),
+    );
+    task.output_globs = vec!["**/*".to_string()];
+
+    let (cp_tx, mut cp_rx) = mpsc::channel(16);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let runner_clone = TaskRunner::new(
+        Uuid::new_v4(),
+        test_capabilities(false),
+        RunnerConfig::new(SandboxConfig::new(sandboxes.path()))
+            .with_checkpoint_poll_interval(Duration::from_millis(50)),
+    );
+    let task_clone = task.clone();
+    let handle = tokio::spawn(async move {
+        runner_clone
+            .execute_task_with_checkpoint(&task_clone, None, Some(cp_tx), None, Some(cancel_rx))
+            .await
+    });
+
+    // Wait for first periodic OXCP1 checkpoint.
+    let first_msg = tokio::time::timeout(Duration::from_secs(10), cp_rx.recv())
+        .await
+        .expect("timed out waiting for periodic OXCP1 checkpoint")
+        .expect("checkpoint channel closed");
+    let (seq1, delta1) = match first_msg {
+        WorkerMessage::Checkpoint {
+            sequence,
+            delta_state,
+            ..
+        } => (sequence, delta_state),
+        other => panic!("unexpected message: {other:?}"),
+    };
+    assert_eq!(seq1, 1);
+    assert!(delta1.as_slice().starts_with(b"OXCP1\x01"));
+
+    let _ = cancel_tx.send("preempt".to_string());
+    let cancelled_res = handle.await.unwrap();
+    assert_eq!(cancelled_res.exit_code, super::EXIT_CODE_CANCELLED);
+
+    // 2. Resume on a second runner with seq=1 checkpoint; next emitted sequence must be 2,
+    //    and output_globs='**/*' must exclude .oxideswarm_checkpoint.
+    let cp_data = CheckpointData {
+        sequence: seq1,
+        delta_state: delta1,
+        timestamp: 100,
+    };
+    let (cp_tx2, mut cp_rx2) = mpsc::channel(16);
+    let mut task2 = task.clone();
+    task2.spec = TaskSpec::ShellScript {
+        script: r#"
+set -e
+test -f "$OXIDESWARM_CHECKPOINT_DIR/step1.done"
+echo "step2_done" > "$OXIDESWARM_CHECKPOINT_DIR/step2.done"
+echo "out_ok" > out.txt
+echo "resumed_ok"
+sleep 0.15
+"#
+        .to_string(),
+        interpreter: None,
+        env: HashMap::new(),
+    };
+    let res2 = runner
+        .execute_task_with_checkpoint(&task2, Some(&cp_data), Some(cp_tx2), None, None)
+        .await;
+    assert!(res2.is_success(), "resumed task failed: {:?}", res2.error);
+    assert!(res2.stdout_str().contains("resumed_ok"));
+    let out_paths: Vec<&str> = res2.outputs.iter().map(|o| o.path.as_str()).collect();
+    assert!(out_paths.contains(&"out.txt"), "outputs={out_paths:?}");
+    assert!(
+        !out_paths
+            .iter()
+            .any(|p| p.contains(".oxideswarm_checkpoint")),
+        "checkpoint dir must be excluded from outputs: {out_paths:?}"
+    );
+
+    if let Ok(Some(WorkerMessage::Checkpoint { sequence, .. })) =
+        tokio::time::timeout(Duration::from_millis(200), cp_rx2.recv()).await
+    {
+        assert_eq!(sequence, 2, "resumed checkpoint sequence must be S + 1");
+    }
+
+    // 3. Non-OXCP1 JSON checkpoint is silently ignored without failing Command.
+    let json_cp = CheckpointData {
+        sequence: 9,
+        delta_state: Bytes::from_static(b"{\"progress\":0.5,\"stage\":\"generative_3d\"}"),
+        timestamp: 200,
+    };
+    let cmd_task = Task::new(
+        TaskSpec::command(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "test -n \"$OXIDESWARM_CHECKPOINT_DIR\" && test -d \"$OXIDESWARM_CHECKPOINT_DIR\" && [ \"$(ls -A \"$OXIDESWARM_CHECKPOINT_DIR\" | wc -l)\" -eq 0 ]".to_string(),
+            ],
+        ),
+        TaskRequirements::generic(1, 30),
+    );
+    let cmd_res = runner
+        .execute_task_with_checkpoint(&cmd_task, Some(&json_cp), None, None, None)
+        .await;
+    assert!(
+        cmd_res.is_success(),
+        "non-OXCP1 payload must be ignored cleanly: {:?}",
+        cmd_res.error
+    );
+
+    // 4. expected_outputs targeting .oxideswarm_checkpoint (including mixed-case & ./) is rejected.
+    for bad_path in [
+        ".oxideswarm_checkpoint/secret.txt",
+        ".OXIDESWARM_CHECKPOINT/secret.txt",
+        "./.Oxideswarm_Checkpoint/secret.txt",
+    ] {
+        let mut bad_expected = Task::new(
+            TaskSpec::shell_script("echo x > \"$OXIDESWARM_CHECKPOINT_DIR/secret.txt\""),
+            TaskRequirements::generic(1, 30),
+        );
+        bad_expected.expected_outputs = vec![bad_path.to_string()];
+        let bad_res = runner.execute_task(&bad_expected, None, None).await;
+        assert!(!bad_res.is_success(), "expected '{bad_path}' to fail");
+        assert!(
+            bad_res
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reserved checkpoint directory"),
+            "{bad_path}: {:?}",
+            bad_res.error
+        );
+    }
+
+    // 5. Oversized checkpoint directory skips emission gracefully without failing the task.
+    let oversize_task = Task::new(
+        TaskSpec::shell_script(
+            "dd if=/dev/zero of=\"$OXIDESWARM_CHECKPOINT_DIR/big.bin\" bs=1048576 count=13 2>/dev/null; sleep 0.15; echo ok",
+        ),
+        TaskRequirements::generic(1, 30),
+    );
+    let (cp_tx3, mut cp_rx3) = mpsc::channel(16);
+    let over_res = runner
+        .execute_task_with_checkpoint(&oversize_task, None, Some(cp_tx3), None, None)
+        .await;
+    assert!(over_res.is_success(), "{:?}", over_res.error);
+    assert!(cp_rx3.try_recv().is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_macos_seatbelt_isolation_injects_and_allows_checkpoint_dir() {
+    let sandboxes = tempfile::tempdir().unwrap();
+    if crate::isolation::verify_isolation_support(
+        crate::isolation::IsolationLevel::Fs,
+        sandboxes.path(),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    let mut cfg = RunnerConfig::new(SandboxConfig::new(sandboxes.path()))
+        .with_isolation(crate::isolation::IsolationLevel::Fs)
+        .with_checkpoint_poll_interval(Duration::from_millis(50));
+    cfg.host_dirs = crate::isolation::HostDirs::detect();
+    let runner = TaskRunner::new(Uuid::new_v4(), test_capabilities(false), cfg);
+
+    let mut env = HashMap::new();
+    env.insert(
+        "OXIDESWARM_CHECKPOINT_DIR".to_string(),
+        "/tmp/cannot_spoof".to_string(),
+    );
+    let task = Task::new(
+        TaskSpec::ShellScript {
+            script: r#"
+set -e
+case "$OXIDESWARM_CHECKPOINT_DIR" in
+  /tmp/cannot_spoof) echo "spoofed"; exit 9 ;;
+esac
+echo "seatbelt_cp_ok" > "$OXIDESWARM_CHECKPOINT_DIR/state.txt"
+sleep 0.15
+cat "$OXIDESWARM_CHECKPOINT_DIR/state.txt"
+"#
+            .to_string(),
+            interpreter: None,
+            env,
+        },
+        TaskRequirements::generic(1, 30),
+    );
+
+    let (cp_tx, mut cp_rx) = mpsc::channel(16);
+    let res = runner
+        .execute_task_with_checkpoint(&task, None, Some(cp_tx), None, None)
+        .await;
+    assert!(
+        res.is_success(),
+        "Seatbelt task failed: {:?} stderr={}",
+        res.error,
+        res.stderr_str()
+    );
+    assert!(res.stdout_str().contains("seatbelt_cp_ok"));
+    let cp_msg = cp_rx
+        .try_recv()
+        .expect("expected OXCP1 checkpoint under Seatbelt");
+    match cp_msg {
+        WorkerMessage::Checkpoint { delta_state, .. } => {
+            assert!(delta_state.as_slice().starts_with(b"OXCP1\x01"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
