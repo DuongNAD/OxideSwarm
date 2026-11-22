@@ -37,11 +37,13 @@ use crate::secret_cmd::{client_secret, peer_insecure, run_secret, SecretCliArgs,
 
 mod mapreduce;
 mod master;
+mod shard;
 mod submit;
 mod tasks;
 mod worker;
 mod workspaces;
 
+pub use shard::{run_shard, ShardArgs};
 pub(crate) use submit::normalize_workspace_cwd;
 pub use submit::{build_task_spec, run_submit, validate_glb_header};
 pub use tasks::{run_cancel, run_result};
@@ -135,6 +137,9 @@ pub enum Commands {
 
     /// Submit a task to the grid cluster
     Submit(SubmitArgs),
+
+    /// Run a command or test suite across N parallel shards
+    Shard(ShardArgs),
 
     /// Query cluster status or task execution state
     Status(StatusArgs),
@@ -1308,6 +1313,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Submit(args) => {
             submit::run_submit_with_secret(args, config_file, secret_opts).await
         }
+        Commands::Shard(args) => shard::run_shard_with_secret(args, config_file, secret_opts).await,
         Commands::Status(args) => tasks::run_status(args, config_file, secret_opts).await,
         Commands::Cancel(args) => run_cancel(args, config_file, secret_opts).await,
         Commands::Result(args) => run_result(args, config_file, secret_opts).await,

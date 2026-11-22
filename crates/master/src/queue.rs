@@ -536,6 +536,14 @@ pub const DEFAULT_MAX_ACTIVE_BYTES: usize = 256 * 1024 * 1024;
 /// Fixed bookkeeping cost charged to every retained task on top of its payload.
 const RETAINED_ENTRY_OVERHEAD_BYTES: usize = 1024;
 
+/// VRAM tier derived from a `Generative3D` task when no explicit `vram_mb` is set (`3D-2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Generative3DVramTier {
+    Fast,
+    Standard,
+    High,
+}
+
 /// What a scheduling pass needs to know about a queued task, without the task's payload.
 ///
 /// A pass looks at far more tasks than it places (everything in front of the first placeable one),
@@ -551,6 +559,11 @@ pub struct TaskView {
     pub requirements: TaskRequirements,
     /// `requirements.gpu_required || spec.requires_gpu()`: only GPU-capable workers may run it.
     pub requires_gpu: bool,
+    /// `AutoRig` with `preferred_provider == Some("blender")` (case-insensitive): only workers
+    /// advertising `capabilities.has_blender` may run it.
+    pub requires_blender: bool,
+    /// Preset VRAM tier for GPU/neural `Generative3D` tasks without explicit `requirements.vram_mb`.
+    pub gen3d_vram_tier: Option<Generative3DVramTier>,
     /// Compilation and GPU specs, which throttled or low-battery mobile workers must not receive.
     pub heavy: bool,
     /// Protocol features a worker must advertise to run the task: `FILE_STAGING` for inline staged
@@ -563,6 +576,9 @@ pub struct TaskView {
     /// validates them, so an error only reaches here for a task that bypassed it; such a task is
     /// placed nowhere.
     pub placement: Result<Placement, String>,
+    /// Soft worker affinity (`prefer:worker=<id|name>` tag). Honored while the preferred worker is
+    /// connected and not avoided; falls back to `placement` when absent or unavailable.
+    pub prefer_worker: Option<String>,
     /// Named persistent workspace (`Task::workspace`), if any (design 0039 D4).
     pub workspace: Option<String>,
 }
@@ -580,6 +596,8 @@ impl TaskView {
             queued_for: Duration::ZERO,
             requirements: task.requirements.clone(),
             requires_gpu: task.requirements.requires_gpu_or_vram() || task.spec.requires_gpu(),
+            requires_blender: task_requires_blender(task),
+            gen3d_vram_tier: gen3d_vram_tier_for(task),
             heavy: matches!(
                 task.spec,
                 TaskSpec::RustCompilation { .. } | TaskSpec::GpuCompute { .. }
@@ -587,8 +605,57 @@ impl TaskView {
             required_features: required_features(task),
             avoid: Vec::new(),
             placement: task.scheduling_placement(),
+            prefer_worker: task_prefer_worker(task),
             workspace: task.workspace.as_ref().map(|w| w.name.clone()),
         }
+    }
+}
+
+pub(crate) fn task_prefer_worker(task: &Task) -> Option<String> {
+    task.tags
+        .iter()
+        .find_map(|t| t.strip_prefix("prefer:worker="))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+pub(crate) fn task_requires_blender(task: &Task) -> bool {
+    matches!(
+        &task.spec,
+        TaskSpec::AutoRig(spec)
+            if spec
+                .preferred_provider
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("blender"))
+    )
+}
+
+fn gen3d_vram_tier_for(task: &Task) -> Option<Generative3DVramTier> {
+    if task.requirements.effective_vram_mb() > 0 {
+        return None;
+    }
+    let TaskSpec::Generative3D(spec) = &task.spec else {
+        return None;
+    };
+    // `auto` always runs the CPU SDF tier on the worker (3D-1 D3), so it needs no VRAM.
+    if matches!(
+        spec.engine(),
+        rusty_grid_core::task::Engine3D::Sdf | rusty_grid_core::task::Engine3D::Auto
+    ) {
+        return None;
+    }
+    let q = spec.quality.trim();
+    if task.requirements.gpu_required || q.eq_ignore_ascii_case("high") {
+        if q.eq_ignore_ascii_case("fast") {
+            Some(Generative3DVramTier::Fast)
+        } else if q.eq_ignore_ascii_case("high") {
+            Some(Generative3DVramTier::High)
+        } else {
+            Some(Generative3DVramTier::Standard)
+        }
+    } else {
+        None
     }
 }
 
@@ -1550,5 +1617,67 @@ impl TaskQueue {
             #[cfg(test)]
             ready_views_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Variant of `assigned_loads` that computes each active or held task's VRAM reservation via
+    /// `vram_for_task`, so preset-VRAM `Generative3D` tasks reserve their configured VRAM across
+    /// scheduling passes and straggler checks without mutating `TaskRequirements`.
+    pub(crate) async fn assigned_loads_with<F>(
+        &self,
+        vram_for_task: F,
+    ) -> HashMap<Uuid, AssignedLoad>
+    where
+        F: Fn(&Task) -> u64,
+    {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut loads = HashMap::with_capacity(inner.worker_assignments.len());
+        for (worker_id, task_ids) in &inner.worker_assignments {
+            let mut load = AssignedLoad::default();
+            for task_id in task_ids {
+                let Some(entry) = inner.tasks.get(task_id) else {
+                    continue;
+                };
+                let attempt_state = if entry.assigned_worker_id == Some(*worker_id) {
+                    entry.state
+                } else if let Some(ref spec) = entry.speculative {
+                    if spec.worker_id == *worker_id {
+                        spec.state
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                if !attempt_state.is_active() {
+                    continue;
+                }
+                load.tasks += 1;
+                load.slots += entry.task.requirements.cpu_cores.max(1);
+                if attempt_state == TaskState::Scheduled {
+                    load.unstarted_ram_mb += entry.task.requirements.ram_mb;
+                }
+                load.vram_mb = load.vram_mb.saturating_add(vram_for_task(&entry.task));
+            }
+            if load.tasks > 0 {
+                loads.insert(*worker_id, load);
+            }
+        }
+        for task_id in &inner.held_tasks {
+            let Some(entry) = inner.tasks.get(task_id) else {
+                continue;
+            };
+            if entry.state == TaskState::Queued {
+                if let Some((worker_id, until)) = entry.adoptable_by {
+                    if now < until {
+                        let load = loads.entry(worker_id).or_default();
+                        load.tasks += 1;
+                        load.slots += entry.task.requirements.cpu_cores.max(1);
+                        load.vram_mb = load.vram_mb.saturating_add(vram_for_task(&entry.task));
+                    }
+                }
+            }
+        }
+        loads
     }
 }

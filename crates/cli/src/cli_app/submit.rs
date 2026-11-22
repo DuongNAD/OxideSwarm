@@ -736,6 +736,46 @@ pub(super) fn any_connected_worker_satisfies_vram(
     })
 }
 
+/// True when at least one connected worker advertises Blender capability.
+pub(super) fn any_connected_worker_has_blender(workers: &[WorkerCapabilities]) -> bool {
+    workers
+        .iter()
+        .any(|w| listed_as_connected(w) && w.has_blender)
+}
+
+/// Effective VRAM (MB) used by master `SchedulerConfig` defaults when `--vram-mb` is omitted.
+pub(super) fn preflight_required_vram_mb(
+    spec: &TaskSpec,
+    gpu_required: bool,
+    explicit_vram_mb: Option<u64>,
+) -> Option<u64> {
+    if let Some(vram) = explicit_vram_mb.filter(|&v| v > 0) {
+        return Some(vram);
+    }
+    let TaskSpec::Generative3D(gen) = spec else {
+        return None;
+    };
+    // `auto` always runs the CPU SDF tier on the worker (3D-1 D3), so it needs no VRAM.
+    if matches!(
+        gen.engine(),
+        rusty_grid_core::task::Engine3D::Sdf | rusty_grid_core::task::Engine3D::Auto
+    ) {
+        return None;
+    }
+    let q = gen.quality.trim();
+    if gpu_required || q.eq_ignore_ascii_case("high") {
+        if q.eq_ignore_ascii_case("fast") {
+            Some(2048)
+        } else if q.eq_ignore_ascii_case("high") {
+            Some(6144)
+        } else {
+            Some(4096)
+        }
+    } else {
+        None
+    }
+}
+
 /// The name of the listed worker with this id, if the list has it.
 fn listed_worker_name(workers: &[WorkerCapabilities], worker_id: Uuid) -> Option<String> {
     workers
@@ -1044,9 +1084,23 @@ async fn run_submit_with_secret_inner(
         .await;
     }
 
+    let requires_blender = matches!(
+        &spec,
+        TaskSpec::AutoRig(rig)
+            if rig
+                .preferred_provider
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("blender"))
+    );
+    let preflight_vram_mb = preflight_required_vram_mb(&spec, is_gpu, vram_mb);
+
     // A constrained or workspace task nobody can take would wait silently; say so (it is still
     // submitted, a matching worker may connect later).
-    if !placement.is_empty() || workspace_ref.is_some() || vram_mb.is_some() {
+    if !placement.is_empty()
+        || workspace_ref.is_some()
+        || preflight_vram_mb.is_some()
+        || requires_blender
+    {
         if let Some(workers) = fetch_workers(&mut transport, &master_addr, had_secret).await {
             if workspace_ref.is_some()
                 && !workers
@@ -1066,12 +1120,17 @@ async fn run_submit_with_secret_inner(
                     "Warning: no connected worker matches the placement constraints ({placement}); the task waits in the queue until one does"
                 );
             }
-            if let Some(req_vram) = vram_mb {
+            if let Some(req_vram) = preflight_vram_mb {
                 if !any_connected_worker_satisfies_vram(&workers, req_vram) {
                     eprintln!(
                         "Warning: no connected GPU worker advertises >= {req_vram} MB VRAM; the task waits in the queue until one does"
                     );
                 }
+            }
+            if requires_blender && !any_connected_worker_has_blender(&workers) {
+                eprintln!(
+                    "Warning: no connected worker has Blender available; the task waits in the queue until one does"
+                );
             }
         }
     }

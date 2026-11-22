@@ -172,6 +172,26 @@ jobs:
           HOME="$TMPISO/home" USERPROFILE="$TMPISO/home" TMPDIR="$TMPISO/tmp" PATH="$TMPISO/bin:$PATH" \
             RUSTY_GRID_NO_BATTERY=1 OXIDESWARM_PROFILE=debug \
             python3 -m unittest tests/test_wave2_e2e.py -v
+      - name: build CLI (--features 3d) and agent mesh binaries for Wave 3 E2E tests
+        if: matrix.os != 'windows-latest'
+        run: |
+          cargo build -p rusty_grid_cli --bin oxideswarm --features 3d --locked
+          cargo build -p agent_mesh --bin agent-mesh --locked
+      - name: run Wave 3 E2E tests
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPISO="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/oxs_e2e.XXXXXX")"
+          trap 'rm -rf "$TMPISO"' EXIT
+          chmod 700 "$TMPISO"
+          mkdir -p "$TMPISO/bin" "$TMPISO/home" "$TMPISO/tmp"
+          printf '#!/bin/sh\necho "Now drawing from '\''AC Power'\''"\nexit 0\n' > "$TMPISO/bin/pmset"
+          chmod 755 "$TMPISO/bin/pmset"
+          HOME="$TMPISO/home" USERPROFILE="$TMPISO/home" TMPDIR="$TMPISO/tmp" PATH="$TMPISO/bin:$PATH" \
+            RUSTY_GRID_NO_BATTERY=1 RUSTY_GRID_DISABLE_DISCOVERY=1 RUSTY_GRID_P2P_MINIMAL=1 \
+            OXIDESWARM_PROFILE=debug OXIDESWARM_E2E_TIER=all PYTHONDONTWRITEBYTECODE=1 \
+            python3 -B -m unittest tests/test_wave3_e2e.py -v
 
   workspace-test:
     # Full Cargo workspace test suite (`tests/` and `crates/*/tests/` included).
@@ -324,6 +344,7 @@ jobs:
       - run: python tests/test_m1_challenger_hygiene.py
       - run: python tests/test_release_skew.py
       - run: python tests/test_bench_grid.py
+      - run: python -B benchmarks/grid/test_bench_shard.py
       - run: python tests/test_scale_harness.py
       - run: python tests/test_bench_sweep.py
       - run: python tests/test_campaign_driver.py

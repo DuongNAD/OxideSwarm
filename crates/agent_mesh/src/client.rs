@@ -93,6 +93,15 @@ fn is_transient_ws_connect_error(err: &tokio_tungstenite::tungstenite::Error) ->
     false
 }
 
+/// Verified output artifact extracted from a `grid_submit` / `grid_result` `CommandResponse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedArtifact {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
 /// The hub answered the registration with a NACK (bad or missing token, duplicate node id, ...).
 #[derive(Debug, Clone)]
 pub struct RegistrationRejected {
@@ -1285,6 +1294,115 @@ impl AgentMeshClient {
         }
     }
 
+    /// Submits a general task (`grid_submit`) to the OxideSwarm Grid via the Agent-Grid Bridge.
+    pub async fn submit_grid(
+        &self,
+        args: Value,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        self.send_command("grid", "grid_submit", args, timeout_ms)
+            .await
+    }
+
+    /// Queries or waits for the result of a previously submitted Grid task (`grid_result`).
+    pub async fn get_grid_result(
+        &self,
+        task_id: &str,
+        wait: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        let args = serde_json::json!({
+            "task_id": task_id,
+            "wait": wait,
+        });
+        self.send_command("grid", "grid_result", args, timeout_ms)
+            .await
+    }
+
+    /// Cancels a Grid task by ID (`grid_cancel`).
+    pub async fn cancel_grid_task(
+        &self,
+        task_id: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<AgentMeshEnvelope, Box<dyn std::error::Error + Send + Sync>> {
+        let args = serde_json::json!({
+            "task_id": task_id,
+        });
+        self.send_command("grid", "grid_cancel", args, timeout_ms.or(Some(5000)))
+            .await
+    }
+
+    /// Extracts and SHA-256-verifies output artifacts from a `grid_submit` or `grid_result`
+    /// `CommandResponse` envelope.
+    pub fn extract_output_artifacts(
+        envelope: &AgentMeshEnvelope,
+    ) -> Result<Vec<ExtractedArtifact>, Box<dyn std::error::Error + Send + Sync>> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        match envelope {
+            AgentMeshEnvelope::CommandResponse {
+                payload: Some(payload),
+                status,
+                ..
+            } => {
+                if status != "success" {
+                    return Err(format!(
+                        "Command response status is '{status}', expected 'success'"
+                    )
+                    .into());
+                }
+                let Some(arr) = payload.get("artifacts").and_then(|v| v.as_array()) else {
+                    return Ok(Vec::new());
+                };
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let path = item
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Artifact entry missing 'path'")?
+                        .to_string();
+                    let b64 = item
+                        .get("data_base64")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Artifact entry missing 'data_base64'")?;
+                    let bytes = STANDARD.decode(b64)?;
+                    let sha256 = item
+                        .get("sha256")
+                        .and_then(|v| v.as_str())
+                        .ok_or("Artifact entry missing 'sha256'")?
+                        .to_string();
+                    if !verify_sha256(&bytes, &sha256) {
+                        return Err(format!(
+                            "Artifact '{path}' SHA-256 verification failed: expected {sha256}, got {}",
+                            compute_sha256(&bytes)
+                        )
+                        .into());
+                    }
+                    let declared_size = item
+                        .get("size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(bytes.len() as u64);
+                    if declared_size != bytes.len() as u64 {
+                        return Err(format!(
+                            "Artifact '{path}' size mismatch: declared {declared_size}, decoded {}",
+                            bytes.len()
+                        )
+                        .into());
+                    }
+                    out.push(ExtractedArtifact {
+                        path,
+                        size: declared_size,
+                        sha256,
+                        bytes,
+                    });
+                }
+                Ok(out)
+            }
+            _ => Err("Envelope is not a CommandResponse with payload".into()),
+        }
+    }
+
     pub async fn send_envelope(
         &self,
         envelope: AgentMeshEnvelope,
@@ -2061,5 +2179,64 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         sender.close().await;
         consumer.close().await;
         hub.stop().await;
+    }
+
+    #[test]
+    fn test_extract_output_artifacts_verifies_sha256_and_detects_tampering() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let raw = b"verified-artifact-bytes";
+        let sha = compute_sha256(raw);
+        let mut ok_env = AgentMeshEnvelope::new_command_response(
+            "grid",
+            "client",
+            "c1",
+            Some("grid_submit".to_string()),
+            "success",
+            0,
+            "",
+            "",
+            5,
+        );
+        if let AgentMeshEnvelope::CommandResponse {
+            ref mut payload, ..
+        } = ok_env
+        {
+            *payload = Some(serde_json::json!({
+                "artifacts": [{
+                    "path": "out/file.bin",
+                    "size": raw.len(),
+                    "sha256": sha,
+                    "data_base64": STANDARD.encode(raw),
+                }]
+            }));
+        }
+
+        let extracted = AgentMeshClient::extract_output_artifacts(&ok_env).unwrap();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].path, "out/file.bin");
+        assert_eq!(extracted[0].bytes, raw);
+
+        // Tampered sha256 must fail verification.
+        if let AgentMeshEnvelope::CommandResponse {
+            ref mut payload, ..
+        } = ok_env
+        {
+            *payload = Some(serde_json::json!({
+                "artifacts": [{
+                    "path": "out/file.bin",
+                    "size": raw.len(),
+                    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "data_base64": STANDARD.encode(raw),
+                }]
+            }));
+        }
+        let err = AgentMeshClient::extract_output_artifacts(&ok_env)
+            .expect_err("tampered SHA-256 must be rejected");
+        assert!(
+            err.to_string().contains("SHA-256 verification failed"),
+            "{err}"
+        );
     }
 }

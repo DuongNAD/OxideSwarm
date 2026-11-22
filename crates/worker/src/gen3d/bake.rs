@@ -36,13 +36,31 @@ pub fn bake_texture_atlas(
     height: u32,
     sampler: &dyn SurfaceSampler,
 ) -> BakedMaterial {
+    bake_texture_atlas_cancellable(mesh, width, height, sampler, &|| false)
+        .expect("Infallible non-cancelled texture bake")
+}
+
+/// Bakes a procedural surface sampler onto a UV-parameterized mesh with cooperative cancellation.
+pub fn bake_texture_atlas_cancellable(
+    mesh: &RawMesh,
+    width: u32,
+    height: u32,
+    sampler: &dyn SurfaceSampler,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<BakedMaterial, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let mut buffer = vec![0u8; (width * height * 4) as usize];
     let mut mask = vec![false; (width * height) as usize];
 
     let w_f = width as f32;
     let h_f = height as f32;
 
-    for chunk in mesh.indices.chunks_exact(3) {
+    for (tri_idx, chunk) in mesh.indices.chunks_exact(3).enumerate() {
+        if tri_idx % 256 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let i0 = chunk[0] as usize;
         let i1 = chunk[1] as usize;
         let i2 = chunk[2] as usize;
@@ -127,6 +145,9 @@ pub fn bake_texture_atlas(
         let mut next_buffer = buffer.clone();
         let mut next_mask = mask.clone();
         for py in 0..height as usize {
+            if py % 32 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             for px in 0..width as usize {
                 let idx = py * width as usize + px;
                 if !mask[idx] {
@@ -162,20 +183,33 @@ pub fn bake_texture_atlas(
         mask = next_mask;
     }
 
-    let png_bytes = encode_png_rgba(&buffer, width, height);
+    let png_bytes = encode_png_rgba_cancellable(&buffer, width, height, should_stop)?;
 
-    BakedMaterial {
+    Ok(BakedMaterial {
         width,
         height,
         base_color_png: png_bytes,
         roughness_factor: 0.6,
         metallic_factor: 0.1,
         base_color_factor: [1.0, 1.0, 1.0, 1.0],
-    }
+    })
 }
 
 /// Pure-Rust uncompressed DEFLATE PNG encoder with Adler-32 and CRC-32 checksums.
 pub fn encode_png_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    encode_png_rgba_cancellable(pixels, width, height, &|| false)
+        .expect("Infallible non-cancelled PNG encode")
+}
+
+fn encode_png_rgba_cancellable(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // PNG Header
 
@@ -188,12 +222,15 @@ pub fn encode_png_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     ihdr.push(0); // Compression method: 0 (DEFLATE)
     ihdr.push(0); // Filter method: 0 (None)
     ihdr.push(0); // Interlace method: 0 (No interlace)
-    write_chunk(&mut out, b"IHDR", &ihdr);
+    write_chunk_cancellable(&mut out, b"IHDR", &ihdr, should_stop)?;
 
     // 2. IDAT Chunk (zlib stream wrapping scanlines with filter 0)
     let scanline_len = (width as usize * 4) + 1;
     let mut raw_data = Vec::with_capacity(scanline_len * height as usize);
     for y in 0..height as usize {
+        if y % 64 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         raw_data.push(0); // Filter type None
         let start = y * (width as usize * 4);
         raw_data.extend_from_slice(&pixels[start..start + width as usize * 4]);
@@ -206,7 +243,10 @@ pub fn encode_png_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     // Compute Adler-32 checksum
     let mut adler_a = 1u32;
     let mut adler_b = 0u32;
-    for &byte in &raw_data {
+    for (idx, &byte) in raw_data.iter().enumerate() {
+        if idx % 65536 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         adler_a = (adler_a + byte as u32) % 65521;
         adler_b = (adler_b + adler_a) % 65521;
     }
@@ -216,6 +256,9 @@ pub fn encode_png_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let chunk_size = 65535;
     let total_chunks = (raw_data.len() + chunk_size - 1).max(1) / chunk_size;
     for (i, slice) in raw_data.chunks(chunk_size).enumerate() {
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let is_last = i == total_chunks.saturating_sub(1);
         zlib.push(if is_last { 0x01 } else { 0x00 });
         let len = slice.len() as u16;
@@ -224,25 +267,38 @@ pub fn encode_png_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
         zlib.extend_from_slice(slice);
     }
     zlib.extend_from_slice(&adler.to_be_bytes());
-    write_chunk(&mut out, b"IDAT", &zlib);
+    write_chunk_cancellable(&mut out, b"IDAT", &zlib, should_stop)?;
 
     // 3. IEND Chunk
-    write_chunk(&mut out, b"IEND", &[]);
+    write_chunk_cancellable(&mut out, b"IEND", &[], should_stop)?;
 
-    out
+    Ok(out)
 }
 
-fn write_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+fn write_chunk_cancellable(
+    out: &mut Vec<u8>,
+    chunk_type: &[u8; 4],
+    data: &[u8],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<(), String> {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(chunk_type);
     out.extend_from_slice(data);
-    let mut crc = crc32_update(0xFFFFFFFF, chunk_type);
-    crc = crc32_update(crc, data);
+    let mut crc = crc32_update_cancellable(0xFFFFFFFF, chunk_type, should_stop)?;
+    crc = crc32_update_cancellable(crc, data, should_stop)?;
     out.extend_from_slice(&(crc ^ 0xFFFFFFFF).to_be_bytes());
+    Ok(())
 }
 
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
+fn crc32_update_cancellable(
+    mut crc: u32,
+    data: &[u8],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<u32, String> {
+    for (idx, &b) in data.iter().enumerate() {
+        if idx % 16384 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         crc ^= b as u32;
         for _ in 0..8 {
             if crc & 1 != 0 {
@@ -252,5 +308,5 @@ fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
             }
         }
     }
-    crc
+    Ok(crc)
 }
