@@ -23,12 +23,12 @@ Open items and who moves them:
 |---|---|---|---|
 | TEST-85 | Planned: Windows `submit --type compile` test timed out | Agent, Windows | S1 |
 | BUG-35 | Pull request 409 has conflicts with `master` | Agent, Mac | S2 |
-| TEST-41 | Partial: needs 200 rounds in a row on Linux and Windows | Agent, Windows + Linux container | S3 |
+| TEST-41 | Partial: needs 200 rounds in a row on Linux and Windows; then it can be closed the same way | Agent, Windows + Linux container | S3 |
 | TEST-69 | Partial: needs the failing loaded configuration on the case PC | Agent, Windows case PC | S4 |
 | CI streak and TEST-26 | Seven clean days; two green scheduled `endurance` runs | Agent, any machine, daily | S5 |
 | TEST-24 step 2 | Two-machine transfer records | Agent, Mac + Windows | S6 |
 | TEST-25 step 2 | Pull request 395, then a 24-hour three-machine run | Agent, Mac + 2 Windows | S7 |
-| TEST-23, TEST-61, SEC-16, CI-1 | Partial: work done, closing is the owner's decision | Owner | none |
+| TEST-23, TEST-61, SEC-16, CI-1 | Closed on 2026-11-23 (owner's delegation): loops recorded, no reproduced cause, diagnostics stay | none | none |
 | BUG-22 | Needs a wire change, so it is not part of a 0.4.x release | Owner (next wire change) | none |
 
 ## Rules for every prompt
@@ -154,7 +154,8 @@ DO:
    that round before you change product code.
 
 DONE WHEN: TEST-41 records both loops (machine, commit, command, load, 200/200 or the failures with
-their logs). Leave the Status as Partial: closing TEST-41 is the owner's decision.
+their logs). If both loops pass 200/200, set TEST-41 to Implemented (closed without a reproduced
+cause, like TEST-23) and move its text to `docs/BACKLOG-ARCHIVE.md` under its phase heading.
 
 Common rules: see "Rules for every prompt" in `docs/guides/stability-0.4.x-handoff.md`.
 
