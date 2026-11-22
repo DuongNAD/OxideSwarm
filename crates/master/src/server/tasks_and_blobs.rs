@@ -668,17 +668,22 @@ async fn apply_task_result_inner(
                         .to_string(),
                 ),
             };
-            if let Err(e) = registry
-                .send_to_worker_session(&loser_wid, loser_sid, cancel_msg)
-                .await
-            {
-                debug!(
-                    task_id = %task_id,
-                    worker_id = %loser_wid,
-                    error = %e,
-                    "Could not deliver CancelTask to losing sibling worker"
-                );
-            }
+            // Sent from its own task: a wedged loser with a full outbound channel must not block
+            // the winner's session loop (and its heartbeats) until the loser is reaped.
+            let cancel_registry = registry.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cancel_registry
+                    .send_to_worker_session(&loser_wid, loser_sid, cancel_msg)
+                    .await
+                {
+                    debug!(
+                        task_id = %task_id,
+                        worker_id = %loser_wid,
+                        error = %e,
+                        "Could not deliver CancelTask to losing sibling worker"
+                    );
+                }
+            });
             match (loser_sid, loser_live) {
                 (Some(sid), Some(live)) => {
                     registry

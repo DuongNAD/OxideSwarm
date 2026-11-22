@@ -1400,7 +1400,15 @@ impl PinnedDir {
     }
 
     /// Enumerates direct child entries of this pinned directory without path re-resolution.
+    // Used by the sandbox tests; production walks go through `read_entries_limited`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_entries(&self) -> std::io::Result<Vec<PinnedDirEntry>> {
+        self.read_entries_limited(usize::MAX)
+    }
+
+    /// Like [`Self::read_entries`], but fails with `ErrorKind::OutOfMemory` as soon as the
+    /// directory holds more than `max` entries, so a huge directory is never read in full.
+    pub(crate) fn read_entries_limited(&self, max: usize) -> std::io::Result<Vec<PinnedDirEntry>> {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use std::os::unix::ffi::OsStringExt;
 
@@ -1477,6 +1485,12 @@ impl PinnedDir {
                 if err.kind() != std::io::ErrorKind::Interrupted {
                     return Err(err);
                 }
+            }
+            if entries.len() >= max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("directory holds more than {max} entries"),
+                ));
             }
             let kind = match st.st_mode & libc::S_IFMT {
                 libc::S_IFLNK => PinnedEntryKind::Symlink,

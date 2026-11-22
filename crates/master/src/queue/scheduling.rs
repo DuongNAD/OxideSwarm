@@ -184,6 +184,7 @@ impl TaskQueue {
                 requires_tree_v2,
                 speculative: None,
                 speculative_spawned: false,
+                last_large_checkpoint_at: None,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -374,6 +375,7 @@ impl TaskQueue {
                 requires_tree_v2,
                 speculative: None,
                 speculative_spawned: false,
+                last_large_checkpoint_at: None,
             };
 
             inner.tasks.insert(task_id, entry);

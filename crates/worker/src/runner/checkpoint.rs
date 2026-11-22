@@ -56,6 +56,10 @@ pub(crate) const MAX_PROCESS_CHECKPOINT_FILES: usize = 4096;
 /// Maximum relative path byte length in one `OXCP1` entry.
 pub(crate) const MAX_PROCESS_CHECKPOINT_PATH_BYTES: usize = 4096;
 
+/// Maximum directory nesting below the checkpoint root; bounds the directory descriptors the
+/// Unix walk holds open at once.
+pub(crate) const MAX_PROCESS_CHECKPOINT_DEPTH: usize = 32;
+
 /// Default periodic scan interval for process-task checkpoint emission.
 pub(crate) const DEFAULT_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -134,6 +138,35 @@ impl ProcessCheckpointCtx {
             poll_interval: poll_interval.max(MIN_CHECKPOINT_POLL_INTERVAL),
         })
     }
+}
+
+/// Returns the channel process checkpoints are captured on, or `None` when capture is unsafe.
+///
+/// Off Unix the checkpoint walk re-opens each entry by path (there is no handle-relative walk yet),
+/// so a task confined by `--isolation fs|fs+net` could swap a checkpoint directory for a junction
+/// between the listing and the open and have the unconfined worker pack files from outside its
+/// sandbox (for example `cluster.secret`) into the next attempt. Until a handle-based walk exists,
+/// such workers do not capture process checkpoints; restoring one still works. Without isolation
+/// the task already has the worker's own file access, so nothing is gained by the race.
+pub(crate) fn capture_tx_for_isolation(
+    tx: Option<mpsc::Sender<WorkerMessage>>,
+    isolation: crate::isolation::IsolationLevel,
+) -> Option<mpsc::Sender<WorkerMessage>> {
+    #[cfg(not(unix))]
+    if isolation != crate::isolation::IsolationLevel::Off {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if tx.is_some() && !WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                "process task checkpoints are not captured on this system under --isolation \
+                 (design 0102 D5); tasks still run and resume from checkpoints they are given"
+            );
+        }
+        return None;
+    }
+    #[cfg(unix)]
+    let _ = isolation;
+    tx
 }
 
 /// Ensures `checkpoint_dir` exists as a real owned `0o700` directory (not a symlink/reparse point).
@@ -395,14 +428,59 @@ fn collect_entries_pinned_unix(
         ));
     }
 
-    let mut stack: Vec<(PinnedDir, String)> = vec![(root_dir, String::new())];
-    while let Some((dir_fd, rel_dir)) = stack.pop() {
-        let dir_entries = dir_fd.read_entries().map_err(|e| {
-            CheckpointError::Io(format!(
-                "cannot read checkpoint directory '{}': {e}",
-                if rel_dir.is_empty() { "." } else { &rel_dir }
-            ))
+    // Directories are opened only when the walk reaches them, so the descriptors held at once
+    // are the ones on the current path (at most `MAX_PROCESS_CHECKPOINT_DEPTH + 1`), not one per
+    // directory in the tree. Every directory entry counts against the node budget before
+    // anything is opened or read, so a task cannot exhaust the worker's descriptors or memory
+    // with a wide or deep tree.
+    struct PendingDir {
+        parent: std::rc::Rc<PinnedDir>,
+        name: std::ffi::OsString,
+        rel: String,
+        depth: usize,
+    }
+    let mut nodes: usize = 0;
+    let mut current: Option<(std::rc::Rc<PinnedDir>, String, usize)> =
+        Some((std::rc::Rc::new(root_dir), String::new(), 0));
+    let mut stack: Vec<PendingDir> = Vec::new();
+    loop {
+        let (dir_fd, rel_dir, depth) = match current.take() {
+            Some(c) => c,
+            None => {
+                let Some(pending) = stack.pop() else { break };
+                let sub_fd = pending
+                    .parent
+                    .open_dir_nofollow(&pending.name)
+                    .map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::InvalidInput {
+                            CheckpointError::UnsafeEntry(format!(
+                                "directory '{}' is a symlink or untrusted: {e}",
+                                pending.rel
+                            ))
+                        } else {
+                            CheckpointError::Io(format!(
+                                "cannot open directory '{}': {e}",
+                                pending.rel
+                            ))
+                        }
+                    })?;
+                (std::rc::Rc::new(sub_fd), pending.rel, pending.depth)
+            }
+        };
+        let budget = MAX_PROCESS_CHECKPOINT_FILES.saturating_sub(nodes);
+        let dir_entries = dir_fd.read_entries_limited(budget).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::OutOfMemory {
+                CheckpointError::LimitExceeded(format!(
+                    "exceeds maximum of {MAX_PROCESS_CHECKPOINT_FILES} entries"
+                ))
+            } else {
+                CheckpointError::Io(format!(
+                    "cannot read checkpoint directory '{}': {e}",
+                    if rel_dir.is_empty() { "." } else { &rel_dir }
+                ))
+            }
         })?;
+        nodes = nodes.saturating_add(dir_entries.len());
         let had_children = !dir_entries.is_empty();
         for entry in dir_entries {
             let name = entry.name.to_str().ok_or_else(|| {
@@ -421,16 +499,17 @@ fn collect_entries_pinned_unix(
                     )));
                 }
                 PinnedEntryKind::Dir => {
-                    let sub_fd = dir_fd.open_dir_nofollow(&entry.name).map_err(|e| {
-                        if e.kind() == std::io::ErrorKind::InvalidInput {
-                            CheckpointError::UnsafeEntry(format!(
-                                "directory '{rel}' is a symlink or untrusted: {e}"
-                            ))
-                        } else {
-                            CheckpointError::Io(format!("cannot open directory '{rel}': {e}"))
-                        }
-                    })?;
-                    stack.push((sub_fd, rel));
+                    if depth >= MAX_PROCESS_CHECKPOINT_DEPTH {
+                        return Err(CheckpointError::LimitExceeded(format!(
+                            "directory '{rel}' is nested deeper than {MAX_PROCESS_CHECKPOINT_DEPTH} levels"
+                        )));
+                    }
+                    stack.push(PendingDir {
+                        parent: std::rc::Rc::clone(&dir_fd),
+                        name: entry.name.clone(),
+                        rel,
+                        depth: depth + 1,
+                    });
                 }
                 PinnedEntryKind::File => {
                     if entries.len() >= MAX_PROCESS_CHECKPOINT_FILES {
@@ -1069,6 +1148,44 @@ mod tests {
             delta_state: Bytes::from(bytes.into()),
             timestamp: 1,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_walk_refuses_nesting_deeper_than_the_limit() {
+        let src = tempfile::tempdir().unwrap();
+        let cp_dir = src.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        prepare_checkpoint_dir(&cp_dir).unwrap();
+        let ok: PathBuf =
+            (0..MAX_PROCESS_CHECKPOINT_DEPTH).fold(cp_dir.clone(), |p, _| p.join("d"));
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::write(ok.join("f"), b"x").unwrap();
+        pack_checkpoint_dir(&cp_dir).expect("exactly the maximum depth packs");
+
+        std::fs::create_dir(ok.join("d")).unwrap();
+        let err = pack_checkpoint_dir(&cp_dir).unwrap_err();
+        assert!(matches!(err, CheckpointError::LimitExceeded(_)), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_walk_counts_directories_against_the_entry_budget() {
+        let src = tempfile::tempdir().unwrap();
+        let cp_dir = src.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        prepare_checkpoint_dir(&cp_dir).unwrap();
+        // Many sibling directories are opened one at a time (only the current path stays open),
+        // so this packs even though it is far more than a default RLIMIT_NOFILE of 256.
+        for i in 0..1500 {
+            std::fs::create_dir(cp_dir.join(format!("d{i}"))).unwrap();
+        }
+        pack_checkpoint_dir(&cp_dir).expect("1500 empty directories pack");
+
+        // Past the budget the walk stops before reading or opening the rest.
+        for i in 1500..=MAX_PROCESS_CHECKPOINT_FILES {
+            std::fs::create_dir(cp_dir.join(format!("d{i}"))).unwrap();
+        }
+        let err = pack_checkpoint_dir(&cp_dir).unwrap_err();
+        assert!(matches!(err, CheckpointError::LimitExceeded(_)), "{err:?}");
     }
 
     #[test]

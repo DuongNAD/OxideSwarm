@@ -56,6 +56,18 @@ Process workloads (`Command`, `ShellScript`, and `Workspace` tasks) receive a pr
 - **Periodic polling (`supervise.rs`)**: `execute_process_supervised_with_checkpoint` polls `checkpoint_dir` every `RunnerConfig::checkpoint_poll_interval` (default `1s`) via non-overlapping `tokio::task::spawn_blocking` packs, emitting `WorkerMessage::Checkpoint` only when the canonical BLAKE3 digest changes. Oversized directories log a warning and skip emission without failing the task.
 - **Final emission & graceful drain (`supervise.rs`, `client/tasks.rs`, `client/session.rs`)**: Non-zero exits, `Ended::Cancelled` (after `stop_tree`), and `Ended::TimedOut` (after `stop_tree`) emit one final changed snapshot if `checkpoint_tx` is open, and `forward_checkpoint` performs a bounded `200 ms` send retry on final emission if `session.data_tx` is momentarily full outside a resume window. On `shutdown_rx` in `run_session`, if active tasks exist and no urgent evacuation override is active, `drain_active_tasks_for_shutdown` grants a bounded `2s` cancel/checkpoint drain and flushes `session.data_tx` before `session.close(Some(Disconnecting))`; idle workers exit with `0 ms` drain overhead.
 
+### D5: No capture off Unix under `--isolation` (review fix, 2026-11-22)
+
+The non-Unix walk re-opens every entry by path; only the last component is checked for a reparse point. A task confined by `--isolation fs|fs+net` could replace a checkpoint subdirectory with a junction to, say, `%USERPROFILE%\.oxideswarm` between the listing and the open, and the unconfined worker would pack `cluster.secret` into the checkpoint that the next attempt restores inside the sandbox. Until a handle-relative walk exists, `capture_tx_for_isolation` (`checkpoint.rs`) drops the checkpoint channel on such workers: no periodic or final process checkpoints are captured, a one-time warning is logged, and restoring a checkpoint the master sends still works. Without isolation the task already has the worker's file access, so the race gains nothing and capture stays on.
+
+### D6: Walk limits on Unix
+
+The Unix walk opens a directory only when it reaches it, so the descriptors held at once are those on the current path, at most `MAX_PROCESS_CHECKPOINT_DEPTH + 1` (32 levels). Every directory entry (files and directories) counts against the `MAX_PROCESS_CHECKPOINT_FILES` (4,096) budget, and `PinnedDir::read_entries_limited` stops reading a directory as soon as it exceeds the remaining budget, so a wide or deep tree can neither exhaust the worker's descriptors nor its memory. Exceeding a limit skips that checkpoint with a warning, as an oversized one does.
+
+### D7: Master budget for checkpoints
+
+Any process task can now produce checkpoints of up to 12 MiB. The master (`record_checkpoint_from`, `queue/lifecycle.rs`) therefore drops a checkpoint of at least `LARGE_CHECKPOINT_BYTES` (1 MiB) that arrives less than `LARGE_CHECKPOINT_MIN_INTERVAL` (5 s) after the task's previous accepted large one, so one task cannot keep the journal appending and compacting; smaller checkpoints are not rate limited. Checkpoints may also grow the active bytes only up to three quarters of `--max-active-mb` (`CHECKPOINT_HEADROOM_DIVISOR`), so running tasks' checkpoints cannot take the room new submissions need.
+
 ## Compatibility
 
 - Protocol 10 (`PROTOCOL_VERSION_CURRENT = 10`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 9`) and Store v4 (`STORE_FORMAT_VERSION = 4`) remain unchanged; `EXTENSION_REGISTRY` and `crates/core/tests/data/wire_layout.txt` are untouched.
@@ -81,3 +93,4 @@ Process workloads (`Command`, `ShellScript`, and `Workspace` tasks) receive a pr
 ## Status log
 
 - 2026-11-21: Created design record `0102` and implemented process task checkpoints (`FEAT-5`) across `crates/worker`.
+- 2026-11-22: Review fixes D5 (no capture off Unix under isolation), D6 (Unix walk depth and entry limits, lazy directory opens) and D7 (master rate limit and headroom for large checkpoints).

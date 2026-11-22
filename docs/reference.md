@@ -961,7 +961,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_SANDBOX_DIR` | Task Runner | Absolute path to the isolated scratch working directory (or the workspace `tree/` directory for workspace tasks) |
 | `RUSTY_GRID_WORKSPACE` | Task Runner | Workspace name when the task runs inside a persistent named workspace (`Task::workspace`) |
 | `RUSTY_GRID_WORKSPACE_DIR` | Task Runner | Absolute path to `<workspace_root>/<name>/tree` when the task runs inside a persistent named workspace |
-| `OXIDESWARM_CHECKPOINT_DIR` | Task Runner | Absolute path to the sandbox-private checkpoint directory for `Command`, `ShellScript`, and `Workspace` tasks (excluded from `--output` globs; [design 0102](design/0102-process-task-checkpoints.md)) |
+| `OXIDESWARM_CHECKPOINT_DIR` | Task Runner | Absolute path to the sandbox-private checkpoint directory for `Command`, `ShellScript`, and `Workspace` tasks (excluded from `--output` globs; at most 4,096 entries, 32 levels deep, 12 MiB encoded; large checkpoints are accepted at most every 5 s; not captured on Windows under `--isolation`; [design 0102](design/0102-process-task-checkpoints.md)) |
 | `OX_SHARD_INDEX` | `oxideswarm shard` / MCP `shard` | 1-based shard index (`1..=OX_SHARD_TOTAL`) injected into each shard's `TaskSpec::Command` or `TaskSpec::ShellScript` environment (overrides colliding `--env` entries) |
 | `OX_SHARD_TOTAL` | `oxideswarm shard` / MCP `shard` | Total shard count (`N`) injected into each shard's environment (overrides colliding `--env` entries) |
 | `OXIDESWARM_BUILD_ONCE_ARCHIVE` | `oxideswarm shard --build-once` | Sandbox-relative path to the staged `(os, arch)` `cargo nextest archive` file inside shard `Task::inputs` (overrides colliding `--env` entries) |
