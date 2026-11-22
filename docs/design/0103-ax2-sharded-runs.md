@@ -40,7 +40,7 @@ Created: 2026-11-22    Updated: 2026-11-22
 ### D2: `OX_SHARD_INDEX`, `OX_SHARD_TOTAL`, and `slots:` SWRR spreading (`crates/cli/src/shard.rs`)
 
 - `filter_eligible_workers` filters `ListWorkers` results using `listed_as_connected` and `worker_matches_cell` (plus `tool:cargo-nextest*` / `tool:cargo` resolution in `--build-once` mode), failing fast if zero workers match.
-- `spread_shards_swrr` runs Smooth Weighted Round-Robin weighted by `advertised_slots(w).unwrap_or(w.cpu_cores.max(1)).max(1)` and pins `placement.worker` to each selected worker's `id:` (or name fallback).
+- `spread_shards_swrr` runs Smooth Weighted Round-Robin weighted by `advertised_slots(w).unwrap_or(w.cpu_cores.max(1)).max(1)` and gives each shard a `prefer:worker=<id>` tag for the selected worker (soft, D7); an explicit `--worker` keeps the hard `require:worker=` pin instead.
 - `inject_shard_env` writes `OX_SHARD_INDEX` (`1..=N`) and `OX_SHARD_TOTAL` (`N`) into `TaskSpec::Command` / `TaskSpec::ShellScript`, overriding any conflicting user `--env OX_SHARD_*` entries.
 
 ### D3: Rust `--build-once` dataflow (`crates/cli/src/shard.rs`)
@@ -58,9 +58,13 @@ Created: 2026-11-22    Updated: 2026-11-22
 - `--output-dir` downloads each shard's outputs into `<output_dir>/<shard_slug>/` via `ensure_non_symlink_cell_dir` (refusing symlinks). When `--junit-out` is set without `--output-dir`, JUnit XML blobs stream into memory via `download_blob` so the current working directory stays clean.
 - `shard::junit` parses `<testsuites>` / `<testsuite>`, handles XML entities and `<![CDATA[...]]>`, aggregates `tests`/`failures`/`errors`/`skipped`/`time`, synthesizes error `<testsuite>` entries for non-completed or malformed-XML shards, rejects all-completed runs with zero JUnit XML files, and writes atomically via `write_junit_atomic` (refusing symlinks).
 
+### D7: Soft worker affinity in the master (`prefer:worker=`)
+
+The SWRR plan is a preference, not a pin: a shard tagged `prefer:worker=<id|name>` is placed on that worker only while it is connected, matches the task's placement and capabilities, and has a free slot for it in the current pass (`Engine::has_eligible_matching_worker`, `crates/master/src/scheduler.rs`). Otherwise the tag is ignored and the task is placed like any other, so a busy, held-back or departed preferred worker never makes a shard wait while another worker is idle. `prefer:` is not a reserved prefix: a user may set the tag on any task and gets the same soft behaviour. A master older than this change ignores the tag, so shards then spread by the master's own ranking.
+
 ## Compatibility
 
-- Zero changes to `crates/core/*`, `crates/master/*`, `crates/worker/*`, or `Cargo.toml` / `Cargo.lock`.
+- `crates/master/src/queue.rs` (`TaskView::prefer_worker`) and `crates/master/src/scheduler.rs` (D7) change; `crates/core`, `crates/worker` and `Cargo.toml` do not.
 - `PROTOCOL_VERSION_CURRENT == 10`, `PROTOCOL_VERSION_MIN_COMPATIBLE == 9`, `STORE_FORMAT_VERSION == 4`, and `EXTENSION_REGISTRY == &[]` remain invariant.
 
 ## Security
@@ -85,4 +89,5 @@ Created: 2026-11-22    Updated: 2026-11-22
 ## Status log
 
 - 2026-11-22: Implemented `oxideswarm shard`, MCP `shard`, `shard::junit`, `--build-once`, `test_ax2_shard.rs`, R2/M1 loopback benchmark, and `docs/guides/sharded-runs.md`.
+- 2026-11-22: Review fix: `prefer:worker=` is soft in the master (D7); before, shards waited for a saturated preferred worker while others sat idle, and this record wrongly said the master was unchanged.
 - 2026-11-22: Recorded single-host loopback Spike R2 (`51.26 %` savings across 3 workers, clearing the `30 %` stop rule) and Measure M1 (`0.5061x` median, `0.466x` min across 725 unit tests on Apple M5 loopback) in `benchmarks/grid/results/2026-11-22-r2-m1-macos-arm64-apple-m5.json` (`benchmarks/grid/bench_shard_r2_m1.py`).

@@ -1372,6 +1372,13 @@ impl<'a> Engine<'a> {
             {
                 return false;
             }
+            // Soft affinity (design 0103 D7): the preference only applies while the preferred
+            // worker can take the task now; a busy one never makes the task wait.
+            if seat.max_slots.saturating_sub(seat.used_slots()) < weight
+                || seat.load() >= seat.max_tasks
+            {
+                return false;
+            }
             if stage6_active && meta.is_gpu {
                 if non_gpu_free {
                     return false;
@@ -8867,108 +8874,41 @@ mod tests {
     }
 
     #[test]
-    fn prefer_worker_holds_affinity_while_saturated_and_isolates_shapes() {
+    fn prefer_worker_is_soft_and_never_waits_for_a_saturated_preferred_worker() {
         let mut w_heavy = make_worker("w-heavy", 2, 8192, false, false);
-        w_heavy.capabilities.tags = vec!["slots:6".into()];
+        w_heavy.capabilities.tags = vec!["slots:2".into()];
         let mut w_light = make_worker("w-light", 2, 8192, false, false);
         w_light.capabilities.tags = vec!["slots:2".into()];
 
-        let make_pref_task = |wid: Uuid| {
-            let mut t = Task::new(
-                TaskSpec::new_command("echo", vec!["shard".into()]),
-                TaskRequirements::generic(1, 64),
-            );
-            t.tags.push(format!("prefer:worker={wid}"));
-            t
-        };
-
-        // Interleaved 6:2 SWRR order: H, H, H, L, H, H, H, L.
-        let mut queue: Vec<Task> = vec![
-            make_pref_task(w_heavy.worker_id),
-            make_pref_task(w_heavy.worker_id),
-            make_pref_task(w_heavy.worker_id),
-            make_pref_task(w_light.worker_id),
-            make_pref_task(w_heavy.worker_id),
-            make_pref_task(w_heavy.worker_id),
-            make_pref_task(w_heavy.worker_id),
-            make_pref_task(w_light.worker_id),
-        ];
-
-        let cfg = SchedulerConfig::default();
-        let workers = vec![w_heavy.clone(), w_light.clone()];
-        let mut heavy_placed = 0usize;
-        let mut light_placed = 0usize;
-
-        // Pass 1: w_heavy saturates after 2 tasks (max_slots=2). H3 hits self.dead for
-        // prefer:worker=w_heavy, yet L1 and L2 (distinct Shape::prefer_worker) still place on w_light!
-        let r1 = WorkloadScheduler::matchmake_with_speed(
-            &cfg,
+        // Four shards all prefer w_heavy, which has room for two: the other two run on the idle
+        // w_light instead of waiting (design 0103 D7).
+        let queue: Vec<Task> = (0..4)
+            .map(|_| {
+                let mut t = Task::new(
+                    TaskSpec::new_command("echo", vec!["shard".into()]),
+                    TaskRequirements::generic(1, 64),
+                );
+                t.tags.push(format!("prefer:worker={}", w_heavy.worker_id));
+                t
+            })
+            .collect();
+        let report = WorkloadScheduler::matchmake_with_speed(
+            &SchedulerConfig::default(),
             &queue,
-            &workers,
+            &[w_heavy.clone(), w_light.clone()],
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
             &SpeedBook::new(),
             &HashMap::new(),
         );
-        assert_eq!(r1.assignments.len(), 4);
-        assert_eq!(r1.skipped.len(), 4);
-        for a in &r1.assignments {
-            if a.worker_id == w_heavy.worker_id {
-                heavy_placed += 1;
-            } else if a.worker_id == w_light.worker_id {
-                light_placed += 1;
-            }
-        }
-        assert_eq!(heavy_placed, 2);
-        assert_eq!(light_placed, 2);
-        for (_, reason) in &r1.skipped {
-            assert_eq!(*reason, ScheduleSkipReason::AllEligibleWorkersSaturated);
-        }
-
-        // Remaining 4 shards all prefer w_heavy and stay queued when w_heavy drains over subsequent passes.
-        let assigned_ids: HashSet<TaskId> = r1.assignments.iter().map(|a| a.task_id).collect();
-        queue.retain(|t| !assigned_ids.contains(&t.id));
-        assert_eq!(queue.len(), 4);
-
-        let r2 = WorkloadScheduler::matchmake_with_speed(
-            &cfg,
-            &queue,
-            &workers,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &SpeedBook::new(),
-            &HashMap::new(),
-        );
-        assert_eq!(r2.assignments.len(), 2);
-        assert!(r2
+        assert_eq!(report.assignments.len(), 4, "skipped: {:?}", report.skipped);
+        let on_heavy = report
             .assignments
             .iter()
-            .all(|a| a.worker_id == w_heavy.worker_id));
-        heavy_placed += 2;
-        let assigned_ids2: HashSet<TaskId> = r2.assignments.iter().map(|a| a.task_id).collect();
-        queue.retain(|t| !assigned_ids2.contains(&t.id));
-
-        let r3 = WorkloadScheduler::matchmake_with_speed(
-            &cfg,
-            &queue,
-            &workers,
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashSet::new(),
-            &SpeedBook::new(),
-            &HashMap::new(),
-        );
-        assert_eq!(r3.assignments.len(), 2);
-        assert!(r3
-            .assignments
-            .iter()
-            .all(|a| a.worker_id == w_heavy.worker_id));
-        heavy_placed += 2;
-
-        assert_eq!(heavy_placed, 6);
-        assert_eq!(light_placed, 2);
+            .filter(|a| a.worker_id == w_heavy.worker_id)
+            .count();
+        assert_eq!(on_heavy, 2);
     }
 
     #[test]
@@ -9063,16 +9003,20 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(report.assignments.len(), 1);
-        assert_eq!(report.assignments[0].task_id, t_avoid.id);
-        assert_eq!(report.assignments[0].worker_id, w2.worker_id);
+        // w1 is saturated, so the preference does not apply: w2 takes two of the three tasks
+        // (the avoiding one among them) and the third waits for a free slot.
+        assert_eq!(report.assignments.len(), 2);
+        assert!(report
+            .assignments
+            .iter()
+            .all(|a| a.worker_id == w2.worker_id));
+        assert!(report.assignments.iter().any(|a| a.task_id == t_avoid.id));
+        assert_eq!(report.skipped.len(), 1);
         assert_eq!(
-            report.skipped,
-            vec![
-                (t_plain.id, ScheduleSkipReason::AllEligibleWorkersSaturated),
-                (t_plain2.id, ScheduleSkipReason::AllEligibleWorkersSaturated),
-            ]
+            report.skipped[0].1,
+            ScheduleSkipReason::AllEligibleWorkersSaturated
         );
+        assert_ne!(report.skipped[0].0, t_avoid.id);
     }
 
     #[test]
