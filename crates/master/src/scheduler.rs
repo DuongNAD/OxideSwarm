@@ -31,11 +31,11 @@ use rusty_grid_core::protocol::{MasterMessage, ProtocolCapabilities};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
 
 use crate::fair_share::FairWalkCursor;
-use crate::queue::{AssignedLoad, QueueOrderKey, TaskQueue, TaskView};
+use crate::queue::{AssignedLoad, Generative3DVramTier, QueueOrderKey, TaskQueue, TaskView};
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use crate::server::WaiterMap;
 use crate::speed::{new_shared_speed_book, SharedSpeedBook, SpeedBook, TaskKey};
-use crate::worker_index::{RegisteredIndex, SeatStaticMeta, WorkerIndex};
+use crate::worker_index::{CapRequirements, RegisteredIndex, SeatStaticMeta, WorkerIndex};
 
 /// Queued tasks examined per page of a scheduling pass (each page is one short read lock).
 const SCAN_PAGE: usize = 512;
@@ -221,18 +221,41 @@ impl SchedulerConfig {
         }
         match &task.spec {
             TaskSpec::Generative3D(spec) => {
-                if spec.engine().is_cpu_capable() {
-                    0
-                } else {
-                    match spec.quality.as_str() {
-                        "fast" => self.min_vram_fast_mb,
-                        "high" => self.min_vram_high_mb,
-                        _ => self.min_vram_standard_mb,
+                if matches!(spec.engine(), rusty_grid_core::task::Engine3D::Sdf) {
+                    return 0;
+                }
+                let q = spec.quality.trim();
+                if task.requirements.gpu_required || q.eq_ignore_ascii_case("high") {
+                    if q.eq_ignore_ascii_case("fast") {
+                        self.min_vram_fast_mb
+                    } else if q.eq_ignore_ascii_case("high") {
+                        self.min_vram_high_mb
+                    } else {
+                        self.min_vram_standard_mb
                     }
+                } else {
+                    0
                 }
             }
             _ => 0,
         }
+    }
+
+    pub(crate) fn effective_vram_mb_for_view(&self, view: &TaskView) -> u64 {
+        let explicit = view.requirements.effective_vram_mb();
+        if explicit > 0 {
+            return explicit;
+        }
+        match view.gen3d_vram_tier {
+            Some(Generative3DVramTier::Fast) => self.min_vram_fast_mb,
+            Some(Generative3DVramTier::Standard) => self.min_vram_standard_mb,
+            Some(Generative3DVramTier::High) => self.min_vram_high_mb,
+            None => 0,
+        }
+    }
+
+    pub(crate) fn effective_requires_gpu(&self, view: &TaskView) -> bool {
+        view.requires_gpu || self.effective_vram_mb_for_view(view) > 0
     }
 
     /// Sets the debounce micro-batch window.
@@ -341,25 +364,35 @@ pub struct ScheduleReport {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Shape {
     requires_gpu: bool,
+    requires_blender: bool,
     heavy: bool,
     required_features: ProtocolCapabilities,
     cpu_cores: usize,
     ram_mb: u64,
     vram_mb: u64,
     placement: Placement,
+    prefer_worker: Option<String>,
     workspace: Option<String>,
 }
 
 impl Shape {
-    fn of(view: &TaskView, placement: &Placement) -> Self {
+    fn of(
+        view: &TaskView,
+        placement: &Placement,
+        prefer_worker: Option<&str>,
+        config: &SchedulerConfig,
+    ) -> Self {
+        let vram_mb = config.effective_vram_mb_for_view(view);
         Self {
-            requires_gpu: view.requires_gpu,
+            requires_gpu: view.requires_gpu || vram_mb > 0,
+            requires_blender: view.requires_blender,
             heavy: view.heavy,
             required_features: view.required_features,
             cpu_cores: view.requirements.cpu_cores,
             ram_mb: view.requirements.ram_mb,
-            vram_mb: view.requirements.effective_vram_mb(),
+            vram_mb,
             placement: placement.clone(),
+            prefer_worker: prefer_worker.map(str::to_owned),
             workspace: view.workspace.clone(),
         }
     }
@@ -386,9 +419,12 @@ fn feature_names(features: ProtocolCapabilities) -> String {
     names.join(" and ")
 }
 
-/// True if `worker` could run a task with `requirements` when idle (static capability check).
-pub(crate) fn statically_fits(requirements: &TaskRequirements, worker: &WorkerInfo) -> bool {
-    let req_vram = requirements.effective_vram_mb();
+/// True if `worker` could run a task with `requirements` and explicit `req_vram` MB when idle.
+pub(crate) fn statically_fits_with_vram(
+    requirements: &TaskRequirements,
+    req_vram: u64,
+    worker: &WorkerInfo,
+) -> bool {
     (requirements.cpu_cores == 0 || worker.capabilities.cpu_cores >= requirements.cpu_cores)
         && (requirements.ram_mb == 0 || worker.capabilities.ram_mb >= requirements.ram_mb)
         && (req_vram == 0 || worker.capabilities.vram_mb.is_some_and(|v| v >= req_vram))
@@ -762,21 +798,28 @@ impl<'a> Engine<'a> {
         if !self.gpu_waiting {
             self.gpu_waiting = true;
             self.gpu_recent = true;
+            self.dead.retain(|_, v| !matches!(v, Verdict::Skip(_)));
             self.dead_speed.clear();
         }
     }
 
     fn any_gpu_worker_fits_view(&self, view: &TaskView) -> bool {
-        view.requires_gpu
+        let req_vram = self.config.effective_vram_mb_for_view(view);
+        (view.requires_gpu || req_vram > 0)
             && view.placement.as_ref().is_ok_and(|placement| {
-                self.worker_index
-                    .attrs()
-                    .any_gpu_fits(self.workers, &view.requirements, placement)
+                self.worker_index.attrs().any_gpu_fits(
+                    self.workers,
+                    &view.requirements,
+                    req_vram,
+                    view.requires_blender,
+                    placement,
+                )
             })
     }
 
     fn skip_reason(&self, view: &TaskView, placement: &Placement) -> ScheduleSkipReason {
-        if view.requires_gpu && !self.any_gpu_worker {
+        let requires_gpu = self.config.effective_requires_gpu(view);
+        if requires_gpu && !self.any_gpu_worker {
             ScheduleSkipReason::NoGpuWorkersAvailable
         } else if !view.required_features.is_empty()
             && !self
@@ -788,7 +831,11 @@ impl<'a> Engine<'a> {
                 "cluster lacks workers with {} capability",
                 feature_names(view.required_features)
             ))
-        } else if view.requires_gpu {
+        } else if view.requires_blender && !self.worker_index.attrs().any_has_blender() {
+            ScheduleSkipReason::ClusterLacksCapability(
+                "cluster lacks workers with Blender capability".into(),
+            )
+        } else if requires_gpu {
             ScheduleSkipReason::NoGpuWorkersAvailable
         } else if !placement.is_empty()
             && !self.worker_index.attrs().any_matches_placement(placement)
@@ -806,12 +853,32 @@ impl<'a> Engine<'a> {
             Ok(placement) => placement,
             Err(e) => return Verdict::Unfulfillable(format!("Invalid placement constraints: {e}")),
         };
-        let shape = Shape::of(view, placement);
+        let req_vram = self.config.effective_vram_mb_for_view(view);
+        let requires_gpu = view.requires_gpu || req_vram > 0;
+        let pref_placement_owned = if self.free_slots > 0 && placement.worker.is_none() {
+            view.prefer_worker.as_ref().and_then(|pw| {
+                let mut cand = placement.clone();
+                cand.worker = Some(pw.clone());
+                self.has_eligible_matching_worker(view, placement, &cand)
+                    .then_some(cand)
+            })
+        } else {
+            None
+        };
+        let effective_placement = pref_placement_owned.as_ref().unwrap_or(placement);
+        let shape = Shape::of(
+            view,
+            placement,
+            pref_placement_owned
+                .as_ref()
+                .and_then(|p| p.worker.as_deref()),
+            self.config,
+        );
         if let Some(verdict) = self.dead.get(&shape) {
             return verdict.clone();
         }
         if self.config.fail_unfulfillable_tasks {
-            if view.requires_gpu && !self.any_gpu_worker {
+            if requires_gpu && !self.any_gpu_worker {
                 let verdict =
                     Verdict::Unfulfillable("Cluster lacks workers with GPU capabilities".into());
                 self.dead.insert(shape, verdict.clone());
@@ -829,6 +896,12 @@ impl<'a> Engine<'a> {
                 self.dead.insert(shape, verdict.clone());
                 return verdict;
             }
+            if view.requires_blender && !self.registered_index.any_has_blender() {
+                let verdict =
+                    Verdict::Unfulfillable("Cluster lacks workers with Blender capability".into());
+                self.dead.insert(shape, verdict.clone());
+                return verdict;
+            }
             let nobody_matches =
                 !placement.is_empty() && !self.registered_index.any_matches_placement(placement);
             if nobody_matches {
@@ -841,24 +914,36 @@ impl<'a> Engine<'a> {
             let nobody_fits = !self.registered_index.any_fits_all(
                 self.registered,
                 &view.requirements,
+                req_vram,
                 placement,
-                view.requires_gpu,
-                view.required_features,
+                CapRequirements {
+                    requires_gpu,
+                    requires_blender: view.requires_blender,
+                    required_features: view.required_features,
+                },
             );
             if nobody_fits {
-                let req_vram = view.requirements.effective_vram_mb();
+                let blender_suffix = if view.requires_blender {
+                    ", blender=true"
+                } else {
+                    ""
+                };
                 let reason = if req_vram > 0 {
                     format!(
-                        "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, vram_mb={}, gpu={})",
+                        "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, vram_mb={}, gpu={}{})",
                         view.requirements.cpu_cores,
                         view.requirements.ram_mb,
                         req_vram,
-                        view.requires_gpu
+                        requires_gpu,
+                        blender_suffix
                     )
                 } else {
                     format!(
-                        "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={})",
-                        view.requirements.cpu_cores, view.requirements.ram_mb, view.requires_gpu
+                        "No registered worker satisfies task requirements (cpu_cores={}, ram_mb={}, gpu={}{})",
+                        view.requirements.cpu_cores,
+                        view.requirements.ram_mb,
+                        requires_gpu,
+                        blender_suffix
                     )
                 };
                 let verdict = Verdict::Unfulfillable(reason);
@@ -902,16 +987,27 @@ impl<'a> Engine<'a> {
         let weight = view.requirements.cpu_cores.max(1);
         let mut full = Vec::new();
         let mut matching = Vec::new();
-        let mut candidates =
-            self.candidates_and_matching(view, &view.avoid, &mut full, &mut matching);
+        let mut candidates = self.candidates_and_matching_with_placement(
+            view,
+            effective_placement,
+            &view.avoid,
+            &mut full,
+            &mut matching,
+        );
         if candidates.is_empty() && !view.avoid.is_empty() {
             // Avoiding is a preference: with nobody else eligible, a worker that refused the task
             // before still gets it rather than leaving it to starve.
-            candidates = self.candidates_and_matching(view, &[], &mut full, &mut matching);
+            candidates = self.candidates_and_matching_with_placement(
+                view,
+                effective_placement,
+                &[],
+                &mut full,
+                &mut matching,
+            );
         }
         if candidates.is_empty() {
-            self.hold_back(&full, weight, view.requirements.effective_vram_mb());
-            let verdict = Verdict::Skip(self.skip_reason(view, placement));
+            self.hold_back(&full, weight, req_vram, requires_gpu);
+            let verdict = Verdict::Skip(self.skip_reason(view, effective_placement));
             self.dead.insert(shape, verdict.clone());
             return verdict;
         }
@@ -997,11 +1093,7 @@ impl<'a> Engine<'a> {
                             let threshold = self.config.speed_hold_factor * (ready_ms + best_avg);
                             if min_expected >= threshold {
                                 if full.contains(&best_idx) {
-                                    self.hold_back(
-                                        &[best_idx],
-                                        weight,
-                                        view.requirements.effective_vram_mb(),
-                                    );
+                                    self.hold_back(&[best_idx], weight, req_vram, requires_gpu);
                                 }
                                 if view.avoid.is_empty() && view.workspace.is_none() {
                                     self.dead_speed
@@ -1032,10 +1124,7 @@ impl<'a> Engine<'a> {
         seat.placed.tasks += 1;
         seat.placed.slots += weight;
         seat.placed.unstarted_ram_mb += view.requirements.ram_mb;
-        seat.placed.vram_mb = seat
-            .placed
-            .vram_mb
-            .saturating_add(view.requirements.effective_vram_mb());
+        seat.placed.vram_mb = seat.placed.vram_mb.saturating_add(req_vram);
         seat.running.push((view.task_key, Duration::ZERO));
         let free_after = seat.remaining_slots();
         self.free_slots = self
@@ -1055,7 +1144,7 @@ impl<'a> Engine<'a> {
     /// worker that needs the fewest slots to free up for it is held back for the rest of the
     /// pass: it takes nothing more, drains, and the task is placed on it in a later pass. Later
     /// tasks only lose a worker that could not have run the waiting task either way.
-    fn hold_back(&mut self, full: &[usize], weight: usize, req_vram_mb: u64) {
+    fn hold_back(&mut self, full: &[usize], weight: usize, req_vram_mb: u64, requires_gpu: bool) {
         let slots_to_free = |seat: &Seat<'_>| {
             let used = seat.used_slots();
             if weight > seat.max_slots {
@@ -1076,10 +1165,35 @@ impl<'a> Engine<'a> {
                 .saturating_add(req_vram_mb)
                 .saturating_sub(cap)
         };
-        let Some(&idx) = full.iter().min_by_key(|&&idx| {
-            let seat = &self.seats[idx];
-            (slots_to_free(seat), vram_to_free(seat), idx)
-        }) else {
+        let stage6_active = !requires_gpu
+            && self.config.preserve_gpu_for_gpu_tasks
+            && (self.gpu_waiting || self.gpu_recent);
+        let Some(&idx) = full
+            .iter()
+            .filter(|&&idx| {
+                if stage6_active && self.worker_index.meta(idx).is_gpu {
+                    let seat = &self.seats[idx];
+                    if self.gpu_waiting && seat.remaining_slots() > 0 {
+                        return false;
+                    }
+                    let reserve = self
+                        .config
+                        .gpu_reserved_slots
+                        .min(seat.max_slots.saturating_sub(1))
+                        .min(seat.max_tasks.saturating_sub(1));
+                    if seat.max_slots.saturating_sub(weight) < reserve
+                        || seat.max_tasks.saturating_sub(1) < reserve
+                    {
+                        return false;
+                    }
+                }
+                true
+            })
+            .min_by_key(|&&idx| {
+                let seat = &self.seats[idx];
+                (slots_to_free(seat), vram_to_free(seat), idx)
+            })
+        else {
             return;
         };
         if !self.reserved[idx] {
@@ -1110,7 +1224,7 @@ impl<'a> Engine<'a> {
 
     fn apply_stage6_and_7(
         &self,
-        view: &TaskView,
+        requires_gpu: bool,
         weight: usize,
         found: &mut Vec<usize>,
         matching: &mut Vec<usize>,
@@ -1119,7 +1233,7 @@ impl<'a> Engine<'a> {
         // Stage 6: GPU preservation. While a GPU task waits, a generic task takes a CPU-only worker
         // whenever one can run it and only spills onto a GPU worker when none can. While GPU work
         // waits or is likely, a spill-over must leave that GPU worker some slots free.
-        if !view.requires_gpu
+        if !requires_gpu
             && config.preserve_gpu_for_gpu_tasks
             && (self.gpu_waiting || self.gpu_recent)
         {
@@ -1157,7 +1271,7 @@ impl<'a> Engine<'a> {
         // Stage 7: Real-GPU priority.
         // For GPU-requiring tasks, prioritize hardware GPU (wgpu) workers over simulated
         // GPU workers. Simulated GPU workers are only used when no idle real-GPU worker is available.
-        if view.requires_gpu {
+        if requires_gpu {
             let has_idle_real_gpu = found.iter().any(|&idx| {
                 self.worker_index.meta(idx).is_real_gpu && self.seats[idx].used_slots() == 0
             });
@@ -1168,10 +1282,116 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// True if at least one non-GPU worker matching `placement` (and not in `view.avoid`) can
+    /// accept `view` right now without violating slot, RAM, or protocol-feature constraints.
+    fn has_free_non_gpu_candidate(&self, view: &TaskView, placement: &Placement) -> bool {
+        let req = &view.requirements;
+        let req_vram = self.config.effective_vram_mb_for_view(view);
+        if view.requires_gpu || req_vram > 0 {
+            return false;
+        }
+        let caps = CapRequirements {
+            requires_gpu: false,
+            requires_blender: view.requires_blender,
+            required_features: view.required_features,
+        };
+        let weight = req.cpu_cores.max(1);
+        let Some(mask) = self.worker_index.free_candidate_mask(
+            placement,
+            caps,
+            req.cpu_cores,
+            view.heavy,
+            &view.avoid,
+        ) else {
+            return false;
+        };
+        mask.iter_ones().any(|idx| {
+            if self.worker_index.meta(idx).is_gpu {
+                return false;
+            }
+            let seat = &self.seats[idx];
+            if !statically_fits_with_vram(req, req_vram, seat.worker)
+                || self.is_seat_ram_short(seat, req.ram_mb)
+                || self.is_seat_vram_short(seat, req_vram)
+                || !seat.worker.features.contains(view.required_features)
+            {
+                return false;
+            }
+            let used = seat.used_slots();
+            let tasks = seat.load();
+            tasks < seat.max_tasks && (used == 0 || used + weight <= seat.max_slots)
+        })
+    }
+
+    /// True if at least one connected, non-avoided, non-host-busy worker satisfies `pref_placement`,
+    /// capabilities, static resources, protocol features, and Stage 6 GPU preservation (ignoring
+    /// current slot saturation and `reserved` unless Stage 6 would reject the GPU worker).
+    fn has_eligible_matching_worker(
+        &self,
+        view: &TaskView,
+        base_placement: &Placement,
+        pref_placement: &Placement,
+    ) -> bool {
+        let req = &view.requirements;
+        let req_vram = self.config.effective_vram_mb_for_view(view);
+        let requires_gpu = view.requires_gpu || req_vram > 0;
+        let caps = CapRequirements {
+            requires_gpu,
+            requires_blender: view.requires_blender,
+            required_features: view.required_features,
+        };
+        let Some(mask) = self.worker_index.matching_static_mask(
+            pref_placement,
+            caps,
+            req.cpu_cores,
+            view.heavy,
+            &view.avoid,
+        ) else {
+            return false;
+        };
+        let stage6_active = !requires_gpu
+            && self.config.preserve_gpu_for_gpu_tasks
+            && (self.gpu_waiting || self.gpu_recent);
+        let non_gpu_free = stage6_active
+            && self.gpu_waiting
+            && self.has_free_non_gpu_candidate(view, base_placement);
+        let weight = req.cpu_cores.max(1);
+        mask.iter_ones().any(|idx| {
+            let meta = self.worker_index.meta(idx);
+            if meta.host_busy {
+                return false;
+            }
+            let seat = &self.seats[idx];
+            if !statically_fits_with_vram(req, req_vram, seat.worker)
+                || !seat.worker.features.contains(view.required_features)
+                || (self.is_seat_ram_short(seat, req.ram_mb) && seat.load() == 0)
+            {
+                return false;
+            }
+            if stage6_active && meta.is_gpu {
+                if non_gpu_free {
+                    return false;
+                }
+                let reserve = self
+                    .config
+                    .gpu_reserved_slots
+                    .min(seat.max_slots.saturating_sub(1))
+                    .min(seat.max_tasks.saturating_sub(1));
+                if seat.max_slots.saturating_sub(seat.used_slots() + weight) < reserve
+                    || seat.max_tasks.saturating_sub(seat.load() + 1) < reserve
+                {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
     /// Indices of the workers that may run `view` right now. `full` is cleared and then receives
     /// the workers that would have taken it but for free slots; `matching` is cleared and receives
     /// all connected workers that satisfy `view`'s capability, placement, GPU, and environmental
     /// rules ignoring free slots and `reserved`.
+    #[allow(dead_code)]
     fn candidates_and_matching(
         &self,
         view: &TaskView,
@@ -1179,19 +1399,37 @@ impl<'a> Engine<'a> {
         full: &mut Vec<usize>,
         matching: &mut Vec<usize>,
     ) -> Vec<usize> {
+        let Ok(ref placement) = view.placement else {
+            full.clear();
+            matching.clear();
+            return Vec::new();
+        };
+        self.candidates_and_matching_with_placement(view, placement, avoided, full, matching)
+    }
+
+    fn candidates_and_matching_with_placement(
+        &self,
+        view: &TaskView,
+        placement: &Placement,
+        avoided: &[Uuid],
+        full: &mut Vec<usize>,
+        matching: &mut Vec<usize>,
+    ) -> Vec<usize> {
         let config = self.config;
         let req = &view.requirements;
-        let req_vram = req.effective_vram_mb();
+        let req_vram = config.effective_vram_mb_for_view(view);
+        let requires_gpu = view.requires_gpu || req_vram > 0;
+        let caps = CapRequirements {
+            requires_gpu,
+            requires_blender: view.requires_blender,
+            required_features: view.required_features,
+        };
         let weight = req.cpu_cores.max(1);
         let mut found: Vec<usize> = Vec::new();
         full.clear();
         matching.clear();
         #[cfg(test)]
         self.candidate_scans.set(self.candidate_scans.get() + 1);
-
-        let Ok(ref placement) = view.placement else {
-            return found;
-        };
 
         let speed_active = self.speed_book.is_some()
             && config.speed_hold_factor.is_finite()
@@ -1200,8 +1438,7 @@ impl<'a> Engine<'a> {
         if !speed_active {
             if let Some(mask) = self.worker_index.free_candidate_mask(
                 placement,
-                view.requires_gpu,
-                view.required_features,
+                caps,
                 req.cpu_cores,
                 view.heavy,
                 avoided,
@@ -1210,7 +1447,7 @@ impl<'a> Engine<'a> {
                     #[cfg(test)]
                     self.workers_inspected.set(self.workers_inspected.get() + 1);
                     let seat = &self.seats[idx];
-                    if !statically_fits(req, seat.worker)
+                    if !statically_fits_with_vram(req, req_vram, seat.worker)
                         || self.is_seat_ram_short(seat, req.ram_mb)
                         || self.is_seat_vram_short(seat, req_vram)
                         || !seat.worker.features.contains(view.required_features)
@@ -1225,14 +1462,13 @@ impl<'a> Engine<'a> {
                     found.push(idx);
                 }
             }
-            self.apply_stage6_and_7(view, weight, &mut found, matching);
+            self.apply_stage6_and_7(requires_gpu, weight, &mut found, matching);
             if !found.is_empty() {
                 return found;
             }
             if let Some(mask) = self.worker_index.unblocked_static_mask(
                 placement,
-                view.requires_gpu,
-                view.required_features,
+                caps,
                 req.cpu_cores,
                 view.heavy,
                 avoided,
@@ -1241,7 +1477,7 @@ impl<'a> Engine<'a> {
                     #[cfg(test)]
                     self.workers_inspected.set(self.workers_inspected.get() + 1);
                     let seat = &self.seats[idx];
-                    if !statically_fits(req, seat.worker)
+                    if !statically_fits_with_vram(req, req_vram, seat.worker)
                         || self.is_seat_ram_short(seat, req.ram_mb)
                         || !seat.worker.features.contains(view.required_features)
                     {
@@ -1262,8 +1498,7 @@ impl<'a> Engine<'a> {
 
         if let Some(mask) = self.worker_index.matching_static_mask(
             placement,
-            view.requires_gpu,
-            view.required_features,
+            caps,
             req.cpu_cores,
             view.heavy,
             avoided,
@@ -1272,7 +1507,7 @@ impl<'a> Engine<'a> {
                 #[cfg(test)]
                 self.workers_inspected.set(self.workers_inspected.get() + 1);
                 let seat = &self.seats[idx];
-                if !statically_fits(req, seat.worker)
+                if !statically_fits_with_vram(req, req_vram, seat.worker)
                     || !seat.worker.features.contains(view.required_features)
                 {
                     continue;
@@ -1299,7 +1534,7 @@ impl<'a> Engine<'a> {
                 found.push(idx);
             }
         }
-        self.apply_stage6_and_7(view, weight, &mut found, matching);
+        self.apply_stage6_and_7(requires_gpu, weight, &mut found, matching);
         found
     }
 
@@ -1320,14 +1555,15 @@ impl<'a> Engine<'a> {
         }
         let config = self.config;
         let seats = &self.seats;
-        let prefer_cpu_only = config.preserve_gpu_for_gpu_tasks && !view.requires_gpu;
+        let requires_gpu = config.effective_requires_gpu(view);
+        let prefer_cpu_only = config.preserve_gpu_for_gpu_tasks && !requires_gpu;
         let gpu_pref = |a: &Seat<'_>, b: &Seat<'_>| {
             if prefer_cpu_only {
                 a.worker
                     .capabilities
                     .can_execute_gpu()
                     .cmp(&b.worker.capabilities.can_execute_gpu())
-            } else if view.requires_gpu {
+            } else if requires_gpu {
                 let a_real =
                     a.worker.capabilities.has_gpu && !a.worker.capabilities.is_simulated_gpu;
                 let b_real =
@@ -1339,7 +1575,7 @@ impl<'a> Engine<'a> {
         };
         match config.policy {
             SchedulingPolicy::RoundRobin => {
-                if view.requires_gpu {
+                if requires_gpu {
                     let real_candidates: Vec<usize> = candidates
                         .iter()
                         .copied()
@@ -1669,7 +1905,7 @@ impl WorkloadScheduler {
             })
             .collect();
         // GPU-capable work in the batch itself is "waiting".
-        let gpu_waiting = views.iter().any(|v| v.requires_gpu);
+        let gpu_waiting = views.iter().any(|v| config.effective_requires_gpu(v));
         let mut engine = Engine::new(config, workers, workers, None, gpu_waiting, false)
             .with_workspaces(workspace_affinity.clone(), active_workspaces.clone());
         if let Some(book) = speed_book {
@@ -1729,10 +1965,14 @@ impl WorkloadScheduler {
             let found = self
                 .queue
                 .any_queued(|task| {
-                    (task.requirements.requires_gpu_or_vram() || task.spec.requires_gpu())
+                    let req_vram = self.config.required_vram_mb(task);
+                    let requires_gpu = task.requirements.requires_gpu_or_vram()
+                        || task.spec.requires_gpu()
+                        || req_vram > 0;
+                    requires_gpu
                         && task.scheduling_placement().is_ok_and(|placement| {
                             gpu_workers.iter().any(|w| {
-                                statically_fits(&task.requirements, w)
+                                statically_fits_with_vram(&task.requirements, req_vram, w)
                                     && placement_admits(&placement, w)
                             })
                         })
@@ -1846,7 +2086,10 @@ impl WorkloadScheduler {
         }
         workers.sort_by_key(|w| w.worker_id);
 
-        let loads = self.queue.assigned_loads().await;
+        let loads = self
+            .queue
+            .assigned_loads_with(|t| self.config.required_vram_mb(t))
+            .await;
         let (workspace_affinity, active_workspaces) = self.queue.workspace_scheduling_state().await;
         let (gpu_waiting, gpu_recent) = self.gpu_demand(&workers).await;
         let speed_snapshot =
@@ -1932,7 +2175,7 @@ impl WorkloadScheduler {
                             target: crate::otel::OTEL_SPAN_TARGET,
                             "place",
                             task_id = %view.task_id,
-                            requires_gpu = view.requires_gpu,
+                            requires_gpu = self.config.effective_requires_gpu(view),
                             worker_id = tracing::field::Empty,
                             verdict = tracing::field::Empty,
                         );
@@ -1947,7 +2190,7 @@ impl WorkloadScheduler {
                                     );
                                 }
                                 placements.push((view.task_id, idx));
-                                if view.requires_gpu {
+                                if self.config.effective_requires_gpu(view) {
                                     self.note_gpu_demand();
                                 }
                                 if placements.len() >= max_batch_size {
@@ -2053,7 +2296,7 @@ impl WorkloadScheduler {
                             target: crate::otel::OTEL_SPAN_TARGET,
                             "place",
                             task_id = %view.task_id,
-                            requires_gpu = view.requires_gpu,
+                            requires_gpu = self.config.effective_requires_gpu(view),
                             worker_id = tracing::field::Empty,
                             verdict = tracing::field::Empty,
                         );
@@ -2068,7 +2311,7 @@ impl WorkloadScheduler {
                                     );
                                 }
                                 placements.push((view.task_id, idx));
-                                if view.requires_gpu {
+                                if self.config.effective_requires_gpu(view) {
                                     self.note_gpu_demand();
                                 }
                                 if placements.len() >= max_batch_size {
@@ -8617,5 +8860,297 @@ mod tests {
         let info = registry.get_worker(w).await.unwrap();
         assert_eq!(info.status, WorkerStatus::Disconnected);
         assert_eq!(info.active_tasks, 0);
+    }
+
+    #[test]
+    fn prefer_worker_holds_affinity_while_saturated_and_isolates_shapes() {
+        let mut w_heavy = make_worker("w-heavy", 2, 8192, false, false);
+        w_heavy.capabilities.tags = vec!["slots:6".into()];
+        let mut w_light = make_worker("w-light", 2, 8192, false, false);
+        w_light.capabilities.tags = vec!["slots:2".into()];
+
+        let make_pref_task = |wid: Uuid| {
+            let mut t = Task::new(
+                TaskSpec::new_command("echo", vec!["shard".into()]),
+                TaskRequirements::generic(1, 64),
+            );
+            t.tags.push(format!("prefer:worker={wid}"));
+            t
+        };
+
+        // Interleaved 6:2 SWRR order: H, H, H, L, H, H, H, L.
+        let mut queue: Vec<Task> = vec![
+            make_pref_task(w_heavy.worker_id),
+            make_pref_task(w_heavy.worker_id),
+            make_pref_task(w_heavy.worker_id),
+            make_pref_task(w_light.worker_id),
+            make_pref_task(w_heavy.worker_id),
+            make_pref_task(w_heavy.worker_id),
+            make_pref_task(w_heavy.worker_id),
+            make_pref_task(w_light.worker_id),
+        ];
+
+        let cfg = SchedulerConfig::default();
+        let workers = vec![w_heavy.clone(), w_light.clone()];
+        let mut heavy_placed = 0usize;
+        let mut light_placed = 0usize;
+
+        // Pass 1: w_heavy saturates after 2 tasks (max_slots=2). H3 hits self.dead for
+        // prefer:worker=w_heavy, yet L1 and L2 (distinct Shape::prefer_worker) still place on w_light!
+        let r1 = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &queue,
+            &workers,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &SpeedBook::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r1.assignments.len(), 4);
+        assert_eq!(r1.skipped.len(), 4);
+        for a in &r1.assignments {
+            if a.worker_id == w_heavy.worker_id {
+                heavy_placed += 1;
+            } else if a.worker_id == w_light.worker_id {
+                light_placed += 1;
+            }
+        }
+        assert_eq!(heavy_placed, 2);
+        assert_eq!(light_placed, 2);
+        for (_, reason) in &r1.skipped {
+            assert_eq!(*reason, ScheduleSkipReason::AllEligibleWorkersSaturated);
+        }
+
+        // Remaining 4 shards all prefer w_heavy and stay queued when w_heavy drains over subsequent passes.
+        let assigned_ids: HashSet<TaskId> = r1.assignments.iter().map(|a| a.task_id).collect();
+        queue.retain(|t| !assigned_ids.contains(&t.id));
+        assert_eq!(queue.len(), 4);
+
+        let r2 = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &queue,
+            &workers,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &SpeedBook::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r2.assignments.len(), 2);
+        assert!(r2
+            .assignments
+            .iter()
+            .all(|a| a.worker_id == w_heavy.worker_id));
+        heavy_placed += 2;
+        let assigned_ids2: HashSet<TaskId> = r2.assignments.iter().map(|a| a.task_id).collect();
+        queue.retain(|t| !assigned_ids2.contains(&t.id));
+
+        let r3 = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &queue,
+            &workers,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &SpeedBook::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r3.assignments.len(), 2);
+        assert!(r3
+            .assignments
+            .iter()
+            .all(|a| a.worker_id == w_heavy.worker_id));
+        heavy_placed += 2;
+
+        assert_eq!(heavy_placed, 6);
+        assert_eq!(light_placed, 2);
+    }
+
+    #[test]
+    fn prefer_worker_fails_over_on_disconnect_or_avoid_and_respects_require_worker() {
+        let w_pref = make_worker("w-pref", 2, 8192, false, false);
+        let w_survive = make_worker("w-survive", 4, 8192, false, false);
+
+        let cfg = SchedulerConfig {
+            fail_unfulfillable_tasks: true,
+            ..Default::default()
+        };
+
+        // 1) Preferred worker disconnected (not in schedulable `workers`), even if still in `registered`:
+        // falls back to w_survive rather than stalling or marking unfulfillable.
+        let mut pref_task = Task::new(
+            TaskSpec::new_command("echo", vec!["failover".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        pref_task
+            .tags
+            .push(format!("prefer:worker={}", w_pref.worker_id));
+        let pref_view = TaskView::of(&pref_task);
+        let mut w_pref_disconnected = w_pref.clone();
+        w_pref_disconnected.status = WorkerStatus::Disconnected;
+        let live_only = vec![w_survive.clone()];
+        let all_reg = vec![w_pref_disconnected, w_survive.clone()];
+        let mut engine = Engine::new(&cfg, &live_only, &all_reg, None, false, false);
+        assert_eq!(engine.place(&pref_view), Verdict::Placed(0));
+
+        // 2) Preferred worker connected, but listed in `view.avoid`: falls back to w_survive.
+        let both_live = vec![w_pref.clone(), w_survive.clone()];
+        let mut avoid_view = TaskView::of(&pref_task);
+        avoid_view.avoid = vec![w_pref.worker_id];
+        let mut engine2 = Engine::new(&cfg, &both_live, &both_live, None, false, false);
+        let placed_idx = match engine2.place(&avoid_view) {
+            Verdict::Placed(idx) => idx,
+            other => panic!("expected placement on w_survive, got {other:?}"),
+        };
+        assert_eq!(
+            engine2.seats[placed_idx].worker.worker_id,
+            w_survive.worker_id
+        );
+
+        // 3) Explicit `require:worker=<missing>` must NOT fall back to w_survive.
+        let mut req_task = Task::new(
+            TaskSpec::new_command("echo", vec!["strict".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        req_task
+            .tags
+            .push(format!("require:worker={}", w_pref.worker_id));
+        let req_view = TaskView::of(&req_task);
+        let mut engine3 = Engine::new(&cfg, &live_only, &live_only, None, false, false);
+        assert!(matches!(
+            engine3.place(&req_view),
+            Verdict::Unfulfillable(_)
+        ));
+    }
+
+    #[test]
+    fn prefer_worker_avoid_does_not_poison_dead_shape_cache() {
+        let mut w1 = make_worker("w1", 2, 8192, false, false);
+        w1.capabilities.tags = vec!["slots:2".into()];
+        w1.active_tasks = 2;
+        let mut w2 = make_worker("w2", 2, 8192, false, false);
+        w2.capabilities.tags = vec!["slots:2".into()];
+
+        let make_pref = || {
+            let mut t = Task::new(
+                TaskSpec::new_command("echo", vec!["probe1b".into()]),
+                TaskRequirements::generic(1, 64),
+            );
+            t.tags.push(format!("prefer:worker={}", w1.worker_id));
+            t
+        };
+
+        let t_plain = make_pref();
+        let t_avoid = make_pref();
+        let t_plain2 = make_pref();
+
+        let mut avoid = HashMap::new();
+        avoid.insert(t_avoid.id, vec![w1.worker_id]);
+
+        let report = WorkloadScheduler::matchmake_with_speed(
+            &SchedulerConfig::default(),
+            &[t_plain.clone(), t_avoid.clone(), t_plain2.clone()],
+            &[w1.clone(), w2.clone()],
+            &avoid,
+            &HashMap::new(),
+            &HashSet::new(),
+            &SpeedBook::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, t_avoid.id);
+        assert_eq!(report.assignments[0].worker_id, w2.worker_id);
+        assert_eq!(
+            report.skipped,
+            vec![
+                (t_plain.id, ScheduleSkipReason::AllEligibleWorkersSaturated),
+                (t_plain2.id, ScheduleSkipReason::AllEligibleWorkersSaturated),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefer_worker_gpu_preservation_fails_over_to_cpu_worker() {
+        let mut w_gpu = make_worker("w-gpu", 4, 8192, true, false);
+        w_gpu.capabilities.tags = vec!["slots:4".into()];
+        w_gpu.active_tasks = 3;
+        let mut w_cpu = make_worker("w-cpu", 4, 8192, false, false);
+        w_cpu.capabilities.tags = vec!["slots:4".into()];
+
+        let mut t_cpu = Task::new(
+            TaskSpec::new_command("echo", vec!["cpu-probe2".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        t_cpu
+            .tags
+            .push(format!("prefer:worker={}", w_gpu.worker_id));
+
+        let mut gpu_req = TaskRequirements::generic(2, 64);
+        gpu_req.gpu_required = true;
+        let t_gpu = Task::new(
+            TaskSpec::new_command("echo", vec!["gpu-wait".into()]),
+            gpu_req,
+        );
+
+        let cfg = SchedulerConfig {
+            preserve_gpu_for_gpu_tasks: true,
+            gpu_reserved_slots: 1,
+            ..Default::default()
+        };
+
+        let report = WorkloadScheduler::matchmake_with_speed(
+            &cfg,
+            &[t_cpu.clone(), t_gpu.clone()],
+            &[w_gpu.clone(), w_cpu.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &SpeedBook::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, t_cpu.id);
+        assert_eq!(report.assignments[0].worker_id, w_cpu.worker_id);
+        assert_eq!(
+            report.skipped,
+            vec![(t_gpu.id, ScheduleSkipReason::NoGpuWorkersAvailable)]
+        );
+    }
+
+    #[test]
+    fn prefer_worker_host_busy_with_active_tasks_fails_over_to_healthy_worker() {
+        let mut w_busy = make_worker("w-busy", 4, 8192, false, false);
+        w_busy.capabilities.tags = vec!["slots:4".into()];
+        w_busy.cpu_usage_pct = 95.0;
+        w_busy.active_tasks = 1;
+
+        let mut w_healthy = make_worker("w-healthy", 4, 8192, false, false);
+        w_healthy.capabilities.tags = vec!["slots:4".into()];
+        w_healthy.cpu_usage_pct = 10.0;
+
+        let mut t = Task::new(
+            TaskSpec::new_command("echo", vec!["probe3b".into()]),
+            TaskRequirements::generic(1, 64),
+        );
+        t.tags.push(format!("prefer:worker={}", w_busy.worker_id));
+
+        let report = WorkloadScheduler::matchmake_with_speed(
+            &SchedulerConfig::default(),
+            &[t.clone()],
+            &[w_busy, w_healthy.clone()],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &SpeedBook::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(report.assignments.len(), 1);
+        assert_eq!(report.assignments[0].task_id, t.id);
+        assert_eq!(report.assignments[0].worker_id, w_healthy.worker_id);
+        assert!(report.skipped.is_empty());
     }
 }

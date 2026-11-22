@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::queue::TaskQueue;
 use crate::registry::{WorkerInfo, WorkerRegistry, WorkerStatus};
 use crate::scheduler::{
-    compute_mobile_flags, effective_worker_limits, placement_admits, statically_fits,
+    compute_mobile_flags, effective_worker_limits, placement_admits, statically_fits_with_vram,
     SchedulerConfig,
 };
 
@@ -364,7 +364,9 @@ pub(crate) async fn run_straggler_pass(
         return;
     }
 
-    let mut loads = queue.assigned_loads().await;
+    let mut loads = queue
+        .assigned_loads_with(|t| config.scheduler_config.required_vram_mb(t))
+        .await;
     candidates.sort_by(|a, b| {
         b.elapsed
             .cmp(&a.elapsed)
@@ -380,15 +382,19 @@ pub(crate) async fn run_straggler_pass(
             continue;
         };
         let req = &cand.view.requirements;
-        let req_vram = req.effective_vram_mb();
+        let req_vram = config
+            .scheduler_config
+            .effective_vram_mb_for_view(&cand.view);
+        let requires_gpu = cand.view.requires_gpu || req_vram > 0;
         let mobile_bucket = (usize::from(req.cpu_cores > 1)) | (usize::from(cand.view.heavy) << 1);
 
         let fastest_matching_avg_ms = connected_workers
             .iter()
             .filter(|w| {
-                (!cand.view.requires_gpu || w.capabilities.can_execute_gpu())
+                (!requires_gpu || w.capabilities.can_execute_gpu())
+                    && (!cand.view.requires_blender || w.capabilities.has_blender)
                     && w.features.contains(cand.view.required_features)
-                    && statically_fits(req, w)
+                    && statically_fits_with_vram(req, req_vram, w)
                     && placement_admits(placement, w)
                     && compute_mobile_flags(&config.scheduler_config, w)[mobile_bucket]
             })
@@ -412,9 +418,10 @@ pub(crate) async fn run_straggler_pass(
             .filter(|w| {
                 w.worker_id != cand.primary_worker_id
                     && !cand.view.avoid.contains(&w.worker_id)
-                    && (!cand.view.requires_gpu || w.capabilities.can_execute_gpu())
+                    && (!requires_gpu || w.capabilities.can_execute_gpu())
+                    && (!cand.view.requires_blender || w.capabilities.has_blender)
                     && w.features.contains(cand.view.required_features)
-                    && statically_fits(req, w)
+                    && statically_fits_with_vram(req, req_vram, w)
                     && placement_admits(placement, w)
                     && compute_mobile_flags(&config.scheduler_config, w)[mobile_bucket]
                     && w.cpu_usage_pct <= config.scheduler_config.max_host_cpu_pct
@@ -454,8 +461,8 @@ pub(crate) async fn run_straggler_pass(
                     .map_or(f64::INFINITY, |e| e.avg_ms);
                 let load_a = loads.get(&a.worker_id).map_or(0, |l| l.tasks);
                 let load_b = loads.get(&b.worker_id).map_or(0, |l| l.tasks);
-                let gpu_spill_a = !cand.view.requires_gpu && a.capabilities.can_execute_gpu();
-                let gpu_spill_b = !cand.view.requires_gpu && b.capabilities.can_execute_gpu();
+                let gpu_spill_a = !requires_gpu && a.capabilities.can_execute_gpu();
+                let gpu_spill_b = !requires_gpu && b.capabilities.can_execute_gpu();
                 avg_a
                     .total_cmp(&avg_b)
                     .then_with(|| gpu_spill_a.cmp(&gpu_spill_b))
@@ -1760,5 +1767,131 @@ mod tests {
                 registry.reserve_dispatch(&w_id, session).await.unwrap();
             assert!(live_post.load(Ordering::Acquire));
         }
+    }
+
+    #[tokio::test]
+    async fn reaper_straggler_pass_enforces_blender_and_preset_vram() {
+        use crate::speed::{mutate_shared_speed_book, new_shared_speed_book, TaskKey};
+        use rusty_grid_core::placement::OPT_REPEATABLE_TAG;
+        use rusty_grid_core::protocol::ProtocolCapabilities;
+        use rusty_grid_core::task::{
+            AutoRigSpec, Bytes, Generative3DSpec, Task, TaskRequirements, TaskResult, TaskSpec,
+        };
+
+        let registry = WorkerRegistry::new();
+        let sb = new_shared_speed_book();
+        registry.set_speed_book(Arc::clone(&sb));
+        let queue = TaskQueue::new();
+
+        let w_primary = Uuid::new_v4();
+        let w_2g = Uuid::new_v4();
+        let w_8g_blender = Uuid::new_v4();
+        let (tx_p, _rx_p) = mpsc::channel(16);
+        let (tx_2g, mut rx_2g) = mpsc::channel(16);
+        let (tx_8g, mut rx_8g) = mpsc::channel(16);
+
+        let reg_p = registry
+            .register_session(
+                w_primary,
+                WorkerCapabilities::new("primary", 8, 16384, true, false, None)
+                    .with_vram_mb(Some(8192))
+                    .with_blender(true, Some("4.2.0".into())),
+                ProtocolCapabilities::all_supported(),
+                "127.0.0.1:9711".parse().unwrap(),
+                tx_p,
+                None,
+            )
+            .await
+            .unwrap();
+        let _reg_2g = registry
+            .register_session(
+                w_2g,
+                WorkerCapabilities::new("gpu-2g-noblender", 8, 16384, true, false, None)
+                    .with_vram_mb(Some(2048))
+                    .with_blender(false, None),
+                ProtocolCapabilities::all_supported(),
+                "127.0.0.1:9712".parse().unwrap(),
+                tx_2g,
+                None,
+            )
+            .await
+            .unwrap();
+        let _reg_8g = registry
+            .register_session(
+                w_8g_blender,
+                WorkerCapabilities::new("gpu-8g-blender", 8, 16384, true, false, None)
+                    .with_vram_mb(Some(8192))
+                    .with_blender(true, Some("4.2.0".into())),
+                ProtocolCapabilities::all_supported(),
+                "127.0.0.1:9713".parse().unwrap(),
+                tx_8g,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let blender_task = Task::new(
+            TaskSpec::AutoRig(AutoRigSpec {
+                input_mesh: Bytes::from(b"glTF\x02\x00\x00\x00".to_vec()),
+                rig_preset: "biped".into(),
+                embed_animations: vec!["idle".into()],
+                preferred_provider: Some("blender".into()),
+            }),
+            TaskRequirements::generic(1, 512),
+        )
+        .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+        let high_task = Task::new(
+            TaskSpec::Generative3D(Generative3DSpec::new_prompt("robot").with_quality("high")),
+            TaskRequirements::generic(1, 60),
+        )
+        .with_tags(vec![OPT_REPEATABLE_TAG.to_string()]);
+
+        let blender_key = TaskKey::for_task(&blender_task);
+        let high_key = TaskKey::for_task(&high_task);
+        let dummy_b = TaskResult::success(w_2g, blender_task.id, "ok", 10, false);
+        let dummy_h = TaskResult::success(w_2g, high_task.id, "ok", 10, true);
+        mutate_shared_speed_book(&sb, |book| {
+            book.record_result(w_2g, blender_key, 60, &dummy_b);
+            book.record_result(w_8g_blender, blender_key, 60, &dummy_b);
+            book.record_result(w_2g, high_key, 60, &dummy_h);
+            book.record_result(w_8g_blender, high_key, 60, &dummy_h);
+        });
+
+        let id_b = queue.submit(blender_task).await.unwrap();
+        let id_h = queue.submit(high_task).await.unwrap();
+        queue
+            .schedule_tasks_batch_in_sessions(&[
+                (id_b, w_primary, reg_p.session_id),
+                (id_h, w_primary, reg_p.session_id),
+            ])
+            .await;
+        queue
+            .mark_running_from(w_primary, Some(reg_p.session_id), &id_b)
+            .await
+            .unwrap();
+        queue
+            .mark_running_from(w_primary, Some(reg_p.session_id), &id_h)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let cfg = ReaperConfig::default()
+            .with_straggler_min_elapsed(Duration::from_millis(20))
+            .with_straggler_multiplier(1.5)
+            .with_scheduler_config(SchedulerConfig::default().without_host_cpu_backpressure());
+        run_straggler_pass(&registry, &queue, &cfg).await;
+
+        assert!(
+            rx_2g.try_recv().is_err(),
+            "2GB non-Blender worker must never receive blender or high-VRAM straggler copies"
+        );
+        let mut got_8g = Vec::new();
+        while let Ok(MasterMessage::AssignTask { task }) = rx_8g.try_recv() {
+            got_8g.push(task.id);
+        }
+        assert!(
+            got_8g.contains(&id_b) && got_8g.contains(&id_h),
+            "expected both blender and high-VRAM straggler copies on 8GB Blender worker, got {got_8g:?}"
+        );
     }
 }
