@@ -362,9 +362,18 @@ fn resolve_remote_master_secret(
                     .into(),
             );
         }
-        let cs = ClusterSecret::from_hex(trimmed)
-            .or_else(|_| ClusterSecret::load_file(Path::new(trimmed)))?;
-        return Ok(Some(cs));
+        if let Ok(cs) = ClusterSecret::from_hex(trimmed) {
+            return Ok(Some(cs));
+        }
+        // Not hex: treat it as a path, but never echo the value (it may be a mistyped secret).
+        let path = Path::new(trimmed);
+        if !path.is_file() {
+            return Err(
+                "--secret / OXIDESWARM_SECRET is neither a valid hex cluster secret nor a readable file"
+                    .into(),
+            );
+        }
+        return Ok(Some(ClusterSecret::load_file(path)?));
     }
     if let Some(path) = secret_file {
         if path.as_os_str().is_empty() {

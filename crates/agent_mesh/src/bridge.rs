@@ -30,6 +30,16 @@ use crate::protocol::{compute_sha256, AgentMeshEnvelope};
 pub struct AgentGridBridge {
     backend: Arc<dyn GridBackend>,
     default_timeout: Duration,
+    health: Arc<std::sync::Mutex<HealthCache>>,
+}
+
+/// How long a grid liveness result is reused by [`AgentGridBridge::catalog_health`].
+pub const GRID_HEALTH_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct HealthCache {
+    last: Option<(std::time::Instant, bool)>,
+    refreshing: bool,
 }
 
 impl AgentGridBridge {
@@ -43,6 +53,7 @@ impl AgentGridBridge {
         Self {
             backend,
             default_timeout: Duration::from_secs(60),
+            health: Arc::new(std::sync::Mutex::new(HealthCache::default())),
         }
     }
 
@@ -60,6 +71,49 @@ impl AgentGridBridge {
     /// Performs a bounded liveness check against the attached Master Grid backend.
     pub async fn health_check(&self) -> GridResult<()> {
         self.backend.health_check().await
+    }
+
+    /// Grid liveness for node catalogs (`/api/nodes`, `NodeList`), which must not wait on a
+    /// master that is down (MESH-3, design 0104). The first call checks once; afterwards a result
+    /// younger than [`GRID_HEALTH_TTL`] is reused, and a stale one is returned while a single
+    /// background check refreshes it.
+    pub async fn catalog_health(&self) -> bool {
+        let now = std::time::Instant::now();
+        let (known, refresh) = {
+            let mut cache = self.health.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = cache
+                .last
+                .is_some_and(|(at, _)| now.saturating_duration_since(at) < GRID_HEALTH_TTL);
+            let refresh = !fresh && !cache.refreshing;
+            if refresh {
+                cache.refreshing = true;
+            }
+            (cache.last.map(|(_, ok)| ok), refresh)
+        };
+        let update = |health: &std::sync::Mutex<HealthCache>, ok: bool| {
+            let mut cache = health.lock().unwrap_or_else(|e| e.into_inner());
+            cache.last = Some((std::time::Instant::now(), ok));
+            cache.refreshing = false;
+        };
+        match (known, refresh) {
+            (None, true) => {
+                let ok = self.backend.health_check().await.is_ok();
+                update(&self.health, ok);
+                ok
+            }
+            (Some(ok), true) => {
+                let backend = Arc::clone(&self.backend);
+                let health = Arc::clone(&self.health);
+                tokio::spawn(async move {
+                    let ok = backend.health_check().await.is_ok();
+                    update(&health, ok);
+                });
+                ok
+            }
+            (Some(ok), false) => ok,
+            // Another caller is running the first check: do not wait for it.
+            (None, false) => false,
+        }
     }
 
     /// Closes any persistent transport resources held by the backend.

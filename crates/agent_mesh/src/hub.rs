@@ -365,7 +365,7 @@ impl HubState {
 
         let bridge_opt = self.bridge.read().await.clone();
         if let Some(bridge) = bridge_opt {
-            let grid_status = if bridge.health_check().await.is_ok() {
+            let grid_status = if bridge.catalog_health().await {
                 "online"
             } else {
                 "offline"

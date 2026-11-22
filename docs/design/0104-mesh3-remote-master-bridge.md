@@ -57,6 +57,10 @@ Created: 2026-11-22    Updated: 2026-11-22
 - **Inline `files` and `outputs`**: `handle_submit` accepts inline `files` (`staged_files` alias) as an array of objects (`path`/`name`, optional `executable`, and exactly one of `text`/`content`, `base64`/`data_base64`/`bytes_base64`, or `data`/`bytes`) or a map `{path: text_or_obj}`, validated via `validate_relative_sandbox_path` and 32 MiB limits. `outputs` (`expected_outputs` alias) validates sandbox-relative paths; both are restricted to `Command`, `ShellScript`, and `RustCompilation` tasks. `map_task_result_to_response` serializes `TaskResult::artifacts` into `payload["artifacts"]` (`path`, `size`, `sha256`, `data_base64`).
 - **`grid_result` / `grid_cancel` and client helpers**: `bridge.rs` dispatches `grid_result`/`result` (supporting `wait: false/true`) and `grid_cancel`/`cancel`. `AgentMeshClient` adds `submit_grid`, `get_grid_result`, `cancel_grid_task`, and `extract_output_artifacts` (verifying `sha256` and `size`).
 
+### D5: Catalog liveness does not wait on the master (review fix, 2026-11-22)
+
+`/api/nodes` and the peer `NodeList` report the `grid` node's status through `AgentGridBridge::catalog_health`: the first call checks the master once; afterwards a result younger than `GRID_HEALTH_TTL` (5 s) is reused, and a stale one is returned at once while a single background check refreshes it. Before, every catalog request opened a new connection and handshake to the master (4 to 7 s when it was down, plus a 3 s discovery under `--grid-connect auto`) and stalled the requesting peer's routing loop.
+
 ## Compatibility
 
 - Protocol 10 (`PROTOCOL_VERSION_CURRENT = 10`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 9`) and Store v4 (`STORE_FORMAT_VERSION = 4`) remain unchanged; `EXTENSION_REGISTRY` and `crates/core/tests/data/wire_layout.txt` are untouched.
@@ -67,6 +71,7 @@ Created: 2026-11-22    Updated: 2026-11-22
 
 - **Zero hub-local disk reads**: `parse_inline_staged_files` and `parse_binary_data` never touch `std::fs` / `tokio::fs` and explicitly reject `Value::Array` of `Value::String`s (e.g. `["/etc/passwd"]`) without submitting tasks.
 - **Fail-closed remote auth**: Non-loopback, `auto`, and P2P `--grid-connect` targets require a cluster secret or `--master-key` unless `--insecure` is explicitly supplied; empty `--secret` / `OXIDESWARM_SECRET` / `--secret-file` / `OXIDESWARM_SECRET_FILE` fail closed.
+- **Known limit (not yet fixed)**: `grid_result` and `grid_cancel` act on any task id of the remote cluster, not only tasks this hub submitted, so any mesh peer that knows a task UUID can read that task's output or cancel it. Task ids are random UUIDs, but connect a hub with `--grid-connect` only to a cluster whose mesh peers you trust with every task on it. `--insecure` also both skips the remote secret and allows a tokenless off-loopback hub.
 - **Sandbox path safety**: All staged file paths and expected output paths pass `validate_relative_sandbox_path`, and `extract_output_artifacts` verifies SHA-256 and byte length on decoded artifacts.
 
 ## Test plan
@@ -83,4 +88,5 @@ Created: 2026-11-22    Updated: 2026-11-22
 
 ## Status log
 
+- 2026-11-22: Review fixes: catalog liveness is cached (D5); a non-hex `--secret` that is not a readable file is refused without echoing the value.
 - 2026-11-22: Created design record `0104` and implemented `GridBackend`, `RemoteMasterBackend`, `--grid-connect`, placement/tags, inline `files`/`outputs`/`artifacts`, `grid_result`, and `grid_cancel` (`MESH-3`).
