@@ -649,6 +649,37 @@ The full suite must pass on a clean machine before CI can require it.
   3. If it still stalls after step 1, find the cause (rule 4) before anything else; do not raise the timeouts.
 - **Done when:** The cause is written here, and `test_ax2_shard` and `test_ax1_matrix` pass 50 runs in a row on
   macOS under 6 busy loops with `--test-threads 3`.
+- **Partial (2026-11-24, pull request 409, commits `c4e46ab7`, `c165b2c4`):**
+  - **Cause (not known):** Pre-change `test_ax2_shard` did not reproduce the stall locally on Apple Silicon M5
+    (`50/50` passed at `09d91c60` under 6 Python CPU busy loops, `209.8 s` total, `3.86–5.53 s` per run), so the
+    root cause of CI run `45054272288` remains **not known**.
+  - **Fix (`crates/cli/tests/` — prevention, not a proven fix):** Routed all CLI child `.output()` calls in the 6
+    other `crates/cli/tests/` files that combine in-process `WorkerClient` with spawned CLI children through
+    `rusty_grid_core::process_spawn::output_std` (or `output_tokio`): `test_ax2_shard.rs` (22 sites),
+    `test_ax1_matrix.rs` (12), `test_challenger_m4_cli_adversarial.rs` (1), `test_cli_3d_submission.rs` (5),
+    `test_cli_mapreduce_scripts.rs` (11), and `test_submit_run_summary.rs` (3). `test_cli_cancel_and_result.rs`
+    already used `output_std`; `test_feat5_cli_e2e.rs` spawns external worker processes (no in-process
+    `WorkerClient`). Stays `Partial | In` until the `macos-latest` CI streak holds or a reproduction identifies
+    the cause.
+  - **50-run macOS stress loops (Apple Silicon M5, 10 logical cores, non-elevated, 6 Python CPU busy loops, `--test-threads 3`, private `HOME`/`USERPROFILE`/`OXIDESWARM_HOME` per run with real `RUSTUP_HOME`/`CARGO_HOME`):**
+
+    | Stage | Date (UTC) | Commit | Binary & Command | Pass | Wall Range | Total |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | Pre-change | 2026-11-23 | `09d91c60` | `cargo test --locked -p rusty_grid_cli --test test_ax2_shard -- --test-threads 3` | `50/50` | `3.86–5.53 s` | `209.8 s` |
+    | Post-change | 2026-11-24 | `c165b2c4` | `cargo test --locked -p rusty_grid_cli --test test_ax2_shard -- --test-threads 3 --nocapture` (`13` tests/run) | `50/50` | `3.634–4.645 s` (median `4.219 s`) | `210.840 s` |
+    | Post-change | 2026-11-24 | `c165b2c4` | `cargo test --locked -p rusty_grid_cli --test test_ax1_matrix -- --test-threads 3 --nocapture` (`9` tests/run) | `50/50` | `2.331–2.631 s` (median `2.419 s`) | `121.648 s` |
+
+  - **Measured `[timing]` lines & individual slowest tests (`c165b2c4`, same machine, `6` Python CPU busy loops):**
+    - `test_ax2_shard` (`50` runs `--nocapture`): `--fail-fast` `27.579–117.451 ms` (median `45.733 ms`),
+      `0-worker preflight` `9.416–76.911 ms` (median `17.510 ms`), `non-matching preflight` `9.581–79.509 ms`
+      (median `16.622 ms`); loaded `--test-threads 1` pass (`7.691 s` total): slowest
+      `test_shard_build_once_archive_blob_inputs_pipeline` (`2.259 s`), `test_shard_count_1_and_256_boundaries`
+      (`2.162 s`), `test_shard_build_once_rejects_empty_and_omitted_archives_e2e` (`0.819 s`).
+    - `test_ax1_matrix` (`50` runs `--nocapture`): `unplaced CLI matrix` `20.855–48.076 ms` (median `24.977 ms`),
+      `unplaced MCP matrix` `13.080–23.958 ms` (median `15.481 ms`); loaded `--test-threads 1` pass (`3.068 s`
+      total): slowest `test_cli_and_mcp_matrix_huge_timeout_and_delimiter_validation` (`1.568 s`),
+      `test_mcp_task_result_and_doctor_huge_timeout_do_not_panic` (`0.510 s`),
+      `test_cli_matrix_input_dedup_output_dir_isolation_and_workspace_sync` (`0.204 s`).
 
 ### TEST-87: macOS: worker portal loopback test fails when its LAN-side bind finds the port in use
 
@@ -2499,3 +2530,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 - 2026-11-23: BUG-35 (pull request 409) merged `origin/master` (`6a9060ba`) at `8d7dc755`, keeping PR 409's design alongside `TEST-84` hardening in `test_cli_cancel_and_result`; audited all production `crates/*/src` spawn sites (`0` unrouted macOS spawns); verified on Apple M5 (10 logical cores, temporary `HOME`) under `6` Python CPU busy loops: `rusty_grid_worker --lib --locked` (`329/329`, `9.31 s`), `test_feat3_os_isolation --locked` (`28/28`, `1` ignored, `27.40 s`), `rusty_grid_core --lib process_spawn --locked` `20/20` (`89.52 s`, `3.70–5.03 s`), and `test_cli_cancel_and_result --locked` `20/20` (`50.80 s`, `2.46–3.21 s`).
+- 2026-11-24: TEST-86 Partial (pull request 409, `c165b2c4`): routed all remaining in-process `WorkerClient` CLI `.output()` sites across 6 `crates/cli/tests/` files through `output_std` / `output_tokio` as a prevention (cause not known: pre-change `test_ax2_shard` passed `50/50` at `09d91c60` in `209.8 s`, `3.86–5.53 s`); confirmed `50/50` loaded runs (`6` Python CPU busy loops, `--test-threads 3 --nocapture`) at `c165b2c4` on Apple M5 for both `test_ax2_shard` (`13` tests/run, `3.634–4.645 s`, median `4.219 s`, total `210.840 s`; slowest tt1 test `2.259 s`) and `test_ax1_matrix` (`9` tests/run, `2.331–2.631 s`, median `2.419 s`, total `121.648 s`; slowest tt1 test `1.568 s`).
