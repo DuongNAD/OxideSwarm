@@ -101,3 +101,6 @@ AppContainer path is unchanged.
 
 - 2026-11-23: Implemented in the pull request of TEST-88. The Windows loop of the test plan runs on
   the case PC.
+- 2026-11-23: Verified on the case PC (Windows 11 Pro) at `012dc68c`: 20/20 runs of the test plan with 0 new
+  console windows and 0 leftover processes, the positive control of the console injection test passes, and
+  `m3_challenger_2_stress` passed 5/5. TEST-88 is Implemented.

@@ -186,6 +186,7 @@ Recounted on 2026-11-23 after TEST-41 Partial (pull request 419): 250 items, 182
 Recounted on 2026-11-23 after TEST-41 Partial (pull request 420): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-69 Implemented (pull request 421): 250 items, 183 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-88 was added (Partial): 251 items, 183 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-88 Implemented (pull request 424): 251 items, 184 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -295,7 +296,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
-| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Partial | In | 424 (open) |
+| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -664,9 +665,18 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** On Windows, 20 runs of `cargo test -p rusty_grid_worker` under 4 busy loops with
   `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, started from a parent without a console, pass with 0 new console
   windows and 0 leftover `PING.EXE` or `powershell` processes.
-- **Partial (2026-11-23, pull request 424):** The change is made (design 0108). macOS `cargo fmt` and `cargo clippy -p
-  rusty_grid_core -p rusty_grid_worker --all-targets -D warnings` pass. The Windows code compiles only in
-  the CI Windows jobs and on the case PC, and the Windows loop of "Done when" has not run yet.
+- **Implemented (2026-11-23, pull request 424, design 0108):** Verified on the case PC (Windows 11 Pro, Intel Core
+  i5-14600KF, 14 physical / 20 logical cores) from a Python parent started with `CREATE_NO_WINDOW`, isolated
+  temporary `HOME`/`TEMP` per run, `cargo +1.96.0 test --locked -p rusty_grid_worker`:
+  - Baseline on `master` `00e836a8` (1 run): 427 passed; 11 new `OpenConsole.exe -Embedding` (6 still alive after
+    the run). Visible windows and leftovers were not caught in that run.
+  - Head `012dc68c`, `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, 4 busy loops: 20/20 runs passed (427 passed, 0 failed,
+    0 ignored in 17 binaries per run; 95.7 to 101.8 s), 0 new `OpenConsole.exe`, 0 visible or `0x800700e8`
+    windows and 0 leftover `PING.EXE`, `powershell` or `Start-Sleep` processes in every run.
+  - `test_console_and_terminal_injection_is_blocked` passed with its positive control: a `PING.EXE` started with
+    `CREATE_NO_WINDOW` has a windowless console, and `AttachConsole(helper)` from an `--isolation off` task
+    succeeds (`ATTACH_HELPER_OK`) while `fs` and `fs+net` are denied.
+  - `m3_challenger_2_stress`: 5/5 runs passed (18 tests each), 0 windows and 0 leftovers.
 
 ## Phase 3: make the documents true
 
@@ -2510,3 +2520,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-69 Implemented (pull requests 403, 421; text in the archive): confirmed on the Windows case PC (`Windows 11 Pro`, `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `>= 28 GB` free RAM) at `9800abea` (`crates/worker` unchanged in `8e55dac9`) with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 cargo +1.96.0 test -p rusty_grid_worker --locked` passing `20/20` runs (`427 passed, 0 failed` per run; `136.26–140.33 s`, median `136.60 s`, total `2,737.24 s`) under `6` Python CPU busy loops plus all `6` hardened `mod windows` tests individually (`0.41–5.58 s`). Index recount: 248 items, 183 Implemented, 20 Partial and 45 Planned; 21 open items are In and 44 are Out.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.
+- 2026-11-23: TEST-88 Implemented (pull request 424): the case PC ran the Windows loop of "Done when" at `012dc68c`: 20/20 runs of `rusty_grid_worker` and 5/5 of `m3_challenger_2_stress` passed with 0 new console windows and 0 leftover processes (master baseline: 11 new `OpenConsole.exe` in one run). INC-20261123-001 closed.
