@@ -12,6 +12,7 @@ use tempfile::TempDir;
 use tokio::sync::watch;
 
 use rusty_grid_core::capabilities::MobileCapabilities;
+use rusty_grid_core::process_spawn;
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{
@@ -157,6 +158,11 @@ fn isolated(mut cmd: Command, home: &Path, fake_bin: &Path) -> Command {
     cmd
 }
 
+/// Runs a CLI command under the macOS spawn lock (`BUG-35`), capturing stdout and stderr.
+fn cli_output(cmd: &mut Command) -> Output {
+    process_spawn::output_std(cmd).expect("cli_output")
+}
+
 fn json_of(out: &Output) -> Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
@@ -281,23 +287,19 @@ async fn test_cli_matrix_1d_three_tagged_workers_and_human_summary() {
     ])
     .await;
 
-    let out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--matrix",
-            "tag=cell-a,cell-b,cell-c",
-            "--json",
-            "--command",
-            "sh",
-            "--",
-            "-c",
-            "printf \"%s\" \"$OXIDESWARM_MATRIX_CELL\"",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--matrix",
+        "tag=cell-a,cell-b,cell-c",
+        "--json",
+        "--command",
+        "sh",
+        "--",
+        "-c",
+        "printf \"%s\" \"$OXIDESWARM_MATRIX_CELL\"",
+    ]));
     assert!(out.status.success(), "{}", describe(&out));
     let v = json_of(&out);
     assert_eq!(v["matrix"], true);
@@ -318,21 +320,17 @@ async fn test_cli_matrix_1d_three_tagged_workers_and_human_summary() {
     assert_eq!(cells[2]["stdout"], "tag=cell-c");
 
     // Human output without --json
-    let plain = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--matrix",
-            "tag=cell-a,cell-b,cell-c",
-            "--command",
-            "echo",
-            "--",
-            "hi",
-        ])
-        .output()
-        .unwrap();
+    let plain = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--matrix",
+        "tag=cell-a,cell-b,cell-c",
+        "--command",
+        "echo",
+        "--",
+        "hi",
+    ]));
     assert!(plain.status.success(), "{}", describe(&plain));
     let stdout = String::from_utf8_lossy(&plain.stdout);
     assert!(stdout.contains("Matrix: 3 completed, 0 failed, 0 unplaced (3 total)"));
@@ -349,25 +347,21 @@ async fn test_cli_matrix_2d_cartesian_tags_and_env_axes() {
     ])
     .await;
 
-    let out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--matrix",
-            "tag=row-1,row-2",
-            "--matrix",
-            "tag=col-1,col-2",
-            "--json",
-            "--command",
-            "sh",
-            "--",
-            "-c",
-            "printf \"%s\" \"$OXIDESWARM_MATRIX_CELL\"",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--matrix",
+        "tag=row-1,row-2",
+        "--matrix",
+        "tag=col-1,col-2",
+        "--json",
+        "--command",
+        "sh",
+        "--",
+        "-c",
+        "printf \"%s\" \"$OXIDESWARM_MATRIX_CELL\"",
+    ]));
     assert!(out.status.success(), "{}", describe(&out));
     let v = json_of(&out);
     assert_eq!(v["total_cells"], 4);
@@ -381,25 +375,21 @@ async fn test_cli_matrix_2d_cartesian_tags_and_env_axes() {
     assert_eq!(workers, ["w-11", "w-12", "w-21", "w-22"]);
 
     // 2D tag x env:<VAR> Cartesian sweep
-    let env_out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--matrix",
-            "tag=row-1,row-2",
-            "--matrix",
-            "env:MODE=fast,slow",
-            "--json",
-            "--command",
-            "sh",
-            "--",
-            "-c",
-            "printf \"%s|%s\" \"$MODE\" \"$OXIDESWARM_MATRIX_INDEX\"",
-        ])
-        .output()
-        .unwrap();
+    let env_out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--matrix",
+        "tag=row-1,row-2",
+        "--matrix",
+        "env:MODE=fast,slow",
+        "--json",
+        "--command",
+        "sh",
+        "--",
+        "-c",
+        "printf \"%s|%s\" \"$MODE\" \"$OXIDESWARM_MATRIX_INDEX\"",
+    ]));
     assert!(env_out.status.success(), "{}", describe(&env_out));
     let ev = json_of(&env_out);
     assert_eq!(ev["total_cells"], 4);
@@ -418,24 +408,20 @@ async fn test_cli_matrix_unplaced_cell_fails_promptly_and_skips_upload_when_all_
     let cluster = Cluster::start_with_tagged_workers(&[("w-a", &["cell-a"])]).await;
 
     let started = Instant::now();
-    let out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--timeout-secs",
-            "60",
-            "--matrix",
-            "tag=cell-a,cell-missing",
-            "--json",
-            "--command",
-            "echo",
-            "--",
-            "ok",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--timeout-secs",
+        "60",
+        "--matrix",
+        "tag=cell-a,cell-missing",
+        "--json",
+        "--command",
+        "echo",
+        "--",
+        "ok",
+    ]));
     // The `unplaced_cells` count below proves the ListWorkers pre-flight caught the cell (a cell
     // that waited for its timeout would be `timed_out`); the time is printed, not asserted (TEST-86).
     eprintln!("[timing] unplaced CLI matrix: {:?}", started.elapsed());
@@ -453,26 +439,22 @@ async fn test_cli_matrix_unplaced_cell_fails_promptly_and_skips_upload_when_all_
     // When 0 cells are placeable, input upload is skipped completely.
     let input_path = cluster.home.path().join("payload.txt");
     std::fs::write(&input_path, b"never-upload-me").unwrap();
-    let all_unplaced = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--timeout-secs",
-            "60",
-            "--input",
-            "payload.txt",
-            "--matrix",
-            "tag=missing-1,missing-2",
-            "--json",
-            "--command",
-            "cat",
-            "--",
-            "payload.txt",
-        ])
-        .output()
-        .unwrap();
+    let all_unplaced = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--timeout-secs",
+        "60",
+        "--input",
+        "payload.txt",
+        "--matrix",
+        "tag=missing-1,missing-2",
+        "--json",
+        "--command",
+        "cat",
+        "--",
+        "payload.txt",
+    ]));
     assert!(
         !all_unplaced.status.success(),
         "{}",
@@ -495,28 +477,24 @@ async fn test_cli_matrix_input_dedup_output_dir_isolation_and_workspace_sync() {
     std::fs::write(cluster.home.path().join("shared.txt"), b"shared-payload").unwrap();
     let out_dir = cluster.home.path().join("matrix_out");
 
-    let out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--input",
-            "shared.txt",
-            "--output",
-            "result.txt",
-            "--output-dir",
-            out_dir.to_str().unwrap(),
-            "--matrix",
-            "tag=cell-a,cell-b,cell-c",
-            "--json",
-            "--type",
-            "shell",
-            "--command",
-            "printf \"%s:%s\" \"$(cat shared.txt)\" \"$OXIDESWARM_MATRIX_CELL\" > result.txt",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--input",
+        "shared.txt",
+        "--output",
+        "result.txt",
+        "--output-dir",
+        out_dir.to_str().unwrap(),
+        "--matrix",
+        "tag=cell-a,cell-b,cell-c",
+        "--json",
+        "--type",
+        "shell",
+        "--command",
+        "printf \"%s:%s\" \"$(cat shared.txt)\" \"$OXIDESWARM_MATRIX_CELL\" > result.txt",
+    ]));
     assert!(out.status.success(), "{}", describe(&out));
     let v = json_of(&out);
     assert_eq!(v["completed_cells"], 3);
@@ -534,26 +512,22 @@ async fn test_cli_matrix_input_dedup_output_dir_isolation_and_workspace_sync() {
     let ws_dir = cluster.home.path().join("ws_src");
     std::fs::create_dir_all(&ws_dir).unwrap();
     std::fs::write(ws_dir.join("hello.txt"), b"from-workspace").unwrap();
-    let ws_out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--workspace",
-            "ax1-ws",
-            "--sync",
-            ws_dir.to_str().unwrap(),
-            "--matrix",
-            "tag=cell-a,cell-b",
-            "--json",
-            "--type",
-            "shell",
-            "--command",
-            "printf \"%s:%s\" \"$(cat hello.txt)\" \"$OXIDESWARM_MATRIX_CELL\"",
-        ])
-        .output()
-        .unwrap();
+    let ws_out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--workspace",
+        "ax1-ws",
+        "--sync",
+        ws_dir.to_str().unwrap(),
+        "--matrix",
+        "tag=cell-a,cell-b",
+        "--json",
+        "--type",
+        "shell",
+        "--command",
+        "printf \"%s:%s\" \"$(cat hello.txt)\" \"$OXIDESWARM_MATRIX_CELL\"",
+    ]));
     assert!(ws_out.status.success(), "{}", describe(&ws_out));
     let wv = json_of(&ws_out);
     assert_eq!(wv["completed_cells"], 2);
@@ -567,22 +541,18 @@ async fn test_cli_matrix_partial_failure_and_invalid_flag_refusals() {
     let cluster =
         Cluster::start_with_tagged_workers(&[("w-a", &["cell-a"]), ("w-b", &["cell-b"])]).await;
 
-    let partial = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--matrix",
-            "tag=cell-a,cell-b",
-            "--json",
-            "--type",
-            "shell",
-            "--command",
-            "if [ \"$OXIDESWARM_MATRIX_INDEX\" = \"1\" ]; then exit 7; fi; echo ok",
-        ])
-        .output()
-        .unwrap();
+    let partial = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--matrix",
+        "tag=cell-a,cell-b",
+        "--json",
+        "--type",
+        "shell",
+        "--command",
+        "if [ \"$OXIDESWARM_MATRIX_INDEX\" = \"1\" ]; then exit 7; fi; echo ok",
+    ]));
     assert!(!partial.status.success(), "{}", describe(&partial));
     let pv = json_of(&partial);
     assert_eq!(pv["status"], "failed");
@@ -593,13 +563,13 @@ async fn test_cli_matrix_partial_failure_and_invalid_flag_refusals() {
 
     // Offline refusals before connecting
     let run_bad = |extra: &[&str]| {
-        cluster
-            .cli()
-            .args(["submit", "--master", "127.0.0.1:1"])
-            .args(extra)
-            .args(["--command", "echo", "--", "x"])
-            .output()
-            .unwrap()
+        cli_output(
+            cluster
+                .cli()
+                .args(["submit", "--master", "127.0.0.1:1"])
+                .args(extra)
+                .args(["--command", "echo", "--", "x"]),
+        )
     };
     assert!(!run_bad(&["--matrix", "bad"]).status.success());
     assert!(!run_bad(&["--matrix", "tag="]).status.success());
@@ -628,24 +598,20 @@ async fn test_cli_and_mcp_matrix_huge_timeout_and_delimiter_validation() {
     let cluster = Cluster::start_with_tagged_workers(&[("w-a", &["cell-a"])]).await;
 
     // 1. CLI --timeout-secs u64::MAX with --matrix must succeed without panic
-    let cli_huge = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--timeout-secs",
-            "18446744073709551615",
-            "--matrix",
-            "tag=cell-a",
-            "--json",
-            "--command",
-            "echo",
-            "--",
-            "huge-timeout",
-        ])
-        .output()
-        .unwrap();
+    let cli_huge = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--timeout-secs",
+        "18446744073709551615",
+        "--matrix",
+        "tag=cell-a",
+        "--json",
+        "--command",
+        "echo",
+        "--",
+        "huge-timeout",
+    ]));
     assert!(cli_huge.status.success(), "{}", describe(&cli_huge));
     let cv = json_of(&cli_huge);
     assert_eq!(cv["completed_cells"], 1);
@@ -872,26 +838,22 @@ async fn test_cli_matrix_symlink_cell_dir_fails_closed() {
     std::fs::create_dir_all(&outside_dir).unwrap();
     std::os::unix::fs::symlink(&outside_dir, out_dir.join("cell-00-cell-a")).unwrap();
 
-    let out = cluster
-        .cli()
-        .args([
-            "submit",
-            "--master",
-            &cluster.addr,
-            "--matrix",
-            "tag=cell-a",
-            "--type",
-            "shell",
-            "--output",
-            "secret.txt",
-            "--output-dir",
-            out_dir.to_str().unwrap(),
-            "--json",
-            "--command",
-            "echo LEAKED_VIA_CLI_SYMLINK > secret.txt",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "submit",
+        "--master",
+        &cluster.addr,
+        "--matrix",
+        "tag=cell-a",
+        "--type",
+        "shell",
+        "--output",
+        "secret.txt",
+        "--output-dir",
+        out_dir.to_str().unwrap(),
+        "--json",
+        "--command",
+        "echo LEAKED_VIA_CLI_SYMLINK > secret.txt",
+    ]));
 
     assert!(
         !out.status.success(),
