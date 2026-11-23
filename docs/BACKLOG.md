@@ -298,7 +298,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
-| TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  |  |
+| TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
