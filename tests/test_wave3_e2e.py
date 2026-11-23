@@ -403,6 +403,16 @@ class IsolatedEnv:
                 continue
             env[k] = v
 
+        orig_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if "RUSTUP_HOME" not in env and orig_home:
+            cand = os.path.join(orig_home, ".rustup")
+            if os.path.isdir(cand):
+                env["RUSTUP_HOME"] = cand
+        if "CARGO_HOME" not in env and orig_home:
+            cand = os.path.join(orig_home, ".cargo")
+            if os.path.isdir(cand):
+                env["CARGO_HOME"] = cand
+
         h = str(home_dir or self.home)
         oxh = str(ox_home_dir or self.ox_home)
         env["HOME"] = h
