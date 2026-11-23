@@ -181,6 +181,7 @@ Recounted on 2026-11-22 after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented a
 Recounted on 2026-11-23 after TEST-85 was added (TEST-56 loses its `Line` value now that pull request 361 is merged): 248 items, 178 Implemented, 24 Partial and 46 Planned; 26 open items are In and 44 are Out.
 Recounted on 2026-11-23 after TEST-23, TEST-61, SEC-16 and CI-1 were closed on the owner's delegation: 248 items, 182 Implemented, 20 Partial and 46 Planned; 22 open items are In and 44 are Out.
 Recounted on 2026-11-23 after TEST-85 Partial (pull request 417): 248 items, 182 Implemented, 21 Partial and 45 Planned; 22 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-88 was added (Partial): 249 items, 182 Implemented, 22 Partial and 45 Planned; 23 open items are In and 44 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -289,6 +290,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
+| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Partial | In | (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -608,6 +610,27 @@ The full suite must pass on a clean machine before CI can require it.
   - **Post-fix (`b0d4058f`, same machine and isolated NTFS `USERPROFILE`/`HOME`/`TEMP`):**
     - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (`4` Python CPU busy loops): `50/50` passed (wall `3.91–4.52` s, median `4.06` s; `compile_wall_ms` `523–619`, median `551`; `exec_ms` `341–431`, median `360`).
     - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu`: `228/228` passed (`10.04` s); `cargo fmt --all -- --check`, `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings`, `cargo +1.96.0 clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
+
+- **Evidence:** Incident `INC-20261123-001` (case PC, Windows 11 Pro, commit `8e55dac9`). The S9 loop ran
+  `cargo test -p rusty_grid_worker --features gpu-wgpu` from a script that captures output. Each run of
+  about 138 s opened 5 to 7 empty console or Windows Terminal windows that took the keyboard focus, and
+  left `PING.EXE` running for up to 120 s. `tests/m3_challenger_2_stress.rs` left Windows Terminal error
+  windows (`0x800700e8`) open. The loop was stopped after 19 of 50 runs, all of which had passed.
+- **Problem:** On Windows, task processes under `--isolation off` and host probes had no `CREATE_NO_WINDOW`.
+  A worker without a console therefore opens a window per console task. Test helpers started `cmd /C ping`
+  (one with `CREATE_NEW_CONSOLE`), and killing `cmd.exe` left `PING.EXE` behind. `Start-Process` without
+  `-NoNewWindow` opened a window per grandchild.
+- **Do:** [Design 0108](design/0108-windows-tasks-without-console-windows.md): `CREATE_NO_WINDOW` for
+  tasks, probes and test helpers, `PING.EXE` started directly, and `-NoNewWindow` in the stress test.
+  Keep every assertion, including the positive control of `test_console_and_terminal_injection_is_blocked`.
+- **Done when:** On Windows, 20 runs of `cargo test -p rusty_grid_worker` under 4 busy loops with
+  `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, started from a parent without a console, pass with 0 new console
+  windows and 0 leftover `PING.EXE` or `powershell` processes.
+- **Partial (2026-11-23):** The change is made (design 0108). macOS `cargo fmt` and `cargo clippy -p
+  rusty_grid_core -p rusty_grid_worker --all-targets -D warnings` pass. The Windows code compiles only in
+  the CI Windows jobs and on the case PC, and the Windows loop of "Done when" has not run yet.
 
 ## Phase 3: make the documents true
 
@@ -2426,3 +2449,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-85 added (the Windows `submit --type compile` timeout of 2026-11-20). Stale "(open)" marks removed from the rows of TEST-24, TEST-26, TEST-56, TEST-69, TEST-84 and SEC-16, whose pull requests are merged. The prompts for the remaining stability work are in [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The id TEST-85 was not claimed through `agent_bridge.py claim` because the hub on Google Drive timed out; no pull request uses it.
 - 2026-11-23: The owner delegated the open decisions to Claude ("làm theo ý bạn"). TEST-23 and TEST-61 closed without a reproduced cause (their loops are recorded, diagnostics stay), SEC-16 closed with no ACL or code change, CI-1 closed with step 2 kept as a standing rule in prompt S5. TEST-41 stays Partial until the loops of prompt S3. Texts moved to the archive.
 - 2026-11-23: TEST-85 Partial (pull request 417, branch `win/test-85-compile-timeout`, commit `b0d4058f`): the CI `60` s timeout hit a task that normally runs in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on Windows, `14` physical / `20` logical cores), so it looks like a stall rather than a slow build; cause not found. Added a `--timeout-secs 600` hang guard, widened worker registration to `60` s, and printed compile timings in `crates/cli/src/cli_app/runtime_tests.rs`; verified `50/50` (`4` busy loops) + `228/228` `rusty_grid_cli --lib --features gpu-wgpu` + `cargo +1.96.0 clippy`; stays Partial until the cause is found or `windows-latest` stays green through the Q80 streak window. Index recounted: `248` items (`182` Implemented, `21` Partial, `45` Planned; `22` In, `44` Out).
+- 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.

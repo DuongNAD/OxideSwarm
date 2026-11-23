@@ -205,6 +205,9 @@ flowchart LR
   the master emits a warning containing `"saturated"` once per change of the connected busy-worker
   set (excluding `Disconnected` workers and capability/GPU mismatches such as `NoGpuWorkersAvailable`,
   [design 0099](design/0099-scheduler-backpressure-visibility.md)). Tasks run at below-normal priority.
+  On Windows, task processes and host probes run without a console window (`CREATE_NO_WINDOW`, also
+  under `--isolation off`), so Ctrl+C in the worker's console reaches only the worker, which then
+  stops its tasks ([design 0108](design/0108-windows-tasks-without-console-windows.md)).
 - **Output capture:** up to 10 MiB per stream, keeping both the head and the tail, so a long build
   log still ends with its summary ([design 0022](design/0022-head-and-tail-stream-capture.md)).
 - **GPU:** a worker built with `--features gpu-wgpu` detects GPU compute hardware (`--gpu`,
