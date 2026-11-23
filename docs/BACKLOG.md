@@ -290,7 +290,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
-| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Partial | In | (open) |
+| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Partial | In | 424 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -628,7 +628,7 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** On Windows, 20 runs of `cargo test -p rusty_grid_worker` under 4 busy loops with
   `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, started from a parent without a console, pass with 0 new console
   windows and 0 leftover `PING.EXE` or `powershell` processes.
-- **Partial (2026-11-23):** The change is made (design 0108). macOS `cargo fmt` and `cargo clippy -p
+- **Partial (2026-11-23, pull request 424):** The change is made (design 0108). macOS `cargo fmt` and `cargo clippy -p
   rusty_grid_core -p rusty_grid_worker --all-targets -D warnings` pass. The Windows code compiles only in
   the CI Windows jobs and on the case PC, and the Windows loop of "Done when" has not run yet.
 
