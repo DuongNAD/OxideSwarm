@@ -181,7 +181,11 @@ Recounted on 2026-11-22 after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented a
 Recounted on 2026-11-23 after TEST-85 was added (TEST-56 loses its `Line` value now that pull request 361 is merged): 248 items, 178 Implemented, 24 Partial and 46 Planned; 26 open items are In and 44 are Out.
 Recounted on 2026-11-23 after TEST-23, TEST-61, SEC-16 and CI-1 were closed on the owner's delegation: 248 items, 182 Implemented, 20 Partial and 46 Planned; 22 open items are In and 44 are Out.
 Recounted on 2026-11-23 after TEST-85 Partial (pull request 417): 248 items, 182 Implemented, 21 Partial and 45 Planned; 22 open items are In and 44 are Out.
-Recounted on 2026-11-23 after TEST-88 was added (Partial): 249 items, 182 Implemented, 22 Partial and 45 Planned; 23 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-86 (In) and BUG-36 (Out) were added: 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-41 Partial (pull request 419): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-41 Partial (pull request 420): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-69 Implemented (pull request 421): 250 items, 183 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-88 was added (Partial): 251 items, 183 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -250,7 +254,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented |  | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented |  | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359, 363, 09c3accd |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359, 363, 09c3accd, 419, 420 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented |  | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented |  | 307 |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented |  | 304 |
@@ -283,13 +287,14 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-77 | e2e_cluster: widen 3-5 s worker and wait_task deadlines to 60 s | P2 | S |  |  | Implemented |  | 399 (open) |
 | TEST-73 | m4_scheduling: prove batch concurrency with a barrier and drop 1.2 s / 1.5 s wall-clock windows | P2 | S |  |  | Implemented |  | 397 (open) |
 | TEST-68 | gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines | P2 | S |  |  | Implemented |  | 396 (open) |
-| TEST-69 | Windows AppContainer isolation tests wait too briefly under load | P1 | S |  |  | Partial | In | 403 |
+| TEST-69 | Windows AppContainer isolation tests wait too briefly under load | P1 | S |  |  | Implemented |  | 403, 421 |
 | TEST-80 | test_sec5_hardened_runner: drop 5 s wall-clock upper bounds in oversized sparse output test | P2 | S |  |  | Implemented |  | 402 (open) |
 | TEST-81 | Test masters keep 85 % host-CPU backpressure, stalling queued tasks under load | P1 | M |  |  | Implemented |  | 404 (open) |
 | TEST-82 | `rusty_grid_worker`: replace wall-clock upper bounds and bound `scale1` status queries | P2 | M |  |  | Implemented |  | 405 (open) |
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
+| TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Partial | In | 424 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
@@ -414,6 +419,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
+| BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -610,6 +616,36 @@ The full suite must pass on a clean machine before CI can require it.
   - **Post-fix (`b0d4058f`, same machine and isolated NTFS `USERPROFILE`/`HOME`/`TEMP`):**
     - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (`4` Python CPU busy loops): `50/50` passed (wall `3.91–4.52` s, median `4.06` s; `compile_wall_ms` `523–619`, median `551`; `exec_ms` `341–431`, median `360`).
     - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu`: `228/228` passed (`10.04` s); `cargo fmt --all -- --check`, `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings`, `cargo +1.96.0 clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-86: macOS: `shard` tests stall for 60 s when run beside other shard tests
+
+- **Evidence:** CI run `45054272288` (push of pull request 415 to `master`, 2026-11-22 18:17 UTC), job
+  `workspace tests (macos-latest)` (`137305932137`), binary `test_ax2_shard`
+  (`crates/cli/tests/test_ax2_shard.rs`): ten tests passed within about 1 s of the start, and three ran to the
+  60 s client deadline: `test_shard_count_1_and_256_boundaries` (72 of 256 shards of `true` on 16 slots
+  completed), `test_shard_slot_spreading_with_max_retries_failover_and_worker_pin` (none of 8 shards of `printf`
+  on 8 slots completed, every shard `timed out after 60s` with `duration_ms` 0) and
+  `test_shard_partial_failure_and_fail_fast_cancels_siblings` (exit 1 instead of 5). It is the first failing test
+  on `master` since TEST-85, so the Q80 streak counts again from 2026-11-22 18:38 UTC.
+- **Problem:** The runner was not slow (the other ten tests finished at once), so the three runs stalled. Cause
+  not proven; the likely one is the BUG-35 class: the test runs its workers in process (`WorkerClient` on the
+  test runtime) and starts each `oxideswarm shard` with `std::process::Command::output()` outside the macOS spawn
+  lock, so a CLI child can inherit the write end of a task's stdout pipe (or a task, such as the `sleep 600`
+  siblings of the fail-fast test, a CLI's pipe). The task then never reaches end of file until the CLI exits, and
+  the CLI waits for the task until its 60 s deadline. Pull request 409 fixed the same deadlock in
+  `test_cli_cancel_and_result.rs` by spawning the CLI through `rusty_grid_core::process_spawn::output_std`.
+  Not reproduced locally: 15 runs of the binary on `master` `9800abea` under 10 busy loops on an Apple M-series
+  Mac (10 cores) all passed (4 to 25 s per run). The 2026-11-23 pull request removed the wall-clock assertions of
+  `test_ax2_shard.rs` and `test_ax1_matrix.rs` (now printed as `[timing]`) and raised their hang guards to 60 s;
+  it does not fix the stall.
+- **Do:**
+  1. After BUG-35 merges, start every CLI child of `test_ax2_shard.rs` and `test_ax1_matrix.rs` (and of any other
+     `crates/cli/tests` file that runs an in-process worker beside CLI children) through `output_std`.
+  2. Before the change, try to reproduce: run the binary 50 times on macOS under 6 busy loops with
+     `--test-threads 3` (the hosted runner has 3 cores); record the stalls.
+  3. If it still stalls after step 1, find the cause (rule 4) before anything else; do not raise the timeouts.
+- **Done when:** The cause is written here, and `test_ax2_shard` and `test_ax1_matrix` pass 50 runs in a row on
+  macOS under 6 busy loops with `--test-threads 3`.
 
 ### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
 
@@ -1282,6 +1318,8 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
 - **Partial (2026-11-19, pull request 363):** Not reproduced on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`) across 200 sequential `cargo test --locked` runs (`2,400` rounds; 0 double runs and 0 failures; `1,697.06 s` elapsed across the 4 batches; plus a 1/1 `RV158_ZERO=1` smoke run beforehand in 7.94 s, `12` rounds, `ran_twice=0`) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (`480` rounds, `327.44 s`), 40 alone `RV158_ZERO=1` runs (`480` rounds, `340.93 s`), 60 default-delay runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `506.52 s`), and 60 `RV158_ZERO=1` runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `522.17 s`). The 200-run part of "Done when" is now met on both Windows (pull request 359) and Linux (this pull request), alongside macOS (pull request 288), while no cause is named because the single double-run of pull request 282 never reproduced; closing TEST-41 as "not reproduced in 200 runs on Linux, Windows and macOS" (keeping the pull request 288 debug-log capture) is the owner's decision.
 - **Partial (2026-11-22, Wave 2 M1 commit `09c3accd`):** Closed three remaining shutdown/durability race gaps: (1) added `durability_failed: bool` to `ResultOutcome` (`crates/master/src/queue.rs`, `queue/lifecycle.rs`) and gated `registry.send_result_ack` across all three branches in `apply_task_result_inner` (`crates/master/src/server/tasks_and_blobs.rs`) on `TaskStore` durability so un-persisted results stay in the worker's `pending_resume_outbox` (`test_failed_store_sync_suppresses_result_ack_across_all_paths`, `test_worker_retains_result_in_pending_resume_outbox_on_store_sync_failure_and_flushes_on_restart`); (2) suppressed `WorkerMessage::Disconnecting` (`farewell = None`) when a worker receives `MasterMessage::Shutdown` (`crates/worker/src/client/session.rs`) so shutdown never triggers spurious evacuations (`test_master_shutdown_via_watch_without_preclose_adopts_once_with_zero_evacuations`, `test_master_shutdown_frame_makes_the_worker_wait_and_reconnect`); (3) checked `*self.shutdown_rx.borrow_and_update()` on `WorkerSession::run` entry before `select!`, flushed `MasterMessage::Shutdown` via `ActiveLanes::send_shutdown_and_flush` (`1 s` bound, `crates/master/src/session.rs`), and added `biased;` shutdown polling in `crates/master/src/server.rs` accept loops (`test_worker_session_run_entry_sends_shutdown_when_already_signaled`). Verified on macOS with `RV158_ZERO=1 RV158_ROUNDS=48` (`48/48` `ran_twice=0`), `persistence_tests` (`17/17`), `session::tests` (`10/10`), `worker_connection_lifecycle` (`12/12`), `master_restart_recovery` (`8/8`), and `tests/test_wave2_e2e.py` (`F2` + Tiers 3–4). Stays `Partial | In` awaiting owner closure decision on the non-reproduced pull request 282 CI hit per `"Done when"`.
+- **Partial (2026-11-23, pull request 419 (open)):** Not reproduced on Linux post-`09c3accd` (`aarch64`, `10` logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 13 (trixie)` in Docker container `rust:1.96` on Apple M5 `10` cores, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `CARGO_TARGET_DIR=/tmp/t`, fresh temporary `HOME` per run) at `origin/master` commit `9800abea` (`9800abeadc2f1dca18faebe6dfd105b7d85262a2`) across `200` sequential `cargo test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture` runs (`2,400` rounds; `0` double runs `ran_twice=0` on every run, `0` failures, `1,633.96 s` elapsed) under `4` CPU busy loops (`yes > /dev/null`, `40 %` load on `10` cores) inside the container: `100/100` default-delay runs (`1,200` rounds, `860.33 s`, `min 7.35 s`, `max 16.20 s`) and `100/100` `RV158_ZERO=1` runs (`1,200` rounds, `773.63 s`, `min 7.34 s`, `max 9.39 s`). Stays `Partial | In` pending the post-`09c3accd` Windows `200`-run loop of prompt S3.
+- **Partial (2026-11-23, Windows 200/200, pull request 420):** Confirmed on Windows 11 Pro (`x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.1` / `cargo 1.96.1`, isolated NTFS temporary `HOME`/`USERPROFILE`/`TEMP`/`TMP` preserving `LOCALAPPDATA`, `CARGO_TARGET_DIR` on NTFS `E:`) at commit `cfed793d` (hardening `tests/master_restart_recovery.rs` after pre-fix baseline at `origin/master` `6a9060ba` hit the `5 s` `wait_for` guard at line `1030` in run `53/100` round `6` after `52/100` passes / `624` rounds with `ran_twice=0`): first verified all 8 tests of `cargo +1.96.0 test -p rusty_grid_master --test master_restart_recovery --locked` (`8/8` passed in `13.59 s`), then passed `200/200` sequential runs (`2,400` rounds, `ran_twice=0`, `0` failures, `2,725.53 s` total) of `cargo +1.96.0 test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture` under 4 Python CPU busy loops: `100/100` default-delay (`1,200` rounds, `ran_twice=0`, `1,308.56 s`, min `12.52 s`, median `13.00 s`, max `14.25 s`) and `100/100` `RV158_ZERO=1` (`1,200` rounds, `ran_twice=0`, `1,416.97 s`, min `14.01 s`, median `14.17 s`, max `14.36 s`). Changes in `tests/master_restart_recovery.rs`: replaced PowerShell `Add-Content`/`Test-Path`/`Start-Sleep` cmdlets in `gated_marker_task` (`#[cfg(windows)]`) with direct `.NET` `[System.IO.File]`/`[System.Threading.Thread]::Sleep` calls so cold module autoloading does not stall startup, bounded the post-gate `done_path` poll loop with early terminal-state exit and `LogSink` timeout diagnostics, and widened helper task `timeout_secs` and `rv158` marker/done waits to `120 s` (after intermediate `60 s` runs observed `BELOW_NORMAL_PRIORITY_CLASS` `powershell.exe` startup starvation up to `57.3 s` when an unrelated concurrent 12-thread Normal-priority host job competed alongside the busy loops; `ran_twice=0` in all completed rounds). Stays `Partial | In` awaiting closure decision (Linux and Windows post-`09c3accd` loops are both 200/200).
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -1481,6 +1519,23 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A client sees the first output line while the task runs. An MCP client polls a
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
+
+### BUG-36: `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout
+
+- **Evidence:** `crates/cli/src/shard.rs` (`execute_shards`, `run_single_task_wait`) and `crates/cli/src/matrix.rs`
+  compute one `safe_deadline(timeout)` when the run starts, from `--timeout-secs` (`DEFAULT_SHARD_TIMEOUT_SECS` is
+  60 for `shard`, 60 for `submit` without a workspace), and use it for every shard or cell: the handshake
+  semaphore, the queue and the run. The worker enforces the same number per task. The MCP `submit` tool already
+  takes a separate `wait_secs` (`crates/cli/src/mcp.rs`).
+- **Problem:** `--timeout-secs` reads as the limit of each task, but the client gives up on the whole run after
+  that time, queue time included. A run with more shards than free slots, or a default 60 s `cargo nextest`
+  shard (design 0103 `--build-once`), reports `timed_out` for shards that would have finished in time.
+- **Do:** Decide in an amendment to designs 0101 and 0103 (with `docs/reference.md`): a wait per shard that
+  starts when the shard's task starts running, or a separate budget for the whole run (`--wait-secs`, as MCP
+  has) with a documented default, and a larger default timeout for `shard`. No wire change. First a test that
+  fails without the change: more shards than slots, each well inside `--timeout-secs`, the run longer than it.
+- **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
+  queue time, and that test passes.
 
 ### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
 
@@ -2449,4 +2504,9 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-85 added (the Windows `submit --type compile` timeout of 2026-11-20). Stale "(open)" marks removed from the rows of TEST-24, TEST-26, TEST-56, TEST-69, TEST-84 and SEC-16, whose pull requests are merged. The prompts for the remaining stability work are in [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The id TEST-85 was not claimed through `agent_bridge.py claim` because the hub on Google Drive timed out; no pull request uses it.
 - 2026-11-23: The owner delegated the open decisions to Claude ("làm theo ý bạn"). TEST-23 and TEST-61 closed without a reproduced cause (their loops are recorded, diagnostics stay), SEC-16 closed with no ACL or code change, CI-1 closed with step 2 kept as a standing rule in prompt S5. TEST-41 stays Partial until the loops of prompt S3. Texts moved to the archive.
 - 2026-11-23: TEST-85 Partial (pull request 417, branch `win/test-85-compile-timeout`, commit `b0d4058f`): the CI `60` s timeout hit a task that normally runs in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on Windows, `14` physical / `20` logical cores), so it looks like a stall rather than a slow build; cause not found. Added a `--timeout-secs 600` hang guard, widened worker registration to `60` s, and printed compile timings in `crates/cli/src/cli_app/runtime_tests.rs`; verified `50/50` (`4` busy loops) + `228/228` `rusty_grid_cli --lib --features gpu-wgpu` + `cargo +1.96.0 clippy`; stays Partial until the cause is found or `windows-latest` stays green through the Q80 streak window. Index recounted: `248` items (`182` Implemented, `21` Partial, `45` Planned; `22` In, `44` Out).
+- 2026-11-23: TEST-86 added: three `test_ax2_shard` tests stalled for 60 s on `macos-latest` in the `master` run of pull request 415 (2026-11-22 18:38 UTC), which restarts the Q80 streak; the likely cause is the BUG-35 class, so it waits for pull request 409. The wall-clock assertions of `test_ax2_shard.rs` and `test_ax1_matrix.rs` are now printed, and their hang guards are 60 s. BUG-36 added (Out): `shard` and `submit --matrix` share one deadline across the run. Both ids were claimed with `agent_bridge.py claim`.
+- 2026-11-23: TEST-41 Partial (pull request 419 (open), S3 Linux part): on Linux (`aarch64`, `10` logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 13 (trixie)` in Docker `rust:1.96` on Apple M5 `10` cores, `rustc 1.96.1`) at `9800abea`, `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`cargo test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture`, temp `HOME` per run) passed `200/200` runs (`2,400` rounds, `ran_twice=0` everywhere, `0` failures, `1,633.96 s` total: `100` default-delay `860.33 s` + `100` `RV158_ZERO=1` `773.63 s`) under `4` CPU busy loops inside the container; stays `Partial | In` pending the post-`09c3accd` Windows `200`-run loop.
+- 2026-11-23: TEST-41 Partial (Windows 200/200 post-`09c3accd`, pull request 420): hardened `tests/master_restart_recovery.rs` (`120 s` helper/marker/done guards, direct `.NET` calls in `#[cfg(windows)] gated_marker_task`, bounded `done_path` loop + `LogSink` timeout dump), verified `master_restart_recovery` `8/8` (`13.59 s`), and passed `200/200` sequential `rv158` runs (`100` default + `100` `RV158_ZERO=1`, `2,400` rounds, `ran_twice=0`, `2,725.53 s` total) on Windows under 4 Python CPU busy loops at `cfed793d`; stays `Partial | In` pending closure decision.
+- 2026-11-23: TEST-69 Implemented (pull requests 403, 421; text in the archive): confirmed on the Windows case PC (`Windows 11 Pro`, `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `>= 28 GB` free RAM) at `9800abea` (`crates/worker` unchanged in `8e55dac9`) with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 cargo +1.96.0 test -p rusty_grid_worker --locked` passing `20/20` runs (`427 passed, 0 failed` per run; `136.26–140.33 s`, median `136.60 s`, total `2,737.24 s`) under `6` Python CPU busy loops plus all `6` hardened `mod windows` tests individually (`0.41–5.58 s`). Index recount: 248 items, 183 Implemented, 20 Partial and 45 Planned; 21 open items are In and 44 are Out.
+- 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.

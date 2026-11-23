@@ -365,7 +365,7 @@ fn gated_marker_task(
 
     let mut req = TaskRequirements::generic(1, 16);
     req.max_retries = max_retries;
-    req.timeout_secs = 20;
+    req.timeout_secs = 120;
 
     #[cfg(unix)]
     let spec = TaskSpec::ShellScript {
@@ -388,10 +388,10 @@ fn gated_marker_task(
             "-NonInteractive".to_string(),
             "-Command".to_string(),
             concat!(
-                "Add-Content -Path $env:MARKER_PATH -Value 'run'; ",
-                "while (-not (Test-Path $env:GATE_PATH)) { Start-Sleep -Milliseconds 30 }; ",
+                "[System.IO.File]::AppendAllText($env:MARKER_PATH, 'run' + [Environment]::NewLine); ",
+                "while (-not [System.IO.File]::Exists($env:GATE_PATH)) { [System.Threading.Thread]::Sleep(30) }; ",
                 "if ($env:OUT_FILE) { [System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY) }; ",
-                "if ($env:DONE_MARKER_PATH) { Add-Content -Path $env:DONE_MARKER_PATH -Value 'done' }"
+                "if ($env:DONE_MARKER_PATH) { [System.IO.File]::AppendAllText($env:DONE_MARKER_PATH, 'done' + [Environment]::NewLine) }"
             )
             .to_string(),
         ],
@@ -425,7 +425,7 @@ fn timed_sleep_marker_task(
 
     let mut req = TaskRequirements::generic(1, 16);
     req.max_retries = max_retries;
-    req.timeout_secs = 20;
+    req.timeout_secs = 120;
 
     #[cfg(unix)]
     let spec = TaskSpec::ShellScript {
@@ -1013,7 +1013,7 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
         });
         assert!(
             wait_for(
-                Duration::from_secs(5),
+                Duration::from_secs(60),
                 Duration::from_millis(25),
                 || async {
                     master1
@@ -1023,28 +1023,50 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
                         .unwrap_or(false)
                 }
             )
-            .await
+            .await,
+            "round {round} worker did not register within 60 s"
         );
         let t = gated_marker_task(&marker_path, &gate_path, Some(&done_path), None, Some(2));
         let tid = master1.submit_task(t).await.expect("submit");
-        assert!(
-            wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(10),
-                || async {
-                    let running = master1
-                        .get_task_info(tid)
-                        .await
-                        .map(|i| i.state == TaskState::Running)
-                        .unwrap_or(false);
-                    running
-                        && std::fs::read_to_string(&marker_path)
-                            .map(|s| s.lines().count() == 1)
-                            .unwrap_or(false)
-                }
-            )
-            .await
-        );
+        let dump_round_diag = |phase: &str,
+                               info: Option<rusty_grid_master::queue::TaskInfo>,
+                               res: Option<rusty_grid_core::task::TaskResult>,
+                               marker: std::io::Result<String>| {
+            eprintln!(
+                "RV158 {phase} round={round} task={tid}: info={info:?} result={res:?} marker={marker:?}"
+            );
+            let lines = sink.0.lock().unwrap_or_else(|e| e.into_inner());
+            for line in lines.iter() {
+                eprintln!("RV158 TIMEOUT LOG: {line}");
+            }
+        };
+        let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut marker_ready = false;
+        while tokio::time::Instant::now() < marker_deadline {
+            let info = master1.get_task_info(tid).await.ok();
+            let running = info.as_ref().is_some_and(|i| i.state == TaskState::Running);
+            if running
+                && std::fs::read_to_string(&marker_path)
+                    .map(|s| s.lines().count() == 1)
+                    .unwrap_or(false)
+            {
+                marker_ready = true;
+                break;
+            }
+            if info.as_ref().is_some_and(|i| i.state.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !marker_ready {
+            let info = master1.get_task_info(tid).await.ok();
+            let res = master1.queue().get_result(&tid).await;
+            let marker = std::fs::read_to_string(&marker_path);
+            dump_round_diag("MARKER_TIMEOUT", info.clone(), res.clone(), marker);
+            panic!(
+                "round {round} task {tid} did not enter Running and write marker within 120 s: info={info:?}"
+            );
+        }
         let worker_id = master1
             .list_workers()
             .await
@@ -1053,8 +1075,31 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
             .map(|w| w.worker_id.to_string())
             .unwrap_or_default();
         std::fs::write(&gate_path, b"go").unwrap();
+        let done_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut polls = 0u64;
         while !done_path.exists() {
+            if tokio::time::Instant::now() >= done_deadline {
+                break;
+            }
+            if polls % 50 == 49
+                && master1
+                    .get_task_info(tid)
+                    .await
+                    .is_ok_and(|i| i.state.is_terminal())
+            {
+                break;
+            }
+            polls += 1;
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if !done_path.exists() {
+            let info = master1.get_task_info(tid).await.ok();
+            let res = master1.queue().get_result(&tid).await;
+            let marker = std::fs::read_to_string(&marker_path);
+            dump_round_diag("DONE_TIMEOUT", info.clone(), res.clone(), marker);
+            panic!(
+                "round {round} task {tid} did not write done_path within 120 s after gate: info={info:?}"
+            );
         }
         let delay_ms = if zero_delay { 0 } else { round % 6 };
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -1062,20 +1107,21 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
         drop(master1);
         assert!(
             wait_for(
-                Duration::from_secs(5),
+                Duration::from_secs(60),
                 Duration::from_millis(10),
                 || async { done_path.exists() }
             )
-            .await
+            .await,
+            "round {round} done_path was not observed within 60 s"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let config2 = ServerConfig::new(master_addr)
             .with_web_ui(false)
             .with_discovery(false)
             .with_state_dir(&state_dir);
-        let master2 = spawn_rebound_master(config2, Duration::from_secs(5)).await;
+        let master2 = spawn_rebound_master(config2, Duration::from_secs(60)).await;
         let res = master2
-            .wait_task(tid, Some(Duration::from_secs(10)))
+            .wait_task(tid, Some(Duration::from_secs(60)))
             .await
             .expect("task completion on master2");
         assert!(res.is_success(), "round {round} task failed: {res:?}");
