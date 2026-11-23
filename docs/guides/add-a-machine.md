@@ -90,6 +90,17 @@ On the new machine (Windows PowerShell):
 .\target\release\oxideswarm.exe worker
 ```
 
+### Approve or manage machines in the web dashboard
+
+If you are using `oxs1-invite:...` invites (for example across networks with `oxideswarm master --p2p`), you can also manage invites and pending requests from the master's web dashboard (`http://127.0.0.1:8080` by default):
+
+1. Obtain the Admin dashboard token on the master (`oxideswarm secret show --dashboard-token`, or use a `--auth-token <TOKEN:NAME:admin>` credential) and open the **Members** tab.
+2. Create an invite under **Cluster Invites** (`worker`, `client`, or single-use approval-required `admin`) and copy the `oxs1-invite:...` string shown once on creation; paste it into `oxideswarm join` on the new machine.
+3. Under **Pending Enrollments**, compare the `Master FP` and ask the joining machine's operator for the 6-digit `Pairing code` printed on their terminal, enter it in the approval box, and click **Approve** (or **Reject** to deny without spending an invite use).
+4. Under **Enrolled Members**, inspect each member's fingerprint and active connection lanes (`worker_tcp`, `worker_quic`, `client_tcp`, `client_p2p`), rename members, or click **Revoke** to remove the member, close all of its connections, and requeue its worker tasks immediately.
+
+Note: a recorded live two-network `--p2p` invite run remains pending owner hardware/network; the recorded run below covers the 2026-11-14 LAN pairing session.
+
 ## Verify
 
 On the master or an enrolled client machine, confirm the worker is online and runs a command:

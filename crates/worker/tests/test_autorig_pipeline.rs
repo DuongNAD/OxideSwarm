@@ -556,15 +556,40 @@ fn test_presets_quadruped_and_generic() {
     let mesh = create_humanoid_test_mesh();
     let obj_content = mesh_to_obj_string(&mesh);
 
-    // Quadruped preset
+    fn parse_joint_names(glb: &[u8]) -> Vec<String> {
+        let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        let gltf: Value = serde_json::from_slice(&glb[20..20 + json_len]).expect("valid glTF JSON");
+        let nodes = gltf["nodes"].as_array().expect("nodes");
+        let skin_joints = gltf["skins"][0]["joints"].as_array().expect("skin joints");
+        skin_joints
+            .iter()
+            .map(|idx| {
+                nodes[idx.as_u64().unwrap() as usize]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    // Quadruped preset (19 distinct quadruped joints)
     let quad_spec = AutoRigSpec::new(Bytes::from(obj_content.clone()), "quadruped");
     let quad_glb = auto_rig_mesh(&quad_spec).expect("Quadruped preset should succeed");
     assert!(quad_glb.len() > 1000);
+    let quad_names = parse_joint_names(&quad_glb);
+    assert_eq!(quad_names.len(), 19);
+    assert_eq!(quad_names[0], "Pelvis");
+    assert!(quad_names.contains(&"Tail_01".to_string()));
+    assert!(quad_names.contains(&"HindUpperLeg_L".to_string()));
+    assert!(quad_names.contains(&"FrontUpperLeg_R".to_string()));
+    assert!(!quad_names.contains(&"Hips".to_string()));
 
-    // Generic preset
+    // Generic preset (5 axial joints)
     let gen_spec = AutoRigSpec::new(Bytes::from(obj_content), "generic");
     let gen_glb = auto_rig_mesh(&gen_spec).expect("Generic preset should succeed");
     assert!(gen_glb.len() > 1000);
+    let gen_names = parse_joint_names(&gen_glb);
+    assert_eq!(gen_names, vec!["Root", "Spine", "Chest", "Neck", "Head"]);
 }
 
 #[test]

@@ -182,6 +182,17 @@ fn clean_token(text: &str) -> GridResult<String> {
     Ok(text)
 }
 
+/// Prints a normalized enrollment rejection line without duplicating an existing
+/// `"enrollment rejected:"` prefix sent by the master.
+fn print_enrollment_rejected(message: &str) {
+    let trimmed = message
+        .get(..20)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("enrollment rejected:"))
+        .map(|_| message[20..].trim_start())
+        .unwrap_or(message);
+    eprintln!("Enrollment rejected: {trimmed}");
+}
+
 /// Reads at most [`MAX_TOKEN_BYTES`] from `reader` (piped standard input) and returns the trimmed
 /// text. Never echoes it.
 pub fn read_token(reader: impl Read) -> GridResult<String> {
@@ -1706,7 +1717,7 @@ pub(crate) async fn run_join_invite_with_pair(
     let (member_id, roles) = if !token.require_approval {
         match first_reply {
             ClientResponse::EnrollRejected { message } | ClientResponse::Error { message } => {
-                eprintln!("Enrollment rejected: {message}");
+                print_enrollment_rejected(&message);
                 return ExitCode::from(AUTH_EXIT_CODE);
             }
             ClientResponse::Enrolled { member_id, roles } => (member_id, roles),
@@ -1723,7 +1734,7 @@ pub(crate) async fn run_join_invite_with_pair(
 
         let mut approved: Option<(String, Vec<MemberRole>)> = match first_reply {
             ClientResponse::EnrollRejected { message } | ClientResponse::Error { message } => {
-                eprintln!("Enrollment rejected: {message}");
+                print_enrollment_rejected(&message);
                 return ExitCode::from(AUTH_EXIT_CODE);
             }
             ClientResponse::EnrollPending { pending_id } => {
@@ -1797,7 +1808,7 @@ pub(crate) async fn run_join_invite_with_pair(
                             }
                             Ok(Some(ClientResponse::EnrollRejected { message }))
                             | Ok(Some(ClientResponse::Error { message })) => {
-                                eprintln!("Enrollment rejected: {message}");
+                                print_enrollment_rejected(&message);
                                 return ExitCode::from(AUTH_EXIT_CODE);
                             }
                             Ok(Some(other)) => {
@@ -1859,7 +1870,7 @@ pub(crate) async fn run_join_invite_with_pair(
                     }
                     Ok(Some(ClientResponse::EnrollRejected { message }))
                     | Ok(Some(ClientResponse::Error { message })) => {
-                        eprintln!("Enrollment rejected: {message}");
+                        print_enrollment_rejected(&message);
                         return ExitCode::from(AUTH_EXIT_CODE);
                     }
                     Ok(Some(other)) => {
@@ -1893,7 +1904,7 @@ pub(crate) async fn run_join_invite_with_pair(
             Ok(Ok(Some(ClientResponse::Hello { .. }))) => {}
             Ok(Ok(Some(ClientResponse::EnrollRejected { message })))
             | Ok(Ok(Some(ClientResponse::Error { message }))) => {
-                eprintln!("Enrollment rejected: {message}");
+                print_enrollment_rejected(&message);
                 return ExitCode::from(AUTH_EXIT_CODE);
             }
             Ok(Ok(other)) => {

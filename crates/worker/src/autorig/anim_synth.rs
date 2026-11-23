@@ -6,7 +6,7 @@
 //! - `turnaround`: 360-degree yaw rotation with alternating foot steps.
 
 use super::math::Quat;
-use super::types::Armature;
+use super::types::{Armature, RigPreset};
 
 /// glTF 2.0 animation channel target path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,23 +51,65 @@ pub struct ProceduralClip {
 pub struct ClipSynthesizer;
 
 impl ClipSynthesizer {
-    /// Synthesizes all requested animation clips for the given armature.
+    /// Synthesizes all requested animation clips for the given armature, failing on unknown clips.
     pub fn synthesize_all(
         requested: &[String],
         character_height: f32,
         armature: &Armature,
     ) -> Vec<ProceduralClip> {
-        let mut clips = Vec::new();
+        Self::synthesize_all_checked(requested, character_height, armature)
+            .expect("Unsupported AutoRig animation clip")
+    }
+
+    /// Validated animation clip synthesis returning `Err` on unknown or empty clip names.
+    pub fn synthesize_all_checked(
+        requested: &[String],
+        character_height: f32,
+        armature: &Armature,
+    ) -> Result<Vec<ProceduralClip>, String> {
+        Self::synthesize_all_cancellable(requested, character_height, armature, &|| false)
+    }
+
+    /// Validated animation clip synthesis with cooperative cancellation checks.
+    pub fn synthesize_all_cancellable(
+        requested: &[String],
+        character_height: f32,
+        armature: &Armature,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<Vec<ProceduralClip>, String> {
+        let mut clips = Vec::with_capacity(requested.len());
+        let mut seen = Vec::with_capacity(requested.len());
         for name in requested {
-            let n = name.trim().to_lowercase();
+            if should_stop() {
+                return Err("Cancelled".to_string());
+            }
+            let n = name.trim().to_ascii_lowercase();
+            if matches!(n.as_str(), "idle" | "walk" | "turnaround") {
+                if seen.contains(&n) {
+                    return Err(format!(
+                        "Duplicate AutoRig animation clip '{n}' in embed_animations"
+                    ));
+                }
+                seen.push(n.clone());
+            }
             match n.as_str() {
                 "idle" => clips.push(Self::synthesize_idle(character_height, armature)),
                 "walk" => clips.push(Self::synthesize_walk(character_height, armature)),
                 "turnaround" => clips.push(Self::synthesize_turnaround(character_height, armature)),
-                _ => {}
+                "" => {
+                    return Err(
+                        "Unsupported empty AutoRig animation clip; valid clips are: idle, walk, turnaround"
+                            .to_string(),
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "Unsupported AutoRig animation clip '{other}'; valid clips are: idle, walk, turnaround"
+                    ))
+                }
             }
         }
-        clips
+        Ok(clips)
     }
 
     /// Synthesizes the `idle` breathing animation clip (T = 2.4s, 73 frames at 30 Hz).
@@ -172,8 +214,8 @@ impl ClipSynthesizer {
             });
         }
 
-        // 4. Arms (UpperArm_L: 11, UpperArm_R: 13): Subtle breathing roll shrug
-        if armature.joints.len() > 13 {
+        // 4. Preset-specific secondary idle tracks
+        if armature.preset == RigPreset::Biped && armature.joints.len() > 13 {
             let mut l_arm_r = Vec::with_capacity(frame_count * 4);
             let mut r_arm_r = Vec::with_capacity(frame_count * 4);
 
@@ -195,6 +237,27 @@ impl ClipSynthesizer {
                 path: AnimationTargetPath::Rotation,
                 timestamps: timestamps.clone(),
                 values: r_arm_r,
+            });
+        } else if armature.preset == RigPreset::Quadruped && armature.joints.len() > 6 {
+            let mut tail1_r = Vec::with_capacity(frame_count * 4);
+            let mut tail2_r = Vec::with_capacity(frame_count * 4);
+            for &t in &timestamps {
+                let yaw1 = 0.08 * (omega * t).sin();
+                let yaw2 = 0.12 * (omega * t - 0.4).sin();
+                tail1_r.extend_from_slice(&Quat::from_euler(0.0, yaw1, 0.0).to_array());
+                tail2_r.extend_from_slice(&Quat::from_euler(0.0, yaw2, 0.0).to_array());
+            }
+            tracks.push(AnimationTrack {
+                target_joint: 5,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: tail1_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 6,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: tail2_r,
             });
         }
 
@@ -268,8 +331,8 @@ impl ClipSynthesizer {
             });
         }
 
-        // 3. Legs (Left: 5, 6, 7; Right: 8, 9, 10)
-        if armature.joints.len() > 10 {
+        // 3. Preset-specific gait tracks
+        if armature.preset == RigPreset::Biped && armature.joints.len() > 14 {
             let mut l_thigh_r = Vec::with_capacity(frame_count * 4);
             let mut l_shin_r = Vec::with_capacity(frame_count * 4);
             let mut l_foot_r = Vec::with_capacity(frame_count * 4);
@@ -338,10 +401,8 @@ impl ClipSynthesizer {
                 timestamps: timestamps.clone(),
                 values: r_foot_r,
             });
-        }
 
-        // 4. Arms (UpperArm_L: 11, LowerArm_L: 12; UpperArm_R: 13, LowerArm_R: 14)
-        if armature.joints.len() > 14 {
+            // 4. Arms (UpperArm_L: 11, LowerArm_L: 12; UpperArm_R: 13, LowerArm_R: 14)
             let mut l_arm_r = Vec::with_capacity(frame_count * 4);
             let mut l_forearm_r = Vec::with_capacity(frame_count * 4);
             let mut r_arm_r = Vec::with_capacity(frame_count * 4);
@@ -385,6 +446,83 @@ impl ClipSynthesizer {
                 path: AnimationTargetPath::Rotation,
                 timestamps: timestamps.clone(),
                 values: r_forearm_r,
+            });
+        } else if armature.preset == RigPreset::Quadruped && armature.joints.len() > 18 {
+            // Quadruped diagonal trot gait + tail wag:
+            // Hind L (7,8) + Front R (16,17) move together; Hind R (10,11) + Front L (13,14) move antiphase.
+            let mut tail1_r = Vec::with_capacity(frame_count * 4);
+            let mut hl_up = Vec::with_capacity(frame_count * 4);
+            let mut hl_lo = Vec::with_capacity(frame_count * 4);
+            let mut hr_up = Vec::with_capacity(frame_count * 4);
+            let mut hr_lo = Vec::with_capacity(frame_count * 4);
+            let mut fl_up = Vec::with_capacity(frame_count * 4);
+            let mut fl_lo = Vec::with_capacity(frame_count * 4);
+            let mut fr_up = Vec::with_capacity(frame_count * 4);
+            let mut fr_lo = Vec::with_capacity(frame_count * 4);
+
+            for &t in &timestamps {
+                let phi_a = two_pi * (t / duration);
+                let phi_b = phi_a + std::f32::consts::PI;
+
+                tail1_r
+                    .extend_from_slice(&Quat::from_euler(0.0, 0.18 * phi_a.sin(), 0.0).to_array());
+
+                let swing_a = 0.34 * phi_a.sin();
+                let swing_b = 0.34 * phi_b.sin();
+                let bend_a = 0.08 + 0.55 * (-phi_a.sin()).max(0.0);
+                let bend_b = 0.08 + 0.55 * (-phi_b.sin()).max(0.0);
+
+                hl_up.extend_from_slice(&Quat::from_euler(swing_a, 0.0, 0.0).to_array());
+                hl_lo.extend_from_slice(&Quat::from_euler(-bend_a, 0.0, 0.0).to_array());
+                fr_up.extend_from_slice(&Quat::from_euler(swing_a, 0.0, 0.0).to_array());
+                fr_lo.extend_from_slice(&Quat::from_euler(bend_a * 0.7, 0.0, 0.0).to_array());
+
+                hr_up.extend_from_slice(&Quat::from_euler(swing_b, 0.0, 0.0).to_array());
+                hr_lo.extend_from_slice(&Quat::from_euler(-bend_b, 0.0, 0.0).to_array());
+                fl_up.extend_from_slice(&Quat::from_euler(swing_b, 0.0, 0.0).to_array());
+                fl_lo.extend_from_slice(&Quat::from_euler(bend_b * 0.7, 0.0, 0.0).to_array());
+            }
+
+            for (joint, vals) in [
+                (5, tail1_r),
+                (7, hl_up),
+                (8, hl_lo),
+                (10, hr_up),
+                (11, hr_lo),
+                (13, fl_up),
+                (14, fl_lo),
+                (16, fr_up),
+                (17, fr_lo),
+            ] {
+                tracks.push(AnimationTrack {
+                    target_joint: joint,
+                    path: AnimationTargetPath::Rotation,
+                    timestamps: timestamps.clone(),
+                    values: vals,
+                });
+            }
+        } else if armature.preset == RigPreset::Generic && armature.joints.len() > 4 {
+            let mut spine_r = Vec::with_capacity(frame_count * 4);
+            let mut head_r = Vec::with_capacity(frame_count * 4);
+            for &t in &timestamps {
+                let phi = two_pi * (t / duration);
+                spine_r
+                    .extend_from_slice(&Quat::from_euler(0.025, 0.04 * phi.sin(), 0.0).to_array());
+                head_r.extend_from_slice(
+                    &Quat::from_euler(-0.025, -0.05 * phi.sin(), 0.0).to_array(),
+                );
+            }
+            tracks.push(AnimationTrack {
+                target_joint: 1,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: spine_r,
+            });
+            tracks.push(AnimationTrack {
+                target_joint: 4,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: head_r,
             });
         }
 
@@ -441,8 +579,8 @@ impl ClipSynthesizer {
             values: root_r,
         });
 
-        // 2. Stepping legs (alternating foot lifts)
-        if armature.joints.len() > 10 {
+        // 2. Preset-specific turnaround stepping / balance tracks
+        if armature.preset == RigPreset::Biped && armature.joints.len() > 10 {
             let mut l_thigh_r = Vec::with_capacity(frame_count * 4);
             let mut l_shin_r = Vec::with_capacity(frame_count * 4);
             let mut r_thigh_r = Vec::with_capacity(frame_count * 4);
@@ -491,6 +629,52 @@ impl ClipSynthesizer {
                 path: AnimationTargetPath::Rotation,
                 timestamps: timestamps.clone(),
                 values: r_shin_r,
+            });
+        } else if armature.preset == RigPreset::Quadruped && armature.joints.len() > 17 {
+            let mut tail_r = Vec::with_capacity(frame_count * 4);
+            let mut hl_r = Vec::with_capacity(frame_count * 4);
+            let mut hr_r = Vec::with_capacity(frame_count * 4);
+            let mut fl_r = Vec::with_capacity(frame_count * 4);
+            let mut fr_r = Vec::with_capacity(frame_count * 4);
+
+            for &t in &timestamps {
+                let step_phase = (t % 0.8) / 0.8;
+                let (lift_a, lift_b) = if step_phase < 0.5 {
+                    let tau = step_phase / 0.5;
+                    ((std::f32::consts::PI * tau).sin() * 0.35, 0.0f32)
+                } else {
+                    let tau = (step_phase - 0.5) / 0.5;
+                    (0.0f32, (std::f32::consts::PI * tau).sin() * 0.35)
+                };
+                tail_r.extend_from_slice(
+                    &Quat::from_euler(0.0, 0.14 * (two_pi * t / duration).sin(), 0.0).to_array(),
+                );
+                hl_r.extend_from_slice(&Quat::from_euler(lift_a * 0.5, 0.0, 0.0).to_array());
+                fr_r.extend_from_slice(&Quat::from_euler(lift_a * 0.5, 0.0, 0.0).to_array());
+                hr_r.extend_from_slice(&Quat::from_euler(lift_b * 0.5, 0.0, 0.0).to_array());
+                fl_r.extend_from_slice(&Quat::from_euler(lift_b * 0.5, 0.0, 0.0).to_array());
+            }
+
+            for (joint, vals) in [(5, tail_r), (7, hl_r), (10, hr_r), (13, fl_r), (16, fr_r)] {
+                tracks.push(AnimationTrack {
+                    target_joint: joint,
+                    path: AnimationTargetPath::Rotation,
+                    timestamps: timestamps.clone(),
+                    values: vals,
+                });
+            }
+        } else if armature.preset == RigPreset::Generic && armature.joints.len() > 2 {
+            let mut chest_r = Vec::with_capacity(frame_count * 4);
+            for &t in &timestamps {
+                let u = t / duration;
+                let sway = 0.04 * (4.0 * std::f32::consts::PI * u).sin();
+                chest_r.extend_from_slice(&Quat::from_euler(sway, 0.0, 0.0).to_array());
+            }
+            tracks.push(AnimationTrack {
+                target_joint: 2,
+                path: AnimationTargetPath::Rotation,
+                timestamps: timestamps.clone(),
+                values: chest_r,
             });
         }
 

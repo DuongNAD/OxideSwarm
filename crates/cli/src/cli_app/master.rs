@@ -19,7 +19,7 @@ use crate::secret_cmd::{announce_master_secret, decide_master_secret, SecretOpts
 
 use super::{
     resolve_auth_mode, resolve_p2p_minimal, resolve_relay_url, resolve_sourced_string,
-    resolve_state_dir_value, resolve_wire_codec, wait_for_worker_shutdown_signal, MasterArgs, MIB,
+    resolve_state_dir_value, resolve_wire_codec, MasterArgs, MIB,
 };
 
 /// Resolve `--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB` / `[master].max_active_mb`
@@ -237,6 +237,9 @@ async fn run_master_inner(
     secret_opts: SecretOpts,
     #[cfg(feature = "otel")] otel_handle: Option<rusty_grid_master::otel::OtlpExporterHandle>,
 ) -> ExitCode {
+    // Installed first, so a stop that arrives during start-up is handled as a clean shutdown
+    // once the master is up instead of killing it with the default action.
+    let shutdown_signals = super::ShutdownSignals::install();
     let master_cfg = config_file.as_ref().and_then(|c| c.master.clone());
 
     let rendezvous_url =
@@ -391,9 +394,6 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
-    // A bare master (no secret, no token) with a loopback dashboard gets local access without a
-    // login; the library enforces that this never applies to a non-loopback dashboard.
-    server_config = server_config.with_implicit_local_dashboard(true);
 
     let max_retained_tasks = resolve_usize(
         args.max_retained_tasks,
@@ -575,6 +575,13 @@ async fn run_master_inner(
             return ExitCode::FAILURE;
         }
     };
+    // A bare master (no secret, no token) with a loopback dashboard gets local access without a
+    // login; the library enforces that this never applies to a non-loopback dashboard. A
+    // members-only master reachable beyond loopback has no secret either, but it is not bare:
+    // local Admin there could mint invites, so only an explicit `--dev` opens its dashboard.
+    let cluster_exposed = !server_config.bind_addr.ip().is_loopback() || enable_p2p;
+    server_config =
+        server_config.with_implicit_local_dashboard(!cluster_exposed || auth_mode.allows_secret());
     let in_unisolated_unit_test =
         cfg!(test) && state_dir.is_none() && std::env::var_os("OXIDESWARM_HOME").is_none();
     let disable_v3_disk = in_unisolated_unit_test
@@ -808,8 +815,8 @@ async fn run_master_inner(
         }
     }
 
-    // Await termination signal (SIGINT or SIGTERM on Unix)
-    wait_for_worker_shutdown_signal().await;
+    // Await termination signal (SIGINT or SIGTERM on Unix), including one sent during start-up.
+    shutdown_signals.wait().await;
     println!("\nRustyGrid Master shutting down...");
     let _ = handle.shutdown();
     #[cfg(feature = "otel")]

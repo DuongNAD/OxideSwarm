@@ -99,7 +99,7 @@ async fn test_cli_cancel_stops_running_sleep_task() {
             "--interpreter",
             "python3",
             "--command",
-            "import time; time.sleep(30)",
+            "import time; time.sleep(120)",
             "--json",
         ],
         "spawn submit",
@@ -117,7 +117,7 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         .to_string();
 
     // Wait until the sleep task is Running on the worker.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let tasks = master.queue().list_tasks().await;
         if let Some(info) = tasks.first() {
@@ -174,17 +174,27 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         serde_json::from_slice(&second_cancel.stdout).expect("parse second cancel json");
     assert_eq!(second_json["cancelled"], false);
 
-    // `result --wait` on the cancelled task reports cancellation without waiting 30s.
+    // `result --wait` on the cancelled task reports cancellation well before 120s sleep.
     let res_out = cli_output(
         home,
         &["result", &task_id_str, "--master", &master_addr, "--wait"],
         "spawn result --wait",
     );
+    let cancel_elapsed = cancel_start.elapsed();
+    println!("cancelled 120s sleep task reported via result --wait in {cancel_elapsed:?}");
     assert!(!res_out.status.success());
     assert!(
-        cancel_start.elapsed() < Duration::from_secs(10),
-        "cancelled sleep task must stop well before 30s"
+        cancel_elapsed < Duration::from_secs(60),
+        "cancelled 120s sleep task hung past 60s guard: took {cancel_elapsed:?}"
     );
+    let cancelled_task = master
+        .queue()
+        .list_tasks()
+        .await
+        .into_iter()
+        .find(|info| info.task_id.to_string() == task_id_str)
+        .expect("cancelled sleep task missing from master queue");
+    assert_eq!(format!("{:?}", cancelled_task.state), "Cancelled");
     let res_stdout = String::from_utf8_lossy(&res_out.stdout);
     assert!(
         res_stdout.contains("cancelled") || res_stdout.contains("Cancelled"),

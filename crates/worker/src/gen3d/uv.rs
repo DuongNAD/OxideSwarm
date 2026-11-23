@@ -16,15 +16,35 @@ pub struct MultiChartBoxUnwrapper;
 
 impl UvUnwrapper for MultiChartBoxUnwrapper {
     fn unwrap(&self, mesh: &RawMesh, gutter_pixels: u32, atlas_size: u32) -> RawMesh {
+        self.unwrap_cancellable(mesh, gutter_pixels, atlas_size, &|| false)
+            .unwrap_or_else(|_| mesh.clone())
+    }
+}
+
+impl MultiChartBoxUnwrapper {
+    /// Parameterizes UV charts with cooperative cancellation polling.
+    pub fn unwrap_cancellable(
+        &self,
+        mesh: &RawMesh,
+        gutter_pixels: u32,
+        atlas_size: u32,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<RawMesh, String> {
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
         if mesh.positions.is_empty() || mesh.indices.is_empty() {
-            return mesh.clone();
+            return Ok(mesh.clone());
         }
 
         let num_faces = mesh.indices.len() / 3;
         let mut face_charts = Vec::with_capacity(num_faces);
 
         // 1. Assign each face to one of 6 cardinal charts (+-X, +-Y, +-Z)
-        for chunk in mesh.indices.chunks_exact(3) {
+        for (f_idx, chunk) in mesh.indices.chunks_exact(3).enumerate() {
+            if f_idx % 4096 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             let n0 = mesh
                 .normals
                 .get(chunk[0] as usize)
@@ -78,6 +98,9 @@ impl UvUnwrapper for MultiChartBoxUnwrapper {
             [f32::NEG_INFINITY, f32::NEG_INFINITY],
         ); 6];
         for (f_idx, chunk) in mesh.indices.chunks_exact(3).enumerate() {
+            if f_idx % 4096 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             let chart = face_charts[f_idx];
             for &v_idx in chunk {
                 let p = mesh.positions[v_idx as usize];
@@ -111,6 +134,9 @@ impl UvUnwrapper for MultiChartBoxUnwrapper {
         let mut vertex_map: HashMap<(u32, usize), u32> = HashMap::new();
 
         for (f_idx, chunk) in mesh.indices.chunks_exact(3).enumerate() {
+            if f_idx % 4096 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             let chart = face_charts[f_idx];
             let (min, max) = chart_bounds[chart];
             let span_u = (max[0] - min[0]).max(1e-5);
@@ -150,13 +176,13 @@ impl UvUnwrapper for MultiChartBoxUnwrapper {
             }
         }
 
-        RawMesh {
+        Ok(RawMesh {
             positions: new_positions,
             normals: new_normals,
             uvs: new_uvs,
             indices: new_indices,
             colors: mesh.colors.clone(),
-        }
+        })
     }
 }
 

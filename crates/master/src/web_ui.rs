@@ -14,7 +14,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use futures::{SinkExt, StreamExt};
@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Semaphore};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{debug, error, info, warn};
+
+mod members;
 
 use crate::auth::{
     rbac_auth_middleware, resolve_dashboard_auth, security_headers_middleware, AuthConfig,
@@ -91,6 +93,9 @@ pub struct WebUiState {
     pub cluster_secret: Option<rusty_grid_core::ClusterSecret>,
     pub rendezvous_registry:
         Arc<tokio::sync::RwLock<Option<rusty_grid_core::discovery::RendezvousLease>>>,
+    pub members: Arc<crate::server::MemberStore>,
+    pub(crate) auth_ctx: crate::server::MasterAuthContext,
+    pub(crate) waiters: crate::server::WaiterMap,
 }
 
 impl WebUiState {
@@ -169,6 +174,17 @@ pub fn create_web_ui_state(
     let cluster_secret = master_handle
         .as_ref()
         .and_then(|h| h.cluster_secret().cloned());
+    let (auth_ctx, waiters) = match master_handle.as_ref() {
+        Some(handle) => (handle.auth_ctx().clone(), handle.waiters().clone()),
+        None => {
+            let ctx = crate::server::MasterAuthContext {
+                p2p_ticket: p2p_ticket.clone(),
+                ..Default::default()
+            };
+            (ctx, crate::server::WaiterMap::default())
+        }
+    };
+    let members = Arc::clone(&auth_ctx.members);
     WebUiState {
         registry,
         queue,
@@ -184,6 +200,9 @@ pub fn create_web_ui_state(
         stream_slots: Arc::new(Semaphore::new(MAX_STREAM_CLIENTS)),
         cluster_secret,
         rendezvous_registry: Arc::new(tokio::sync::RwLock::new(None)),
+        members,
+        auth_ctx,
+        waiters,
     }
 }
 
@@ -282,6 +301,17 @@ pub fn create_web_ui_router_full(
     let cluster_secret = master_handle
         .as_ref()
         .and_then(|h| h.cluster_secret().cloned());
+    let (auth_ctx, waiters) = match master_handle.as_ref() {
+        Some(handle) => (handle.auth_ctx().clone(), handle.waiters().clone()),
+        None => {
+            let ctx = crate::server::MasterAuthContext {
+                p2p_ticket: p2p_ticket.clone(),
+                ..Default::default()
+            };
+            (ctx, crate::server::WaiterMap::default())
+        }
+    };
+    let members = Arc::clone(&auth_ctx.members);
     let state = WebUiState {
         registry,
         queue,
@@ -297,6 +327,9 @@ pub fn create_web_ui_router_full(
         stream_slots: Arc::new(Semaphore::new(MAX_STREAM_CLIENTS)),
         cluster_secret,
         rendezvous_registry: Arc::new(tokio::sync::RwLock::new(None)),
+        members,
+        auth_ctx,
+        waiters,
     };
 
     Router::new()
@@ -308,6 +341,29 @@ pub fn create_web_ui_router_full(
         .route("/api/workers", get(api_get_workers))
         .route("/api/tasks", get(api_get_tasks).post(api_submit_task))
         .route("/api/tasks/{task_id}", get(api_get_task_standardized))
+        // Member & Invite Administration APIs (Admin scope enforced in auth.rs)
+        .route("/api/members", get(members::api_get_members))
+        .route(
+            "/api/members/{name_or_id}/approve",
+            post(members::api_approve_member),
+        )
+        .route(
+            "/api/members/{name_or_id}/reject",
+            post(members::api_reject_member),
+        )
+        .route(
+            "/api/members/{name_or_id}/revoke",
+            post(members::api_revoke_member),
+        )
+        .route(
+            "/api/members/{name_or_id}/rename",
+            post(members::api_rename_member),
+        )
+        .route(
+            "/api/invites",
+            get(members::api_list_invites).post(members::api_create_invite),
+        )
+        .route("/api/invites/{id}", delete(members::api_revoke_invite))
         // Discovery & Rendezvous Probe APIs
         .route("/api/discovery/probe", get(api_discovery_probe))
         .route("/api/rendezvous/register", post(api_rendezvous_register))
@@ -363,7 +419,7 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
     }
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
@@ -465,6 +521,8 @@ pub struct WorkerUiInfo {
     pub interconnect_type: String,
     pub is_relayed: bool,
     pub rtt_ms: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,6 +716,13 @@ async fn api_status(
             }
         };
 
+        let speed_factor = rusty_grid_core::placement::tag_value(
+            &w.capabilities.tags,
+            rusty_grid_core::placement::SPEED_TAG_PREFIX,
+        )
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+
         workers.push(WorkerUiInfo {
             id: w.worker_id.to_string(),
             name: w.capabilities.name,
@@ -678,6 +743,7 @@ async fn api_status(
             interconnect_type,
             is_relayed,
             rtt_ms,
+            speed_factor,
         });
     }
 
@@ -851,7 +917,7 @@ struct SubmitTaskResponse {
     message: String,
 }
 
-fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(super) fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
     (
         status,
         Json(serde_json::json!({
@@ -1567,6 +1633,7 @@ mod tests {
             interconnect_type: "Direct P2P (QUIC)".to_string(),
             is_relayed: false,
             rtt_ms: Some(18.5),
+            speed_factor: Some(1.25),
         };
 
         let json = serde_json::to_string(&info).expect("WorkerUiInfo should serialize to json");
@@ -1581,6 +1648,7 @@ mod tests {
         assert!(json.contains("\"interconnect_type\":\"Direct P2P (QUIC)\""));
         assert!(json.contains("\"is_relayed\":false"));
         assert!(json.contains("\"rtt_ms\":18.5"));
+        assert!(json.contains("\"speed_factor\":1.25"));
     }
 
     #[test]
@@ -1650,6 +1718,50 @@ mod tests {
         assert!(
             html.contains("runWorkflowMode('doc', 'export')"),
             "Dashboard must provide Update/Export Spec button in Doc mode"
+        );
+
+        // 8. Members & Enrollment tab UI + XSS-safe delegated event handling (ENROLL-1d)
+        assert!(
+            html.contains("id=\"btnTabMembers\""),
+            "Members tab button must be present"
+        );
+        assert!(
+            html.contains("id=\"tabMembers\""),
+            "Members tab pane must be present"
+        );
+        assert!(
+            html.contains("<span id=\"tabMembersBadge\">0</span>"),
+            "tabMembersBadge must be initialized to 0"
+        );
+        assert!(
+            html.contains("/api/members") && html.contains("/api/invites"),
+            "Members tab must call /api/members and /api/invites"
+        );
+        assert!(
+            html.contains("data-action=") && html.contains("data-id="),
+            "Members tab actions must use delegated data-action/data-id attributes"
+        );
+        assert!(
+            html.contains("setHtml(") && html.contains("wireMembersView"),
+            "Members tab must render via setHtml() and wire delegated listeners"
+        );
+        assert!(
+            html.contains("isInputFocusedInside") && html.contains("syncMembers(true)"),
+            "Members background polling must preserve active inline inputs and focus"
+        );
+        assert!(
+            html.contains(".node-title-group {"),
+            "node-title-group CSS rule must be defined"
+        );
+        assert!(
+            html.contains(".badge-speed {")
+                && html.contains("id=\"mSpeed\"")
+                && html.contains("speed_factor"),
+            "Worker speed badge and modal detail row must be present (SCHED-4d)"
+        );
+        assert!(
+            html.matches(".innerHTML").count() == 1,
+            "setHtml() must remain the single innerHTML assignment in dashboard.html"
         );
     }
 

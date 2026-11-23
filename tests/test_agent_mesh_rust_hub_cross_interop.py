@@ -12,6 +12,9 @@ Tests the compiled Rust binary (`agent-mesh` Hub) with Python agent nodes across
    - Verifies strict Node 2 isolation (Node 2 receives 0 commands).
    - Verifies DeliveryNack for nonexistent target.
    - Performs 50-packet bidirectional data burst.
+   - Sends a 2.5 MiB (3-chunk) payload with the Rust `agent-mesh data` CLI to the Python
+     `scripts/agent_node.py` node, which reassembles and verifies it before the one receipt that
+     makes the CLI report delivery (design 0107).
 2. Suite 2 (`test_agent_mesh_token_auth.py`):
    - Token authentication, duplicate node ID rejection, forged `from` NACK, foreign Origin 403,
      and `--token` / `OXIDE_MESH_TOKEN` CLI flags.
@@ -51,10 +54,14 @@ logger = logging.getLogger("CrossInterop")
 # Ensure tests and root directory are in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-for p in [current_dir, parent_dir]:
+for p in [current_dir, parent_dir, os.path.join(parent_dir, "scripts")]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import hashlib  # noqa: E402
+import tempfile  # noqa: E402
+
+from agent_node import OxideAgentNode  # noqa: E402
 from test_agent_mesh_simulation import SimulatedAgentNode
 from test_agent_mesh_token_auth import run_token_auth_tests
 from test_agent_mesh_adversarial_stress import run_adversarial_stress_tests
@@ -205,6 +212,50 @@ async def run_cross_interop_tests():
         assert len(node1.received_data_payloads) == 25
         assert len(node2.received_data_payloads) == 0, "Node 2 intercepted packets during burst!"
         logger.info("✓ 50-packet burst through Rust Hub succeeded with 0 data loss and strict isolation!")
+
+        # Rust sender -> Rust hub -> Python agent_node.py: a multi-chunk payload is reassembled,
+        # verified as a whole, and only then confirmed (design 0107).
+        logger.info("Sending a 3-chunk payload from the Rust CLI to the Python agent node...")
+        py_node = OxideAgentNode(hub_ws_url, "py-chunk-consumer", "linux")
+        await py_node.connect()
+        py_listener = asyncio.create_task(py_node.listen())
+        try:
+            reg_deadline = time.time() + 60.0
+            while time.time() < reg_deadline:
+                with urllib.request.urlopen(f"{hub_http_url}/api/nodes", timeout=2.0) as resp:
+                    if any(n["node_id"] == "py-chunk-consumer" for n in json.loads(resp.read())):
+                        break
+                await asyncio.sleep(0.02)
+            payload = (bytes(range(256)) * 10241)[: 2 * 1024 * 1024 + 512 * 1024]
+            payload_sha = hashlib.sha256(payload).hexdigest()
+            with tempfile.TemporaryDirectory() as tmp:
+                payload_path = os.path.join(tmp, "payload.bin")
+                with open(payload_path, "wb") as f:
+                    f.write(payload)
+                sender = await asyncio.create_subprocess_exec(
+                    bin_path, "data", "--hub", hub_ws_url, "--from", "rust-chunk-sender",
+                    "--to", "py-chunk-consumer", "--payload-file", payload_path,
+                    "--timeout-ms", "60000",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                out, err = await asyncio.wait_for(sender.communicate(), timeout=120.0)
+            out_text, err_text = out.decode(errors="replace"), err.decode(errors="replace")
+            assert sender.returncode == 0, f"agent-mesh data failed: {err_text}"
+            assert payload_sha in out_text and "Chunks: 3" in out_text, out_text
+            assert "py-chunk-consumer (data_received_verified)" in out_text, out_text
+            assert len(py_node.received_data_payloads) == 1
+            kept = py_node.received_data_payloads[-1]
+            assert kept["data"].encode("latin1") == payload, "Python node kept other bytes"
+            assert kept["checksum_sha256"] == payload_sha
+        finally:
+            py_node.running = False
+            await py_node.ws.close()
+            py_listener.cancel()
+            try:
+                await py_listener
+            except (asyncio.CancelledError, Exception):
+                pass
+        logger.info("✓ Python node reassembled and verified a 3-chunk Rust payload before its receipt")
 
         # Close clients
         await node1.close()

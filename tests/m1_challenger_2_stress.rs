@@ -29,6 +29,7 @@ use rusty_grid_master::server::{MasterServer, ServerConfig};
 /// The bound on how long a test waits for a master's Web UI to accept a connection or for its port
 /// to come free again (TEST-52). It is a limit, not a window: each wait ends as soon as its
 /// condition holds.
+#[cfg(feature = "dashboard")]
 const WEB_UI_WAIT: Duration = Duration::from_secs(30);
 
 /// Helper polling predicate until condition is met or timeout elapses.
@@ -230,6 +231,7 @@ async fn test_master_server_rpc_resilience_on_web_ui_port_conflict() {
     let _ = master.shutdown();
 }
 
+#[cfg(feature = "dashboard")]
 #[tokio::test]
 async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() {
     // 1. Bind a TCP listener to a dedicated port to simulate a port conflict
@@ -278,6 +280,7 @@ async fn test_master_server_explicit_dashboard_port_conflict_returns_io_error() 
     drop(blocker);
 }
 
+#[cfg(feature = "dashboard")]
 #[tokio::test]
 async fn test_web_ui_port_release_and_reuse_after_shutdown() {
     // 1. Master 1 picks its own Web UI port (TEST-52): a port the test bound, dropped and then
@@ -571,6 +574,7 @@ async fn test_server_config_environment_variable_override_matrix() {
     assert!(cfg4.enable_web_ui);
 }
 
+#[cfg(feature = "dashboard")]
 #[tokio::test]
 async fn test_web_ui_http_api_endpoints_under_ephemeral_multi_master() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

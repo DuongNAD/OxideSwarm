@@ -1,3 +1,5 @@
+#![cfg(feature = "dashboard")]
+
 //! Automated Integration Test Suite for Milestone 10: Embedded Web Observability Dashboard.
 //!
 //! Validates:

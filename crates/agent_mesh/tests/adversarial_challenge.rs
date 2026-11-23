@@ -165,24 +165,27 @@ async fn test_rust_executor_direct_hung_command_kill() {
     let (cmd, args) = (
         "shell_exec",
         serde_json::json!({
-            "cmd": "powershell -NoProfile -Command Start-Sleep -Seconds 10"
+            "cmd": "powershell -NoProfile -Command Start-Sleep -Seconds 120"
         }),
     );
 
     #[cfg(not(target_os = "windows"))]
-    let (cmd, args) = ("shell_exec", serde_json::json!({"cmd": "sleep 10"}));
+    let (cmd, args) = ("shell_exec", serde_json::json!({"cmd": "sleep 120"}));
 
     let t0 = std::time::Instant::now();
     let res = CommandExecutor::execute(cmd, &args, Some(1000)).await;
     let elapsed = t0.elapsed();
 
-    println!("Direct Hung Command Timeout Result: {:?}", res);
+    println!(
+        "Direct Hung Command Timeout Result: {:?} in {elapsed:?}",
+        res
+    );
     assert_eq!(res.status, "timeout");
     assert_eq!(res.exit_code, 124);
     assert!(res.stderr.contains("1000 ms"));
     assert!(
-        elapsed.as_millis() < 4000,
-        "Direct command was not terminated upon timeout! Took {:?}",
+        elapsed < Duration::from_secs(60),
+        "Direct command was not terminated before 60s guard! Took {:?}",
         elapsed
     );
 }

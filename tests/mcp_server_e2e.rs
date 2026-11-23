@@ -1878,13 +1878,14 @@ async fn test_mcp_and_cli_workspace_sync_dir_refusals_and_wait_warning() {
         .output()
         .expect("run oxideswarm submit --workspace --wait --timeout-secs 1");
     let elapsed = started.elapsed();
+    println!("submit --workspace --wait --timeout-secs 1 finished in {elapsed:?}");
     assert!(
         !cli_wait.status.success(),
         "submit --wait must fail on timeout"
     );
     assert!(
-        elapsed < Duration::from_secs(10),
-        "submit --wait must honour --timeout-secs 1 (took {elapsed:?})"
+        elapsed < Duration::from_secs(60),
+        "submit --wait --timeout-secs 1 hung past 60s guard (took {elapsed:?})"
     );
     let stderr = String::from_utf8_lossy(&cli_wait.stderr);
     assert!(

@@ -3377,7 +3377,7 @@ async fn test_worker_client_with_blender_path_plumbs_override_to_runner() {
         )
         .expect("procedural 3d mesh");
         let spec = rusty_grid_core::task::AutoRigSpec::new(
-            rusty_grid_core::task::Bytes::from(glb_bytes),
+            rusty_grid_core::task::Bytes::from(glb_bytes.clone()),
             "biped",
         )
         .with_provider("blender");
@@ -3390,13 +3390,47 @@ async fn test_worker_client_with_blender_path_plumbs_override_to_runner() {
             .execute_task_with_checkpoint(&task, None, None, None, None)
             .await;
         assert!(
-                marker_file.exists(),
-                "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
-            );
+            marker_file.exists(),
+            "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
+        );
         assert!(
-            result.is_success(),
-            "AutoRig should fall back cleanly after fake Blender exits 42: {:?}",
-            result.error
+            !result.is_success(),
+            "Explicit preferred_provider='blender' must fail when fake Blender exits 42"
+        );
+        assert_ne!(result.exit_code, 0);
+        let err_str = result.error.as_deref().unwrap_or("");
+        assert!(
+            err_str.contains("42"),
+            "Expected exit code 42 diagnostic in error, got: {err_str}"
+        );
+
+        // Explicit "auto" provider falls back cleanly to Builtin on Blender failure
+        let _ = std::fs::remove_file(&marker_file);
+        let auto_spec = rusty_grid_core::task::AutoRigSpec::new(
+            rusty_grid_core::task::Bytes::from(glb_bytes),
+            "biped",
+        )
+        .with_provider("auto");
+        let auto_task = Task::new(
+            rusty_grid_core::task::TaskSpec::AutoRig(auto_spec),
+            rusty_grid_core::task::TaskRequirements::generic(1, 30),
+        );
+        let auto_result = client
+            .runner
+            .execute_task_with_checkpoint(&auto_task, None, None, None, None)
+            .await;
+        assert!(
+            marker_file.exists(),
+            "AutoRig 'auto' must attempt configured blender_path before falling back"
+        );
+        assert!(
+            auto_result.is_success(),
+            "AutoRig 'auto' should fall back cleanly after fake Blender exits 42: {:?}",
+            auto_result.error
+        );
+        assert_eq!(
+            auto_result.device_name.as_deref(),
+            Some("OxideSwarm-AutoRig-Builtin")
         );
     }
     #[cfg(not(feature = "3d"))]
