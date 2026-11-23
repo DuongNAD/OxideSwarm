@@ -61,6 +61,13 @@ DISK_RESERVE_BYTES = 10 * GIB
 DEFAULT_SEED = 20261119
 ALL_SCENARIOS = ("T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9")
 DEFAULT_LOOPBACK_SCENARIOS = ("T1", "T2", "T3", "T4", "T6", "T7", "T8")
+TRANSFER_LINKS = ("loopback", "lan-tcp", "lan-quic", "quic-relay")
+LINK_SEED_OFFSETS = {
+    "loopback": 0,
+    "lan-tcp": 10000,
+    "lan-quic": 20000,
+    "quic-relay": 30000,
+}
 
 UPLOAD_RE = re.compile(
     r"Inputs: (\d+) files \(([^)]*)\); sent (\d+) of (\d+) blobs \(([^)]*)\), (\d+) already on the master"
@@ -71,6 +78,8 @@ HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _DRIVE_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s\"'<>|,;\)\]]+")
 _USER_UNIX_PATH_RE = re.compile(r"/(?:Users|home)/[^/\s\"'<>|,;\)\]]+(?:/[^\s\"'<>|,;\)\]]*)*")
 _IPV4_PORT_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})(:\d+)?\b")
+_P2P_TICKET_JSON_RE = re.compile(r'\{"id":"[0-9a-f]{32,128}","addrs":\[[^\n]*?\]\}')
+_BRACKET_IPV6_RE = re.compile(r"\[(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\](?::\d+)?")
 
 _SAFE_ENV_STRIP_EXACT = {
     "OXIDESWARM_SECRET",
@@ -1440,6 +1449,13 @@ def _replace_non_loopback_ipv4(m: re.Match) -> str:
     return "<ip>" + (":<port>" if port else "")
 
 
+def _replace_non_loopback_ipv6(m: re.Match) -> str:
+    txt = m.group(0)
+    if txt.startswith("[::1]"):
+        return txt
+    return "<ipv6>"
+
+
 def _whole_token_pattern(token: str) -> re.Pattern:
     """Compile a case-insensitive whole-token matcher so short tokens do not hit substrings."""
     escaped = re.escape(token.strip())
@@ -1447,10 +1463,12 @@ def _whole_token_pattern(token: str) -> re.Pattern:
 
 
 def redact_text(text: str, extra_secrets: Iterable[str] = ()) -> str:
-    """Scrub host names, user names, local paths, and non-loopback IPv4 addresses."""
+    """Scrub host names, user names, local paths, P2P tickets, and non-loopback IPs."""
     if not text:
         return text
     out = str(text)
+    out = _P2P_TICKET_JSON_RE.sub("<p2p-ticket>", out)
+    out = _BRACKET_IPV6_RE.sub(_replace_non_loopback_ipv6, out)
     out = _DRIVE_PATH_RE.sub("<path>", out)
     out = _USER_UNIX_PATH_RE.sub("<path>", out)
     for tok in _sensitive_tokens(extra_secrets):
@@ -1466,6 +1484,12 @@ def _scan_string_privacy(
 ) -> List[Dict[str, str]]:
     hits: List[Dict[str, str]] = []
     lower = value.lower()
+    if _P2P_TICKET_JSON_RE.search(value):
+        hits.append({"field": field_path, "reason": "matched P2P ticket"})
+    for m6 in _BRACKET_IPV6_RE.finditer(value):
+        if not m6.group(0).startswith("[::1]"):
+            hits.append({"field": field_path, "reason": "matched non-loopback IPv6 address"})
+            break
     for pat in token_patterns:
         if pat.search(value):
             hits.append({"field": field_path, "reason": "matched local host/user/path token"})
@@ -2091,8 +2115,44 @@ class BackgroundSampler:
 # ---------------------------------------------------------------- isolated cluster management
 
 
+def _isolated_process_env(home: str, empty_config: str) -> Dict[str, str]:
+    """Isolated process environment with private HOME/OXIDESWARM_HOME while preserving Rust toolchains."""
+    os.makedirs(home, exist_ok=True)
+    tmp_dir = os.path.join(home, "tmp")
+    ox_home = os.path.join(home, "oxideswarm")
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(ox_home, exist_ok=True)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("RUSTY_GRID_") and k not in _SAFE_ENV_STRIP_EXACT
+    }
+    orig_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if "RUSTUP_HOME" not in env and orig_home:
+        cand = os.path.join(orig_home, ".rustup")
+        if os.path.isdir(cand):
+            env["RUSTUP_HOME"] = cand
+    if "CARGO_HOME" not in env and orig_home:
+        cand = os.path.join(orig_home, ".cargo")
+        if os.path.isdir(cand):
+            env["CARGO_HOME"] = cand
+    env.update(
+        HOME=home,
+        USERPROFILE=home,
+        OXIDESWARM_HOME=ox_home,
+        TEMP=tmp_dir,
+        TMP=tmp_dir,
+        TMPDIR=tmp_dir,
+        RUSTY_GRID_CONFIG=empty_config,
+        RUSTY_GRID_NO_BATTERY="1",
+        NO_COLOR="1",
+    )
+    return env
+
+
 class EnduranceCluster:
     """Isolated master + worker(s) on 127.0.0.1 using ephemeral ports and private homes."""
+    is_remote = False
 
     def __init__(
         self,
@@ -2131,28 +2191,7 @@ class EnduranceCluster:
         self.client_env = self._build_env(os.path.join(self.workdir, "home-client"))
 
     def _build_env(self, home: str) -> Dict[str, str]:
-        os.makedirs(home, exist_ok=True)
-        tmp_dir = os.path.join(home, "tmp")
-        ox_home = os.path.join(home, "oxideswarm")
-        os.makedirs(tmp_dir, exist_ok=True)
-        os.makedirs(ox_home, exist_ok=True)
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith("RUSTY_GRID_") and k not in _SAFE_ENV_STRIP_EXACT
-        }
-        env.update(
-            HOME=home,
-            USERPROFILE=home,
-            OXIDESWARM_HOME=ox_home,
-            TEMP=tmp_dir,
-            TMP=tmp_dir,
-            TMPDIR=tmp_dir,
-            RUSTY_GRID_CONFIG=self.empty_config,
-            RUSTY_GRID_NO_BATTERY="1",
-            NO_COLOR="1",
-        )
-        return env
+        return _isolated_process_env(home, self.empty_config)
 
     def _spawn(self, name: str, args: List[str]) -> subprocess.Popen:
         log = open(os.path.join(self.workdir, name + ".log"), "wb")
@@ -2354,6 +2393,280 @@ class EnduranceCluster:
             except Exception:
                 pass
         self.procs = []
+
+
+def resolve_master_arg(raw: Optional[str]) -> Optional[str]:
+    """Resolve --master value, reading UTF-8 ticket file when prefixed with '@'."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        path = os.path.expanduser(text[1:].strip())
+        if not path or not os.path.isfile(path):
+            raise ValueError("master ticket file not found: %s" % path)
+        with open(path, encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            raise ValueError("master ticket file is empty: %s" % path)
+        return content
+    return text
+
+
+def _parse_host_port(addr: str) -> Tuple[str, int]:
+    s = (addr or "").strip()
+    if not s or s.startswith("{") or ":" not in s:
+        return "", 0
+    if s.startswith("["):
+        if "]:" not in s:
+            return "", 0
+        host, pstr = s[1:].rsplit("]:", 1)
+    else:
+        host, pstr = s.rsplit(":", 1)
+    if not pstr.isdigit():
+        return "", 0
+    return host, int(pstr)
+
+
+def _sum_tmp_bytes(blob_dir: Optional[str]) -> int:
+    if not blob_dir:
+        return 0
+    tmp_dir = os.path.join(blob_dir, "tmp")
+    if not os.path.isdir(tmp_dir):
+        return 0
+    total = 0
+    try:
+        with os.scandir(tmp_dir) as it:
+            for entry in it:
+                try:
+                    total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def _summarize_remote_worker(w: Dict[str, Any]) -> Dict[str, Any]:
+    tags = [str(t) for t in w.get("tags") or []]
+    keep_tags = [
+        t for t in tags
+        if t.startswith(("os:", "arch:", "iso:", "slots:", "proto:", "link:", "state:", "tool:"))
+    ]
+    return {
+        "name": str(w.get("name") or ""),
+        "cpu_cores": w.get("cpu_cores"),
+        "ram_mb": w.get("ram_mb"),
+        "has_gpu": bool(w.get("has_gpu")),
+        "is_simulated_gpu": bool(w.get("is_simulated_gpu")),
+        "link": str(w.get("link") or ""),
+        "tags": keep_tags,
+    }
+
+
+class RemoteEnduranceCluster:
+    """Adapter for TEST-24 two-machine runs against an already-running remote master and worker."""
+    is_remote = True
+
+    def __init__(
+        self,
+        binary: str,
+        workdir: str,
+        master_addr: str,
+        *,
+        secret_file: Optional[str] = None,
+        insecure: bool = False,
+        require_tags: Iterable[str] = (),
+        target_worker: Optional[str] = None,
+        master_pid: Optional[int] = None,
+        master_blob_dir: Optional[str] = None,
+        master_log: Optional[str] = None,
+    ) -> None:
+        self.binary = binary
+        self.workdir = os.path.abspath(workdir)
+        os.makedirs(self.workdir, exist_ok=True)
+        self.master_addr = str(master_addr).strip()
+        self.master_host, self.master_port = _parse_host_port(self.master_addr)
+        self.secret_file = os.path.abspath(secret_file) if secret_file else None
+        self.insecure = bool(insecure)
+        self.require_tags = [str(t).strip() for t in require_tags if str(t).strip()]
+        self.target_worker = str(target_worker).strip() if (target_worker and str(target_worker).strip()) else None
+        self.master_pid = int(master_pid) if master_pid else None
+        self.blob_dir = os.path.abspath(master_blob_dir) if master_blob_dir else None
+        self.master_log = os.path.abspath(master_log) if master_log else None
+        self.sandbox_dirs: List[str] = []
+        self.empty_config = os.path.join(self.workdir, "empty.toml")
+        with open(self.empty_config, "w", encoding="utf-8") as f:
+            f.write("")
+        self._extra_pids_lock = threading.Lock()
+        self._extra_pids: Dict[str, int] = {}
+        self.client_env = self._build_env(os.path.join(self.workdir, "home-client"))
+        self._log_start_offset = 0
+        self.remote_workers: List[Dict[str, Any]] = []
+        self.forbidden_tokens = [
+            tok for tok in (self.master_addr, self.secret_file, self.blob_dir, self.master_log) if tok
+        ]
+
+    def _build_env(self, home: str) -> Dict[str, str]:
+        return _isolated_process_env(home, self.empty_config)
+
+    def _auth_flags(self) -> List[str]:
+        if self.secret_file:
+            return ["--secret-file", self.secret_file]
+        if self.insecure:
+            return ["--insecure"]
+        return []
+
+    def build_cli_cmd(self, args: List[str], master_addr: Optional[str] = None) -> List[str]:
+        subcmd = args[:1]
+        rest = list(args[1:])
+        addr = master_addr or self.master_addr
+        extra = list(self._auth_flags())
+        if subcmd == ["submit"]:
+            if self.target_worker:
+                extra.extend(["--worker", self.target_worker])
+            for tag in self.require_tags:
+                extra.extend(["--require-tag", tag])
+        return [self.binary] + subcmd + ["--master", addr] + extra + rest
+
+    def active_pids(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        if self.master_pid and pid_alive(self.master_pid):
+            out["master"] = self.master_pid
+        with self._extra_pids_lock:
+            out.update(self._extra_pids)
+        return out
+
+    def set_extra_pid(self, role: str, pid: Optional[int]) -> None:
+        with self._extra_pids_lock:
+            if pid is None:
+                self._extra_pids.pop(role, None)
+            else:
+                self._extra_pids[role] = int(pid)
+
+    def _matches_tags(self, worker: Dict[str, Any]) -> bool:
+        wtags = set(str(t) for t in (worker.get("tags") or []))
+        if any(t.startswith("state:") for t in wtags) and "state:connected" not in wtags:
+            return False
+        if self.target_worker:
+            wname = str(worker.get("name") or "")
+            wid = ""
+            for t in wtags:
+                if t.startswith("id:"):
+                    wid = t[3:]
+                    break
+            if self.target_worker.lower() not in (wname.lower(), wid.lower()):
+                return False
+        if not self.require_tags:
+            return True
+        return all(t in wtags for t in self.require_tags)
+
+    def start(self) -> "RemoteEnduranceCluster":
+        if self.master_log and os.path.isfile(self.master_log):
+            try:
+                self._log_start_offset = os.path.getsize(self.master_log)
+            except OSError:
+                self._log_start_offset = 0
+        deadline = time.monotonic() + 20.0
+        last_err = ""
+        while time.monotonic() < deadline:
+            r = self.run_client(["workers", "--json"], timeout=15.0)
+            if r.returncode == 0:
+                try:
+                    listed = json.loads(r.stdout)
+                except ValueError as exc:
+                    last_err = "invalid workers JSON: %s" % exc
+                else:
+                    matched = [w for w in listed if self._matches_tags(w)] if isinstance(listed, list) else []
+                    if matched:
+                        self.remote_workers = [_summarize_remote_worker(w) for w in matched]
+                        return self
+                    last_err = "no connected worker matching tags=%r (saw %d workers)" % (
+                        self.require_tags,
+                        len(listed) if isinstance(listed, list) else 0,
+                    )
+            else:
+                last_err = redact_text((r.stderr or r.stdout or "").strip()[-300:], self.forbidden_tokens)
+            time.sleep(0.5)
+        raise RuntimeError("remote cluster readiness failed: %s" % (last_err or "timeout"))
+
+    def dir_map(self) -> Dict[str, str]:
+        if self.blob_dir:
+            return {"blob_store_bytes": self.blob_dir}
+        return {}
+
+    def run_client(
+        self,
+        args: List[str],
+        timeout: float = 120.0,
+        master_addr: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        cmd = self.build_cli_cmd(args, master_addr=master_addr)
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.client_env,
+            timeout=timeout,
+        )
+
+    def spawn_submit(
+        self,
+        submit_args: List[str],
+        master_addr: Optional[str] = None,
+    ) -> subprocess.Popen:
+        cmd = self.build_cli_cmd(["submit"] + submit_args, master_addr=master_addr)
+        kw: Dict[str, Any] = {} if IS_WINDOWS else {"start_new_session": True}
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.client_env,
+            **kw,
+        )
+
+    def run_submit_sampled(
+        self,
+        submit_args: List[str],
+        timeout: float = 600.0,
+        master_addr: Optional[str] = None,
+    ) -> Tuple[int, str, str, float]:
+        t0 = time.perf_counter()
+        p = self.spawn_submit(submit_args, master_addr=master_addr)
+        self.set_extra_pid("client", p.pid)
+        try:
+            stdout, stderr = p.communicate(timeout=timeout)
+            dt = time.perf_counter() - t0
+            return p.returncode, stdout or "", stderr or "", dt
+        except subprocess.TimeoutExpired:
+            p.kill()
+            stdout, stderr = p.communicate()
+            dt = time.perf_counter() - t0
+            return 124, stdout or "", (stderr or "") + "\n[harness] submit timed out after %.1f s" % dt, dt
+        finally:
+            self.set_extra_pid("client", None)
+
+    def read_log(self, role: str) -> str:
+        if role != "master" or not self.master_log or not os.path.isfile(self.master_log):
+            return ""
+        with open(self.master_log, encoding="utf-8", errors="replace") as f:
+            if self._log_start_offset > 0:
+                try:
+                    if os.path.getsize(self.master_log) >= self._log_start_offset:
+                        f.seek(self._log_start_offset)
+                except OSError:
+                    pass
+            return f.read()
+
+    def stop(self) -> None:
+        # Remote mode never stops the external master or remote worker; only remove client workdir.
+        shutil.rmtree(self.workdir, ignore_errors=True)
 
 
 def pid_alive(pid: int) -> bool:
@@ -3281,6 +3594,280 @@ class SoakCluster(EnduranceCluster):
                     self._record_pid_exit(p.pid)
         self.procs = []
 
+
+def resolve_master_arg(raw: Optional[str]) -> Optional[str]:
+    """Resolve --master value, reading UTF-8 ticket file when prefixed with '@'."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        path = os.path.expanduser(text[1:].strip())
+        if not path or not os.path.isfile(path):
+            raise ValueError("master ticket file not found: %s" % path)
+        with open(path, encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            raise ValueError("master ticket file is empty: %s" % path)
+        return content
+    return text
+
+
+def _parse_host_port(addr: str) -> Tuple[str, int]:
+    s = (addr or "").strip()
+    if not s or s.startswith("{") or ":" not in s:
+        return "", 0
+    if s.startswith("["):
+        if "]:" not in s:
+            return "", 0
+        host, pstr = s[1:].rsplit("]:", 1)
+    else:
+        host, pstr = s.rsplit(":", 1)
+    if not pstr.isdigit():
+        return "", 0
+    return host, int(pstr)
+
+
+def _sum_tmp_bytes(blob_dir: Optional[str]) -> int:
+    if not blob_dir:
+        return 0
+    tmp_dir = os.path.join(blob_dir, "tmp")
+    if not os.path.isdir(tmp_dir):
+        return 0
+    total = 0
+    try:
+        with os.scandir(tmp_dir) as it:
+            for entry in it:
+                try:
+                    total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def _summarize_remote_worker(w: Dict[str, Any]) -> Dict[str, Any]:
+    tags = [str(t) for t in w.get("tags") or []]
+    keep_tags = [
+        t for t in tags
+        if t.startswith(("os:", "arch:", "iso:", "slots:", "proto:", "link:", "state:", "tool:"))
+    ]
+    return {
+        "name": str(w.get("name") or ""),
+        "cpu_cores": w.get("cpu_cores"),
+        "ram_mb": w.get("ram_mb"),
+        "has_gpu": bool(w.get("has_gpu")),
+        "is_simulated_gpu": bool(w.get("is_simulated_gpu")),
+        "link": str(w.get("link") or ""),
+        "tags": keep_tags,
+    }
+
+
+class RemoteEnduranceCluster:
+    """Adapter for TEST-24 two-machine runs against an already-running remote master and worker."""
+    is_remote = True
+
+    def __init__(
+        self,
+        binary: str,
+        workdir: str,
+        master_addr: str,
+        *,
+        secret_file: Optional[str] = None,
+        insecure: bool = False,
+        require_tags: Iterable[str] = (),
+        target_worker: Optional[str] = None,
+        master_pid: Optional[int] = None,
+        master_blob_dir: Optional[str] = None,
+        master_log: Optional[str] = None,
+    ) -> None:
+        self.binary = binary
+        self.workdir = os.path.abspath(workdir)
+        os.makedirs(self.workdir, exist_ok=True)
+        self.master_addr = str(master_addr).strip()
+        self.master_host, self.master_port = _parse_host_port(self.master_addr)
+        self.secret_file = os.path.abspath(secret_file) if secret_file else None
+        self.insecure = bool(insecure)
+        self.require_tags = [str(t).strip() for t in require_tags if str(t).strip()]
+        self.target_worker = str(target_worker).strip() if (target_worker and str(target_worker).strip()) else None
+        self.master_pid = int(master_pid) if master_pid else None
+        self.blob_dir = os.path.abspath(master_blob_dir) if master_blob_dir else None
+        self.master_log = os.path.abspath(master_log) if master_log else None
+        self.sandbox_dirs: List[str] = []
+        self.empty_config = os.path.join(self.workdir, "empty.toml")
+        with open(self.empty_config, "w", encoding="utf-8") as f:
+            f.write("")
+        self._extra_pids_lock = threading.Lock()
+        self._extra_pids: Dict[str, int] = {}
+        self.client_env = self._build_env(os.path.join(self.workdir, "home-client"))
+        self._log_start_offset = 0
+        self.remote_workers: List[Dict[str, Any]] = []
+        self.forbidden_tokens = [
+            tok for tok in (self.master_addr, self.secret_file, self.blob_dir, self.master_log) if tok
+        ]
+
+    def _build_env(self, home: str) -> Dict[str, str]:
+        return _isolated_process_env(home, self.empty_config)
+
+    def _auth_flags(self) -> List[str]:
+        if self.secret_file:
+            return ["--secret-file", self.secret_file]
+        if self.insecure:
+            return ["--insecure"]
+        return []
+
+    def build_cli_cmd(self, args: List[str], master_addr: Optional[str] = None) -> List[str]:
+        subcmd = args[:1]
+        rest = list(args[1:])
+        addr = master_addr or self.master_addr
+        extra = list(self._auth_flags())
+        if subcmd == ["submit"]:
+            if self.target_worker:
+                extra.extend(["--worker", self.target_worker])
+            for tag in self.require_tags:
+                extra.extend(["--require-tag", tag])
+        return [self.binary] + subcmd + ["--master", addr] + extra + rest
+
+    def active_pids(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        if self.master_pid and pid_alive(self.master_pid):
+            out["master"] = self.master_pid
+        with self._extra_pids_lock:
+            out.update(self._extra_pids)
+        return out
+
+    def set_extra_pid(self, role: str, pid: Optional[int]) -> None:
+        with self._extra_pids_lock:
+            if pid is None:
+                self._extra_pids.pop(role, None)
+            else:
+                self._extra_pids[role] = int(pid)
+
+    def _matches_tags(self, worker: Dict[str, Any]) -> bool:
+        wtags = set(str(t) for t in (worker.get("tags") or []))
+        if any(t.startswith("state:") for t in wtags) and "state:connected" not in wtags:
+            return False
+        if self.target_worker:
+            wname = str(worker.get("name") or "")
+            wid = ""
+            for t in wtags:
+                if t.startswith("id:"):
+                    wid = t[3:]
+                    break
+            if self.target_worker.lower() not in (wname.lower(), wid.lower()):
+                return False
+        if not self.require_tags:
+            return True
+        return all(t in wtags for t in self.require_tags)
+
+    def start(self) -> "RemoteEnduranceCluster":
+        if self.master_log and os.path.isfile(self.master_log):
+            try:
+                self._log_start_offset = os.path.getsize(self.master_log)
+            except OSError:
+                self._log_start_offset = 0
+        deadline = time.monotonic() + 20.0
+        last_err = ""
+        while time.monotonic() < deadline:
+            r = self.run_client(["workers", "--json"], timeout=15.0)
+            if r.returncode == 0:
+                try:
+                    listed = json.loads(r.stdout)
+                except ValueError as exc:
+                    last_err = "invalid workers JSON: %s" % exc
+                else:
+                    matched = [w for w in listed if self._matches_tags(w)] if isinstance(listed, list) else []
+                    if matched:
+                        self.remote_workers = [_summarize_remote_worker(w) for w in matched]
+                        return self
+                    last_err = "no connected worker matching tags=%r (saw %d workers)" % (
+                        self.require_tags,
+                        len(listed) if isinstance(listed, list) else 0,
+                    )
+            else:
+                last_err = redact_text((r.stderr or r.stdout or "").strip()[-300:], self.forbidden_tokens)
+            time.sleep(0.5)
+        raise RuntimeError("remote cluster readiness failed: %s" % (last_err or "timeout"))
+
+    def dir_map(self) -> Dict[str, str]:
+        if self.blob_dir:
+            return {"blob_store_bytes": self.blob_dir}
+        return {}
+
+    def run_client(
+        self,
+        args: List[str],
+        timeout: float = 120.0,
+        master_addr: Optional[str] = None,
+    ) -> subprocess.CompletedProcess:
+        cmd = self.build_cli_cmd(args, master_addr=master_addr)
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.client_env,
+            timeout=timeout,
+        )
+
+    def spawn_submit(
+        self,
+        submit_args: List[str],
+        master_addr: Optional[str] = None,
+    ) -> subprocess.Popen:
+        cmd = self.build_cli_cmd(["submit"] + submit_args, master_addr=master_addr)
+        kw: Dict[str, Any] = {} if IS_WINDOWS else {"start_new_session": True}
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.client_env,
+            **kw,
+        )
+
+    def run_submit_sampled(
+        self,
+        submit_args: List[str],
+        timeout: float = 600.0,
+        master_addr: Optional[str] = None,
+    ) -> Tuple[int, str, str, float]:
+        t0 = time.perf_counter()
+        p = self.spawn_submit(submit_args, master_addr=master_addr)
+        self.set_extra_pid("client", p.pid)
+        try:
+            stdout, stderr = p.communicate(timeout=timeout)
+            dt = time.perf_counter() - t0
+            return p.returncode, stdout or "", stderr or "", dt
+        except subprocess.TimeoutExpired:
+            p.kill()
+            stdout, stderr = p.communicate()
+            dt = time.perf_counter() - t0
+            return 124, stdout or "", (stderr or "") + "\n[harness] submit timed out after %.1f s" % dt, dt
+        finally:
+            self.set_extra_pid("client", None)
+
+    def read_log(self, role: str) -> str:
+        if role != "master" or not self.master_log or not os.path.isfile(self.master_log):
+            return ""
+        with open(self.master_log, encoding="utf-8", errors="replace") as f:
+            if self._log_start_offset > 0:
+                try:
+                    if os.path.getsize(self.master_log) >= self._log_start_offset:
+                        f.seek(self._log_start_offset)
+                except OSError:
+                    pass
+            return f.read()
+
+    def stop(self) -> None:
+        # Remote mode never stops the external master or remote worker; only remove client workdir.
+        shutil.rmtree(self.workdir, ignore_errors=True)
+
     def leftover_pids(self) -> List[int]:
         alive = list(self._unclean_pids)
         with self._lifecycle_lock:
@@ -3346,8 +3933,52 @@ def _detect_reaped_lines(master_log: str) -> List[str]:
     return hits
 
 
+def _effective_seed(args: argparse.Namespace) -> int:
+    link = (getattr(args, "link", None) or "loopback").strip().lower()
+    return int(args.seed) + int(LINK_SEED_OFFSETS.get(link, 0))
+
+
+def _make_transfer_cluster(
+    args: argparse.Namespace,
+    sc_dir: str,
+    *,
+    blob_store_mb: Optional[int] = None,
+    worker_via_proxy: Optional[ThrottleProxy] = None,
+) -> Any:
+    resolved_master = resolve_master_arg(getattr(args, "master", None))
+    if resolved_master:
+        return RemoteEnduranceCluster(
+            args.bin,
+            os.path.join(sc_dir, "remote-client"),
+            resolved_master,
+            secret_file=getattr(args, "secret_file", None),
+            insecure=bool(getattr(args, "insecure", False)),
+            require_tags=getattr(args, "require_tag", None) or (),
+            target_worker=getattr(args, "target_worker", None),
+            master_pid=getattr(args, "master_pid", None),
+            master_blob_dir=getattr(args, "master_blob_dir", None),
+            master_log=getattr(args, "master_log", None),
+        )
+    return EnduranceCluster(
+        args.bin,
+        os.path.join(sc_dir, "cluster"),
+        workers=1,
+        blob_store_mb=blob_store_mb,
+        worker_via_proxy=worker_via_proxy,
+    )
+
+
+def _cluster_forbidden(cluster: Any, *extra: Optional[str]) -> List[str]:
+    out = [str(x) for x in extra if x]
+    for tok in getattr(cluster, "forbidden_tokens", ()) or ():
+        if tok:
+            out.append(str(tok))
+    return out
+
+
 def run_t1(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     sizes_gib = [float(x.strip()) for x in args.t1_sizes_gib.split(",") if x.strip()]
+    base_seed = _effective_seed(args)
     entries = []
     for idx, gib_val in enumerate(sizes_gib):
         size_bytes = int(round(gib_val * GIB))
@@ -3355,19 +3986,14 @@ def run_t1(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
         os.makedirs(sc_dir, exist_ok=True)
         payload = os.path.join(sc_dir, "payload.bin")
         store_mb = int(max(4096, round(gib_val * 1024) + 2048)) if gib_val > 3.0 else None
-        meta = generate_seeded_file(payload, size_bytes, args.seed + 100 + idx)
+        meta = generate_seeded_file(payload, size_bytes, base_seed + 100 + idx)
 
-        c = EnduranceCluster(
-            args.bin,
-            os.path.join(sc_dir, "cluster"),
-            workers=1,
-            blob_store_mb=store_mb,
-        )
+        c = _make_transfer_cluster(args, sc_dir, blob_store_mb=store_mb)
         sampler: Optional[BackgroundSampler] = None
         try:
             c.start()
             sampler = BackgroundSampler(c.active_pids, c.dir_map(), interval_s=args.sample_interval).start()
-            before_objs = list_blob_objects(c.blob_dir)
+            before_objs = list_blob_objects(c.blob_dir) if c.blob_dir else {}
             cmd_args = [
                 "--input",
                 payload + ":payload.bin",
@@ -3381,8 +4007,12 @@ def run_t1(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                 ["payload.bin", str(size_bytes), meta["sha256"]],
             )
             rc, stdout, stderr, wall_s = c.run_submit_sampled(cmd_args, timeout=2100.0)
-            after_objs = list_blob_objects(c.blob_dir)
-            cache_objs = list_blob_objects(os.path.join(c.sandbox_dirs[0], "cache", "blobs"))
+            after_objs = list_blob_objects(c.blob_dir) if c.blob_dir else {}
+            cache_objs = (
+                list_blob_objects(os.path.join(c.sandbox_dirs[0], "cache", "blobs"))
+                if c.sandbox_dirs
+                else {}
+            )
             parsed_json = extract_json_payload(stdout)
             task_stdout = decode_bytes_field((parsed_json or {}).get("stdout"))
             parsed_inputs = parse_inputs_line(stderr)
@@ -3391,14 +4021,15 @@ def run_t1(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             ]
             matching_cache_ids = [bid for bid, bsz in cache_objs.items() if bsz == size_bytes]
             verified = rc == 0 and ("VERIFY_OK %d %s" % (size_bytes, meta["sha256"])) in task_stdout
+            master_blob_ok = bool(matching_master_ids) if c.blob_dir else True
             samples = sampler.stop()
             summary = BackgroundSampler.summarize(samples)
             entries.append(
                 {
                     "size_gib": gib_val,
                     "size_bytes": size_bytes,
-                    "blob_store_mb": store_mb or 4096,
-                    "passed": bool(verified and matching_master_ids),
+                    "blob_store_mb": None if c.is_remote else (store_mb or 4096),
+                    "passed": bool(verified and master_blob_ok),
                     "wall_s": round(wall_s, 3),
                     "throughput_mib_per_s": round((size_bytes / MIB) / wall_s, 3) if wall_s > 0 else None,
                     "sha256_expected": meta["sha256"],
@@ -3408,7 +4039,7 @@ def run_t1(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                     "input_upload": (parsed_json or {}).get("input_upload") or parsed_inputs,
                     "error": redact_text(
                         str((parsed_json or {}).get("error") or ("" if rc == 0 else stderr[-400:])),
-                        [sc_dir, work_root],
+                        _cluster_forbidden(c, sc_dir, work_root),
                     ),
                     "resource_summary": summary,
                     "samples": samples,
@@ -3423,13 +4054,16 @@ def run_t1(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     mem_comparisons = {}
     if len(entries) >= 2:
         small, large = entries[0], entries[-1]
-        for role in ("master", "worker0", "client"):
+        roles = ("master", "client") if getattr(args, "master", None) else ("master", "worker0", "client")
+        for role in roles:
             p_small = small["resource_summary"]["processes"].get(role, {}).get("peak_rss_bytes")
             p_large = large["resource_summary"]["processes"].get(role, {}).get("peak_rss_bytes")
+            if getattr(args, "master", None) and p_small is None and p_large is None and role == "master":
+                continue
             mem_comparisons[role] = check_t1_memory_flat(p_small, p_large)
 
     all_verified = all(e["passed"] for e in entries)
-    mem_ok = all(v["passed"] for v in mem_comparisons.values()) if mem_comparisons else True
+    mem_ok = (all(v["passed"] for v in mem_comparisons.values()) and bool(mem_comparisons)) if len(entries) >= 2 else True
     return {
         "id": "T1",
         "name": "Large single-file transfer and memory flatness",
@@ -3444,13 +4078,14 @@ def run_t2(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     os.makedirs(sc_dir, exist_ok=True)
     tree_dir = os.path.join(sc_dir, "tree")
     tgen0 = time.perf_counter()
-    tree_meta = generate_seeded_tree(tree_dir, int(args.t2_files), args.seed + 200)
+    tree_meta = generate_seeded_tree(tree_dir, int(args.t2_files), _effective_seed(args) + 200)
     gen_s = time.perf_counter() - tgen0
 
-    c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1)
+    c = _make_transfer_cluster(args, sc_dir)
     sampler: Optional[BackgroundSampler] = None
     try:
         c.start()
+        before_objs = set(list_blob_objects(c.blob_dir)) if c.blob_dir else set()
         sampler = BackgroundSampler(c.active_pids, c.dir_map(), interval_s=args.sample_interval).start()
         cmd_args = [
             "--input",
@@ -3473,7 +4108,9 @@ def run_t2(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             and ("VERIFY_TREE_OK %d %d %s" % (tree_meta["files"], tree_meta["total_bytes"], tree_meta["tree_sha256"]))
             in task_stdout
         )
-        master_blobs = len(list_blob_objects(c.blob_dir))
+        after_objs = set(list_blob_objects(c.blob_dir)) if c.blob_dir else set()
+        master_blobs = len(after_objs) if c.blob_dir else None
+        master_new_blobs = len(after_objs - before_objs) if c.blob_dir else None
         samples = sampler.stop()
         summary = BackgroundSampler.summarize(samples)
         return {
@@ -3486,11 +4123,12 @@ def run_t2(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             "tree_generate_s": round(gen_s, 3),
             "wall_s": round(wall_s, 3),
             "master_blobs_stored": master_blobs,
+            "master_new_blobs": master_new_blobs,
             "worker_verified": verified,
             "input_upload": (parsed_json or {}).get("input_upload") or parsed_inputs,
             "error": redact_text(
                 str((parsed_json or {}).get("error") or ("" if rc == 0 else stderr[-400:])),
-                [sc_dir, work_root],
+                _cluster_forbidden(c, sc_dir, work_root),
             ),
             "resource_summary": summary,
             "samples": samples,
@@ -3508,9 +4146,10 @@ def run_t3(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     pass_bytes = int(args.t3_pass_mib) * MIB
     fail_bytes = int(args.t3_fail_mib) * MIB
 
-    pass_seed = args.seed + 301
+    base_seed = _effective_seed(args)
+    pass_seed = base_seed + 301
     pass_sha = expected_seeded_sha256(pass_bytes, pass_seed)
-    c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1)
+    c = _make_transfer_cluster(args, sc_dir)
     sampler: Optional[BackgroundSampler] = None
     try:
         c.start()
@@ -3563,13 +4202,13 @@ def run_t3(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
         ] + _worker_python_args(
             args.worker_python,
             _WORKER_GEN_OUTPUT_SRC,
-            ["out_fail.bin", str(fail_bytes), str(args.seed + 302), "-"],
+            ["out_fail.bin", str(fail_bytes), str(base_seed + 302), "-"],
         )
         rc_fail, stdout_fail, stderr_fail, wall_fail = c.run_submit_sampled(cmd_fail, timeout=1500.0)
         json_fail = extract_json_payload(stdout_fail)
         err_text = str((json_fail or {}).get("error") or "") + "\n" + stderr_fail + "\n" + stdout_fail
         step_fail_passed = (rc_fail != 0 or bool((json_fail or {}).get("error"))) and ("--output-limit-mb" in err_text)
-        tmp_left = list_tmp_entries(c.blob_dir)
+        tmp_left = list_tmp_entries(c.blob_dir) if c.blob_dir else []
         samples = sampler.stop()
         return {
             "id": "T3",
@@ -3583,7 +4222,10 @@ def run_t3(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                 "wall_s": round(wall_ok, 3),
                 "download_verified": dl_match,
                 "outputs": outputs_ok,
-                "error": redact_text(str((json_ok or {}).get("error") or ("" if rc_ok == 0 else stderr_ok[-400:])), [sc_dir]),
+                "error": redact_text(
+                    str((json_ok or {}).get("error") or ("" if rc_ok == 0 else stderr_ok[-400:])),
+                    _cluster_forbidden(c, sc_dir, work_root),
+                ),
             },
             "over_limit": {
                 "size_mib": args.t3_fail_mib,
@@ -3592,7 +4234,7 @@ def run_t3(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                 "rc": rc_fail,
                 "wall_s": round(wall_fail, 3),
                 "mentions_output_limit_mb": "--output-limit-mb" in err_text,
-                "error": redact_text(err_text.strip()[:500], [sc_dir, work_root]),
+                "error": redact_text(err_text.strip()[:500], _cluster_forbidden(c, sc_dir, work_root)),
             },
             "master_tmp_leftovers": tmp_left,
             "resource_summary": BackgroundSampler.summarize(samples),
@@ -3610,9 +4252,9 @@ def run_t4(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     os.makedirs(sc_dir, exist_ok=True)
     size_bytes = int(round(float(args.t4_size_gib) * GIB))
     payload = os.path.join(sc_dir, "payload.bin")
-    meta = generate_seeded_file(payload, size_bytes, args.seed + 400)
+    meta = generate_seeded_file(payload, size_bytes, _effective_seed(args) + 400)
 
-    c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1)
+    c = _make_transfer_cluster(args, sc_dir)
     sampler: Optional[BackgroundSampler] = None
     try:
         c.start()
@@ -3629,42 +4271,45 @@ def run_t4(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             _WORKER_VERIFY_FILE_SRC,
             ["payload.bin", str(size_bytes), meta["sha256"]],
         )
-        b0 = dir_bytes(c.blob_dir)
+        b0 = dir_bytes(c.blob_dir) if c.blob_dir else None
         rc1, out1, err1, w1 = c.run_submit_sampled(cmd_args, timeout=2100.0)
-        b1 = dir_bytes(c.blob_dir)
+        b1 = dir_bytes(c.blob_dir) if c.blob_dir else None
         j1 = extract_json_payload(out1) or {}
         u1 = j1.get("input_upload") or parse_inputs_line(err1) or {}
 
         rc2, out2, err2, w2 = c.run_submit_sampled(cmd_args, timeout=1200.0)
-        b2 = dir_bytes(c.blob_dir)
+        b2 = dir_bytes(c.blob_dir) if c.blob_dir else None
         j2 = extract_json_payload(out2) or {}
         u2 = j2.get("input_upload") or parse_inputs_line(err2) or {}
 
+        g1 = (b1 - b0) if (b0 is not None and b1 is not None) else None
+        g2 = (b2 - b1) if (b1 is not None and b2 is not None) else None
         zero_uploaded = (
             u2.get("uploaded") == 0
             or u2.get("blobs_sent") == 0
-        ) and u2.get("bytes", 0) == 0 and (b2 - b1) == 0
+        ) and u2.get("bytes", 0) == 0 and (g2 in (None, 0))
+        first_uploaded = u1.get("uploaded", 0) >= 1 or u1.get("blobs_sent", 0) >= 1 or u1.get("bytes", 0) > 0
         ok1 = rc1 == 0 and "VERIFY_OK" in decode_bytes_field(j1.get("stdout"))
         ok2 = rc2 == 0 and "VERIFY_OK" in decode_bytes_field(j2.get("stdout"))
         samples = sampler.stop()
         return {
             "id": "T4",
             "name": "Repeated 3 GiB submission uploads zero blob bytes",
-            "passed": bool(ok1 and ok2 and zero_uploaded),
+            "passed": bool(ok1 and ok2 and first_uploaded and zero_uploaded),
             "size_gib": float(args.t4_size_gib),
             "size_bytes": size_bytes,
             "first": {
                 "rc": rc1,
                 "wall_s": round(w1, 3),
                 "verified": ok1,
-                "master_blob_store_growth_bytes": b1 - b0,
+                "master_blob_store_growth_bytes": g1,
                 "input_upload": u1,
             },
             "second": {
                 "rc": rc2,
                 "wall_s": round(w2, 3),
                 "verified": ok2,
-                "master_blob_store_growth_bytes": b2 - b1,
+                "master_blob_store_growth_bytes": g2,
                 "input_upload": u2,
             },
             "resource_summary": BackgroundSampler.summarize(samples),
@@ -3678,20 +4323,19 @@ def run_t4(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
 
 
 def run_t5(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
-    """Client upload cut at roughly half via ThrottleProxy, then resubmitted."""
+    """Client upload cut at roughly half via TCP proxy or mid-upload kill, then resubmitted."""
     sc_dir = os.path.join(work_root, "t5")
     os.makedirs(sc_dir, exist_ok=True)
     size_bytes = int(args.t5_size_mib) * MIB
     payload = os.path.join(sc_dir, "payload.bin")
-    meta = generate_seeded_file(payload, size_bytes, args.seed + 500)
+    meta = generate_seeded_file(payload, size_bytes, _effective_seed(args) + 500)
 
-    c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1)
+    c = _make_transfer_cluster(args, sc_dir)
     proxy: Optional[ThrottleProxy] = None
     sampler: Optional[BackgroundSampler] = None
     try:
         c.start()
         sampler = BackgroundSampler(c.active_pids, c.dir_map(), interval_s=args.sample_interval).start()
-        proxy = ThrottleProxy(c.master_host, c.master_port, rate_mbps=args.t5_rate_mbps).start()
         cmd_args = [
             "--input",
             payload + ":payload.bin",
@@ -3704,45 +4348,79 @@ def run_t5(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             _WORKER_VERIFY_FILE_SRC,
             ["payload.bin", str(size_bytes), meta["sha256"]],
         )
-        proc = c.spawn_submit(cmd_args, master_addr=proxy.bound_addr)
-        c.set_extra_pid("client", proc.pid)
+        half = size_bytes // 2
         cut_at_bytes = 0
         cut_done = False
-        half = size_bytes // 2
-        deadline = time.monotonic() + 180.0
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                break
-            if proxy.bytes_c2s >= half:
-                cut_at_bytes = proxy.bytes_c2s
-                proxy.cut_links(pause_s=1.0)
-                cut_done = True
-                break
-            time.sleep(0.05)
-        out1, err1 = proc.communicate(timeout=30.0)
-        rc1 = proc.returncode
-        c.set_extra_pid("client", None)
-        proxy.set_rate(None)
+        use_tcp_proxy = bool(c.master_host and c.master_port > 0) and not getattr(args, "skip_t5_proxy", False)
+        cut_method = "tcp_proxy" if use_tcp_proxy else "client_sigkill"
+
+        if use_tcp_proxy:
+            proxy = ThrottleProxy(c.master_host, c.master_port, rate_mbps=args.t5_rate_mbps).start()
+            proc = c.spawn_submit(cmd_args, master_addr=proxy.bound_addr)
+            c.set_extra_pid("client", proc.pid)
+            deadline = time.monotonic() + 180.0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                if proxy.bytes_c2s >= half:
+                    cut_at_bytes = proxy.bytes_c2s
+                    proxy.cut_links(pause_s=1.0)
+                    cut_done = True
+                    break
+                time.sleep(0.05)
+            out1, err1 = proc.communicate(timeout=30.0)
+            rc1 = proc.returncode
+            c.set_extra_pid("client", None)
+            proxy.set_rate(None)
+        else:
+            if not c.blob_dir:
+                raise RuntimeError("remote QUIC/relay T5 requires --master-blob-dir to detect half-upload")
+            proc = c.spawn_submit(cmd_args)
+            c.set_extra_pid("client", proc.pid)
+            deadline = time.monotonic() + 300.0
+            max_tmp = 0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                cur_tmp = _sum_tmp_bytes(c.blob_dir)
+                if cur_tmp > max_tmp:
+                    max_tmp = cur_tmp
+                if cur_tmp >= half:
+                    cut_at_bytes = cur_tmp
+                    proc.kill()
+                    cut_done = True
+                    break
+                time.sleep(0.01)
+            out1, err1 = proc.communicate(timeout=30.0)
+            rc1 = proc.returncode if proc.returncode is not None else -9
+            c.set_extra_pid("client", None)
+            # Wait briefly for the master to finish cleaning the dropped QUIC upload stream tmp file.
+            clean_deadline = time.monotonic() + 10.0
+            while time.monotonic() < clean_deadline and list_tmp_entries(c.blob_dir):
+                time.sleep(0.1)
+
         # Re-submit against direct master address on clean connection
         rc2, out2, err2, w2 = c.run_submit_sampled(cmd_args, timeout=600.0)
         j2 = extract_json_payload(out2) or {}
         u2 = j2.get("input_upload") or parse_inputs_line(err2) or {}
         ok2 = rc2 == 0 and "VERIFY_OK" in decode_bytes_field(j2.get("stdout"))
+        tmp_left = list_tmp_entries(c.blob_dir) if c.blob_dir else []
         samples = sampler.stop()
         return {
             "id": "T5",
             "name": "Client upload cut at half then resubmitted",
-            "passed": bool(cut_done and ok2),
+            "passed": bool(cut_done and ok2 and not tmp_left),
+            "cut_method": cut_method,
             "size_bytes": size_bytes,
             "cut_done": cut_done,
             "bytes_c2s_before_cut": cut_at_bytes,
             "first_attempt_rc": rc1,
-            "first_attempt_stderr": redact_text(err1[-300:], [sc_dir]),
+            "first_attempt_stderr": redact_text(err1[-300:], _cluster_forbidden(c, sc_dir, work_root)),
             "resubmit_rc": rc2,
             "resubmit_wall_s": round(w2, 3),
             "bytes_sent_on_resubmit": u2.get("bytes"),
             "input_upload": u2,
-            "master_tmp_leftovers": list_tmp_entries(c.blob_dir),
+            "master_tmp_leftovers": tmp_left,
             "resource_summary": BackgroundSampler.summarize(samples),
             "samples": samples,
         }
@@ -3756,11 +4434,20 @@ def run_t5(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
 
 
 def run_t6(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
+    if getattr(args, "master", None):
+        return {
+            "id": "T6",
+            "name": "Worker link cut during input fetch, recovery, clean cache tmp",
+            "passed": False,
+            "skipped": True,
+            "reason": "Remote T6 requires starting the target worker behind an external cuttable proxy; test separately over TCP proxy or loopback.",
+            "samples": [],
+        }
     sc_dir = os.path.join(work_root, "t6")
     os.makedirs(sc_dir, exist_ok=True)
     size_bytes = int(args.t6_size_mib) * MIB
     payload = os.path.join(sc_dir, "payload.bin")
-    meta = generate_seeded_file(payload, size_bytes, args.seed + 600)
+    meta = generate_seeded_file(payload, size_bytes, _effective_seed(args) + 600)
 
     proxy = ThrottleProxy("127.0.0.1", 0, rate_mbps=args.t6_rate_mbps, delay_ms=0.0)
     c = EnduranceCluster(
@@ -3867,25 +4554,15 @@ def run_t7(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     os.makedirs(sc_dir, exist_ok=True)
     size_bytes = int(args.t7_size_mib) * MIB
     in_file = os.path.join(sc_dir, "payload.bin")
-    in_meta = generate_seeded_file(in_file, size_bytes, args.seed + 700)
+    base_seed = _effective_seed(args)
+    in_meta = generate_seeded_file(in_file, size_bytes, base_seed + 700)
 
-    out_seed = args.seed + 701
-    rng = random.Random(out_seed)
-    h_out = hashlib.sha256()
-    rem = size_bytes
-    while rem > 0:
-        n = min(4 * MIB, rem)
-        h_out.update(rng.randbytes(n) if hasattr(rng, "randbytes") else bytes(rng.getrandbits(8) for _ in range(n)))
-        rem -= n
-    expected_out_sha = h_out.hexdigest()
+    out_seed = base_seed + 701
+    expected_out_sha = expected_seeded_sha256(size_bytes, out_seed)
 
-    proxy = ThrottleProxy("127.0.0.1", 0, rate_mbps=args.t7_rate_mbps, delay_ms=args.t7_delay_ms)
-    c = EnduranceCluster(
-        args.bin,
-        os.path.join(sc_dir, "cluster"),
-        workers=1,
-        worker_via_proxy=proxy,
-    )
+    is_remote = bool(getattr(args, "master", None))
+    proxy = None if is_remote else ThrottleProxy("127.0.0.1", 0, rate_mbps=args.t7_rate_mbps, delay_ms=args.t7_delay_ms)
+    c = _make_transfer_cluster(args, sc_dir, worker_via_proxy=proxy)
     sampler: Optional[BackgroundSampler] = None
     try:
         c.start()
@@ -3938,6 +4615,7 @@ def run_t7(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             "id": "T7",
             "name": "Throttled 2 Mbit/s 50 ms RTT TCP link (256 MiB in + 256 MiB out)",
             "passed": bool(passed),
+            "throttle_mode": "external_worker_proxy" if is_remote else "embedded_loopback_proxy",
             "size_mib": int(args.t7_size_mib),
             "rate_mbps": float(args.t7_rate_mbps),
             "delay_ms": float(args.t7_delay_ms),
@@ -3948,13 +4626,13 @@ def run_t7(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             "input_verified": input_ok,
             "output_verified": output_ok,
             "worker_reaped": worker_reaped,
-            "reap_log_lines": reaped_lines[:10],
-            "proxy_bytes_c2s": proxy.bytes_c2s,
-            "proxy_bytes_s2c": proxy.bytes_s2c,
+            "reap_log_lines": [redact_text(x, _cluster_forbidden(c, sc_dir, work_root)) for x in reaped_lines[:10]],
+            "proxy_bytes_c2s": proxy.bytes_c2s if proxy is not None else None,
+            "proxy_bytes_s2c": proxy.bytes_s2c if proxy is not None else None,
             "outputs": outputs,
             "error": redact_text(
                 str(parsed_json.get("error") or ("" if rc == 0 else stderr[-600:])),
-                [sc_dir, work_root],
+                _cluster_forbidden(c, sc_dir, work_root),
             ),
             "resource_summary": BackgroundSampler.summarize(samples),
             "samples": samples,
@@ -3962,7 +4640,8 @@ def run_t7(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     finally:
         if sampler is not None and not sampler._stop.is_set():
             sampler.stop()
-        proxy.stop()
+        if proxy is not None:
+            proxy.stop()
         c.stop()
         shutil.rmtree(sc_dir, ignore_errors=True)
 
@@ -3977,11 +4656,12 @@ def run_t8(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     f_big = os.path.join(sc_dir, "too_big.bin")
     f_a = os.path.join(sc_dir, "part_a.bin")
     f_b = os.path.join(sc_dir, "part_b.bin")
-    generate_seeded_file(f_big, too_big_bytes, args.seed + 801)
-    generate_seeded_file(f_a, half_plus_bytes, args.seed + 802)
-    generate_seeded_file(f_b, half_plus_bytes, args.seed + 803)
+    base_seed = _effective_seed(args)
+    generate_seeded_file(f_big, too_big_bytes, base_seed + 801)
+    generate_seeded_file(f_a, half_plus_bytes, base_seed + 802)
+    generate_seeded_file(f_b, half_plus_bytes, base_seed + 803)
 
-    c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1, blob_store_mb=store_mb)
+    c = _make_transfer_cluster(args, sc_dir, blob_store_mb=store_mb)
     proxy: Optional[ThrottleProxy] = None
     sampler: Optional[BackgroundSampler] = None
     try:
@@ -3995,26 +4675,37 @@ def run_t8(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             timeout=180.0,
         )
         msg_a = (err_a + "\n" + out_a).strip()
-        tmp_after_a = list_tmp_entries(c.blob_dir)
+        tmp_after_a = list_tmp_entries(c.blob_dir) if c.blob_dir else []
         passed_a = rc_a != 0 and "--blob-store-mb" in msg_a and not tmp_after_a
 
         # 8b: two concurrent uploads that together exceed store_mb
-        proxy = ThrottleProxy(c.master_host, c.master_port, rate_mbps=4.0, delay_ms=0.0).start()
-        proc1 = c.spawn_submit(
-            ["--input", f_a + ":a.bin", "--timeout-secs", "300", "--wait"]
-            + ["--command", args.worker_python, "--", "-c", "print('a')"],
-            master_addr=proxy.bound_addr,
-        )
+        use_proxy = bool(c.master_host and c.master_port > 0)
+        if use_proxy:
+            proxy = ThrottleProxy(c.master_host, c.master_port, rate_mbps=4.0, delay_ms=0.0).start()
+            proc1 = c.spawn_submit(
+                ["--input", f_a + ":a.bin", "--timeout-secs", "300", "--wait"]
+                + ["--command", args.worker_python, "--", "-c", "print('a')"],
+                master_addr=proxy.bound_addr,
+            )
+        else:
+            proc1 = c.spawn_submit(
+                ["--input", f_a + ":a.bin", "--timeout-secs", "300", "--wait"]
+                + ["--command", args.worker_python, "--", "-c", "print('a')"],
+            )
         c.set_extra_pid("client", proc1.pid)
         saw_tmp = False
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            if proc1.poll() is not None:
-                break
-            if list_tmp_entries(c.blob_dir):
-                saw_tmp = True
-                break
-            time.sleep(0.025)
+        if c.blob_dir:
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                if proc1.poll() is not None:
+                    break
+                if list_tmp_entries(c.blob_dir):
+                    saw_tmp = True
+                    break
+                time.sleep(0.025)
+        else:
+            time.sleep(0.2)
+            saw_tmp = proc1.poll() is None
 
         rc_b = 0
         out_b = ""
@@ -4026,7 +4717,8 @@ def run_t8(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                 timeout=120.0,
             )
             rc_b, out_b, err_b = r_b.returncode, r_b.stdout or "", r_b.stderr or ""
-        proxy.set_rate(None)
+        if proxy is not None:
+            proxy.set_rate(None)
         try:
             proc1.communicate(timeout=120.0)
             rc_p1 = proc1.returncode
@@ -4038,7 +4730,7 @@ def run_t8(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             c.set_extra_pid("client", None)
 
         time.sleep(0.3)
-        tmp_after_b = list_tmp_entries(c.blob_dir)
+        tmp_after_b = list_tmp_entries(c.blob_dir) if c.blob_dir else []
         msg_b = (err_b + "\n" + out_b).strip()
         passed_b = saw_tmp and rc_b != 0 and "--blob-store-mb" in msg_b and not tmp_after_b
         samples = sampler.stop()
@@ -4054,7 +4746,7 @@ def run_t8(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                 "wall_s": round(w_a, 3),
                 "mentions_blob_store_mb": "--blob-store-mb" in msg_a,
                 "tmp_leftovers": tmp_after_a,
-                "error": redact_text(msg_a[:400], [sc_dir, work_root]),
+                "error": redact_text(msg_a[:400], _cluster_forbidden(c, sc_dir, work_root)),
             },
             "concurrent_over_limit": {
                 "each_size_bytes": half_plus_bytes,
@@ -4064,7 +4756,7 @@ def run_t8(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
                 "second_upload_rc": rc_b,
                 "mentions_blob_store_mb": "--blob-store-mb" in msg_b,
                 "tmp_leftovers": tmp_after_b,
-                "error": redact_text(msg_b[:400], [sc_dir, work_root]),
+                "error": redact_text(msg_b[:400], _cluster_forbidden(c, sc_dir, work_root)),
             },
             "resource_summary": BackgroundSampler.summarize(samples),
             "samples": samples,
@@ -4084,9 +4776,9 @@ def run_t9(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
     os.makedirs(sc_dir, exist_ok=True)
     size_bytes = int(round(float(args.t9_size_gib) * GIB))
     payload = os.path.join(sc_dir, "payload.bin")
-    meta = generate_seeded_file(payload, size_bytes, args.seed + 900)
+    meta = generate_seeded_file(payload, size_bytes, _effective_seed(args) + 900)
 
-    c = EnduranceCluster(args.bin, os.path.join(sc_dir, "cluster"), workers=1)
+    c = _make_transfer_cluster(args, sc_dir)
     sampler: Optional[BackgroundSampler] = None
     try:
         c.start()
@@ -4108,7 +4800,7 @@ def run_t9(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             rc, stdout, stderr, wall_s = c.run_submit_sampled(cmd_args, timeout=2100.0)
             pj = extract_json_payload(stdout) or {}
             ok = rc == 0 and "VERIFY_OK" in decode_bytes_field(pj.get("stdout"))
-            cache_bytes = dir_bytes(os.path.join(c.sandbox_dirs[0], "cache", "blobs"))
+            cache_bytes = dir_bytes(os.path.join(c.sandbox_dirs[0], "cache", "blobs")) if c.sandbox_dirs else None
             runs.append(
                 {
                     "run": idx + 1,
@@ -4121,7 +4813,9 @@ def run_t9(args: argparse.Namespace, work_root: str) -> Dict[str, Any]:
             )
         samples = sampler.stop()
         summary = BackgroundSampler.summarize(samples)
-        peak_worker_disk = summary["dirs"].get("sandbox_base_bytes", {}).get("peak_bytes", 0)
+        peak_worker_disk = (
+            summary["dirs"].get("sandbox_base_bytes", {}).get("peak_bytes", 0) if c.sandbox_dirs else None
+        )
         return {
             "id": "T9",
             "name": "3 GiB input larger than worker cache across 3 sequential tasks",
@@ -4216,7 +4910,12 @@ def _prepare_work_root(work_dir: Optional[str], largest_bytes: int, keep_workdir
     return work_root, disk_check
 
 
-def _collect_env_metadata(binary: str, rtt_ms: Optional[float], link: str) -> Dict[str, Any]:
+def _collect_env_metadata(
+    binary: str,
+    rtt_ms: Optional[float],
+    link: str,
+    resolved_master: Optional[str] = None,
+) -> Dict[str, Any]:
     started = datetime.datetime.now(datetime.timezone.utc)
     hw = hardware()
     os_facts = os_info()
@@ -4249,6 +4948,10 @@ def _collect_env_metadata(binary: str, rtt_ms: Optional[float], link: str) -> Di
         stop_probe.set()
         pt.join(timeout=2.0)
         probe_srv.close()
+    elif loopback_rtt_ms is None and link == "lan-tcp" and resolved_master:
+        mhost, mport = _parse_host_port(resolved_master)
+        if mhost and mport > 0:
+            loopback_rtt_ms = measure_tcp_rtt_ms(mhost, mport)
 
     return {
         "started": started,
@@ -4271,15 +4974,17 @@ def _save_or_print_record(
     hw: Dict[str, Any],
     no_write: bool,
     work_root: str,
+    extra_forbidden: Iterable[str] = (),
 ) -> bool:
+    forbidden = [work_root] + [str(x) for x in extra_forbidden if x]
     quarantined = False
     if no_write:
         text = json.dumps(record, indent=2) + "\n"
-        assert_record_private(text, forbidden=[work_root])
+        assert_record_private(text, forbidden=forbidden)
         print(text)
     else:
         target = out_path or result_path(os.path.join(HERE, "results"), started, default_link, os_facts, hw)
-        write_res = write_record(target, record, forbidden=[work_root])
+        write_res = write_record(target, record, forbidden=forbidden)
         quarantined = bool(write_res["quarantined"])
         if quarantined:
             print("quarantined", write_res["path"], flush=True)
@@ -4289,25 +4994,35 @@ def _save_or_print_record(
 
 
 def validate_transfer_args(args: argparse.Namespace) -> None:
-    """Reject unimplemented multi-machine links and remote flags in step 1 (TEST-24)."""
+    """Validate transfer --link and remote master/auth flags (TEST-24 steps 1 & 2)."""
     link = (getattr(args, "link", None) or "").strip().lower()
-    if link != "loopback":
+    if link not in TRANSFER_LINKS:
         raise ValueError(
-            "only --link loopback is supported in TEST-24 step 1 (got --link %r; two-machine links arrive in step 2)"
-            % getattr(args, "link", None)
+            "unsupported --link %r (expected one of: %s)"
+            % (getattr(args, "link", None), ", ".join(TRANSFER_LINKS))
         )
-    bad_flags: List[str] = []
-    if getattr(args, "master", None):
-        bad_flags.append("--master")
-    if getattr(args, "secret_file", None):
-        bad_flags.append("--secret-file")
-    if getattr(args, "insecure", False):
-        bad_flags.append("--insecure")
-    if bad_flags:
-        raise ValueError(
-            "%s require two-machine mode (TEST-24 step 2) and cannot be combined with loopback step 1"
-            % ", ".join(bad_flags)
-        )
+    has_master = bool((getattr(args, "master", None) or "").strip())
+    has_secret = bool((getattr(args, "secret_file", None) or "").strip())
+    has_insecure = bool(getattr(args, "insecure", False))
+
+    if link == "loopback":
+        bad_flags: List[str] = []
+        if has_master:
+            bad_flags.append("--master")
+        if has_secret:
+            bad_flags.append("--secret-file")
+        if has_insecure:
+            bad_flags.append("--insecure")
+        if bad_flags:
+            raise ValueError(
+                "%s require two-machine mode (TEST-24 step 2) and cannot be combined with loopback step 1"
+                % ", ".join(bad_flags)
+            )
+    else:
+        if not has_master:
+            raise ValueError("--link %s requires --master (<host:port>, ticket, or @ticket_file)" % link)
+        if not (has_secret or has_insecure):
+            raise ValueError("--link %s requires either --secret-file <path> or --insecure" % link)
 
 
 def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
@@ -5156,8 +5871,16 @@ def run_soak(args: argparse.Namespace, work_root: str, parsed_params: Dict[str, 
 def cmd_transfer(args: argparse.Namespace) -> int:
     try:
         validate_transfer_args(args)
+        resolved_master = resolve_master_arg(getattr(args, "master", None))
     except ValueError as exc:
         raise SystemExit(str(exc))
+
+    secret_file = getattr(args, "secret_file", None)
+    if secret_file:
+        secret_file = os.path.abspath(os.path.expanduser(secret_file))
+        if not os.path.isfile(secret_file):
+            raise SystemExit("secret file not found: %s" % secret_file)
+        args.secret_file = secret_file
 
     binary = os.path.abspath(args.bin)
     if not os.path.isfile(binary):
@@ -5174,7 +5897,39 @@ def cmd_transfer(args: argparse.Namespace) -> int:
 
     largest_bytes = compute_largest_file_bytes(scenarios, args)
     work_root, disk_check = _prepare_work_root(args.work_dir, largest_bytes, keep_workdir=args.keep_workdir)
-    meta = _collect_env_metadata(binary, args.rtt_ms, args.link)
+    meta = _collect_env_metadata(binary, args.rtt_ms, args.link, resolved_master=resolved_master)
+    extra_forbidden = [
+        tok
+        for tok in (
+            resolved_master,
+            getattr(args, "master", None),
+            getattr(args, "secret_file", None),
+            getattr(args, "master_blob_dir", None),
+            getattr(args, "master_log", None),
+        )
+        if tok
+    ]
+
+    remote_workers: Optional[List[Dict[str, Any]]] = None
+    if resolved_master:
+        probe_dir = os.path.join(work_root, "remote-preflight")
+        probe_cluster = RemoteEnduranceCluster(
+            binary,
+            probe_dir,
+            resolved_master,
+            secret_file=getattr(args, "secret_file", None),
+            insecure=bool(getattr(args, "insecure", False)),
+            require_tags=getattr(args, "require_tag", None) or (),
+            target_worker=getattr(args, "target_worker", None),
+            master_pid=getattr(args, "master_pid", None),
+            master_blob_dir=getattr(args, "master_blob_dir", None),
+            master_log=getattr(args, "master_log", None),
+        )
+        try:
+            probe_cluster.start()
+            remote_workers = probe_cluster.remote_workers
+        finally:
+            probe_cluster.stop()
 
     results: List[Dict[str, Any]] = []
     try:
@@ -5182,16 +5937,16 @@ def cmd_transfer(args: argparse.Namespace) -> int:
             print("[%s] starting..." % sc, flush=True)
             res = SCENARIO_RUNNERS[sc](args, work_root)
             results.append(res)
-            status = "PASS" if res["passed"] else "FAIL"
+            status = "SKIP" if res.get("skipped") else ("PASS" if res["passed"] else "FAIL")
             print("[%s] %s" % (sc, status), flush=True)
     finally:
         if not args.keep_workdir:
             shutil.rmtree(work_root, ignore_errors=True)
 
     omitted_scenarios = [s for s in ALL_SCENARIOS if s not in scenarios]
-    omitted_links = [lk for lk in ("loopback", "lan-tcp", "lan-quic", "quic-relay") if lk != args.link]
+    omitted_links = [lk for lk in TRANSFER_LINKS if lk != args.link]
 
-    record = {
+    record: Dict[str, Any] = {
         "benchmark": "TEST-24 large-transfer endurance suite",
         "date_utc": meta["started"].strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git": meta["git"],
@@ -5203,8 +5958,11 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         "python": platform.python_version(),
         "link": args.link,
         "parameters": {
-            "seed": int(args.seed),
+            "seed": _effective_seed(args),
+            "base_seed": int(args.seed),
             "sample_interval_s": float(args.sample_interval),
+            "require_tags": list(getattr(args, "require_tag", None) or []),
+            "target_worker": getattr(args, "target_worker", None),
         },
         "measured_rtt_ms": meta["loopback_rtt_ms"],
         "theoretical_single_blob_bound_mib_per_s": theoretical_single_blob_bound_mib_per_s(meta["loopback_rtt_ms"]),
@@ -5218,10 +5976,13 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         "scenarios_requested": scenarios,
         "omitted_scenarios": omitted_scenarios,
         "omitted_links": omitted_links,
-        "note": redact_text(args.label, [work_root]),
+        "note": redact_text(args.label, [work_root] + extra_forbidden),
         "all_passed": all(r["passed"] for r in results),
         "scenarios": results,
     }
+    if resolved_master:
+        record["link_target_kind"] = "p2p-ticket" if resolved_master.startswith("{") else "tcp-addr"
+        record["remote_workers"] = remote_workers or []
 
     quarantined = _save_or_print_record(
         record,
@@ -5232,9 +5993,11 @@ def cmd_transfer(args: argparse.Namespace) -> int:
         hw=meta["hw"],
         no_write=args.no_write,
         work_root=work_root,
+        extra_forbidden=extra_forbidden,
     )
     for r in results:
-        print("  %-4s %-5s %s" % (r["id"], "PASS" if r["passed"] else "FAIL", r["name"]), flush=True)
+        status = "SKIP" if r.get("skipped") else ("PASS" if r["passed"] else "FAIL")
+        print("  %-4s %-5s %s" % (r["id"], status, r["name"]), flush=True)
     if quarantined:
         return 2
     return 0 if record["all_passed"] else 1
@@ -5438,9 +6201,15 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--work-dir", help="Base directory for temporary stores and payloads")
     tr.add_argument("--keep-workdir", action="store_true", help="Keep temporary workdir on exit")
     tr.add_argument("--link", default="loopback", help="Link label (loopback, lan-tcp, lan-quic, quic-relay)")
-    tr.add_argument("--master", help="Optional remote master address or P2P ticket (for two-machine runs)")
+    tr.add_argument("--master", help="Remote master address, P2P ticket JSON, or @/path/to/ticket file")
     tr.add_argument("--secret-file", help="Cluster secret file path when using --master")
     tr.add_argument("--insecure", action="store_true", help="Pass --insecure to client submits with --master")
+    tr.add_argument("--require-tag", action="append", default=[], help="Worker placement tag filter (repeatable)")
+    tr.add_argument("--target-worker", help="Restrict submissions to one worker name or id (--worker)")
+    tr.add_argument("--master-pid", type=int, help="External local master PID for resource sampling")
+    tr.add_argument("--master-blob-dir", help="External local master blob dir for store/tmp inspection")
+    tr.add_argument("--master-log", help="External local master log path for T6/T7 inspection")
+    tr.add_argument("--skip-t5-proxy", action="store_true", help="Use client SIGKILL cut instead of TCP proxy in T5")
     tr.add_argument("--rtt-ms", type=float, help="Measured link RTT in ms")
     tr.add_argument("--sample-interval", type=float, default=1.0, help="Resource poll interval in seconds")
     tr.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Base PRNG seed")
