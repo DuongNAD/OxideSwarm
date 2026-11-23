@@ -21,7 +21,7 @@ usage() {
 Usage: install.sh [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run] [-h|--help]
 
 Install oxideswarm, rusty-grid, and ox-mode for the current user after verifying
-SHA256SUMS (and GitHub build provenance attestation when `gh` is installed).
+SHA256SUMS (and GitHub build provenance attestation when `gh` is installed and authenticated).
 
 Options:
   --version <VERSION>  Release version to install (default: 0.4.4)
@@ -146,13 +146,21 @@ ARCHIVE="${ARCHIVE_STEM}.tar.gz"
 ARCHIVE_URL="${DOWNLOAD_BASE}/v${VERSION}/${ARCHIVE}"
 SUMS_URL="${DOWNLOAD_BASE}/v${VERSION}/SHA256SUMS"
 
-if command -v gh >/dev/null 2>&1; then
-  ATTEST_PLAN="verify with gh attestation verify"
-else
-  ATTEST_PLAN="skip (gh CLI not found; SHA256SUMS only)"
-fi
+gh_is_authenticated() {
+  if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    return 0
+  fi
+  gh auth token >/dev/null 2>&1
+}
 
 if [ "${DRY_RUN}" = "1" ]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    ATTEST_PLAN="skip (gh CLI not found; SHA256SUMS only)"
+  elif gh_is_authenticated; then
+    ATTEST_PLAN="verify with gh attestation verify"
+  else
+    ATTEST_PLAN="skip (gh CLI is not authenticated; SHA256SUMS only)"
+  fi
   printf 'Dry run: no files will be downloaded or written.\n'
   printf '  version:     %s\n' "${VERSION}"
   printf '  platform:    %s / %s -> %s\n' "${OS_NAME}" "${ARCH_NAME}" "${TARGET}"
@@ -242,15 +250,19 @@ fi
 printf 'Checksum verified (%s).\n' "${ACTUAL_SHA}"
 
 if command -v gh >/dev/null 2>&1; then
-  printf 'Verifying release provenance attestation with gh...\n'
-  if ! gh attestation verify "${ARCHIVE_PATH}" \
-    --repo "${REPO}" \
-    --signer-workflow "${SIGNER_WORKFLOW}" \
-    --source-ref "refs/tags/v${VERSION}"; then
-    printf 'error: provenance attestation verification failed for %s\n' "${ARCHIVE}" >&2
-    exit 1
+  if gh_is_authenticated; then
+    printf 'Verifying release provenance attestation with gh...\n'
+    if ! gh attestation verify "${ARCHIVE_PATH}" \
+      --repo "${REPO}" \
+      --signer-workflow "${SIGNER_WORKFLOW}" \
+      --source-ref "refs/tags/v${VERSION}"; then
+      printf 'error: provenance attestation verification failed for %s\n' "${ARCHIVE}" >&2
+      exit 1
+    fi
+    printf 'Provenance attestation verified.\n'
+  else
+    printf "Warning: gh CLI is installed but not authenticated; skipping provenance attestation check (SHA-256 verified). Run 'gh auth login' to enable provenance verification.\n"
   fi
-  printf 'Provenance attestation verified.\n'
 else
   printf 'Note: gh CLI not found; skipping provenance attestation check (SHA-256 verified).\n'
 fi

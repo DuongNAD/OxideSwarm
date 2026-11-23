@@ -1,7 +1,7 @@
 # 0059: First users (who gains what, and the order of work that serves them)
 
-Status: Partial (ADOPT-2 implemented in pull request 350, open; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are open)
-Created: 2026-11-10    Updated: 2026-11-18
+Status: Partial (ADOPT-2 implemented in pull request 350, open; ADOPT-3 implemented in pull request 431, open; the owner accepted Q37 on 2026-11-11; Q36, Q38 and Q39 are open)
+Created: 2026-11-10    Updated: 2026-11-24
 
 ## Summary
 
@@ -258,7 +258,9 @@ steps:
 
 1. Detect the system and the architecture, and name them when no archive exists for them.
 2. Download the archive of one release and its `SHA256SUMS`, and compare them.
-3. When LV-5 has landed and `gh` is present, verify the attestation of the archive.
+3. When LV-5 has landed and `gh` is present and authenticated, verify the attestation of the
+   archive (if `gh` is absent or not logged in, print a notice or warning and continue after
+   `SHA256SUMS` verification; if authenticated and verification fails, fail closed).
 4. Unpack into a directory of the current user, and print it with the next two commands of the
    Quick start.
 
@@ -274,6 +276,11 @@ Rules:
   listed in `README.md` and `docs/reference.md`.
 - The item checks on a clean Mac whether a file fetched by the script carries a quarantine mark,
   and records the answer. If it carries none, the `xattr` step of the README applies to browser
+  downloads only. **Recorded (2026-11-24):** on Apple Silicon M5 (macOS Darwin `27.2.0`), running
+  `scripts/install.sh --version 0.4.4` against real GitHub Releases passed `SHA256SUMS` and
+  `gh attestation verify`; `xattr -l` on `oxideswarm`, `rusty-grid`, and `ox-mode` showed
+  `com.apple.provenance` only (no `com.apple.quarantine`), and `oxideswarm --version` ran
+  directly (`rusty-grid 0.4.4`), confirming `xattr -dr com.apple.quarantine` applies to browser
   downloads only.
 
 The scripted measure of M15 times the Quick start from an empty home directory: install, master,
@@ -389,7 +396,7 @@ and their status is kept there.
 |---|---|---|---|---|---|---|---|
 | ADOPT-1 | A study of first use, in two rounds | All | S, owner | Release `0.1.1` | This record | "Study records" holds at least three sessions of the first round, with M15 to M17 | Planned |
 | ADOPT-2 | Run summary in `submit --wait`, in its JSON output and in the MCP results | A1, A2 | S | Nothing for one task. AX-1 and AX-2 for several | `crates/cli/src/run_summary.rs`, `crates/cli/src/cli_app/submit.rs`, `crates/cli/src/mcp/`, `README.md`, `CHANGELOG.md` | The ADOPT-2 tests of the test plan pass | Implemented |
-| ADOPT-3 | Install scripts and the scripted measure of M15 | All | M | REL-4. LV-5 for the attestation step | `scripts/install.sh`, `scripts/install.ps1`, `tests/test_launcher_scripts.py`, `benchmarks/grid/`, `README.md` | The ADOPT-3 tests pass, and M15 by script is recorded for macOS, Windows and Linux | Planned |
+| ADOPT-3 | Install scripts and the scripted measure of M15 | All | M | REL-4. LV-5 for the attestation step | `scripts/install.sh`, `scripts/install.ps1`, `tests/test_launcher_scripts.py`, `benchmarks/grid/`, `README.md` | The ADOPT-3 tests pass, and M15 by script is recorded for macOS, Windows and Linux | Implemented |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | A1, A2, A4 | M | The first round of ADOPT-1. AX-1 and AX-2 for the first two guides | `docs/guides/`, `docs/README.md`, `crates/core/src/capabilities.rs` if probes are added | Three guides each have a "Verify" block and a dated run record, and the index lists them | Planned |
 
 ## Decisions for the owner
@@ -452,7 +459,10 @@ None yet.
 - 2026-11-18: ADOPT-2 Implemented in pull request 350 (open): `crates/cli/src/run_summary.rs`,
   `submit --wait`, `submit --json`, and MCP `submit` / `task_result` (including `waited_ms: null`
   when an MCP session has no recorded submission timestamp and excluding `--verify` replicas).
-- 2026-11-24: ADOPT-3 Partial (`win2/adopt-3-install-scripts`): added `scripts/install.sh` (macOS/Linux,
-  bash 3.2), `scripts/install.ps1` (Windows), `OXIDESWARM_DOWNLOAD_BASE`, ADOPT-3 tests in
-  `tests/test_launcher_scripts.py`, and `benchmarks/grid/bench_m15_quickstart.py` (with Windows
-  M15 record; macOS and Linux M15 records plus macOS quarantine check pending `agent-mac-ag`).
+- 2026-11-24: ADOPT-3 Implemented in pull request 431 (open): added `scripts/install.sh`
+  (macOS/Linux, bash 3.2), `scripts/install.ps1` (Windows), `OXIDESWARM_DOWNLOAD_BASE`,
+  unauthenticated-`gh` warning/skip after `SHA256SUMS`, ADOPT-3 tests in
+  `tests/test_launcher_scripts.py`, `benchmarks/grid/bench_m15_quickstart.py` (with `GH_CONFIG_DIR`
+  preserved for `install.sh` on Unix while isolating `HOME`/`OXIDESWARM_HOME`), M15 records for
+  Windows (`8.551 s`), macOS (`8.727 s`), and Linux Docker (`1.434 s`), and the macOS quarantine
+  check (no `com.apple.quarantine` on `curl` installs).

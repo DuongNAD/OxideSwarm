@@ -38,7 +38,7 @@ local runs ([record](benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.jso
 
 Install the pinned release (`v0.4.4`) for your user with the two-step installer (no `sudo`, no
 background service, verifies `SHA256SUMS` before unpacking and `gh attestation verify` when `gh`
-is installed):
+is installed and authenticated; warns and continues after `SHA256SUMS` if `gh` is not logged in):
 
 ```bash
 # macOS / Linux (writes to ~/.local/bin by default; --dir <DIR> changes it)
@@ -75,7 +75,9 @@ Expand-Archive .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip -DestinationPath C:
 ```
 
 The binaries are not signed. On macOS, a browser download carries a quarantine flag that must be
-removed before the first start: `xattr -dr com.apple.quarantine oxideswarm-0.4.4-aarch64-apple-darwin`.
+removed before the first start: `xattr -dr com.apple.quarantine oxideswarm-0.4.4-aarch64-apple-darwin`
+(browser downloads only — verified on macOS Darwin `27.2.0` that binaries fetched via `scripts/install.sh`
+and `curl` carry no `com.apple.quarantine` attribute).
 Targets, the `-gpu` archives, what the attestation proves and the service installers:
 [docs/reference.md](docs/reference.md#install).
 

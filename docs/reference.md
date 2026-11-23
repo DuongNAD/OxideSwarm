@@ -50,12 +50,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 [--version <VERSION>] [--
 # PowerShell flag names (-Version, -Dir, -Gpu, -DryRun, -Help) are also accepted.
 ```
 
-Both scripts verify `SHA256SUMS` before unpacking, verify `gh attestation verify` against
-`DuongNAD/OxideSwarm/.github/workflows/release.yml` (`refs/tags/v<VERSION>`) when `gh` is on `PATH`,
-and replace existing binaries in `--dir`. `--dry-run` prints the resolved target, URLs, and
-destination without downloading or writing files; unsupported OS/architecture pairs fail with both
-names printed. `OXIDESWARM_DOWNLOAD_BASE` overrides the download base URL (default
-`https://github.com/DuongNAD/OxideSwarm/releases/download`).
+Both scripts verify `SHA256SUMS` before unpacking, run `gh attestation verify` against
+`DuongNAD/OxideSwarm/.github/workflows/release.yml` (`refs/tags/v<VERSION>`) when `gh` is on `PATH`
+and authenticated (if `gh` is absent or not logged in, they print a notice or warning and continue
+after `SHA256SUMS` verification; if `gh` is authenticated and attestation fails, they fail closed),
+and atomically replace existing binaries in `--dir`. `--dry-run` prints the resolved target, URLs,
+and destination without downloading or writing files; unsupported OS/architecture pairs fail with
+both names printed. `OXIDESWARM_DOWNLOAD_BASE` overrides the download base URL (default
+`https://github.com/DuongNAD/OxideSwarm/releases/download`). On macOS (Darwin `27.2.0`), binaries
+fetched by `scripts/install.sh` via `curl` carry `com.apple.provenance` only and no
+`com.apple.quarantine` flag, so `xattr -dr com.apple.quarantine` applies to browser downloads only.
 
 For manual downloads, each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should

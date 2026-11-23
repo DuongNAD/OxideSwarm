@@ -3973,7 +3973,14 @@ class InstallShTests(unittest.TestCase):
         open(log, "w", encoding="utf-8").close()
         gh = os.path.join(d, "gh")
         with open(gh, "w", encoding="utf-8") as f:
-            f.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "${FAKE_GH_LOG:?}"\nexit "${FAKE_GH_EXIT:-0}"\n')
+            f.write(
+                '#!/bin/sh\n'
+                'if [ "$1" = "auth" ]; then\n'
+                '  exit "${FAKE_GH_AUTH_EXIT:-0}"\n'
+                'fi\n'
+                'printf "%s\\n" "$*" >> "${FAKE_GH_LOG:?}"\n'
+                'exit "${FAKE_GH_EXIT:-0}"\n'
+            )
         os.chmod(gh, 0o755)
         return d, log
 
@@ -4070,6 +4077,46 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertIn("skipping provenance attestation", res.stdout)
         self.assertTrue(os.path.isfile(os.path.join(dest, "oxideswarm")))
+
+    def test_unauthenticated_gh_skips_attestation_with_warning(self):
+        target, shim = self._detect_target_or_shim()
+        gh_dir, gh_log = self._make_fake_gh(99)
+        path = os.pathsep.join([p for p in (gh_dir, shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        routes = self._build_release_routes("0.4.4", target, "UNAUTH_GH")
+        dest_dry = os.path.join(self.tmp, "dest_unauth_dry")
+        dest = os.path.join(self.tmp, "dest_unauth")
+        with _FakeReleaseServer(routes) as srv:
+            dry = self._run(
+                ["--version", "0.4.4", "--dir", dest_dry, "--dry-run"],
+                {
+                    "PATH": path,
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_AUTH_EXIT": "1",
+                    "FAKE_GH_EXIT": "99",
+                },
+            )
+            self.assertEqual(srv.requests, [])
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {
+                    "PATH": path,
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_AUTH_EXIT": "1",
+                    "FAKE_GH_EXIT": "99",
+                },
+            )
+        self.assertEqual(dry.returncode, 0, dry.stdout)
+        self.assertIn("not authenticated", dry.stdout)
+        self.assertFalse(os.path.exists(dest_dry))
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("Warning:", res.stdout)
+        self.assertIn("not authenticated", res.stdout)
+        self.assertIn("skipping provenance attestation", res.stdout)
+        self.assertEqual(read(gh_log).strip(), "", "unauthenticated gh must not call gh attestation verify")
+        for b in ("oxideswarm", "rusty-grid", "ox-mode"):
+            self.assertTrue(os.path.isfile(os.path.join(dest, b)))
 
     def test_attestation_failure_refuses_and_leaves_no_file(self):
         target, shim = self._detect_target_or_shim()
@@ -4184,7 +4231,15 @@ class InstallPs1Tests(unittest.TestCase):
         open(log, "w", encoding="utf-8").close()
         gh = os.path.join(d, "gh.cmd")
         with open(gh, "w", encoding="ascii", newline="\r\n") as f:
-            f.write("@echo off\r\n>> \"%FAKE_GH_LOG%\" echo %*\r\nexit /b %FAKE_GH_EXIT%\r\n")
+            f.write(
+                "@echo off\r\n"
+                "if /I \"%~1\"==\"auth\" goto :do_auth\r\n"
+                ">> \"%FAKE_GH_LOG%\" echo %*\r\n"
+                "exit /b %FAKE_GH_EXIT%\r\n"
+                ":do_auth\r\n"
+                "if not \"%FAKE_GH_AUTH_EXIT%\"==\"\" exit /b %FAKE_GH_AUTH_EXIT%\r\n"
+                "exit /b 0\r\n"
+            )
         return d, log
 
     def _no_gh_path(self):
@@ -4218,7 +4273,10 @@ class InstallPs1Tests(unittest.TestCase):
         }
 
     def _run(self, args, env_extra=None, remove_keys=()):
-        env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+        env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "GH_TOKEN", "GITHUB_TOKEN")
+        }
         env.update({
             "HOME": self.home,
             "USERPROFILE": self.home,
@@ -4273,6 +4331,33 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stdout)
         self.assertIn("skipping provenance attestation", res.stdout)
         self.assertTrue(os.path.isfile(os.path.join(dest, "oxideswarm.exe")))
+
+    def test_unauthenticated_gh_skips_attestation_with_warning(self):
+        gh_dir, gh_log = self._make_fake_gh(99)
+        routes = self._build_release_routes("0.4.4", "WIN_UNAUTH_GH")
+        dest_dry = os.path.join(self.tmp, "dest_unauth_dry")
+        dest = os.path.join(self.tmp, "dest_unauth")
+        env_extra = {
+            "PATH": gh_dir + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_GH_LOG": gh_log,
+            "FAKE_GH_AUTH_EXIT": "1",
+            "FAKE_GH_EXIT": "99",
+        }
+        with _FakeReleaseServer(routes) as srv:
+            env_extra["OXIDESWARM_DOWNLOAD_BASE"] = srv.base_url
+            dry = self._run(["--version", "0.4.4", "--dir", dest_dry, "--dry-run"], env_extra)
+            self.assertEqual(srv.requests, [])
+            res = self._run(["--version", "0.4.4", "--dir", dest], env_extra)
+        self.assertEqual(dry.returncode, 0, dry.stdout)
+        self.assertIn("not authenticated", dry.stdout)
+        self.assertFalse(os.path.exists(dest_dry))
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("Warning:", res.stdout)
+        self.assertIn("not authenticated", res.stdout)
+        self.assertIn("skipping provenance attestation", res.stdout)
+        self.assertEqual(read(gh_log).strip(), "", "unauthenticated gh must not call gh attestation verify")
+        for b in ("oxideswarm.exe", "rusty-grid.exe", "ox-mode.exe"):
+            self.assertTrue(os.path.isfile(os.path.join(dest, b)))
 
     def test_attestation_failure_refuses_and_leaves_no_file(self):
         gh_dir, gh_log = self._make_fake_gh(1)

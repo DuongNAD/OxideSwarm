@@ -16,7 +16,7 @@ Usage: install.ps1 [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run] [-h|-
        install.ps1 [-Version <VERSION>] [-Dir <DIR>] [-Gpu] [-DryRun] [-Help]
 
 Install oxideswarm.exe, rusty-grid.exe, and ox-mode.exe for the current user
-after verifying SHA256SUMS (and GitHub build provenance attestation when `gh` is installed).
+after verifying SHA256SUMS (and GitHub build provenance attestation when `gh` is installed and authenticated).
 
 Options:
   --version, -Version <VERSION>  Release version to install (default: 0.4.4)
@@ -123,10 +123,32 @@ $ArchiveName = "$ArchiveStem.zip"
 $ArchiveUrl = "$DownloadBase/v$Version/$ArchiveName"
 $SumsUrl = "$DownloadBase/v$Version/SHA256SUMS"
 
+function Test-GhAuthenticated($Cmd) {
+    if (-not $Cmd) { return $false }
+    if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN) -or -not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+        return $true
+    }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Cmd.Source auth token 2>$null | Out-Null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    return ($code -eq 0)
+}
+
 $GhCmd = Get-Command gh -ErrorAction SilentlyContinue
-$AttestPlan = if ($GhCmd) { 'verify with gh attestation verify' } else { 'skip (gh CLI not found; SHA256SUMS only)' }
 
 if ($DryRun) {
+    if (-not $GhCmd) {
+        $AttestPlan = 'skip (gh CLI not found; SHA256SUMS only)'
+    } elseif (Test-GhAuthenticated $GhCmd) {
+        $AttestPlan = 'verify with gh attestation verify'
+    } else {
+        $AttestPlan = 'skip (gh CLI is not authenticated; SHA256SUMS only)'
+    }
     Write-Output 'Dry run: no files will be downloaded or written.'
     Write-Output "  version:     $Version"
     Write-Output "  platform:    Windows / $rawArch -> $Target"
@@ -188,16 +210,20 @@ try {
     Write-Output "Checksum verified ($ActualSha)."
 
     if ($GhCmd) {
-        Write-Output 'Verifying release provenance attestation with gh...'
-        $prevEap = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        & $GhCmd.Source attestation verify $ArchivePath --repo $Repo --signer-workflow $SignerWorkflow --source-ref ("refs/tags/v" + $Version)
-        $ghExit = $LASTEXITCODE
-        $ErrorActionPreference = $prevEap
-        if ($ghExit -ne 0) {
-            Fail-Install "provenance attestation verification failed for $ArchiveName" 1
+        if (Test-GhAuthenticated $GhCmd) {
+            Write-Output 'Verifying release provenance attestation with gh...'
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & $GhCmd.Source attestation verify $ArchivePath --repo $Repo --signer-workflow $SignerWorkflow --source-ref ("refs/tags/v" + $Version)
+            $ghExit = $LASTEXITCODE
+            $ErrorActionPreference = $prevEap
+            if ($ghExit -ne 0) {
+                Fail-Install "provenance attestation verification failed for $ArchiveName" 1
+            }
+            Write-Output 'Provenance attestation verified.'
+        } else {
+            Write-Output "Warning: gh CLI is installed but not authenticated; skipping provenance attestation check (SHA-256 verified). Run 'gh auth login' to enable provenance verification."
         }
-        Write-Output 'Provenance attestation verified.'
     } else {
         Write-Output 'Note: gh CLI not found; skipping provenance attestation check (SHA-256 verified).'
     }

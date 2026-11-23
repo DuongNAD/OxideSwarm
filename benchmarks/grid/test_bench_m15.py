@@ -58,6 +58,58 @@ class BenchM15Tests(unittest.TestCase):
         self.assertNotIn(sentinel, out)
         self.assertIn("-m15-", os.path.basename(out))
 
+    def test_isolated_env_preserves_gh_config_dir_on_unix_for_install_only(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bench, "IS_WINDOWS", False):
+            real_home = os.path.join(d, "real_home")
+            real_gh = os.path.join(real_home, ".config", "gh")
+            xdg_home = os.path.join(d, "xdg_cfg")
+            xdg_gh = os.path.join(xdg_home, "gh")
+            explicit_gh = os.path.join(d, "explicit_gh")
+            iso_home = os.path.join(d, "iso_home")
+            tmp_dir = os.path.join(d, "tmp")
+            bin_dir = os.path.join(d, "bin")
+            empty_cfg = os.path.join(d, "empty.toml")
+            for p in (real_gh, xdg_gh, explicit_gh, iso_home, tmp_dir, bin_dir):
+                os.makedirs(p, exist_ok=True)
+            with open(empty_cfg, "w", encoding="utf-8") as f:
+                f.write("")
+
+            with mock.patch.dict(os.environ, {"HOME": real_home, "PATH": "/usr/bin"}, clear=True):
+                env_inst = bench._isolated_env(
+                    iso_home, tmp_dir, bin_dir, "http://127.0.0.1:9999", empty_cfg, preserve_gh_config=True
+                )
+                self.assertEqual(env_inst["HOME"], iso_home)
+                self.assertEqual(env_inst["OXIDESWARM_HOME"], os.path.join(iso_home, ".oxideswarm"))
+                self.assertEqual(env_inst["GH_CONFIG_DIR"], real_gh)
+                self.assertNotIn("XDG_CONFIG_HOME", env_inst)
+
+                env_runtime = bench._isolated_env(
+                    iso_home, tmp_dir, bin_dir, "http://127.0.0.1:9999", empty_cfg, preserve_gh_config=False
+                )
+                self.assertEqual(env_runtime["HOME"], iso_home)
+                self.assertNotIn("GH_CONFIG_DIR", env_runtime)
+
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": real_home, "XDG_CONFIG_HOME": xdg_home, "PATH": "/usr/bin"},
+                clear=True,
+            ):
+                env_xdg = bench._isolated_env(
+                    iso_home, tmp_dir, bin_dir, "http://127.0.0.1:9999", empty_cfg, preserve_gh_config=True
+                )
+                self.assertEqual(env_xdg["GH_CONFIG_DIR"], xdg_gh)
+                self.assertNotIn("XDG_CONFIG_HOME", env_xdg)
+
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": real_home, "XDG_CONFIG_HOME": xdg_home, "GH_CONFIG_DIR": explicit_gh, "PATH": "/usr/bin"},
+                clear=True,
+            ):
+                env_exp = bench._isolated_env(
+                    iso_home, tmp_dir, bin_dir, "http://127.0.0.1:9999", empty_cfg, preserve_gh_config=True
+                )
+                self.assertEqual(env_exp["GH_CONFIG_DIR"], explicit_gh)
+
 
 if __name__ == "__main__":
     unittest.main()

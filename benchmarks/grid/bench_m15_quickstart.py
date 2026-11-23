@@ -206,15 +206,27 @@ class _ArchiveHttpServer:
         self._thread.join(timeout=5)
 
 
-def _isolated_env(home_dir, tmp_dir, bin_dir, download_base, empty_config):
+def _isolated_env(home_dir, tmp_dir, bin_dir, download_base, empty_config, preserve_gh_config=False):
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith("RUSTY_GRID_")
         and not k.startswith("OXIDESWARM_")
         and not k.startswith("OXIDE_")
-        and k.upper() != "PSMODULEPATH"
+        and k.upper() not in ("PSMODULEPATH", "XDG_CONFIG_HOME")
     }
+    if preserve_gh_config and not IS_WINDOWS:
+        if not env.get("GH_CONFIG_DIR"):
+            xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+            orig_home = os.environ.get("HOME")
+            if xdg_cfg:
+                cand = os.path.join(xdg_cfg, "gh")
+            elif orig_home:
+                cand = os.path.join(orig_home, ".config", "gh")
+            else:
+                cand = ""
+            if cand and os.path.isdir(cand):
+                env["GH_CONFIG_DIR"] = cand
     local_app = os.path.join(home_dir, "AppData", "Local")
     os.makedirs(local_app, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
@@ -267,7 +279,10 @@ def run_single_m15(version, download_base, run_idx, work_parent=None):
         total_t0 = time.perf_counter()
 
         # 1. Install via scripts/install.ps1 or scripts/install.sh
-        env_install = _isolated_env(home_install, os.path.join(root, "tmp-install"), bin_dir, download_base, empty_cfg)
+        env_install = _isolated_env(
+            home_install, os.path.join(root, "tmp-install"), bin_dir, download_base, empty_cfg,
+            preserve_gh_config=True,
+        )
         if IS_WINDOWS:
             install_cmd = [
                 "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
