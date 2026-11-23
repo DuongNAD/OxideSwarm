@@ -184,6 +184,7 @@ Recounted on 2026-11-23 after TEST-85 Partial (pull request 417): 248 items, 182
 Recounted on 2026-11-23 after TEST-86 (In) and BUG-36 (Out) were added: 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-41 Partial (pull request 419): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-41 Partial (pull request 420): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-89 was added (Planned, In): 251 items, 182 Implemented, 21 Partial and 48 Planned; 24 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -293,6 +294,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
+| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -643,6 +645,32 @@ The full suite must pass on a clean machine before CI can require it.
   3. If it still stalls after step 1, find the cause (rule 4) before anything else; do not raise the timeouts.
 - **Done when:** The cause is written here, and `test_ax2_shard` and `test_ax1_matrix` pass 50 runs in a row on
   macOS under 6 busy loops with `--test-threads 3`.
+
+### TEST-89: macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s
+
+- **Evidence:** CI run `45180089954` (pull request 421, head `c4987058`, docs only, 2026-11-23 13:30 UTC), job
+  `unit tests (macos-latest)` (`137711364019`), step `python3 -B -m unittest tests/test_wave3_e2e.py -v`: 62 of 63
+  tests passed (588 s in all); `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed at
+  `tests/test_wave3_e2e.py:5347` with `TimeoutError: Worker w-8gb-bl-ok did not reach state:connected within
+  15.0s`. The worker log: started 13:30:23.31, the host probes of `cargo` and `rustc` each timed out after 3 s
+  (13:30:26.48 and 13:30:29.58), `Worker client initialized` at 13:30:29.62, and no later line until the test
+  gave up at about 13:30:38. The master log was not printed. The rerun on the same head is the case PC's
+  (S11).
+- **Problem:** `start_worker` (`tests/test_wave3_e2e.py`, about line 1968) polls `workers --json` until the
+  worker carries `state:connected`, with a 15 s wall-clock deadline that starts at spawn. On a loaded runner the
+  start-up probes alone took 6.3 s, so the worker had less than 9 s to register. Either the runner was slow
+  (the deadline is a wall-clock assertion, which the lessons of design 0087 forbid) or registration stalled
+  (then a longer deadline only hides it). The log cannot tell the two apart: it shows no connect attempt and no
+  master side.
+- **Do:**
+  1. Failing check first: hold the master's accept loop (or start the worker against a port that answers late)
+     and show the 15 s false failure.
+  2. Make the wait a hang guard, not a time limit: a 120 s deadline in `start_worker` (and the other 15 s
+     `_wait_until` guards of the file that wait for a process to start), the elapsed time printed as
+     `[timing]`, and on timeout the master's log printed beside the worker's.
+  3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
+- **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
+  passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
 
 ## Phase 3: make the documents true
 
@@ -2483,3 +2511,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-86 added: three `test_ax2_shard` tests stalled for 60 s on `macos-latest` in the `master` run of pull request 415 (2026-11-22 18:38 UTC), which restarts the Q80 streak; the likely cause is the BUG-35 class, so it waits for pull request 409. The wall-clock assertions of `test_ax2_shard.rs` and `test_ax1_matrix.rs` are now printed, and their hang guards are 60 s. BUG-36 added (Out): `shard` and `submit --matrix` share one deadline across the run. Both ids were claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Partial (pull request 419 (open), S3 Linux part): on Linux (`aarch64`, `10` logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 13 (trixie)` in Docker `rust:1.96` on Apple M5 `10` cores, `rustc 1.96.1`) at `9800abea`, `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`cargo test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture`, temp `HOME` per run) passed `200/200` runs (`2,400` rounds, `ran_twice=0` everywhere, `0` failures, `1,633.96 s` total: `100` default-delay `860.33 s` + `100` `RV158_ZERO=1` `773.63 s`) under `4` CPU busy loops inside the container; stays `Partial | In` pending the post-`09c3accd` Windows `200`-run loop.
 - 2026-11-23: TEST-41 Partial (Windows 200/200 post-`09c3accd`, pull request 420): hardened `tests/master_restart_recovery.rs` (`120 s` helper/marker/done guards, direct `.NET` calls in `#[cfg(windows)] gated_marker_task`, bounded `done_path` loop + `LogSink` timeout dump), verified `master_restart_recovery` `8/8` (`13.59 s`), and passed `200/200` sequential `rv158` runs (`100` default + `100` `RV158_ZERO=1`, `2,400` rounds, `ran_twice=0`, `2,725.53 s` total) on Windows under 4 Python CPU busy loops at `cfed793d`; stays `Partial | In` pending closure decision.
+- 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
