@@ -298,6 +298,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
+| TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Planned | In | (unlanded claim `TEST-70`) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -690,6 +691,21 @@ The full suite must pass on a clean machine before CI can require it.
   3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
 - **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
   passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
+
+### TEST-93: macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation
+
+- **Evidence:** CI run `45261621774` (push of pull request 426 to `master`, commit `720106d8`, 2026-11-23 20:39 UTC),
+  job `workspace tests (macos-latest)` (`137997584352`), step 8 (`cargo test --workspace --locked --no-fail-fast`),
+  binary `m2_challenger_1_stress` (`tests/m2_challenger_1_stress.rs`, via `rusty_grid_master`): 11 of 12 tests passed
+  and `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` failed at `2026-11-23T21:35:22Z` with
+  `QUIC 5MB Saturation: Heartbeat avg_latency=73.508552ms, max_latency=517.037542ms` and panicked at
+  `crates/master/../../tests/m2_challenger_1_stress.rs:472:5`: `"Control lane average latency must stay sub-50ms under 5MB saturation (got 73.508552ms)"`. It is the first failing test on `master` after `45054272288` (`TEST-86`), so the Q80 streak resets and counts again from `2026-11-23 21:35 UTC`.
+- **Problem:** `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` (`tests/m2_challenger_1_stress.rs:420-477`) asserts the Category 1 wall-clock upper bound `assert!(avg_latency < Duration::from_millis(50))` while streaming 5 MiB across a concurrent QUIC data stream on a shared debug runner. It was skipped in `TEST-83` (pull request `406`) because `TEST-70` (`claims/item/TEST-70__owner__20261119T202928854486Z__962fe400.json`, branch `win2/test-m2-quic-latency`) had claimed that bound, but `TEST-70` never landed in `docs/BACKLOG.md` or any pull request.
+- **Do:**
+  1. Audit `tests/m2_challenger_1_stress.rs` for `line 472` (`< 50 ms`) and any other Category 1 wall-clock upper bounds.
+  2. Replace `avg_latency < Duration::from_millis(50)` with a structural QUIC multiplexing / control-lane anti-HOL proof (matching `TEST-83`'s `zero_copy_quic_test` `test_quic_stream_multiplexing_isolation_and_anti_hol_blocking`, printing `avg_latency` / `max_latency` as `[timing]` lines instead of failing on debug CPU jitter).
+  3. Verify `cargo test --locked -p rusty_grid_master --test m2_challenger_1_stress` passes `20/20` runs under 6 Python CPU busy loops on macOS.
+- **Done when:** `tests/m2_challenger_1_stress.rs` uses structural multiplexing proofs instead of `< 50 ms` and passes `20/20` loaded runs.
 
 ## Phase 3: make the documents true
 
@@ -2496,3 +2512,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
+- 2026-11-24: TEST-93 added (`Planned | In`, claimed via `claims/item/TEST-93`): `master` push CI run `45261621774` (`720106d8`, pull request 426) failed in `workspace tests (macos-latest)` (`137997584352`) at `tests/m2_challenger_1_stress.rs:472` (`test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation`: `avg_latency=73.508552ms` vs `< 50 ms` wall-clock bound skipped in `TEST-83` under unlanded claim `TEST-70`), resetting the Q80 clean streak from `2026-11-23 21:35 UTC`.
