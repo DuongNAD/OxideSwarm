@@ -119,6 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
     fn spawn_and_output_preserve_enoent_and_output() {
         let mut missing_cmd = Command::new("/nonexistent-oxideswarm-bug35-probe");
         let err = spawn_std(&mut missing_cmd).expect_err("nonexistent binary must fail spawn");
@@ -265,6 +266,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg_attr(miri, ignore = "Miri: spawns a process")]
         fn test_macos_concurrent_spawns_do_not_inherit_unrelated_pipes() {
             let stalled = run_concurrent_gate_ordering_check(true, 10);
             assert_eq!(
