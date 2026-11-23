@@ -403,6 +403,7 @@ block the Q80 exit check, so run them when the machines and the owner are free.
 
 ## S8 Windows manual check record (2026-11-23)
 
+- **Pull request**: 422 (`win/s8-windows-manual-check`)
 - **Commit**: `8e55dac9` (`origin/master`, PRs 410, 413 and 414)
 - **Machine**: Windows 11 Pro `x86_64`, `Intel Core i5-14600KF` (`14` physical / `20` logical cores); loopback `127.0.0.1` with isolated temporary `USERPROFILE`/`HOME`/`OXIDESWARM_HOME` and separate `TEMP`/`TMP` dirs per process; all processes stopped cleanly by PID.
 - **Build**: `cargo +1.96.0 build --locked --bin rusty-grid -p rusty_grid_cli` and `cargo +1.96.0 build --locked -p agent_mesh`.
