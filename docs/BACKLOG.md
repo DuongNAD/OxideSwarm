@@ -298,6 +298,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
+| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -690,6 +691,24 @@ The full suite must pass on a clean machine before CI can require it.
   3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
 - **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
   passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
+
+### TEST-90: Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700`
+
+- **Evidence:** Scheduled CI run `45180525786` (`2026-11-23T13:05:51Z`, `edd82f64`), job `endurance (loopback)`
+  (`137725714467`) on `ubuntu-latest`: step 8 (`Run short transfer suite`) passed, and step 9
+  (`Run 45-minute loopback soak`) exited 1 immediately when `w0` failed to open persistent workspaces:
+  `Configuration error: Workspace store cannot be opened: workspace root '.../soak/cluster/workspaces-w0' cannot be used: Task sandboxes cannot use '.../workspaces-w0' safely: its mode is 755: other users can enter it (it must be 700)`.
+  Because this was a `schedule` run (not a `master` push run), it does not reset the Q80 7-day push streak;
+  `TEST-26` remains `0/2` green scheduled runs.
+- **Problem:** `SoakCluster._start_worker_locked` in `benchmarks/endurance/endurance.py:2950` creates
+  `self.workspace_dirs[idx]` with `os.makedirs(self.workspace_dirs[idx], exist_ok=True)`, which uses default
+  `0o777` masked by the process umask (`0o022` on Ubuntu CI -> `0o755`), while `rusty_grid_worker` rejects any
+  Unix `--workspace-root` whose mode is not `0o700` (and `sandbox_dirs[idx]` at line 2932 has the same pattern).
+- **Do:** Create `workspace_dirs[idx]` (and `sandbox_dirs[idx]`) with `mode=0o700` and enforce `os.chmod(..., 0o700)`
+  on Unix in `benchmarks/endurance/endurance.py`; add a unit check in `tests/test_endurance_harness.py` that
+  fails under `umask 0o022` without the fix.
+- **Done when:** `tests/test_endurance_harness.py` verifies `0o700` permissions on created soak directories under
+  a `0o022` umask, and a Linux `endurance.py soak` smoke run starts and connects workers cleanly.
 
 ## Phase 3: make the documents true
 
@@ -2496,3 +2515,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
+- 2026-11-24: TEST-90 added (`Planned | In`, claimed via `claims/item/TEST-90`): scheduled CI run `45180525786` (`2026-11-23T13:05:51Z`, `edd82f64`), job `endurance (loopback)` (`137725714467`) failed in step 9 (`soak`) because `benchmarks/endurance/endurance.py:2950` creates `workspaces-w0` with `os.makedirs(..., exist_ok=True)` (mode `0755` under default `ubuntu-latest` umask instead of `0700`); `schedule` event does not reset the Q80 push streak, and `TEST-26` remains `0/2` green scheduled runs.
