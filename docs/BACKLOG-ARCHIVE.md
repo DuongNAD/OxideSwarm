@@ -4053,6 +4053,7 @@ Priority: P1 | Effort: M | Status: Implemented | Pull Request: 409 (open)
   - `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` pass with zero warnings.
   - Under 6 Python CPU busy loops on Apple M5: `rusty_grid_core --lib process_spawn::tests` passed `20/20` (`total 106.18 s`, `min 4.40 s`, `max 7.37 s`) and `rusty_grid_cli --test test_cli_cancel_and_result` passed `20/20` (`total 60.65 s`, `min 2.60 s`, `max 7.55 s`).
   - Full `cargo test --workspace --locked` passed on macOS (`0` failed, `2,230` passed across workspace crates, `5` upstream `#[ignore]`d); `python3 tests/test_m1_challenger_hygiene.py` passed.
+  - Post-merge (`origin/master` `6a9060ba` merged at `8d7dc755`, 2026-11-23, Apple M5 10 logical cores, temporary `HOME` per run, full `crates/*/src` spawn-site audit finding `0` unrouted macOS production spawns): under `6` Python CPU busy loops, `cargo test -p rusty_grid_worker --lib --locked` passed `1/1` (`329/329`, `9.31 s`), `cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked` passed `1/1` (`28/28`, `1` ignored, `27.40 s`), `cargo test -p rusty_grid_core --lib process_spawn --locked` passed `20/20` (`total 89.52 s`, `min 3.70 s`, `max 5.03 s`), and `cargo test -p rusty_grid_cli --test test_cli_cancel_and_result --locked` passed `20/20` (`total 50.80 s`, `min 2.46 s`, `max 3.21 s`).
 
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
