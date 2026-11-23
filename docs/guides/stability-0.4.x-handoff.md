@@ -398,3 +398,32 @@ Run S1 and S2 first (they are the only code changes and S1's test is the newest 
 on idle machine time, S5 every day from now on. S8, S9 and S10 (added 2026-11-23) follow S1,
 S3 and S4 on the case PC, in that order. S6 and S7 finish TEST-24 and TEST-25 but do not
 block the Q80 exit check, so run them when the machines and the owner are free.
+
+---
+
+## S8 Windows manual check record (2026-11-23)
+
+- **Commit**: `8e55dac9` (`origin/master`, PRs 410, 413 and 414)
+- **Machine**: Windows 11 Pro `x86_64`, `Intel Core i5-14600KF` (`14` physical / `20` logical cores); loopback `127.0.0.1` with isolated temporary `USERPROFILE`/`HOME`/`OXIDESWARM_HOME` and separate `TEMP`/`TMP` dirs per process; all processes stopped cleanly by PID.
+- **Build**: `cargo +1.96.0 build --locked --bin rusty-grid -p rusty_grid_cli` and `cargo +1.96.0 build --locked -p agent_mesh`.
+- **Defects found**: none (`0` new BACKLOG items).
+
+1. **AX-1 matrix fan-out — PASS**
+   - 1D axis (`submit --matrix env:FOO=a,b,c --wait --json --command cmd -- /c echo FOO=%FOO%`): exit `0`, 3 cells returned `FOO=a`, `FOO=b`, `FOO=c`.
+   - 2-axis (`submit --matrix env:A=1,2 --matrix env:B=x,y --wait --json --command cmd -- /c echo %A%-%B%`): exit `0`, 4 cells returned `1-x`, `1-y`, `2-x`, `2-y`.
+   - Unplaceable cell (`submit --matrix os=linux --wait --command cmd -- /c echo hi`): failed fast in `0.031 s` (`0.002 s` wait reported by CLI) with exit `1`, `"status": "unplaced"`, and `no connected worker matches cell constraints (os=linux)`.
+   - Per-cell `--output` (`submit --matrix env:CELL=alpha,beta --output out.txt --output-dir <out> --wait --json --command cmd -- /c echo %CELL%>out.txt`): exit `0`, outputs saved separately to `<out>/cell-00-alpha/out.txt` (`alpha`) and `<out>/cell-01-beta/out.txt` (`beta`).
+2. **AX-2 shards — PASS (with 1 sub-check skipped)**
+   - 4 shards across 2 workers (`shard --count 4 --json --type command --command python3 -- -c ...OX_SHARD_INDEX/OX_SHARD_TOTAL...`): exit `0`, `machines: 2`, outputs `SHARD=1/4`, `SHARD=2/4`, `SHARD=3/4`, `SHARD=4/4`, 2 shards executed on `win-w1` and 2 on `win-w2`.
+   - Fail-fast (`shard --count 4 --fail-fast --json ...` with shard `1` exiting `1` at `0.2 s` and shards `2..4` sleeping `25 s`): exited `1` in `0.344 s` with `failed_shards: 1` and `cancelled_shards: 3`.
+   - `--build-once --junit-out`: **SKIPPED** (`cargo +1.96.0 nextest --version` returned `error: no such command: nextest`; `cargo-nextest` is not installed on this machine).
+3. **FEAT-5 process checkpoints — PASS**
+   - `--isolation off` failover (master with `--heartbeat-interval-secs 1 --heartbeat-timeout-secs 3 --reaper-interval-secs 1 --session-resume-hold-secs 0`; two workers; Python task writing `%OXIDESWARM_CHECKPOINT_DIR%\counter.txt` every `1 s` up to `7`): started on `ckpt-w2`, master logged debug checkpoints `sequence=1`, `2`, `3`; killed `ckpt-w2` (`TerminateProcess` / PID `25092`); task resumed on `ckpt-w1` from `RESUME_START=3`, logged checkpoints `sequence=4`, `5`, `6`, and completed with `DONE=7` (exit `0`).
+   - `--isolation fs` (worker `iso-fs-w1` with `RUST_LOG=info`): ran two `cmd /c` tasks (`"echo probe>%OXIDESWARM_CHECKPOINT_DIR%\probe.txt"`); both exited `0` (`ISO_DONE=ok`, `SECOND_DONE=ok`), master recorded `0` mid-task checkpoints (`debug` log absent), and worker logged the design 0102 D5 warning exactly once: `process task checkpoints are not captured on this system under --isolation (design 0102 D5); tasks still run and resume from checkpoints they are given`.
+4. **ENROLL-1d members mode — PASS**
+   - Started master with `--auth members --auth-token <token>:win-admin:admin`. Created a 2-use invite via `POST /api/invites`, joined `win-member-a` and `win-member-b` interactively via `rusty-grid join --no-doctor` in Windows ConPTY, approved both via `POST /api/members/{pending}/approve`, revoked `win-member-a` by name (`POST /api/members/win-member-a/revoke`), and revoked `win-member-b` by 8-char ID prefix (`POST /api/members/b49e1f63/revoke`).
+   - Master log emitted all 5 audit lines (`dashboard: invite created`, 2x `dashboard: member approved`, 2x `dashboard: member revoked`), every line naming `actor="win-admin"`.
+5. **MESH-2 verified delivery — PASS**
+   - Started `agent-mesh hub`, two `scripts/agent_node.py` nodes (`py-node-a`, `py-node-b`), and `agent-mesh node --inbox-dir <dir> --inbox-max-mb 1 --inbox-max-files 10`.
+   - Sent `1,572,864` bytes (`1.5 MiB`) to `py-node-b` via `agent-mesh data --payload-file ... --timeout-ms 60000`: exit `0`, `Chunks: 2`, `Responder: py-node-b (data_received_verified)`, and `py-node-b` logged `Received valid DataPayload (1572864 bytes, SHA-256 verified)`.
+   - Sent `204,800` bytes (`200 KiB`) to `rust-inbox-node`: exit `0`, persisted on disk with matching SHA-256. Sent `1,572,864` bytes (`1.5 MiB`) to `rust-inbox-node` under `--inbox-max-mb 1`: exit `1` with `ERR_INBOX_FULL`.
