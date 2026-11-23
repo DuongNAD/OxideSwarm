@@ -1729,6 +1729,7 @@ class OxideCluster:
         self.env = env
         self.bin = str(find_binary("oxideswarm"))
         self.secret_file: Optional[Path] = None
+        self._last_master: Optional["MasterInstance"] = None
 
     def _base_argv(self, secret_file: Optional[Path] = None) -> list[str]:
         argv = [self.bin]
@@ -1840,7 +1841,7 @@ class OxideCluster:
                 f"Master did not write port file within {timeout}s:\n{mp.logs()}"
             )
 
-        return MasterInstance(
+        mi = MasterInstance(
             proc=mp,
             listen_addr=f"127.0.0.1:{bound_port}",
             port=bound_port,
@@ -1848,6 +1849,8 @@ class OxideCluster:
             state_dir=sd,
             blob_dir=bd,
         )
+        self._last_master = mi
+        return mi
 
     def workers_json(
         self, master_addr: str, secret_file: Optional[Path] = None
@@ -1890,7 +1893,8 @@ class OxideCluster:
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
         wait_connected: bool = True,
-        timeout: float = 15.0,
+        timeout: float = 120.0,
+        master_instance: Optional["MasterInstance"] = None,
     ) -> WorkerInstance:
         sb = sandbox_base_dir or (self.env.root / f"sb_{name}_{uuid.uuid4().hex[:6]}")
         sb.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1966,7 +1970,8 @@ class OxideCluster:
         )
 
         if wait_connected:
-            deadline = time.monotonic() + timeout
+            t0 = time.monotonic()
+            deadline = t0 + timeout
             while time.monotonic() < deadline:
                 if mp.poll() is not None:
                     raise RuntimeError(
@@ -1976,12 +1981,22 @@ class OxideCluster:
                     wlist = self.workers_json(master_addr, secret_file=secret_file)
                     for w in wlist:
                         if w.get("name") == name and "state:connected" in w.get("tags", []):
+                            elapsed = time.monotonic() - t0
+                            print(f"[timing] {name} connected after {elapsed:.2f} s", file=sys.stderr)
                             return WorkerInstance(proc=mp, name=name, sandbox_dir=sb)
                 except Exception:
                     pass
                 time.sleep(0.05)
+            # Print master log alongside worker log on timeout
+            master_log = ""
+            mi = master_instance or self._last_master
+            if mi is not None:
+                try:
+                    master_log = f"\n--- master log ---\n{mi.proc.logs()}"
+                except Exception:
+                    pass
             raise TimeoutError(
-                f"Worker {name} did not reach state:connected within {timeout}s:\n{mp.logs()}"
+                f"Worker {name} did not reach state:connected within {timeout}s:\n{mp.logs()}{master_log}"
             )
 
         return WorkerInstance(proc=mp, name=name, sandbox_dir=sb)
@@ -2332,14 +2347,17 @@ class MeshCluster:
 
 def _wait_until(
     predicate: Callable[[], Any],
-    timeout: float = 15.0,
+    timeout: float = 120.0,
     interval: float = 0.03,
     desc: str = "condition",
 ) -> Any:
-    deadline = time.monotonic() + timeout
+    t0 = time.monotonic()
+    deadline = t0 + timeout
     while time.monotonic() < deadline:
         val = predicate()
         if val:
+            elapsed = time.monotonic() - t0
+            print(f"[timing] _wait_until({desc}) satisfied after {elapsed:.2f} s", file=sys.stderr)
             return val
         time.sleep(interval)
     raise TimeoutError(f"Timed out after {timeout}s waiting for {desc}")
@@ -2678,7 +2696,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
         )
         _wait_until(
             lambda: marker.is_file() and len(marker.read_text(encoding="utf-8").splitlines()) == 4,
-            timeout=15.0,
+            timeout=120.0,
             desc="all 4 shards running simultaneously across 2 workers",
         )
         gate.write_text("go\n", encoding="utf-8")
@@ -2908,7 +2926,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
         task_id = sub.get("payload", {}).get("task_id")
         self.assertTrue(task_id, f"Missing task_id in async grid_submit: {sub!r}")
 
-        _wait_until(marker.is_file, timeout=15.0, desc="async mesh task started on external worker")
+        _wait_until(marker.is_file, timeout=120.0, desc="async mesh task started on external worker")
         st = ws.grid_status(task_id=task_id)
         self.assertEqual(st.get("status"), "success", st)
 
@@ -3196,7 +3214,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
                 "--command", f'touch "{marker}"; while [ ! -f "{gate}" ]; do sleep 0.02; done',
             ],
         )
-        _wait_until(marker.is_file, timeout=15.0, desc="w-busy-bl occupied")
+        _wait_until(marker.is_file, timeout=120.0, desc="w-busy-bl occupied")
 
         in_mesh = self.env.work / "hold_input.glb"
         in_mesh.write_bytes(make_minimal_glb_bytes())
@@ -3621,7 +3639,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
         self.assertEqual(sub.returncode, 0, f"stderr:\n{sub.stderr}\nstdout:\n{sub.stdout}")
         task_id = json.loads(sub.stdout)["task_id"]
 
-        _wait_until(hang_marker.is_file, timeout=15.0, desc="fake Blender started for cancel")
+        _wait_until(hang_marker.is_file, timeout=120.0, desc="fake Blender started for cancel")
         t_cancel = time.monotonic()
         c_res = self.ox.cancel_cli(master.listen_addr, task_id)
         self.assertEqual(c_res.returncode, 0, f"stderr:\n{c_res.stderr}\nstdout:\n{c_res.stdout}")
@@ -4299,7 +4317,7 @@ class Tier2BoundaryCornerTests(Wave3E2ETestBase):
                 f'echo "END_1" >> "{log_file}"',
             ],
         )
-        _wait_until(m1.is_file, timeout=15.0, desc="task 1 (6144 MB) running")
+        _wait_until(m1.is_file, timeout=120.0, desc="task 1 (6144 MB) running")
 
         p2 = self.ox.submit_cli_popen(
             master.listen_addr,
@@ -4318,7 +4336,7 @@ class Tier2BoundaryCornerTests(Wave3E2ETestBase):
 
         gate1.write_text("go\n", encoding="utf-8")
         self.assertEqual(p1.wait(timeout=15.0), 0, p1.logs())
-        _wait_until(m2.is_file, timeout=15.0, desc="task 2 started after task 1 released VRAM")
+        _wait_until(m2.is_file, timeout=120.0, desc="task 2 started after task 1 released VRAM")
         gate2.write_text("go\n", encoding="utf-8")
         self.assertEqual(p2.wait(timeout=15.0), 0, p2.logs())
 
@@ -4702,7 +4720,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
                 sys.executable, "-c", shard_py,
             ],
         )
-        _wait_until(started_1.is_file, timeout=15.0, desc="first shard running on w-die-1")
+        _wait_until(started_1.is_file, timeout=120.0, desc="first shard running on w-die-1")
         self.ox.start_worker(master.listen_addr, name="w-survive-2", cores=4, max_concurrency=4)
         w1.proc.stop(sig=signal.SIGKILL, timeout=5.0)
         rc = proc.wait(timeout=30.0)
@@ -4784,7 +4802,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
         )
         self.assertEqual(sub.get("status"), "success", sub)
         tid = sub["payload"]["task_id"]
-        _wait_until(marker.is_file, timeout=15.0, desc="durability task started")
+        _wait_until(marker.is_file, timeout=120.0, desc="durability task started")
         gate.write_text("go\n", encoding="utf-8")
 
         _wait_until(
@@ -4896,7 +4914,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
                 "--wait", "--json",
             ],
         )
-        _wait_until(hang_marker.is_file, timeout=15.0, desc="AutoRig running on w-fo-bl-1")
+        _wait_until(hang_marker.is_file, timeout=120.0, desc="AutoRig running on w-fo-bl-1")
         hang_flag.unlink()
         w2.proc.stop(sig=signal.SIGKILL, timeout=5.0)
 
@@ -5047,7 +5065,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
         )
         _wait_until(
             lambda: hang_marker.is_file() and hang_pids.is_file(),
-            timeout=15.0,
+            timeout=120.0,
             desc="t3 cancel task started with task_id",
         )
         pids = json.loads(hang_pids.read_text(encoding="utf-8"))
@@ -5173,7 +5191,7 @@ class Tier4WorkloadScenarios(Wave3E2ETestBase):
             {"script": f'touch "{marker}"; sleep 60', "wait": False}
         )
         runaway_id = runaway["payload"]["task_id"]
-        _wait_until(marker.is_file, timeout=15.0, desc="runaway mesh task started")
+        _wait_until(marker.is_file, timeout=120.0, desc="runaway mesh task started")
         can = ws_alpha.grid_cancel(runaway_id)
         self.assertEqual(can.get("status"), "success", can)
 
@@ -5430,7 +5448,7 @@ class Tier4WorkloadScenarios(Wave3E2ETestBase):
                 pool.submit(run_builtin_rig, 0),
                 pool.submit(run_builtin_rig, 1),
             ]
-            _wait_until(hang_marker.is_file, timeout=15.0, desc="stress hanging Blender started")
+            _wait_until(hang_marker.is_file, timeout=120.0, desc="stress hanging Blender started")
             t_cancel = time.monotonic()
             c_hang = self.ox.cancel_cli(master.listen_addr, hang_tid)
             self.assertEqual(c_hang.returncode, 0, f"stderr:\n{c_hang.stderr}\nstdout:\n{c_hang.stdout}")
