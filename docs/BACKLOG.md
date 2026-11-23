@@ -296,7 +296,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
-| TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Partial | In |  |
+| TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Implemented |  | 429 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
@@ -648,29 +648,6 @@ The full suite must pass on a clean machine before CI can require it.
   3. If it still stalls after step 1, find the cause (rule 4) before anything else; do not raise the timeouts.
 - **Done when:** The cause is written here, and `test_ax2_shard` and `test_ax1_matrix` pass 50 runs in a row on
   macOS under 6 busy loops with `--test-threads 3`.
-
-### TEST-87: macOS: worker portal loopback test fails when its LAN-side bind finds the port in use
-
-- **Evidence:** `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` failed on
-  `macos-latest` in pull request 419 (run `45129742542`, job `137542373519`, head `116353d0`, docs-only): the
-  panic at `crates/worker/src/client/tests.rs:4155` was `must not bind 0.0.0.0:49623 (binding
-  192.168.64.11:49623 failed: AddrInUse)`. 328 other tests in the binary passed.
-- **Problem:** The test proves the portal is not on `0.0.0.0` by binding `<lan_ip>:<portal port>`. Any other
-  socket on that address and port makes the bind fail, for example a concurrent test's outgoing connection
-  with an ephemeral local port in the same 49152–65535 range. The listener's `local_addr` is already
-  asserted to be `127.0.0.1`, so the LAN-side bind adds only noise.
-- **Do:** Write a failing check first (hold a socket on `<lan_ip>:<port>` before the bind and show the false
-  failure). Then, on `AddrInUse`, connect to `<lan_ip>:<port>` instead: refused, or an answer that is not the
-  portal's `/api/status` body, passes. Only the portal's body fails. Keep the `127.0.0.1` assertion.
-- **Done when:** 50 runs of `cargo test -p rusty_grid_worker --lib client::tests` pass under 4 busy loops
-  on Windows, plus the same run on macOS by `agent-mac`.
-- **Partial (2026-11-24, branch `win/test-87-portal-lan-bind`, commit `ff832b0e`):**
-  - **Failing check first:** added `test_portal_lan_bind_check_tolerates_non_portal_socket_on_addr_in_use` calling the naive `std::net::TcpListener::bind` check against an occupied loopback listener port (`127.0.0.1:26921`); failed as expected with `Os { code: 10048, kind: AddrInUse, message: "Only one usage of each socket address (protocol/network address/port) is normally permitted." }`.
-  - **Fix (`crates/worker/src/client/tests.rs`):** kept the `127.0.0.1` `local_addr().ip()` assertion in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` and replaced the bare LAN bind with `assert_portal_not_listening_on_lan`. On `ErrorKind::AddrInUse`, it connects to `(lan_ip, portal_port)` and sends `GET /api/status` (bounded by `TEST_WAIT_TIMEOUT = 60 s`), failing only when the response parses as the worker portal `200 OK` JSON status (`"role":"WORKER_PORTAL"` and `"master_cluster_addr"`, `is_worker_portal_status_response`). Added three toleration cases (unrelated HTTP server, silent closing listener, bound non-listening socket) and negative control `test_portal_lan_bind_check_rejects_real_portal_on_addr_in_use` proving a live `run_portal` on the probed address still fails (`answered /api/status`).
-  - **Windows loop (`ff832b0e`, `git status --porcelain` empty, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`OXIDESWARM_HOME`/`TEMP`/`TMP`):**
-    - `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops: `50/50` passed (`83` tests/run; `0` failures; wall `6.72–7.91 s`, median `6.81 s`, total `342.20 s`).
-    - `cargo +1.96.0 fmt --all -- --check` and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed (`0` warnings).
-  - Stays `Partial` pending `50/50` loaded runs on macOS from `agent-mac-ag`.
 
 ### TEST-89: macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s
 
@@ -2503,4 +2480,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
-- 2026-11-24: TEST-87 Partial (branch `win/test-87-portal-lan-bind`, commit `ff832b0e`): reproduced the `AddrInUse` false failure first, updated `crates/worker/src/client/tests.rs` (`assert_portal_not_listening_on_lan`, keeping the `127.0.0.1` check) to probe `GET /api/status` on `AddrInUse` and fail only on the worker portal JSON body (plus negative control rejecting a live portal), and passed `50/50` runs of `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` (`83` tests/run, `6.72–7.91 s`, median `6.81 s`, total `342.20 s`) under `4` Python CPU busy loops on Windows (`14` physical / `20` logical cores); stays Partial pending `50` macOS runs from `agent-mac-ag`.
+- 2026-11-24: TEST-87 Implemented (pull request 429, branch `win/test-87-portal-lan-bind`, text moved to the archive): reproduced the `AddrInUse` false failure first, updated `crates/worker/src/client/tests.rs` (`assert_portal_not_listening_on_lan`, keeping the `127.0.0.1` check) to probe `GET /api/status` on `AddrInUse` and fail only on the worker portal JSON body (plus negative control rejecting a live portal); passed `50/50` runs of `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops on Windows (`ff832b0e`, `14` physical / `20` logical cores, `83` tests/run, `6.72–7.91 s`, median `6.81 s`, total `342.20 s`) and `50/50` runs under `4` Python CPU busy loops on Apple Silicon M5 macOS (`d3103d30`, `agent-mac-ag`, `10` logical cores, `84` tests/run, `9.52–11.65 s`, median `9.75 s`, total `490.43 s`).

@@ -3783,6 +3783,30 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `python::test_sec6_mesh_sandbox`: single passed, after `20/20` (`total=192.31s`, `min=9.51s`, `max=9.67s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
 
+### TEST-87: macOS: worker portal loopback test fails when its LAN-side bind finds the port in use
+
+- **Evidence:** `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` failed on
+  `macos-latest` in pull request 419 (run `45129742542`, job `137542373519`, head `116353d0`, docs-only): the
+  panic at `crates/worker/src/client/tests.rs:4155` was `must not bind 0.0.0.0:49623 (binding
+  192.168.64.11:49623 failed: AddrInUse)`. 328 other tests in the binary passed.
+- **Problem:** The test proves the portal is not on `0.0.0.0` by binding `<lan_ip>:<portal port>`. Any other
+  socket on that address and port makes the bind fail, for example a concurrent test's outgoing connection
+  with an ephemeral local port in the same 49152–65535 range. The listener's `local_addr` is already
+  asserted to be `127.0.0.1`, so the LAN-side bind adds only noise.
+- **Do:** Write a failing check first (hold a socket on `<lan_ip>:<port>` before the bind and show the false
+  failure). Then, on `AddrInUse`, connect to `<lan_ip>:<port>` instead: refused, or an answer that is not the
+  portal's `/api/status` body, passes. Only the portal's body fails. Keep the `127.0.0.1` assertion.
+- **Done when:** 50 runs of `cargo test -p rusty_grid_worker --lib client::tests` pass under 4 busy loops
+  on Windows, plus the same run on macOS by `agent-mac`.
+- **Implemented (2026-11-24, pull request 429, branch `win/test-87-portal-lan-bind`):**
+  - **Failing check first (`crates/worker/src/client/tests.rs`):** added `test_portal_lan_bind_check_tolerates_non_portal_socket_on_addr_in_use` calling the naive `std::net::TcpListener::bind` check against an occupied loopback listener port (`127.0.0.1:26921`); failed as expected with `Os { code: 10048, kind: AddrInUse, message: "Only one usage of each socket address (protocol/network address/port) is normally permitted." }`.
+  - **Fix (`crates/worker/src/client/tests.rs`):** kept the `127.0.0.1` `local_addr().ip()` assertion in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` and replaced the bare LAN bind with `assert_portal_not_listening_on_lan`. On `ErrorKind::AddrInUse`, it connects to `(lan_ip, portal_port)` and sends `GET /api/status` (bounded by `TEST_WAIT_TIMEOUT = 60 s`), failing only when the response parses as the worker portal `200 OK` JSON status (`"role":"WORKER_PORTAL"` and `"master_cluster_addr"`, `is_worker_portal_status_response`). Added three toleration cases (unrelated HTTP server, silent closing listener, bound non-listening socket) and negative control `test_portal_lan_bind_check_rejects_real_portal_on_addr_in_use` proving a live `run_portal` on the probed address still fails (`answered /api/status`).
+  - **Windows loop (`ff832b0e`, `git status --porcelain` empty, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`OXIDESWARM_HOME`/`TEMP`/`TMP`):**
+    - `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops: `50/50` passed (`83` tests/run; `0` failures; wall `6.72–7.91 s`, median `6.81 s`, total `342.20 s`).
+    - `cargo +1.96.0 fmt --all -- --check` and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed (`0` warnings).
+  - **macOS loop (`d3103d30`, `agent-mac-ag`, Apple Silicon M5, `10` logical cores, isolated temporary `HOME`/`USERPROFILE`/`OXIDESWARM_HOME` per run, real `RUSTUP_HOME`/`CARGO_HOME`):**
+    - `cargo test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops: `50/50` passed (`84` tests/run; `0` failures; min `9.52 s`, median `9.75 s`, max `11.65 s`, total `490.43 s`).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
