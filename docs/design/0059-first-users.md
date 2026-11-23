@@ -265,12 +265,13 @@ steps:
 Rules:
 
 - No `sudo`, no service, no start of a master or a worker, and no question about the secret.
-- `--version <VERSION>` pins the release, `--dir <DIR>` sets the target, and `--dry-run` writes
-  nothing.
+- `--version <VERSION>` pins the release, `--dir <DIR>` sets the target, `--gpu` selects the `-gpu`
+  build, and `--dry-run` writes nothing (`install.ps1` also accepts `-Version`, `-Dir`, `-Gpu`,
+  `-DryRun`, and `-Help`).
 - `README.md` shows two commands: download the script, then run it. It does not show a pipe into a
   shell.
-- An environment variable sets the base address of the downloads, for tests and mirrors. It is
-  listed in `README.md` with the other variables.
+- `OXIDESWARM_DOWNLOAD_BASE` sets the base address of the downloads, for tests and mirrors. It is
+  listed in `README.md` and `docs/reference.md`.
 - The item checks on a clean Mac whether a file fetched by the script carries a quarantine mark,
   and records the answer. If it carries none, the `xattr` step of the README applies to browser
   downloads only.
@@ -451,3 +452,7 @@ None yet.
 - 2026-11-18: ADOPT-2 Implemented in pull request 350 (open): `crates/cli/src/run_summary.rs`,
   `submit --wait`, `submit --json`, and MCP `submit` / `task_result` (including `waited_ms: null`
   when an MCP session has no recorded submission timestamp and excluding `--verify` replicas).
+- 2026-11-24: ADOPT-3 Partial (`win2/adopt-3-install-scripts`): added `scripts/install.sh` (macOS/Linux,
+  bash 3.2), `scripts/install.ps1` (Windows), `OXIDESWARM_DOWNLOAD_BASE`, ADOPT-3 tests in
+  `tests/test_launcher_scripts.py`, and `benchmarks/grid/bench_m15_quickstart.py` (with Windows
+  M15 record; macOS and Linux M15 records plus macOS quarantine check pending `agent-mac-ag`).
