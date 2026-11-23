@@ -695,13 +695,18 @@ The full suite must pass on a clean machine before CI can require it.
   3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
 - **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
   passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
-- **Done:** Cause is recorded as "likely a slow runner; not proven" (see above). Pending Step 2 TCP-proxy
-  outputs and post-merge run. Changes: `start_worker` timeout `15 s → 120 s` with `[timing]` print and
-  master log dump on timeout; `_wait_until` default `15 s → 120 s` with `[timing]` print; 12 explicit
-  `timeout=15.0` marker/start waits raised to `120 s`; process-exit, CLI-command and result waits left
-  unchanged. `tests/test_wave3_e2e.py` (63 tests, ~2 minutes per run: `115.4–122.4 s`) passed `20/20` runs
-  (`2,369.8 s` total, max connect `3.19 s`) on Apple M5 (`10` logical cores) under `4` Python CPU busy loops at
-  `4b87e64b`.
+- **Done:** Cause is recorded as "likely a slow runner; not proven" (see above). Step 2 late-connect TCP proxy
+  check (`w-late-proxy`, registration connections held until `+20.0 s` using `ox-wt-t89-mac/target/debug/oxideswarm`):
+  - Before fix (`27a910ec`, `timeout=15.0`): failed at `15.06 s` with
+    `TimeoutError: Worker w-late-proxy did not reach state:connected within 15.0s:` (`registration_handshake`
+    timed out after `5s` at attempt 1 and attempt 2 before the `15.0 s` guard fired).
+  - After fix (`8ccf776f`, `timeout=120.0`): passed at `20.07 s` with
+    `[timing] w-late-proxy connected after 20.07 s` (`RESULT=PASS elapsed=20.07s worker=w-late-proxy`).
+  Changes: `start_worker` timeout `15 s → 120 s` with `[timing]` print and master log dump on timeout;
+  `_wait_until` default `15 s → 120 s` with `[timing]` print; 12 explicit `timeout=15.0` marker/start waits
+  raised to `120 s`; process-exit, CLI-command and result waits left unchanged. `tests/test_wave3_e2e.py`
+  (`63` tests, per-run time ~`2` minutes: `115.4–122.4 s`) passed `20/20` runs (`2,369.8 s` total, max connect
+  `3.19 s`) on Apple M5 (`10` logical cores) under `4` Python CPU busy loops at `4b87e64b`.
 
 ## Phase 3: make the documents true
 
@@ -2508,4 +2513,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
-- 2026-11-24: TEST-89 Implemented (pull requests 425, 427 (open), branch `mac/test-89-wave3-connect-guard`): cause is "likely a slow runner; not proven" (local runs set/inherited `RUSTUP_HOME`/`CARGO_HOME` and did not hit CI's `3 s` `cargo`/`rustc` probe timeouts, so `0.4–3.2 s` local connect times do not prove what the CI runner did). Step 2 verified with a 20 s TCP proxy holding worker registration (`15 s` `TimeoutError` on `27a910ec`, passes at `~20 s` on PR 427 head). Raised `start_worker`, `_wait_until`, and 12 marker/start waits from `15 s` to `120 s` hang guards with `[timing]` prints and master log dump; `tests/test_wave3_e2e.py` (63 tests, ~2 min per run: `115.4–122.4 s`) passed `20/20` (`2,369.8 s` total, max connect `3.19 s`) under 4 busy loops on Apple M5 (`10` cores).
+- 2026-11-24: TEST-89 Implemented (pull requests 425, 427 (open), branch `mac/test-89-wave3-connect-guard`): cause is "likely a slow runner; not proven" (local runs set/inherited `RUSTUP_HOME`/`CARGO_HOME` and did not hit CI's `3 s` `cargo`/`rustc` probe timeouts, so `0.4–3.2 s` local connect times do not prove what the CI runner did). Step 2 verified with a 20 s TCP proxy holding worker registration (`15.06 s` `TimeoutError` on `27a910ec`, passed at `20.07 s` with `[timing] w-late-proxy connected after 20.07 s` on `8ccf776f`). Raised `start_worker`, `_wait_until`, and 12 marker/start waits from `15 s` to `120 s` hang guards with `[timing]` prints and master log dump; `tests/test_wave3_e2e.py` (63 tests, ~2 min per run: `115.4–122.4 s`) passed `20/20` (`2,369.8 s` total, max connect `3.19 s`) under 4 busy loops on Apple M5 (`10` cores) at `4b87e64b`.
