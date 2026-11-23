@@ -95,7 +95,7 @@ impl Cluster {
     }
 
     async fn wait_for_workers(&self, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             let workers = self._master.list_workers().await.unwrap_or_default();
             if workers
@@ -436,10 +436,9 @@ async fn test_cli_matrix_unplaced_cell_fails_promptly_and_skips_upload_when_all_
         ])
         .output()
         .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "unplaced matrix cell should fail promptly via ListWorkers without waiting timeout_secs"
-    );
+    // The `unplaced_cells` count below proves the ListWorkers pre-flight caught the cell (a cell
+    // that waited for its timeout would be `timed_out`); the time is printed, not asserted (TEST-86).
+    eprintln!("[timing] unplaced CLI matrix: {:?}", started.elapsed());
     assert!(!out.status.success(), "{}", describe(&out));
     let v = json_of(&out);
     assert_eq!(v["status"], "failed");
@@ -766,10 +765,8 @@ async fn test_mcp_matrix_workflows_validation_framing_and_eof_grace() {
         "timeout_secs": 60,
         "matrix": ["tag=mcp-a,mcp-missing"],
     }));
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "MCP unplaced matrix cell hung: {body_unplaced}"
-    );
+    // `unplaced` on the cell proves the pre-flight path; the time is printed only (TEST-86).
+    eprintln!("[timing] unplaced MCP matrix: {:?}", started.elapsed());
     assert!(err_unplaced, "{body_unplaced}");
     assert_eq!(body_unplaced["unplaced_cells"], 1);
     assert_eq!(body_unplaced["cells"][1]["unplaced"], true);

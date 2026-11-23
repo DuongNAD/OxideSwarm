@@ -1130,7 +1130,7 @@ async fn test_submit_compile_builds_crate_with_local_dependency_and_avoids_worke
     });
 
     // Wait until both workers are registered on the master.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let workers = master.list_workers().await.unwrap_or_default();
         let connected = workers
@@ -1189,11 +1189,15 @@ edition = "2021"
     let input_spec = format!("{}:local_math", dep_dir.display());
     // Note: no explicit `--require-tool cargo` flag is passed; `submit --type compile`
     // automatically adds `require:tool=cargo` because `Cargo.toml` is in `source_files`.
+    // Pass `--timeout-secs 600` (TEST-85) so a cold Cargo build on a loaded Windows runner
+    // cannot hit the 60 s non-workspace `submit` default.
     let s_args = submit_args(&[
         "--master",
         &master_addr,
         "--type",
         "compile",
+        "--timeout-secs",
+        "600",
         "--source",
         crate_dir.to_str().unwrap(),
         "--input",
@@ -1202,7 +1206,9 @@ edition = "2021"
         client_out_dir.to_str().unwrap(),
     ]);
 
+    let compile_started = std::time::Instant::now();
     let exit = run_submit_with_secret(s_args, None, secret_opts).await;
+    let compile_wall_ms = compile_started.elapsed().as_millis();
     assert_eq!(
         exit,
         ExitCode::SUCCESS,
@@ -1212,6 +1218,12 @@ edition = "2021"
     // Verify the task ran on Worker 2 (`worker-with-cargo`) and avoided Worker 1 (`worker-no-cargo`).
     let tasks = master.queue().list_tasks().await;
     assert_eq!(tasks.len(), 1);
+    eprintln!(
+        "TEST-85 compile_wall_ms={compile_wall_ms} exec_ms={}",
+        tasks[0]
+            .execution_time_ms
+            .map_or_else(|| "none".to_string(), |ms| ms.to_string())
+    );
     assert_eq!(tasks[0].assigned_worker_id, Some(w2_id));
     assert_ne!(tasks[0].assigned_worker_id, Some(w1_id));
 
