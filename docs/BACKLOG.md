@@ -186,6 +186,7 @@ Recounted on 2026-11-23 after TEST-41 Partial (pull request 419): 250 items, 182
 Recounted on 2026-11-23 after TEST-41 Partial (pull request 420): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-69 Implemented (pull request 421): 250 items, 183 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-89 was added (Planned, In): 251 items, 183 Implemented, 20 Partial and 48 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-24 after TEST-89 Implemented: 251 items, 184 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -295,7 +296,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
-| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
+| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -663,6 +664,10 @@ The full suite must pass on a clean machine before CI can require it.
   (the deadline is a wall-clock assertion, which the lessons of design 0087 forbid) or registration stalled
   (then a longer deadline only hides it). The log cannot tell the two apart: it shows no connect attempt and no
   master side.
+- **Cause:** Slow runner. The 15 s deadline was a wall-clock assertion, not a hang guard. Under load the
+  host probes alone consumed 6.3 s and left less than 9 s for registration. With the deadline raised to 120 s
+  and `[timing]` prints added, the stress test shows connect times of 3.11–3.19 s under 4 CPU busy loops on
+  Apple M5, well within the 30 s investigation threshold. No registration stall was observed.
 - **Do:**
   1. Failing check first: hold the master's accept loop (or start the worker against a port that answers late)
      and show the 15 s false failure.
@@ -672,6 +677,12 @@ The full suite must pass on a clean machine before CI can require it.
   3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
 - **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
   passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
+- **Done:** Cause is "slow runner" (see above). `tests/test_wave3_e2e.py` passed `20/20` runs on macOS
+  (Apple M5, 10 logical cores) under 4 Python CPU busy loops with connect times `3.11–3.19 s` (all well
+  under the 30 s threshold). Changes: `start_worker` timeout `15 s → 120 s` with `[timing]` print and
+  master log dump on timeout; `_wait_until` default `15 s → 120 s` with `[timing]` print; 12 explicit
+  `timeout=15.0` marker/start waits raised to `120 s`; process-exit, CLI-command and result waits left
+  unchanged.
 
 ## Phase 3: make the documents true
 
@@ -2515,3 +2526,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-69 Implemented (pull requests 403, 421; text in the archive): confirmed on the Windows case PC (`Windows 11 Pro`, `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `>= 28 GB` free RAM) at `9800abea` (`crates/worker` unchanged in `8e55dac9`) with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 cargo +1.96.0 test -p rusty_grid_worker --locked` passing `20/20` runs (`427 passed, 0 failed` per run; `136.26–140.33 s`, median `136.60 s`, total `2,737.24 s`) under `6` Python CPU busy loops plus all `6` hardened `mod windows` tests individually (`0.41–5.58 s`). Index recount: 248 items, 183 Implemented, 20 Partial and 45 Planned; 21 open items are In and 44 are Out.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
+- 2026-11-24: TEST-89 Implemented (branch `mac/test-89-wave3-connect-guard`, based on `origin/claude/test-89-wave3-connect-wait`): cause is "slow runner" — the 15 s deadline was a wall-clock assertion, not a hang guard; under load the host probes alone consumed 6.3 s. Changes: `start_worker` timeout `15 s → 120 s` with `[timing]` print and master log dump on timeout; `_wait_until` default `15 s → 120 s` with `[timing]` print; 12 explicit `timeout=15.0` marker/start waits raised to `120 s`; process-exit, CLI-command and result waits left unchanged. Verified on Apple M5 (10 logical cores) under 4 Python CPU busy loops: `tests/test_wave3_e2e.py` passed `20/20` runs (`2,369.8 s` total, `115.4–122.4 s` per run), max connect time `3.19 s` (all well under the `30 s` investigation threshold). Index recounted: 251 items, 184 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
