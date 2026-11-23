@@ -234,11 +234,24 @@ def _isolated_env(home_dir, tmp_dir, bin_dir, download_base, empty_config):
     return env
 
 
-def run_single_m15(version, download_base, run_idx):
+def _tail_text(path, max_bytes=4096):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return data[-max_bytes:].decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def run_single_m15(version, download_base, run_idx, work_parent=None):
     """Execute one cold M15 Quick start sequence from a fresh empty HOME."""
-    root = tempfile.mkdtemp(prefix="ox_m15_r%d_" % run_idx)
+    if work_parent:
+        os.makedirs(work_parent, exist_ok=True)
+    root = tempfile.mkdtemp(prefix="ox_m15_r%d_" % run_idx, dir=work_parent)
     procs = []
     logs = []
+    master_log_path = os.path.join(root, "master.log")
+    worker_log_path = os.path.join(root, "worker.log")
     try:
         bin_dir = os.path.join(root, "bin")
         home_install = os.path.join(root, "home-install")
@@ -292,7 +305,7 @@ def run_single_m15(version, download_base, run_idx):
         dash_file = os.path.join(root, "dash.port")
         blob_dir = os.path.join(root, "blobs")
         env_master = _isolated_env(home_master, os.path.join(root, "tmp-master"), bin_dir, download_base, empty_cfg)
-        mlog = open(os.path.join(root, "master.log"), "wb")
+        mlog = open(master_log_path, "wb")
         logs.append(mlog)
         t_m0 = time.perf_counter()
         master_proc = subprocess.Popen(
@@ -312,7 +325,10 @@ def run_single_m15(version, download_base, run_idx):
         deadline = time.perf_counter() + 60.0
         while time.perf_counter() < deadline:
             if master_proc.poll() is not None:
-                raise RuntimeError("master exited early (code %s)" % master_proc.returncode)
+                mlog.flush()
+                raise RuntimeError("master exited early (code %s):\n%s" % (
+                    master_proc.returncode, _tail_text(master_log_path)
+                ))
             if os.path.exists(port_file) and os.path.getsize(port_file) > 0:
                 with open(port_file, encoding="utf-8") as f:
                     txt = f.read().strip()
@@ -334,7 +350,7 @@ def run_single_m15(version, download_base, run_idx):
             os.chmod(ws_dir, 0o700)
         env_worker = _isolated_env(home_worker, os.path.join(root, "tmp-worker"), bin_dir, download_base, empty_cfg)
         env_client = _isolated_env(home_client, os.path.join(root, "tmp-client"), bin_dir, download_base, empty_cfg)
-        wlog = open(os.path.join(root, "worker.log"), "wb")
+        wlog = open(worker_log_path, "wb")
         logs.append(wlog)
         t_w0 = time.perf_counter()
         worker_proc = subprocess.Popen(
@@ -355,7 +371,10 @@ def run_single_m15(version, download_base, run_idx):
         connected = False
         while time.perf_counter() < w_deadline:
             if worker_proc.poll() is not None:
-                raise RuntimeError("worker exited early (code %s)" % worker_proc.returncode)
+                wlog.flush()
+                raise RuntimeError("worker exited early (code %s):\n%s" % (
+                    worker_proc.returncode, _tail_text(worker_log_path)
+                ))
             chk = subprocess.run(
                 [oxideswarm, "workers", "--master", master_addr, "--json"],
                 env=env_client, stdin=subprocess.DEVNULL,
@@ -432,12 +451,14 @@ def main():
     ap.add_argument("--version", default="0.4.4", help="Release version in --archive-dir (default: 0.4.4)")
     ap.add_argument("--runs", type=int, default=3, help="Number of cold runs (default: 3)")
     ap.add_argument("--out", help="Output JSON path (default: benchmarks/grid/results/<date>-m15-<os>-<arch>.json)")
+    ap.add_argument("--work-dir", help="Parent directory for temporary run sandboxes (default on Windows: LOCALAPPDATA when set)")
     ap.add_argument("--no-write", action="store_true", help="Print JSON instead of writing file")
     ap.add_argument("--label", default="", help="Optional note recorded in JSON")
     args = ap.parse_args()
 
     if args.runs < 1:
         raise SystemExit("--runs must be >= 1")
+    work_parent = args.work_dir or (os.environ.get("LOCALAPPDATA") if IS_WINDOWS else None) or None
     version = args.version.lstrip("v")
     target, ext = expected_target()
     archive_name = "oxideswarm-%s-%s%s" % (version, target, ext)
@@ -454,7 +475,7 @@ def main():
     with _ArchiveHttpServer(args.archive_dir, version) as srv:
         for idx in range(1, args.runs + 1):
             print("[m15] cold quickstart run %d/%d (%s)..." % (idx, args.runs, target), flush=True)
-            row = run_single_m15(version, srv.base_url, idx)
+            row = run_single_m15(version, srv.base_url, idx, work_parent=work_parent)
             print("[m15] run %d: total=%.3fs (install=%.3fs master=%.3fs worker=%.3fs submit=%.3fs, attest=%s)" % (
                 idx, row["total_s"], row["install_s"], row["master_ready_s"],
                 row["worker_ready_s"], row["first_submit_s"], row["attestation_checked"],
