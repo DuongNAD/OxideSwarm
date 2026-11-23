@@ -18,6 +18,8 @@ python3 benchmarks/grid/scale_harness.py --quick --no-write                     
 python3 tests/test_scale_harness.py                                             # helper checks, no binary
 python3 benchmarks/grid/bench_shard_r2_m1.py --bin target/release/oxideswarm    # (e) AX-2 Spike R2 & Measure M1 (loopback)
 python3 benchmarks/grid/test_bench_shard.py                                     # AX-2 helper checks, no binary
+python3 benchmarks/grid/bench_m15_quickstart.py --archive-dir <DIR>             # (f) ADOPT-3 M15 Quick start (local archive mirror)
+python3 benchmarks/grid/test_bench_m15.py                                       # M15 helper checks, no binary
 ```
 
 Every run starts its own master and workers on `127.0.0.1` with ephemeral ports, gives each process a
@@ -234,6 +236,16 @@ queues, bitset worker indexing, and durable cold-result spilling.
 - **Spike `R2` (`submit --wait`)**: `3` loopback workers saved **`51.26 %`** wall time vs `1` worker (`27.32 s` vs `56.05 s`), clearing design `0056`'s `>= 30 %` stop-rule threshold (`stop_rule_triggered: false`).
 - **Measure `M1` (`oxideswarm shard`)**: `3` loopback workers ran in **`0.5061x`** of `1`-worker median time (`27.76 s` vs `54.85 s`; minimum `25.54 s`, `0.466x`) on a loaded host (`load_average_before: [7.44, 14.24, 12.48]`), where shared-CPU contention raised `task_time_sum_ms` from `54.8 s` (`1w`) to `70.3 s` (`3w`).
 
+**(f) Scripted time to first result (`ADOPT-3`, Measure `M15`).** `2026-11-23` UTC (`2026-11-24` local, commit `c0d86c6a`, clean worktree), Windows 11 `AMD64` (`13th Gen Intel(R) Core(TM) i7-1355U`, `12` logical CPUs, `15.69 GiB` RAM, non-elevated), `3` cold Quick start runs from fresh empty `HOME`/`USERPROFILE` directories against a local HTTP mirror serving the real `v0.4.4` Windows release archive (`oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip` + `SHA256SUMS`), with `gh attestation verify` passing on all `3/3` runs:
+
+- Windows record: [`results/2026-11-24-m15-windows-amd64.json`](results/2026-11-24-m15-windows-amd64.json)
+- `install_s`: median `6.378 s` (`5.789–6.564 s`)
+- `master_ready_s`: median `1.553 s` (`1.437–1.565 s`)
+- `worker_ready_s`: median `0.355 s` (`0.301–0.379 s`)
+- `first_submit_s`: median `0.194 s` (`0.128–0.464 s`)
+- `total_s`: median `8.551 s` (`7.939–8.641 s`, `3/3` succeeded)
+- macOS and Linux (Docker) M15 records remain pending (`agent-mac-ag`).
+
 ## Limits
 
 - (a) and (b) run on one machine over loopback: no network cost, no NAT, no relay, no cluster secret (loopback runs
@@ -250,3 +262,4 @@ queues, bitset worker indexing, and durable cold-result spilling.
   relayed or Internet link would add transfer time to a first run.
 - (d) isolates the master's control plane, blob store and journal by running simulated workers in one driver process on the same host over loopback (or user-space stream delays): it skips per-task OS process spawn, sandbox setup, and real multi-host NIC/router queues, and submit-to-assign timestamps include the Windows timer and scheduler quantum (~15.6 ms).
 - (e) runs on **single-host loopback (`127.0.0.1`) only; NOT 3 physical machines**: all 3 workers, the master, and the CLI client share one machine's CPU cores (`10` cores), memory bus, and disk, and the run experienced background host load (`load_average_before: [7.44, 14.24, 12.48]`). These numbers validate `oxideswarm shard` scheduling, overhead, and relative sharding speedup under loopback contention; they do not claim 3 physical machines.
+- (f) runs on one machine over loopback (`127.0.0.1`) downloading the release archive from a local `127.0.0.1` HTTP server (`OXIDESWARM_DOWNLOAD_BASE`), so `install_s` excludes public Internet download latency while still running real `gh attestation verify` network calls; on Windows it places temporary run directories under `%LOCALAPPDATA%` rather than `%TEMP%` because the test host's `%TEMP%` carries extra account SIDs on its ACL.
