@@ -2547,7 +2547,7 @@ class RemoteEnduranceCluster:
 
     def _matches_tags(self, worker: Dict[str, Any]) -> bool:
         wtags = set(str(t) for t in (worker.get("tags") or []))
-        if any(t.startswith("state:") for t in wtags) and "state:connected" not in wtags:
+        if "state:disconnected" in wtags:
             return False
         if self.target_worker:
             wname = str(worker.get("name") or "")
@@ -3747,7 +3747,7 @@ class RemoteEnduranceCluster:
 
     def _matches_tags(self, worker: Dict[str, Any]) -> bool:
         wtags = set(str(t) for t in (worker.get("tags") or []))
-        if any(t.startswith("state:") for t in wtags) and "state:connected" not in wtags:
+        if "state:disconnected" in wtags:
             return False
         if self.target_worker:
             wname = str(worker.get("name") or "")

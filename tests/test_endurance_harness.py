@@ -478,6 +478,7 @@ class SamplerAndPrivacyTests(unittest.TestCase):
                 self.assertNotIn("--require-tag", wcmd)
                 self.assertNotIn("--worker", wcmd)
                 self.assertFalse(rc._matches_tags({"name": "win-case-lab", "tags": ["os:windows", "iso:fs", "state:disconnected"]}))
+                self.assertTrue(rc._matches_tags({"name": "win-case-lab", "tags": ["os:windows", "iso:fs", "state:busy"]}))
                 self.assertTrue(rc._matches_tags({"name": "win-case-lab", "tags": ["os:windows", "iso:fs", "state:connected"]}))
             finally:
                 rc.stop()
