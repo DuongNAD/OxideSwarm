@@ -1442,9 +1442,9 @@ impl AgentMeshClient {
             return;
         }
         let mut sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::new()
-                .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
-                .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
+            sysinfo::RefreshKind::nothing()
+                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
         );
         loop {
             if let Err(e) = self.connect().await {
@@ -1478,9 +1478,9 @@ impl AgentMeshClient {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             while self.is_connected() {
                 interval.tick().await;
-                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
-                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::new().with_ram());
-                let cpu_usage_pct = Some(sys.global_cpu_info().cpu_usage());
+                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing().with_cpu_usage());
+                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+                let cpu_usage_pct = Some(sys.global_cpu_usage());
                 let avail_bytes = sys.available_memory();
                 let mem_bytes = if avail_bytes > 0 {
                     avail_bytes

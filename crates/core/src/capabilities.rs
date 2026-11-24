@@ -3670,7 +3670,7 @@ Now drawing from 'AC Power'
         };
         let deadline = std::time::Instant::now() + wait_budget;
         loop {
-            sys.refresh_processes();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let alive = sys
                 .process(sysinfo::Pid::from(pid as usize))
                 .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie);
