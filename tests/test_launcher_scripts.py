@@ -3625,7 +3625,7 @@ public class Program {
         import ctypes
         from ctypes import wintypes
 
-        tmp = tempfile.mkdtemp(prefix="ox_usb_bug38_")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_usb_bug38_"))
         tmp_home = os.path.join(tmp, "home")
         tmp_localappdata = os.path.join(tmp, "localappdata")
         tmp_appdata = os.path.join(tmp, "appdata")
