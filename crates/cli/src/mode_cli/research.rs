@@ -23,12 +23,12 @@ pub fn run_hardware_profile() -> ModeExecutionResult {
     let mut res = ModeExecutionResult::new(WorkflowMode::Research, "profile");
 
     let mut sys = System::new_with_specifics(
-        RefreshKind::new()
-            .with_cpu(CpuRefreshKind::new().with_cpu_usage())
-            .with_memory(MemoryRefreshKind::new().with_ram()),
+        RefreshKind::nothing()
+            .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+            .with_memory(MemoryRefreshKind::nothing().with_ram()),
     );
     std::thread::sleep(Duration::from_millis(150));
-    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
+    sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
     sys.refresh_memory();
 
     let total_ram_mb = sys.total_memory() / (1024 * 1024);
@@ -53,7 +53,7 @@ pub fn run_hardware_profile() -> ModeExecutionResult {
         .first()
         .map(|c| c.brand().trim().to_string())
         .unwrap_or_else(|| "Unknown CPU".to_string());
-    let cpu_usage_pct = sys.global_cpu_info().cpu_usage();
+    let cpu_usage_pct = sys.global_cpu_usage();
 
     let os_name = System::name().unwrap_or_else(|| "Unknown OS".to_string());
     let os_version = System::os_version().unwrap_or_default();

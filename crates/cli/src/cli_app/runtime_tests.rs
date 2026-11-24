@@ -51,6 +51,8 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     use crate::config::{MasterFileConfig, SubmitFileConfig, WorkerFileConfig};
     use rusty_grid_master::scheduler::SchedulingPolicy;
 
+    let _env_guard = crate::test_env_lock::lock_async().await;
+
     let test_secret = ClusterSecret::from_bytes(&[0x22; 32]).unwrap();
     let secret_opts = SecretOpts {
         value: Some(crate::config::SecretText(test_secret.to_hex())),
@@ -239,30 +241,28 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     //    Even on an exposed bind (`--listen 0.0.0.0:0`), a bad `--wire-codec` is rejected
     //    before secret setup so a fresh `OXIDESWARM_HOME` remains empty.
     let fresh_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var("OXIDESWARM_HOME").ok();
-    std::env::set_var("OXIDESWARM_HOME", fresh_home.path());
-    let bad_exposed_cli = Cli::try_parse_from([
-        "oxideswarm",
-        "master",
-        "--listen",
-        "0.0.0.0:0",
-        "--wire-codec",
-        "xml",
-    ])
-    .unwrap();
-    let Commands::Master(bad_exposed_args) = bad_exposed_cli.command else {
-        panic!("expected Master");
+    let bad_exposed_code = {
+        let _home_guard =
+            crate::test_env_lock::ScopedEnvVar::set("OXIDESWARM_HOME", fresh_home.path());
+        let bad_exposed_cli = Cli::try_parse_from([
+            "oxideswarm",
+            "master",
+            "--listen",
+            "0.0.0.0:0",
+            "--wire-codec",
+            "xml",
+        ])
+        .unwrap();
+        let Commands::Master(bad_exposed_args) = bad_exposed_cli.command else {
+            panic!("expected Master");
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_master(bad_exposed_args, None, SecretOpts::default()),
+        )
+        .await
+        .expect("bad exposed master --wire-codec must exit immediately")
     };
-    let bad_exposed_code = tokio::time::timeout(
-        Duration::from_secs(5),
-        run_master(bad_exposed_args, None, SecretOpts::default()),
-    )
-    .await
-    .expect("bad exposed master --wire-codec must exit immediately");
-    match prev_home {
-        Some(v) => std::env::set_var("OXIDESWARM_HOME", v),
-        None => std::env::remove_var("OXIDESWARM_HOME"),
-    }
     assert_eq!(bad_exposed_code, ExitCode::FAILURE);
     assert!(
         std::fs::read_dir(fresh_home.path())
@@ -352,16 +352,18 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     assert_eq!(bad_w_code, ExitCode::FAILURE);
 
     // Client commands also reject an invalid `RUSTY_GRID_WIRE_CODEC` instead of silently ignoring it.
-    std::env::set_var("RUSTY_GRID_WIRE_CODEC", "xml");
-    let bad_client_err = connect_master("127.0.0.1:8088", Some(&test_secret))
-        .await
-        .err()
-        .expect("client connect_master must reject invalid RUSTY_GRID_WIRE_CODEC");
-    assert!(
-        matches!(bad_client_err, GridError::Config(ref msg) if msg.contains("RUSTY_GRID_WIRE_CODEC")),
-        "expected GridError::Config for bad RUSTY_GRID_WIRE_CODEC, got: {bad_client_err:?}"
-    );
-    std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
+    {
+        let _wire_xml_guard =
+            crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_WIRE_CODEC", "xml");
+        let bad_client_err = connect_master("127.0.0.1:8088", Some(&test_secret))
+            .await
+            .err()
+            .expect("client connect_master must reject invalid RUSTY_GRID_WIRE_CODEC");
+        assert!(
+            matches!(bad_client_err, GridError::Config(ref msg) if msg.contains("RUSTY_GRID_WIRE_CODEC")),
+            "expected GridError::Config for bad RUSTY_GRID_WIRE_CODEC, got: {bad_client_err:?}"
+        );
+    }
 
     // 3. `--max-queue-size 2` rejects the 3rd submit, and `RUSTY_GRID_WIRE_CODEC=json`
     //    takes effect on the master when `--wire-codec` is omitted on the CLI.
@@ -373,7 +375,7 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     let port_file_str = port_file.to_str().unwrap().to_string();
     let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
 
-    std::env::set_var("RUSTY_GRID_WIRE_CODEC", "json");
+    let wire_json_guard = crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_WIRE_CODEC", "json");
     let resolved_env_codec = resolve_wire_codec(None, Some("bincode".into())).unwrap();
     assert_eq!(
         resolved_env_codec,
@@ -420,7 +422,8 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     // Clear `RUSTY_GRID_WIRE_CODEC` BEFORE connecting the client so the client speaks
     // `WireCodec::Bincode` (0x02). A master configured with `RUSTY_GRID_WIRE_CODEC=json`
     // must still reply in `WireCodec::Json` (0x01) instead of mirroring the client's bincode.
-    std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
+    drop(wire_json_guard);
+    let _wire_cleared = crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_WIRE_CODEC");
 
     let mut transport = connect_master_within_bound(
         &master_addr_str,
@@ -433,6 +436,7 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
         WireCodec::Bincode,
         "client transport must send bincode after RUSTY_GRID_WIRE_CODEC is cleared"
     );
+    drop(_wire_cleared);
     transport
         .send_msg(&ClientMessage::ClusterStatus)
         .await
@@ -693,54 +697,58 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
     //    CLI flag -> `--wire-codec: ...` / `--scheduler-policy: ...`
     //    Env var  -> `RUSTY_GRID_WIRE_CODEC: ...` / `RUSTY_GRID_SCHEDULER_POLICY: ...`
     //    Config   -> `wire_codec: ...` / `scheduler_policy: ...`
-    std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
-    std::env::remove_var("RUSTY_GRID_SCHEDULER_POLICY");
-    assert!(
-        resolve_wire_codec(Some("xml".into()), None)
-            .unwrap_err()
-            .starts_with("--wire-codec: "),
-        "CLI wire codec error must start with '--wire-codec: '"
-    );
-    assert!(
-        resolve_wire_codec(None, Some("xml".into()))
-            .unwrap_err()
-            .starts_with("wire_codec: "),
-        "Config wire codec error must start with 'wire_codec: '"
-    );
-    std::env::set_var("RUSTY_GRID_WIRE_CODEC", "xml");
-    assert!(
-        resolve_wire_codec(None, Some("json".into()))
-            .unwrap_err()
-            .starts_with("RUSTY_GRID_WIRE_CODEC: "),
-        "Env wire codec error must start with 'RUSTY_GRID_WIRE_CODEC: '"
-    );
-    std::env::remove_var("RUSTY_GRID_WIRE_CODEC");
+    {
+        let _clear_wire = crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_WIRE_CODEC");
+        let _clear_sched =
+            crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_SCHEDULER_POLICY");
+        assert!(
+            resolve_wire_codec(Some("xml".into()), None)
+                .unwrap_err()
+                .starts_with("--wire-codec: "),
+            "CLI wire codec error must start with '--wire-codec: '"
+        );
+        assert!(
+            resolve_wire_codec(None, Some("xml".into()))
+                .unwrap_err()
+                .starts_with("wire_codec: "),
+            "Config wire codec error must start with 'wire_codec: '"
+        );
+        {
+            let _wire_xml = crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_WIRE_CODEC", "xml");
+            assert!(
+                resolve_wire_codec(None, Some("json".into()))
+                    .unwrap_err()
+                    .starts_with("RUSTY_GRID_WIRE_CODEC: "),
+                "Env wire codec error must start with 'RUSTY_GRID_WIRE_CODEC: '"
+            );
+        }
 
-    assert!(
-        resolve_scheduler_policy(Some("bogus".into()), None)
-            .unwrap_err()
-            .starts_with("--scheduler-policy: "),
-        "CLI scheduler policy error must start with '--scheduler-policy: '"
-    );
-    assert!(
-        resolve_scheduler_policy(None, Some("bogus".into()))
-            .unwrap_err()
-            .starts_with("scheduler_policy: "),
-        "Config scheduler policy error must start with 'scheduler_policy: '"
-    );
-    std::env::set_var("RUSTY_GRID_SCHEDULER_POLICY", "bogus");
-    assert!(
-        resolve_scheduler_policy(None, Some("round-robin".into()))
-            .unwrap_err()
-            .starts_with("RUSTY_GRID_SCHEDULER_POLICY: "),
-        "Env scheduler policy error must start with 'RUSTY_GRID_SCHEDULER_POLICY: '"
-    );
-    std::env::remove_var("RUSTY_GRID_SCHEDULER_POLICY");
+        assert!(
+            resolve_scheduler_policy(Some("bogus".into()), None)
+                .unwrap_err()
+                .starts_with("--scheduler-policy: "),
+            "CLI scheduler policy error must start with '--scheduler-policy: '"
+        );
+        assert!(
+            resolve_scheduler_policy(None, Some("bogus".into()))
+                .unwrap_err()
+                .starts_with("scheduler_policy: "),
+            "Config scheduler policy error must start with 'scheduler_policy: '"
+        );
+        {
+            let _sched_bogus =
+                crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_SCHEDULER_POLICY", "bogus");
+            assert!(
+                resolve_scheduler_policy(None, Some("round-robin".into()))
+                    .unwrap_err()
+                    .starts_with("RUSTY_GRID_SCHEDULER_POLICY: "),
+                "Env scheduler policy error must start with 'RUSTY_GRID_SCHEDULER_POLICY: '"
+            );
+        }
+    }
 
     // Precedence for `fail_unfulfillable_tasks` via `resolve_fail_unfulfillable_tasks`:
     // CLI `--fail-unfulfillable-tasks` > `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS` > `[master].fail_unfulfillable_tasks` > false
-    std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
-
     let parsed_fail_true_cfg: ConfigFile = toml::from_str(
         r#"
 [master]
@@ -755,88 +763,104 @@ fail_unfulfillable_tasks = false
 "#,
     )
     .unwrap();
-    assert!(!resolve_fail_unfulfillable_tasks(None, None));
-    assert!(resolve_fail_unfulfillable_tasks(
-        None,
-        parsed_fail_true_cfg.master.as_ref()
-    ));
-    std::env::set_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "1");
-    assert!(
-        resolve_fail_unfulfillable_tasks(None, parsed_fail_false_cfg.master.as_ref()),
-        "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=1 must override config false"
-    );
-    std::env::set_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "0");
-    assert!(
-        !resolve_fail_unfulfillable_tasks(None, parsed_fail_true_cfg.master.as_ref()),
-        "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=0 must override config true"
-    );
-    assert!(
-        resolve_fail_unfulfillable_tasks(Some(true), parsed_fail_false_cfg.master.as_ref()),
-        "--fail-unfulfillable-tasks CLI flag must override env 0"
-    );
-    std::env::remove_var("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+    {
+        let _clear_fail =
+            crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS");
+
+        assert!(!resolve_fail_unfulfillable_tasks(None, None));
+        assert!(resolve_fail_unfulfillable_tasks(
+            None,
+            parsed_fail_true_cfg.master.as_ref()
+        ));
+        {
+            let _fail_one =
+                crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "1");
+            assert!(
+                resolve_fail_unfulfillable_tasks(None, parsed_fail_false_cfg.master.as_ref()),
+                "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=1 must override config false"
+            );
+        }
+        {
+            let _fail_zero =
+                crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS", "0");
+            assert!(
+                !resolve_fail_unfulfillable_tasks(None, parsed_fail_true_cfg.master.as_ref()),
+                "RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS=0 must override config true"
+            );
+            assert!(
+                resolve_fail_unfulfillable_tasks(Some(true), parsed_fail_false_cfg.master.as_ref()),
+                "--fail-unfulfillable-tasks CLI flag must override env 0"
+            );
+        }
+    }
 
     // Precedence & validation for `speed_hold_factor`:
     // CLI `--speed-hold-factor` > `RUSTY_GRID_SPEED_HOLD_FACTOR` > `[master].speed_hold_factor` > 1.5
-    std::env::remove_var("RUSTY_GRID_SPEED_HOLD_FACTOR");
-    let parsed_hold_cfg: ConfigFile = toml::from_str(
-        r#"
+    {
+        let _clear_hold =
+            crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_SPEED_HOLD_FACTOR");
+        let parsed_hold_cfg: ConfigFile = toml::from_str(
+            r#"
 [master]
 speed_hold_factor = 2.25
 "#,
-    )
-    .unwrap();
-    assert_eq!(resolve_speed_hold_factor(None, None).unwrap(), 1.5);
-    assert_eq!(
-        resolve_speed_hold_factor(
-            None,
-            parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
         )
-        .unwrap(),
-        2.25
-    );
-    std::env::set_var("RUSTY_GRID_SPEED_HOLD_FACTOR", "0");
-    assert_eq!(
-        resolve_speed_hold_factor(
-            None,
-            parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
-        )
-        .unwrap(),
-        0.0,
-        "RUSTY_GRID_SPEED_HOLD_FACTOR=0 must override config 2.25 and disable D2"
-    );
-    assert_eq!(
-        resolve_speed_hold_factor(
-            Some("1.75".into()),
-            parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
-        )
-        .unwrap(),
-        1.75,
-        "--speed-hold-factor CLI flag must override env and config"
-    );
-    for bad in ["1.0", "0.5", "-1", "nan", "inf", "not-a-float"] {
-        assert!(
-            resolve_speed_hold_factor(Some(bad.into()), None)
-                .unwrap_err()
-                .starts_with("--speed-hold-factor: "),
-            "CLI error for '{bad}' must start with '--speed-hold-factor: '"
+        .unwrap();
+        assert_eq!(resolve_speed_hold_factor(None, None).unwrap(), 1.5);
+        assert_eq!(
+            resolve_speed_hold_factor(
+                None,
+                parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+            )
+            .unwrap(),
+            2.25
         );
-        std::env::set_var("RUSTY_GRID_SPEED_HOLD_FACTOR", bad);
-        assert!(
-            resolve_speed_hold_factor(None, None)
-                .unwrap_err()
-                .starts_with("RUSTY_GRID_SPEED_HOLD_FACTOR: "),
-            "Env error for '{bad}' must start with 'RUSTY_GRID_SPEED_HOLD_FACTOR: '"
-        );
-    }
-    std::env::remove_var("RUSTY_GRID_SPEED_HOLD_FACTOR");
-    for bad_cfg in [1.0, 0.5, -1.0, f64::NAN, f64::INFINITY] {
-        assert!(
-            resolve_speed_hold_factor(None, Some(bad_cfg))
-                .unwrap_err()
-                .starts_with("speed_hold_factor: "),
-            "Config error for '{bad_cfg}' must start with 'speed_hold_factor: '"
-        );
+        {
+            let _hold_zero =
+                crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_SPEED_HOLD_FACTOR", "0");
+            assert_eq!(
+                resolve_speed_hold_factor(
+                    None,
+                    parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+                )
+                .unwrap(),
+                0.0,
+                "RUSTY_GRID_SPEED_HOLD_FACTOR=0 must override config 2.25 and disable D2"
+            );
+            assert_eq!(
+                resolve_speed_hold_factor(
+                    Some("1.75".into()),
+                    parsed_hold_cfg.master.as_ref().unwrap().speed_hold_factor
+                )
+                .unwrap(),
+                1.75,
+                "--speed-hold-factor CLI flag must override env and config"
+            );
+        }
+        for bad in ["1.0", "0.5", "-1", "nan", "inf", "not-a-float"] {
+            assert!(
+                resolve_speed_hold_factor(Some(bad.into()), None)
+                    .unwrap_err()
+                    .starts_with("--speed-hold-factor: "),
+                "CLI error for '{bad}' must start with '--speed-hold-factor: '"
+            );
+            let _hold_bad =
+                crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_SPEED_HOLD_FACTOR", bad);
+            assert!(
+                resolve_speed_hold_factor(None, None)
+                    .unwrap_err()
+                    .starts_with("RUSTY_GRID_SPEED_HOLD_FACTOR: "),
+                "Env error for '{bad}' must start with 'RUSTY_GRID_SPEED_HOLD_FACTOR: '"
+            );
+        }
+        for bad_cfg in [1.0, 0.5, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                resolve_speed_hold_factor(None, Some(bad_cfg))
+                    .unwrap_err()
+                    .starts_with("speed_hold_factor: "),
+                "Config error for '{bad_cfg}' must start with 'speed_hold_factor: '"
+            );
+        }
     }
 
     // 6. Live `run_master` verification of `sched_config`:
@@ -1054,6 +1078,7 @@ async fn test_submit_compile_builds_crate_with_local_dependency_and_avoids_worke
     use rusty_grid_worker::MobileTelemetryHandle;
     use tokio::sync::watch;
 
+    let _env_guard = crate::test_env_lock::lock_async().await;
     let temp = tempfile::tempdir().unwrap();
     let secret = rusty_grid_core::cluster_auth::ClusterSecret::generate().unwrap();
     let secret_opts = SecretOpts {
@@ -1350,6 +1375,7 @@ fn test_submit_workspace_flag_parsing_and_conflicts() {
 
 #[tokio::test]
 async fn test_submit_workspace_max_files_and_max_mb_enforced_before_connect() {
+    let _env_guard = crate::test_env_lock::lock_async().await;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), vec![b'a'; 1024]).unwrap();
     std::fs::write(dir.path().join("b.txt"), vec![b'b'; 1024]).unwrap();
@@ -1557,6 +1583,7 @@ relay_url = "https://cfg-client.relay.example.com"
 
 #[tokio::test]
 async fn test_run_master_worker_and_client_refuse_invalid_relay_url_before_network() {
+    let _env_guard = crate::test_env_lock::lock_async().await;
     let secret = ClusterSecret::from_bytes(&[0x33; 32]).unwrap();
     let secret_opts = SecretOpts {
         value: Some(SecretText(secret.to_hex())),
@@ -1633,6 +1660,7 @@ async fn test_run_master_worker_and_client_refuse_invalid_relay_url_before_netwo
 
 #[tokio::test]
 async fn test_worker_workspace_options_parsing_precedence_and_validation() {
+    let _env_guard = crate::test_env_lock::lock_async().await;
     // 1. Default values when nothing is set.
     let cli_default = Cli::try_parse_from(["oxideswarm", "worker"]).unwrap();
     let Commands::Worker(w_default) = cli_default.command else {

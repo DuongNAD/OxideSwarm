@@ -94,6 +94,44 @@ class NoHostnameTests(unittest.TestCase):
         self.assertNotIn(self.SENTINEL, path)
         self.assertIn("-r2-m1-", os.path.basename(path))
 
+    def test_remote_report_and_privacy_checks(self):
+        sample_report = json.dumps({
+            "shard": True,
+            "status": "completed",
+            "total_shards": 3,
+            "completed_shards": 3,
+            "failed_shards": 0,
+            "machines": 3,
+            "waited_ms": 2100,
+            "task_time_sum_ms": 5900,
+            "shards": [
+                {
+                    "index": 1,
+                    "worker_name": "mac-lab-worker",
+                    "stdout": 'ok\nAX2_SHARD_SUMMARY {"executed_tests": 100, "idx": 1, "listed_tests": 300, "total": 3}\n',
+                },
+                {
+                    "index": 2,
+                    "worker_name": "win-case-lab",
+                    "stdout": 'AX2_SHARD_SUMMARY {"executed_tests": 100, "idx": 2, "listed_tests": 300, "total": 3}\n',
+                },
+                {
+                    "index": 3,
+                    "worker_name": "linux-docker-lab",
+                    "stdout": 'AX2_SHARD_SUMMARY {"executed_tests": 100, "idx": 3, "listed_tests": 300, "total": 3}\n',
+                },
+            ],
+        })
+        full = bench.parse_shard_report_full(sample_report)
+        self.assertEqual(full["per_worker_shards"], {"linux-docker-lab": 1, "mac-lab-worker": 1, "win-case-lab": 1})
+        self.assertEqual(sum(c["executed_tests"] for c in full["cargo_summaries"]), 300)
+
+        bench.assert_no_private_identifiers({"ok": "mac-lab-worker", "count": 3})
+        with self.assertRaises(ValueError):
+            bench.assert_no_private_identifiers({"ip": "192.168.99.42"})
+        with self.assertRaises(ValueError):
+            bench.assert_no_private_identifiers({"tok": "oxs1-abcdefgh12345"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -196,7 +196,7 @@ pub async fn poll_pids_async(
 
 /// Verifies that all given PIDs are actively running (and not zombies) in the OS process table.
 pub fn assert_all_alive(sys: &mut sysinfo::System, pids: &[u32]) {
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for &pid in pids {
         assert!(
             is_pid_alive(sys, pid),
@@ -209,7 +209,7 @@ pub fn assert_all_alive(sys: &mut sysinfo::System, pids: &[u32]) {
 pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duration) {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let any_alive = pids.iter().any(|&pid| is_pid_alive(sys, pid));
         if !any_alive {
             return;
@@ -217,7 +217,7 @@ pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duratio
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let elapsed = start.elapsed();
     let survivors: Vec<u32> = pids
         .iter()
@@ -250,7 +250,7 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
     let mut sys = sysinfo::System::new();
     let start = Instant::now();
     while start.elapsed() < timeout {
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let any_alive = pids.iter().any(|&pid| is_pid_alive(&sys, pid));
         if !any_alive {
             return;
@@ -258,7 +258,7 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let elapsed = start.elapsed();
     let survivors: Vec<u32> = pids
         .iter()
