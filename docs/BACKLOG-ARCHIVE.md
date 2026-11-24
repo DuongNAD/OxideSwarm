@@ -3783,6 +3783,29 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `python::test_sec6_mesh_sandbox`: single passed, after `20/20` (`total=192.31s`, `min=9.51s`, `max=9.67s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
 
+### TEST-91: Windows case PC: S9 real GPU stability and VRAM routing record
+
+- **Claim:** `claims/item/TEST-91__win__20261123T211437648778Z__1382298f.json`
+- **Hardware & environment (Windows case PC):** Windows 11 Pro `x86_64`, Intel Core i5-14600KF (`14` physical / `20` logical cores), `48 GB` RAM, NVIDIA GeForce RTX 5060 Ti (`16311 MiB` VRAM, driver `621.24`), non-elevated session, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`TEMP`/`TMP` under `C:\ox_tmp\w1_s9` (`OXIDESWARM_HOME` unset for unit/integration suites; child-isolated `OXIDESWARM_HOME` for loopback processes; `creationflags=CREATE_NO_WINDOW`).
+- **Tested code:** Local S9.1–S9.5 on PR #424 head `055ca0c794652d05127324f8df2349a4bb58cac7` (`git status --porcelain` empty; PR #424 still `OPEN` at test time, ahead of `720106d8`). Stage B W6 cross-machine run on `master` `720106d8da69eb5c42bc0e9c0ee4f862e7e72781` across Mac lab master + `win-case-lab` (`--isolation fs --gpu --vram-mb 16311 --workspaces --no-portal`) + `mac-lab-worker` + `linux-docker-lab`.
+- **S9 checks ([guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s9-real-gpu-stability-record-on-the-case-pc)):**
+  1. `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader`: `NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 621.24`.
+  2. Warm-up (`RUSTY_GRID_REQUIRE_GPU=1 cargo +1.96.0 test --locked -p rusty_grid_worker --features gpu-wgpu`): `443` passed, `0` failed across `17` test targets. Followed by `50/50` consecutive fresh passes (`0` failures; wall `96.203–106.968 s`, median `96.757 s`, total `4,891.748 s`).
+  3. `gemm_bench` (`cargo +1.96.0 run --locked --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench -- <dim>`, `3` runs each, adapter `NVIDIA GeForce RTX 5060 Ti (Vulkan, DiscreteGpu)`):
+     - `1024x1024 f32` (`2.15 GFLOP`): engine init `355 / 276 / 277 ms`; GPU best `3 / 3 / 3 ms`, median `3 / 3 / 4 ms`; CPU SIMD 1-thread `397 / 401 / 398 ms` (`132.3x / 133.7x / 99.5x`; wall `159.422 s` incl. build, `1.265 s`, `1.266 s`).
+     - `2048x2048 f32` (`17.18 GFLOP`): engine init `269 / 341 / 277 ms`; GPU best `20 / 19 / 19 ms`, median `21 / 19 / 19 ms`; CPU SIMD 1-thread `3733 / 3529 / 3419 ms` (`177.8x / 185.7x / 179.9x`; wall `5.140 / 4.891 / 4.609 s`).
+  4. Loopback GEMM + 3D VRAM routing (`cargo +1.96.0 build --locked --release --bin oxideswarm --features gpu-wgpu,3d`; master + `win-gpu` `--gpu --vram-mb 16311` + `win-cpu` `--no-gpu`, stopped cleanly by PID):
+     - `20/20` `--type gpu --gpu` GEMM submits (`--wait --json`): `0.062–0.109 s`, all `20` executed on `win-gpu` with `Status: VERIFIED_OK`.
+     - `--type 3d --engine triposr --quality high --prompt "s9 test cube"`: routed strictly to `win-gpu` (`exit_code: 1`, expected missing Python/TripoSR error `"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"`; `0` runs on `win-cpu`).
+     - With `win-gpu` stopped, both `--type 3d --engine auto` (`55 ms`) and `--type 3d --engine sdf` (`52 ms`) succeeded (`exit_code: 0`, `"Tier 0 procedural SDF mesh generated: 9992 vertices, 15224 triangles"`) on CPU-only `win-cpu`.
+  5. Kill GPU worker mid-GEMM without CPU fallback (`--type gpu --gpu --matrix-dim 8192`): killed `win-gpu` by PID while `Running` on `win-gpu` with `win-cpu` connected & idle; master logged `Re-enqueued orphaned tasks for reassignment count=1`; all `6` consecutive `1 s` polls stayed `Queued` (`assigned_worker: None`); restarted `win-gpu` and the requeued task finished on `win-gpu` in `1143 ms` (`1099511627776` FLOPs, max relative error `7.060e-6` vs `9.766e-4`, `0` non-finite, `Status: VERIFIED_OK`).
+  6. Stage B W6 cross-machine LAN verification (`720106d8` Mac lab master + `win-case-lab` `--isolation fs --gpu --vram-mb 16311 --workspaces --no-portal` + `mac-lab-worker` + `linux-docker-lab`, executed from Mac client):
+     - `doctor --expect-workers 3`: `15` passed, `0` warnings, `0` failed, `0` skipped; `C5 GPU probe win-case-lab`: `512x512 GEMM verified in 4 ms, 67.1 GFLOP/s on NVIDIA GeForce RTX 5060 Ti`; `C6 Spread`: `12` tasks of `500 ms` finished in `517 ms` across `3` workers (`linux-docker-lab` `2`, `mac-lab-worker` `4`, `win-case-lab` `6`).
+     - `20/20` `--type gpu --gpu --require-isolation fs --wait --json` GEMM submits: all `20` executed on `win-case-lab` in `0.0105–0.0181 s`, all `20` printed `Status: VERIFIED_OK` (`64x64 f32`, `Vulkan` backend, `1 ms` exec, max relative error `5.069e-7` vs `7.629e-6`, `0` non-finite).
+     - Unpinned `--type 3d --engine triposr --quality high --prompt "w6 test cube"`: routed strictly to `win-case-lab` (`0` runs on CPU workers `mac-lab-worker` / `linux-docker-lab`), exited `1` in `22 ms` with expected `"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"`.
+     - `--type 3d --engine sdf --prompt "w6 test cube" --worker win-case-lab`: exited `0` in `78 ms`, `"Tier 0 procedural SDF mesh generated: 9992 vertices, 15224 triangles in 78 ms"` (`4,608,376`-byte GLB).
+- **Status:** Implemented (2026-11-24, pull request 434).
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
