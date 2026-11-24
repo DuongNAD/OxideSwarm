@@ -418,7 +418,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350, (design 0059) |
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
-| AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
+| AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Implemented |  | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
@@ -1407,48 +1407,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** Three guides each have a "Verify" block and a dated run record that names its
   machines and release, and the index of `docs/README.md` lists them.
 
-### AX-1: Matrix fan-out in `submit` and in MCP
-
-- **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A1. One `submit` call
-  places one task on one worker. `crates/cli/src/cli_app/submit.rs` has no `--matrix` flag (the
-  flag `--matrix-dim` belongs to the GPU benchmark task), and the MCP tool `submit` has no `matrix`
-  field (`crates/cli/src/mcp.rs`).
-- **Problem:** Checking one change on macOS, Windows and Linux takes three calls and three
-  results that the caller merges. This is the first job of the first audience of design 0059, and
-  the purpose of Q1.
-- **Do:** As part A1 of design 0056. The expansion happens in the client, so the wire format does
-  not change:
-  1. `submit --matrix os=macos,windows,linux -- <command>` submits one task per value with the
-     matching `require:` entry. `--matrix` may repeat for a product, up to a fixed cell limit.
-  2. With `--workspace`, the tree syncs to each chosen worker.
-  3. The client waits for every cell. `--json` prints one record per cell: cell, worker, exit
-     code, duration, and the head and tail of the output. The exit code is non-zero when any cell
-     fails.
-  4. A cell that no worker matches is reported as unplaced after a check against `ListWorkers`.
-     It does not hang.
-  5. The MCP tool `submit` takes the same `matrix` field and returns the array.
-  6. A design record, the `README.md` reference and `docs/guides/mcp-client-setup.md` land in the
-     same pull request.
-- **Done when:** An end-to-end test with three tagged workers returns three cell records from one
-  call, and a cell without a worker is reported unplaced. A live record shows one MCP call
-  testing a change on macOS, Windows and Linux. That record is exit check E8 of design 0088,
-  together with AX-2, AX-3 and CACHE-1 in a release.
-- **Partial (2026-11-22, design 0101, commits `0e13d69d`, `58c41543`, `36a2d647`):** Implemented client-side
-  matrix fan-out across `crates/cli/src/matrix.rs`, `cli_app.rs`, `cli_app/submit.rs`, `mcp.rs`, `mcp/submit.rs`,
-  and `mcp/submit_matrix.rs` (plus `README.md`, `docs/reference.md`, and `docs/guides/mcp-client-setup.md`) with
-  zero wire or store changes on Protocol 10 / Store v4: repeatable `--matrix <KEY=V1,V2>` and MCP `matrix`
-  (array or axis object) across `os`, `arch`, `worker`, `iso`, `tool`, `tag`, and process `env:<VAR>`,
-  `--max-matrix-cells` (`64` default, `256` cap), pre-flight `ListWorkers` unplaced-cell detection without
-  hanging (skipping uploads when zero cells are placeable), 1x `--input` / `--workspace --sync` upload
-  deduplication, concurrent `JoinSet` dispatch with `safe_deadline` / `safe_std_deadline` overflow protection
-  (also applied to `mcp/task_result.rs` and `doctor.rs`), per-cell `--output-dir/<cell_slug>` isolation with
-  `ensure_non_symlink_cell_dir` symlink refusal across both CLI and MCP, bounded JSON-escaped inline streams
-  with `MatrixReport` / `RunSummary`, `-32602` validation, and `isError: true` propagation. Verified by unit
-  tests (`matrix` 11/11, `mcp` 16/16, `submit_matrix` 1/1), `crates/cli/tests/test_ax1_matrix.rs` (`9/9`,
-  covering 3 tagged workers and unplaced cells), and `tests/test_wave2_e2e.py` (`F3`, `F4`, Tiers 3–4).
-  Remains `Partial | In` pending only the external live MCP call record across physical macOS, Windows, and
-  Linux workers (`"Done when"` / exit check E8).
-
 ### AX-2: Sharded runs, with a build-once mode for Rust
 
 - **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A2, and spike R2. The
@@ -1482,9 +1440,28 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   3 physical machines: Spike R2 achieved `51.26 %` savings `56.05 s -> 27.32 s`, clearing the `>= 30 %`
   stop rule; Measure M1 achieved `27.76 s` median / `25.54 s` min vs `54.85 s` 1-worker median,
   `0.5061x` median with `"target_met": false` against `<= 0.50x` under shared-CPU contention).
-  Remains `Partial | In` pending: (1) a 3-physical-machine Measure M1 record meeting `<= 0.50x`
-  (`"Done when"` / design `0056`), and (2) live `--build-once` verification with a real `cargo-nextest`
-  binary (absent on the macOS verification host) and cross-`(os, arch)` multi-machine workers.
+- **Progress (2026-11-24, 3-worker live record at `720106d8`):** Extended `benchmarks/grid/bench_shard_r2_m1.py`
+  with `--master`/`--secret-file`/`--workers`/`--baseline-worker`/`--shard-counts` multi-machine support
+  (`test_bench_shard.py` `7/7`) and recorded `benchmarks/grid/results/2026-11-24-r2-m1-3workers-macos-windows-linux.json`
+  over LAN TCP across three workers (`mac-lab-worker` macOS `aarch64` `10` cores/`9` slots, `win-case-lab`
+  Windows `x86_64` `20` cores/`19` slots `--isolation off`, and `linux-docker-lab` Linux `aarch64` `rust:1.96`
+  Docker container on the Mac with `--init` and non-root UID `1000`, `10` container cores/`9` slots):
+  - **Spike R2 (`submit`, `--count` = `1` vs `3` across all `3` workers, warm shared temp targets):**
+    `1`-worker Mac median `136.036 s` (`135.19–138.64 s`, `1391` tests) vs `3`-worker parallel median
+    `99.055 s` (`97.31–99.95 s`, `1347`–`1391` listed tests across OSes) = **`27.18 %` wall-time savings**,
+    triggering the **design 0056 `< 30 %` stop rule** (`stop_rule_triggered: true`). Even with warm
+    shared `CARGO_TARGET_DIR`, per-task workspace sync and incremental `cargo test --no-run` metadata/check
+    overhead (`~48.5–53.2 s` per worker under shared-Mac CPU contention) dominates sharded execution
+    (`17.7–46.4 s`), capping full-workspace `cargo test --workspace --lib` speedup below `30 %`.
+  - **Measure M1 (`oxideswarm shard`, `3` runs each, `1`w Mac vs `--count 3` and `--count 6`):**
+    `1`w median `137.492 s` (`134.50–138.75 s`); `--count 3` (`machines_median = 3`, SWRR `1 Mac + 1 Win + 1 Linux`)
+    median `89.355 s` (`88.06–89.39 s`, **`0.6499x`**, `target <= 0.50x`: `false`); `--count 6`
+    (`machines_median = 3`, SWRR `3 Win + 2 Linux + 1 Mac`) median `81.503 s` (`81.20–84.39 s`,
+    **`0.5928x`**, `target <= 0.50x`: `false`).
+  Stays `Partial | In` pending: (1) a 3rd physical Linux host (here Linux ran inside Docker on the Mac,
+  sharing the Mac's M5 cores with `mac-lab-worker`) and evaluation of the design 0056 `< 30 %` stop rule
+  (`guide recipe only` vs `--build-once` prebuilt binaries), and (2) live `--build-once` verification with a
+  real `cargo-nextest` binary (absent on all three lab hosts).
 
 ### AX-3: Live output, `logs`, and MCP tasks
 
@@ -2496,3 +2473,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
+- 2026-11-24: AX-1 Implemented (`mac/ax1-ax2-live-records`, text moved to `docs/BACKLOG-ARCHIVE.md`) via live 3-OS MCP `submit` matrix call (`os=macos,windows,linux` over `--workspace ax1-live-2026-11-24`, `3/3` cells passed in `102.221 s`, `machines = 3`, `0` failed cells); AX-2 updated (`Partial | In`) with the 3-worker LAN TCP + Docker Linux live record `benchmarks/grid/results/2026-11-24-r2-m1-3workers-macos-windows-linux.json` (Spike R2 `27.18 %` savings triggering the `< 30 %` stop rule; Measure M1 `0.6499x` at `--count 3` and `0.5928x` at `--count 6`). Index recount deferred to stage D (`M9`).

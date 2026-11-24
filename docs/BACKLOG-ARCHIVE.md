@@ -4386,6 +4386,63 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
     test, 1 never acquired. The exit check of Q80 is read from its last line.
 - **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** steps 1, 3, 4 and 5 are in pull request 306; step 2 (rerun a never-acquired macOS job on the current head, record it) is a standing rule and is now part of prompt S5 of [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The output for 2026-11-16 names 5 runs as never acquired, not 6, because run `43952618376` also holds a failing test and is counted under that class.
 
+### AX-1: Matrix fan-out in `submit` and in MCP
+
+- **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A1. One `submit` call
+  places one task on one worker. `crates/cli/src/cli_app/submit.rs` has no `--matrix` flag (the
+  flag `--matrix-dim` belongs to the GPU benchmark task), and the MCP tool `submit` has no `matrix`
+  field (`crates/cli/src/mcp.rs`).
+- **Problem:** Checking one change on macOS, Windows and Linux takes three calls and three
+  results that the caller merges. This is the first job of the first audience of design 0059, and
+  the purpose of Q1.
+- **Do:** As part A1 of design 0056. The expansion happens in the client, so the wire format does
+  not change:
+  1. `submit --matrix os=macos,windows,linux -- <command>` submits one task per value with the
+     matching `require:` entry. `--matrix` may repeat for a product, up to a fixed cell limit.
+  2. With `--workspace`, the tree syncs to each chosen worker.
+  3. The client waits for every cell. `--json` prints one record per cell: cell, worker, exit
+     code, duration, and the head and tail of the output. The exit code is non-zero when any cell
+     fails.
+  4. A cell that no worker matches is reported as unplaced after a check against `ListWorkers`.
+     It does not hang.
+  5. The MCP tool `submit` takes the same `matrix` field and returns the array.
+  6. A design record, the `README.md` reference and `docs/guides/mcp-client-setup.md` land in the
+     same pull request.
+- **Done when:** An end-to-end test with three tagged workers returns three cell records from one
+  call, and a cell without a worker is reported unplaced. A live record shows one MCP call
+  testing a change on macOS, Windows and Linux. That record is exit check E8 of design 0088,
+  together with AX-2, AX-3 and CACHE-1 in a release.
+- **Partial (2026-11-22, design 0101, commits `0e13d69d`, `58c41543`, `36a2d647`):** Implemented client-side
+  matrix fan-out across `crates/cli/src/matrix.rs`, `cli_app.rs`, `cli_app/submit.rs`, `mcp.rs`, `mcp/submit.rs`,
+  and `mcp/submit_matrix.rs` (plus `README.md`, `docs/reference.md`, and `docs/guides/mcp-client-setup.md`) with
+  zero wire or store changes on Protocol 10 / Store v4: repeatable `--matrix <KEY=V1,V2>` and MCP `matrix`
+  (array or axis object) across `os`, `arch`, `worker`, `iso`, `tool`, `tag`, and process `env:<VAR>`,
+  `--max-matrix-cells` (`64` default, `256` cap), pre-flight `ListWorkers` unplaced-cell detection without
+  hanging (skipping uploads when zero cells are placeable), 1x `--input` / `--workspace --sync` upload
+  deduplication, concurrent `JoinSet` dispatch with `safe_deadline` / `safe_std_deadline` overflow protection
+  (also applied to `mcp/task_result.rs` and `doctor.rs`), per-cell `--output-dir/<cell_slug>` isolation with
+  `ensure_non_symlink_cell_dir` symlink refusal across both CLI and MCP, bounded JSON-escaped inline streams
+  with `MatrixReport` / `RunSummary`, `-32602` validation, and `isError: true` propagation. Verified by unit
+  tests (`matrix` 11/11, `mcp` 16/16, `submit_matrix` 1/1), `crates/cli/tests/test_ax1_matrix.rs` (`9/9`,
+  covering 3 tagged workers and unplaced cells), and `tests/test_wave2_e2e.py` (`F3`, `F4`, Tiers 3–4).
+- **Implemented (2026-11-24, live 3-OS MCP call record at `720106d8`):** Executed one MCP `tools/call`
+  (`submit` with `command: "cargo"`, `args: ["test", "-p", "rusty_grid_core", "--lib", "--locked"]`,
+  `matrix: ["os=macos,windows,linux"]`, `workspace: {"name": "ax1-live-2026-11-24", "sync_dir": "."}`,
+  `timeout_secs: 1800`, `wait: true`) over `oxideswarm mcp` (`protocolVersion: "2024-11-05"`,
+  `rusty-grid 0.4.4`): `isError: false`, `status: "completed"`, `total_cells: 3`, `completed_cells: 3`,
+  `failed_cells: 0`, `unplaced_cells: 0`, `machines: 3`, `workspace.files: 837`, `task_time_sum_ms: 101807`,
+  `waited_ms: 102185` (overall `wall_s: 102.221`):
+  - `cell-00-macos` (`os=macos`, `mac-lab-worker`, `aarch64`, `--isolation off`): `exit_code: 0`,
+    `duration_ms: 33790` (`24.51 s` compile, `8.34 s` test), `296 passed; 0 failed`.
+  - `cell-01-windows` (`os=windows`, `win-case-lab`, `x86_64`, `--isolation off`): `exit_code: 0`,
+    `duration_ms: 52763` (`46.09 s` compile, `5.32 s` test; skipped 2 workspace symlinks with Windows
+    `ERROR_PRIVILEGE_NOT_HELD (1314)`). Under Windows AppContainer `--isolation fs`, compiling `ring v0.17.14`
+    failed with MSVC `fatal error C1083: Cannot open include file: 'stddef.h'` outside AppContainer-readable
+    directories.
+  - `cell-02-linux` (`os=linux`, `linux-docker-lab`, `aarch64`, Docker `rust:1.96` on the Mac,
+    `--isolation off`): `exit_code: 0`, `duration_ms: 15254` (`8.51 s` compile, `6.59 s` test),
+    `296 passed; 0 failed`.
+
 ## Phase 15: coordination between agents
 
 From [design 0087](design/0087-shared-coordination-state.md) (accepted on 2026-11-17, Q84 to Q86). Several
