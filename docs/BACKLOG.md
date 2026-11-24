@@ -193,6 +193,7 @@ Recounted on 2026-11-24 from the rows with pull request 427: 253 items, 187 Impl
 Recounted on 2026-11-24 from the rows with pull request 433: 254 items, 188 Implemented, 19 Partial and 47 Planned; 21 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows after the batch merge of pull requests 423, 427 to 430, 432 to 435, 437, 438 and 441: 258 items, 194 Implemented, 16 Partial and 48 Planned; 19 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 409: 259 items, 195 Implemented, 17 Partial and 47 Planned; 19 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows with pull request 368: 283 items, 195 Implemented, 18 Partial and 70 Planned; 19 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -458,6 +459,30 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BENCH-7 | Benchmark headlines at the top of the README; the interconnect report by Q91 | P1 | S | BENCH-3, BENCH-4, BENCH-5, BENCH-6 | Q91 | Planned | Out | (design 0093) |
 | BENCH-8 | Find why the two-machine W1 sweep reached 73 % efficiency, not 85 % | P2 | S | BENCH-3 |  | Implemented |  | 355, (design 0093) |
 | BENCH-9 | Split the per-machine cost of running W1 through the grid into task process time and slot idle time | P2 | S | BENCH-8 | Q93 | Partial | Out | 354, (design 0093) |
+| R21 | Spike: what Mesh-LLM already does of the planned model items | P1 | S |  | Yes | Planned | Out | (design 0064) |
+| APP-1 | Trial: a coding agent on a Mac (LIVA later, Q98), the model on another machine, over an SSH forward | P1 | S |  | Yes | Planned | Out | (design 0061) |
+| R22 | Spike: the concurrency knee of a model server, reached from another machine | P1 | S | APP-1 |  | Partial | Out | 254, (design 0067) |
+| R14 | Spike: where the time goes from an empty machine to the first token | P2 | S |  | Yes | Planned | Out | (design 0056) |
+| R15 | Spike: the cost of pushing weights through llama.cpp's RPC backend | P2 | S |  | Yes | Planned | Out | (design 0062) |
+| R16 | Spike: whether `ggml-rpc-server` survives a connection through a relay | P2 | S |  | Yes | Planned | Out | (design 0062) |
+| R17 | Spike: a quantised model built from memory with `llama_model_init_from_user` | P2 | S |  | Yes | Planned | Out | (design 0062) |
+| R18 | Spike: the cost of a boundary in a split whose head has a GPU | P3 | S |  | Yes | Planned | Out | (design 0062) |
+| FEAT-9b | Report usable GPU memory live, not the configured total | P2 | M | FEAT-9 |  | Planned | Out | (design 0067) |
+| LLM-1 | Expert routing through local model servers: a guide and a script | P2 | S | R21 |  | Planned | Out | (design 0038) |
+| LLM-15 | Spike: Laya as a fast router in front of the model services, then a decision | P3 | S | R21 |  | Planned | Out | 368 |
+| LLM-9 | Named model services (`worker --serve`) and a client tunnel (`llm connect`) | P1 | L | APP-1 | Q42 | Planned | Out | (design 0061) |
+| LLM-14 | Knee-point admission and interactive versus batch bands for model requests | P2 | M | R22, LLM-9 |  | Planned | Out | (design 0067) |
+| LLM-6 | OpenAI-compatible gateway (`llm serve`) | P2 | M | LLM-1, LLM-9 |  | Planned | Out | (design 0056) |
+| LLM-3 | Memory-aware placement for model services | P2 | M | FEAT-9b |  | Planned | Out | (design 0038) |
+| LLM-12 | The runner: a model server that takes its model from a stream | P2 | L | R15, R17, LLM-9 | Q45, Q46 | Planned | Out | (design 0062) |
+| LLM-13 | `llm push`: weights by tensor through the tunnel, with a cache on the target | P2 | M | LLM-9, LLM-12 | Q45 | Planned | Out | (design 0062) |
+| LLM-2 | Service tasks | P2 | L | FEAT-1, FEAT-8, R21 |  | Planned | Out | (design 0038) |
+| LLM-4 | Authenticated tunnel for llama.cpp RPC traffic | P3 | L | LLM-2, LLM-9, R16 |  | Planned | Out | (design 0038) |
+| LLM-5 | `llm up` and `llm down` for a split model, with the head on a worker | P3 | M | LLM-3, LLM-4, R18 | Q45, Q47 | Planned | Out | (design 0038) |
+| LLM-7 | Model distribution and model choice by probe (`llm pull`) | P3 | M | SCALE-3, R14 |  | Planned | Out | (design 0056) |
+| LLM-8 | Batch inference (`llm batch`) | P3 | M | LLM-1 |  | Planned | Out | (design 0056) |
+| LLM-10 | Usage records for tunnels (`llm usage`) | P3 | M | LLM-9, ENROLL-1 |  | Planned | Out | (design 0061) |
+| LLM-11 | A balance per member, display only | P3 | S | LLM-10 | Q14 | Planned | Out | (design 0061) |
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
@@ -1822,6 +1847,506 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   (`competing_processes`). Steps 2 and 3 (the live runs on Windows and Mac under a committed plan, and debug-log
   round-trip breakdown if idle slots remain) are next.
 
+## Phase 18: 0.5.0, language model serving across machines
+
+Added as a draft on 2026-11-19 and updated on 2026-11-24 for the owner decisions of pull request 442 (Q41,
+Q54, Q60 to Q63, and Q98; pull request 368). The owner approved on 2026-11-19 that the coordinator prepares
+release `0.5.0` beside the stability release. The items come from
+[design 0038](design/0038-large-language-model-inference.md) (LLM-1 to LLM-5),
+[design 0056](design/0056-frontier-program.md) (LLM-6 to LLM-8, R14),
+[design 0061](design/0061-first-application-model-tunnel.md) (APP-1, LLM-9 to LLM-11),
+[design 0062](design/0062-model-weights-into-remote-memory.md) (R15 to R18, LLM-12, LLM-13),
+[design 0064](design/0064-research-of-2026-11-13-and-route.md) (R21) and
+[design 0067](design/0067-multi-node-llm-serving-and-admission.md) (R22, LLM-14, FEAT-9b). LLM-15 comes from the
+owner's question of 2026-11-20 and the first session of
+[benchmarks/model-bringup](../benchmarks/model-bringup/README.md). Each item keeps the id and the meaning its
+design gives it. Every item is outside the stop line of
+[design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) (D1), so its Line is Out.
+
+The gate:
+
+- **Q80 (decided on 2026-11-17).** No item of this phase is built before the stability release, the
+  `0.4.x` release whose exit check is under "Stability" in [ROADMAP.md](ROADMAP.md).
+- **Q54 (decided yes on 2026-11-24).** No model item is built before spike R21 has a record, and an item
+  closes where Mesh-LLM already does the work, in favour of running Mesh-LLM as a service. Part 1 of R21
+  (reading Mesh-LLM's documents and code) is assigned to an agent; part 2 stays with the owner.
+- **Decisions of 2026-11-24 and 2026-11-19.** On 2026-11-24 (pull request 442) the owner also decided Q41
+  (build LLM-9 before LLM-6 and let LLM-4 reuse it, if APP-1 records show the remote model is worth using),
+  Q60 to Q63 at their recommended defaults (Q60: expand APP-1 with R22 on each GPU machine; Q61: admission in
+  LLM-14 counts prompt plus answer tokens as well as requests; Q62: usable GPU memory in FEAT-9b; Q63: direct
+  fast links after single-hop LLM-9, outside the first `0.5.0`), and Q98 (trial APP-1 runs first with a coding
+  agent while LIVA is on hold). Q43 was closed as display only on 2026-11-19 by Q96.
+- **Remaining open decisions** gate single items, and the Owner column names them: Q42 (design 0061,
+  encryption per hop vs end to end with ENROLL-1), Q45 to Q47 (design 0062, LLM-12, LLM-13 and LLM-5) and Q14
+  (credits or units in LLM-11; first version displays using ROADMAP.md's default).
+- The spikes and trial APP-1 build nothing in the product ("Before 0.5.0 has items" in ROADMAP.md). They
+  run on the owner's machines (apart from R21 part 1).
+
+The order:
+
+1. Q41, Q54, Q60 to Q63 and Q98 are decided; the owner answers Q45 to Q47 before LLM-12, LLM-13 and LLM-5,
+   and Q42 before clusters of several owners use LLM-9.
+2. R21. R15, R16 and R17 in any order, and R18 with them or after them. The spike part of LLM-15 at
+   any time after R21; it builds nothing.
+3. APP-1 Part A, in the same sitting as R14 and the two-machine run of R22.
+4. After the stability release and R21: FEAT-9b and LLM-1 (closed or narrowed if R21 covers it); LLM-9 (once
+   APP-1 records show the remote model is worth using, Q41); LLM-14 (Q61); LLM-6 (closed or narrowed if R21
+   covers it); LLM-3.
+5. LLM-12 and LLM-13, if the stop rules of R15 and R17 leave them open.
+6. LLM-2, LLM-4 after R16, and LLM-5 with the head rule of design 0062 (Q45, Q47).
+7. LLM-7 after SCALE-3, LLM-8, LLM-10 after ENROLL-1, and LLM-11 last.
+
+Which items ship in `0.5.0` is not decided. A release takes what is merged
+([design 0076](design/0076-protocol-compatibility-and-release-train.md), D1). FEAT-9b, LLM-2, LLM-4,
+LLM-9 and LLM-14 change the wire format, and each such merge is followed by a release within 48 hours. SCALE-3
+keeps its row in Phase 7. EDU-1 and EDU-2 (design 0056, classroom) and TRAIN-1 to TRAIN-5 and R19
+([design 0045](design/0045-distributed-training.md), training) are not in this phase.
+
+### R21: Spike: what Mesh-LLM already does of the planned model items
+
+- **Evidence:** [Design 0064](design/0064-research-of-2026-11-13-and-route.md) D3 and finding 19. Its
+  work-item table lists R21 as Planned. No record under `benchmarks/` names Mesh-LLM.
+- **Problem:** LLM-1, LLM-6, LLM-12 and LLM-13 may repeat work that another open project already does
+  (G4 of design 0064). By Q54 (decided yes on 2026-11-24), no model item is built before this record exists.
+- **Do:**
+  1. Part 1 (assigned to an agent): read Mesh-LLM's documents and code for how a model reaches a node, whether
+     a node needs the file, how a request is routed, how a model is split, what authenticates a node, and which
+     systems it runs on.
+  2. Part 2 (owner): install it on the owner's two machines, outside the grid. Read its access control before
+     it listens beyond loopback. Serve one model.
+  3. Record its version and licence.
+- **Done when:** The table of design 0064 D3 (planned item, what Mesh-LLM does, what is left) is in
+  that record's status log, with a dated record under `benchmarks/`. Each item it covers is closed or
+  narrowed here, by Q54.
+
+### APP-1: Trial: a coding agent on a Mac (LIVA later, Q98), the model on another machine, over an SSH forward
+
+- **Evidence:** [Design 0061](design/0061-first-application-model-tunnel.md) D3, including "Changed by Q98
+  (2026-11-24)". The owner decided Q40 on 2026-11-11 (the trial comes before any build item of design 0061)
+  and Q98 on 2026-11-24: LIVA is on hold until after the current projects because its desktop build likely stops
+  at start-up and its "Cloud" provider (KH-1) has no code, so APP-1 runs first with a coding agent against an
+  OpenAI-compatible endpoint (for example aider or opencode; the choice is recorded with the trial) and LIVA
+  follows as the second application. Design 0061's "Trial records" section says "None yet". The trial needs
+  nothing from this repository.
+- **Problem:** Nobody knows whether a coding agent on a Mac (and later LIVA) is good enough to use when another
+  machine computes its model. By Q41 (decided on 2026-11-24), LLM-9 is built only if the trial records show
+  that the remote model is worth using.
+- **Do:** As design 0061 D3 ("Changed by Q98 (2026-11-24)"):
+  1. Part A. On the second machine, a model server listens on loopback. On the Mac, an SSH local forward maps
+     `127.0.0.1:<PORT>` to it. Run a load generator against `http://127.0.0.1:<PORT>/v1` (AIPerf, as in spike
+     R22, or a streaming request sent with `curl`), then the same suite with the model on the Mac where it fits
+     (`liva_eval --provider cloud --api-base http://127.0.0.1:<PORT>/v1` runs when LIVA follows later).
+  2. Run R14 and the two-machine run of R22 in the same sitting where the owner can.
+  3. Part B. The coding agent on the Mac makes a real change in a repository (an edit that a test checks), once
+     with the model on the second machine and once, where the Mac can hold it, on the Mac; then stop the second
+     machine in the middle of an answer and write down what the agent does. Record the agent and its version,
+     the task, whether the test passed, and how many requests the agent sent. Once LIVA starts on macOS and
+     has KH-1, run its typed and spoken questions and middle-of-answer stop as the second application (using
+     LLM-9 instead of SSH if it exists by then).
+- **Done when:** "Trial records" of design 0061 holds a dated entry for Part A and one for Part B,
+  each with the fields that D3 and Q98 list, and no host name, user name or address.
+
+### R22: Spike: the concurrency knee of a model server, reached from another machine
+
+- **Evidence:** [Design 0067](design/0067-multi-node-llm-serving-and-admission.md) D5.
+- **Partial (2026-11-16, pull request 254):** session 8 of
+  [benchmarks/model-bringup/README.md](../benchmarks/model-bringup/README.md) holds one record, with
+  `llama-server` and AIPerf both on the GPU machine (an RTX 5060 Ti with 16 GiB). Output peaks at
+  `C = 16` for `chat` and at `C = 8` for `coding`. At `coding` `C = 32` the shared cache ran out: the
+  server ended the answers early, and `llamacpp:requests_deferred` stayed 0.
+- **Problem:** R22 asks for the curve as a client on the Mac sees it, through the forward of APP-1. By Q60
+  (decided on 2026-11-24), the 2026-11-16 record is the start and each GPU machine that serves a model gets
+  one; the defaults of LLM-14 come from those curves.
+- **Do:** Repeat session 8 with AIPerf on the Mac, through the SSH forward of APP-1: the same server
+  build, model and levels (`C = 1, 2, 4, 8, 16, 32`, `3 * C` warm-up, `10 * C` measured). At each level
+  record prompt plus answer tokens against the size of the server's pool.
+- **Done when:** A second dated record in session 8 holds the same tables for the two-machine path, and
+  the status log of design 0067 says whether its knees match those of 2026-11-16.
+
+### R14: Spike: where the time goes from an empty machine to the first token
+
+- **Evidence:** [Design 0056](design/0056-frontier-program.md) D9. Session 1 of
+  [benchmarks/model-bringup/README.md](../benchmarks/model-bringup/README.md) (2026-11-11, one Mac, a
+  small decision model) is not the method of R14. Session 3, the method of R14, is Planned. The
+  master's blob store is bounded to 4096 MiB (`DEFAULT_BLOB_STORE_MAX_BYTES`,
+  `crates/master/src/blob_store.rs`) and a worker's cache to 2048 MiB (`DEFAULT_BLOB_CACHE_MAX_BYTES`,
+  `crates/worker/src/blob_cache.rs`), at or below the size of a 4 GiB model file.
+- **Problem:** Without the split into fetch, load and first token, nobody knows which comes first: LLM-7
+  for the fetch, a note in the guide of LLM-1 for the load, or the application's own plan for the first
+  token.
+- **Do:** As design 0056 D9, on two of the owner's machines, each segment from a committed script:
+  1. Fetch a model file of about 4 GiB by a plain copy over SSH, by `submit --input`, and by
+     `submit --input` a second time.
+  2. Load `llama-server` until `/health` answers, after a restart of the machine and on a second start,
+     with `--load-mode mmap` and with `--load-mode none`.
+  3. First token for one prompt with a long fixed prefix: first and second request, with and without
+     `--cache-prompt`, and after a slot restore.
+  4. State the `--blob-store-mb` and `--blob-cache-mb` values used.
+- **Done when:** Session 3 holds a dated record that names the slowest segment.
+
+### R15: Spike: the cost of pushing weights through llama.cpp's RPC backend
+
+- **Evidence:** [Design 0062](design/0062-model-weights-into-remote-memory.md) D2, rows 1 to 3 and 13.
+  Session 4 of [benchmarks/model-bringup/README.md](../benchmarks/model-bringup/README.md) is Planned.
+  Nothing in this repository speaks llama.cpp's RPC protocol (row 23).
+- **Problem:** If upstream's push of weights reaches 95 % of the tokens per second of a local file,
+  LLM-12 is not needed for speed, and LLM-4 serves case 1 of design 0062.
+- **Do:** Steps 1 to 6 of R15 in design 0062 D2, under its conditions: llama.cpp built from source at
+  one upstream commit of November 2026 or later with `-DGGML_RPC=ON`, a network with no other device, a
+  firewall rule that limits the RPC port to the peer, `GGML_RPC_NO_RDMA=1`, and AC power.
+- **Done when:** Session 4 holds a dated record from a committed script, and the status log of design
+  0062 holds the result of the stop rule.
+
+### R16: Spike: whether `ggml-rpc-server` survives a connection through a relay
+
+- **Evidence:** Design 0062 D2 and rows 5, 24, 27 and 28. Upstream issue 26680 reports that the RPC
+  server ends when a relay such as `ssh -L` reaches it, and was closed as not planned. Session 5 of
+  `benchmarks/model-bringup/README.md` is Planned.
+- **Problem:** The tunnel of LLM-4 is such a relay. Design 0062 holds LLM-4 unsized until the cause is
+  known.
+- **Do:** R16 as design 0062 D2 writes it: the RPC server on loopback on each target system, as a native
+  program (on Windows not inside WSL2); through an `ssh -L` forward, a connection that sends nothing,
+  then a real load; the same through a relay that is not SSH; if the server ends, the two variants of
+  row 24.
+- **Done when:** Session 5 holds a dated record that says, for each step and system, whether the server
+  process lived, with its last log lines, and the status log of design 0062 holds the stop rule's result.
+
+### R17: Spike: a quantised model built from memory with `llama_model_init_from_user`
+
+- **Evidence:** Design 0062 D2 and rows 9 and 16 to 19. By the source, a quantised model keeps its types
+  and each tensor has its device buffer when the callback runs. No run confirms it. Session 6 of
+  `benchmarks/model-bringup/README.md` is Planned.
+- **Problem:** LLM-12 rests on this call. If a quantised model does not load this way, or the load needs
+  a second full copy of the weights in RAM, LLM-12 closes and case 1 uses a file.
+- **Do:** The throwaway program of R17, on each system that will be a target: the metadata from the
+  first bytes of the file with `gguf_init_from_buffer`, and a callback that fills each tensor part by
+  part from memory. Record the callback order against the file order, each tensor's type and size, the
+  device buffer, the peak memory against a load from the file, and the first 64 tokens of a greedy reply
+  against the file load. List the places in `llama-server` that a patch for design 0062 D3 would touch.
+- **Done when:** Session 6 holds a dated record, and the status log of design 0062 holds the stop rule's
+  result.
+
+### R18: Spike: the cost of a boundary in a split whose head has a GPU
+
+- **Evidence:** Design 0062 D2, D5 and rows 11, 21, 26 and 31. Session 7 of
+  `benchmarks/model-bringup/README.md` is Planned.
+- **Problem:** The rule that the head of a split runs on the stronger worker (design 0062 D5, the proposed
+  text for LLM-5) and the answer to Q47 rest on a measurement nobody has made.
+- **Do:** R18 as design 0062 D2 writes it: a model that fits the head alone, whole and then split in
+  halves; a model that fits only when split, if the two machines allow one; the head on the other
+  machine; the head's own GPU first in the device order; and one run with prima.cpp for a model that
+  fits neither machine. Record time to the first token for a prompt of about 4096 tokens, tokens per
+  second, and the bytes for one reply token. A head on a Mac loads without mapping the file.
+- **Done when:** Session 7 holds a dated record, and the status log of design 0062 holds the stop rule's
+  result.
+
+### FEAT-9b: Report usable GPU memory live, not the configured total
+
+- **Evidence:** [Design 0067](design/0067-multi-node-llm-serving-and-admission.md) D2 and Q62 (decided yes on
+  2026-11-24). The status log line of FEAT-9a (2026-11-15) leaves FEAT-9b open, and
+  [design 0068](design/0068-task-vram-accounting.md) lists live free GPU memory as a non-goal.
+  `WorkerMessage::Heartbeat` (`crates/core/src/protocol.rs`) carries `ram_available_mb` and no GPU
+  memory. `WorkerCapabilities::vram_mb` (`crates/core/src/capabilities.rs`) comes from `worker
+  --vram-mb` or the config file (`crates/cli/src/cli_app/worker.rs`), not from a probe.
+  `WorkerCapabilities::satisfies` and the static fit in `crates/master/src/worker_index.rs` compare a
+  task's `vram_mb` with that figure.
+- **Problem:** A worker whose GPU a model server already holds still takes a task that asks for the GPU
+  memory it had when empty. On the R22 machine the idle server held 13,416 MiB of 16,311 MiB. A Mac
+  reports no GPU memory unless its owner sets `--vram-mb`.
+- **Do:**
+  1. A design record for the probe and its wire form, following
+     [design 0040](design/0040-protocol-versioning.md) and the window rule of
+     [design 0083](design/0083-one-version-window.md).
+  2. The worker probes usable GPU memory, by Q62: on Windows `IDXGIAdapter3::QueryVideoMemoryInfo`
+     (`Budget - CurrentUsage` of the local segment); on macOS `MTLDevice.recommendedMaxWorkingSetSize`,
+     bounded by free memory; on Linux NVML `free`, or `/sys/class/drm` on AMD, times a ceiling of 0.90.
+  3. The worker reports it with its heartbeat. The new field goes into the public enum, both mirror
+     enums and all four `From` impls.
+  4. The scheduler places a task's `vram_mb` against the usable figure, less what it has reserved.
+- **Done when:** On a Windows worker with an NVIDIA GPU and on a Mac, `workers --json` shows the usable
+  figure fall when a model server starts, and a placement test keeps a task waiting whose `vram_mb`
+  exceeds the usable figure while the configured total would admit it.
+
+### LLM-1: Expert routing through local model servers
+
+- **Evidence:** [Design 0038](design/0038-large-language-model-inference.md) D1. `worker --tag` and
+  `submit --require-tag` exist (`crates/cli/src/cli_app.rs`, `crates/core/src/placement.rs`).
+  `docs/guides/` holds no guide for a model server, and `scripts/` no example for one.
+- **Problem:** A user with a model server on a strong machine has no written way to send it a prompt
+  through the grid.
+- **Do:** As design 0038 D1: a guide in `docs/guides/`, an example script that posts a prompt to the
+  loopback model server of the tagged worker and prints the reply, and an MCP usage note. The reply
+  arrives when the task ends and is capped by the output limit; the guide says so. Close or narrow the
+  item if R21 shows that Mesh-LLM does this (Q54, decided yes on 2026-11-24).
+- **Done when:** The guide and the script send a prompt to the tagged worker and print the reply, and
+  the integration test of design 0038 D1 (a stub HTTP model server behind a tagged worker) passes.
+
+### LLM-15: Spike: Laya as a fast router in front of the model services, then a decision
+
+- **Evidence:** Laya ([model card](https://huggingface.co/convaiinnovations/laya), Apache-2.0) scores
+  a fixed list of labels in one forward pass and generates no text, so it cannot answer with a label
+  outside the list. Its checkpoints: the root (ModernBERT-large, about 421M parameters, English),
+  `multilingual` (mmBERT-base, about 322M parameters, 1,024 tokens) and `typed-decisions`, for which
+  its authors report 0.766 accuracy on their own 2,000-decision benchmark. Session 1 of
+  [benchmarks/model-bringup](../benchmarks/model-bringup/README.md) (2026-11-11, Apple M5, checkpoint
+  `multilingual`): one decision median 17.7 ms (n=100), warm load 2.09 s, 18 of 20 Vietnamese
+  sentences sorted correctly into "command" and "question", the same labels over six passes, and
+  probabilities that do not separate right answers from wrong ones.
+- **Problem:** In this phase the user picks the model service for every request (a tag in LLM-1, a
+  name in LLM-9, a model in LLM-6). A request that a small model on the caller's machine could answer
+  still waits for a large model split across machines, and no item decides per request. A generative
+  model used as a router would add its own latency and could answer outside the list of routes.
+- **Do:** A spike on the owner's machines, then a decision. It builds nothing in the product.
+  1. A labelled set of 200 requests in English and Vietnamese for three or four routes (for example:
+     a small local model, the large model, a request that needs a tool, a request to refuse),
+     labelled by the owner, with no private data.
+  2. Accuracy of `multilingual` and `typed-decisions` with no fine-tuning, then after fine-tuning on
+     half of the set, measured on the other half; temperature calibration, and the probability
+     under which a request goes to the large model.
+  3. Time per decision on the processor of each machine (median of at least 100, the model loaded
+     once) and the memory the process holds; the Dell under its memory rules.
+  4. One record per machine under `benchmarks/model-bringup/results/`, with the record rules of
+     session 1 (no host name, user name or path).
+  Decision: build the router (as part of LLM-6 or LLM-9, with its own design record) only if the
+  fine-tuned accuracy on the held-out half is at least 0.95 with the rule "unsure goes to the large
+  model", and the median time per decision is under 50 ms on the slowest machine; otherwise close
+  the item with the record. A built router runs first as a Python task or service of a worker, with
+  no new Rust dependency; an ONNX path in Rust only if that later pays. Laya never decides a merge,
+  a placement, an admission or anything about security: even a good router is wrong about one
+  request in twenty. A batch classification run with Laya is also a candidate workload for the
+  campaigns of design 0094 (the road to a shared research grid); that is not part of
+  this item.
+- **Done when:** The records exist, and LLM-15 is either closed with them or replaced by a build item
+  that has a design record.
+
+### LLM-9: Named model services and a client tunnel
+
+- **Evidence:** [Design 0061](design/0061-first-application-model-tunnel.md) D4. A client connects only
+  to the master (`connect_master`, `crates/cli/src/connect.rs`). On QUIC a client connection is one
+  stream tagged `STREAM_CLIENT`, and `crates/core/src/transport.rs` defines no other stream kind for it.
+  No `--serve` flag exists, and `serve:` is not among the eleven `RESERVED_TAG_PREFIXES`
+  (`crates/core/src/placement.rs`). Blobs already move off the inbound loop (`BlobService`,
+  `crates/master/src/server.rs`), a pattern a tunnel can follow. Design 0067 D1 finds the count of open
+  tunnels a poor load measure (Q61, decided on 2026-11-24; LLM-14).
+- **Problem:** A program on one machine cannot reach a model server on another machine's loopback
+  through the grid, and the model server must never listen beyond loopback.
+- **Do:** As design 0061 D4, once APP-1 records show the remote model is worth using (Q41, decided on
+  2026-11-24):
+  1. `worker --serve <NAME>=127.0.0.1:<PORT>`, repeatable. The worker adds the tag `serve:<NAME>`, and
+     `serve:` joins `RESERVED_TAG_PREFIXES`. A worker without `--serve` refuses every tunnel.
+  2. `oxideswarm llm connect --service <NAME> [--listen 127.0.0.1:<PORT>]` listens on loopback only.
+  3. The master joins a client tunnel connection and a worker tunnel connection. Bytes pass in bounded
+     chunks, and a close on one side closes the other. No retry.
+  4. On TCP a connection type of its own (handshake, then AEAD records); on iroh a stream kind of its
+     own. Caps per worker and on the master, and an idle close.
+  5. Wire change: new variants in both mirror enums and all four `From` impls, a `ProtocolCapabilities`
+     bit, and a protocol version bump. The master is upgraded first.
+  6. The guide says that a task under `--isolation off` or `fs` can reach the worker's loopback ports,
+     and that `fs+net` closes that. ENROLL-1 comes first for a cluster of several owners (Q42).
+- **Done when:** An unchanged OpenAI client on one machine streams a reply from a loopback model server
+  on another, the integration tests of design 0061's test plan pass, a worker without `--serve` refuses,
+  and part B of APP-1 runs again through the tunnel with both sets of times recorded.
+
+### LLM-14: Knee-point admission and interactive versus batch bands
+
+- **Evidence:** [Design 0067](design/0067-multi-node-llm-serving-and-admission.md) D1 and Q61 (decided yes on
+  2026-11-24). The R22 record of 2026-11-16 found a knee on both workloads, and found that on llama.cpp a
+  full cache pool ends answers early while `llamacpp:requests_deferred` stays 0.
+  `crates/master/src/metrics.rs` exports Prometheus metrics (ECO-4). Nothing admits or queues model requests.
+- **Problem:** Above the knee more requests at once lower total output and multiply the time between
+  tokens. An interactive request (for example LIVA or a spoken reply) needs a short time between tokens, and
+  batch clients (agents or a class) want total output.
+- **Do:** As design 0067 D1 and Q61, with the R22 finding:
+  1. An optional loopback `--serve-metrics <NAME>=http://127.0.0.1:<MPORT>/metrics`; the worker reports
+     three numbers with its heartbeat and reads no prompt or reply. This is a wire change, under the
+     same rules as FEAT-9b.
+  2. Without engine metrics, a `max_inflight` per service, its default from R22.
+  3. An admission budget that counts prompt plus answer tokens against the server's pool as well as the
+     count of active requests, because the R22 record shows a request count alone misses answers cut short.
+  4. Two bands on the gateway or tunnel: `interactive` (LIVA) up to `max_inflight`, `batch` (agents, a
+     class) up to a lower watermark. Queue depth goes out through `metrics.rs`.
+- **Done when:** Under a burst of 32 requests in an integration test, the worker's in-flight count stays
+  at or below `max_inflight`, no request is dropped, and an `interactive` request passes queued `batch`
+  requests.
+
+### LLM-6: OpenAI-compatible gateway
+
+- **Evidence:** [Design 0056](design/0056-frontier-program.md) D5. Design 0061 D7 proposes that its
+  streaming version uses LLM-9 and comes first (Q41, decided yes on 2026-11-24). The master's HTTP router
+  (`crates/master/src/web_ui.rs`) serves `/`, `/metrics`, `/api/*`, `/ws` and SSE, and no `/v1/` route.
+- **Problem:** An unchanged OpenAI-compatible client cannot reach a model on the grid.
+- **Do:**
+  1. `oxideswarm llm serve` offers the chat completion and model list routes. It listens on loopback by
+     default, and any other address needs a token under the dashboard's policy.
+  2. Each request goes to a worker that holds the model. A queue per model is bounded, and a limit per
+     client keeps one user from taking every worker. Placement follows LLM-14 (Q61, decided on 2026-11-24).
+  3. By Q41 (decided on 2026-11-24), the first version streams through LLM-9 to a model server the owner
+     starts by hand rather than waiting for non-streaming tasks or LLM-2 and LLM-4.
+  4. Close or narrow the item if R21 shows that Mesh-LLM does this (Q54, decided yes on 2026-11-24).
+- **Done when:** An unchanged OpenAI client completes a chat through the gateway, and requests spread over
+  two workers.
+
+### LLM-3: Memory-aware placement for model services
+
+- **Evidence:** [Design 0038](design/0038-large-language-model-inference.md) D3 and design 0067 D2. Part of
+  D3 exists: `TaskRequirements` has `ram_mb` and, since FEAT-9a, `vram_mb` (`crates/core/src/task.rs`);
+  the heartbeat reports free RAM; `WorkerCapabilities::satisfies` (`crates/core/src/capabilities.rs`)
+  checks both against the totals a worker advertises; and `required_vram_mb` (`crates/master/src/scheduler.rs`)
+  applies the `Generative3D` VRAM presets when `--vram-mb` is omitted (3D-2, Implemented,
+  [design 0105](design/0105-3d2-vram-blender-routing.md)). Live usable GPU memory (FEAT-9b) and model-service
+  sizing do not exist yet.
+- **Problem:** A model service needs room for its weights, its cache and a margin. Placement against the
+  total admits a model that does not fit: in design 0067, 218 GiB of weights took 231.35 GiB at idle.
+- **Do:**
+  1. Place a long-lived service by FEAT-9b's usable GPU memory and by free RAM.
+  2. Add the sizing rule of design 0067 D2 to the guide and to the `llm` commands that place a model:
+     `vram_mb = weights_mb + kv_cache_mb(max_model_len, kv_dtype_bytes, max_seqs) +
+     workspace_margin_mb`.
+  3. Reuse the placement mechanism of FEAT-9a and 3D-2 so 3D tasks and models share one path (design 0038 D3).
+- **Done when:** The placement tests of design 0038 D3 pass, including a task that no worker can hold,
+  and a model service whose computed `vram_mb` exceeds the usable memory of every worker waits.
+
+### LLM-12: The runner: a model server that takes its model from a stream
+
+- **Evidence:** [Design 0062](design/0062-model-weights-into-remote-memory.md) D3. The owner decided Q44
+  on 2026-11-11 (weights go from the file on one machine into the memory of another, with no file written
+  there first) and Q54 on 2026-11-24 (wait for R21, close if Mesh-LLM covers it). No code in this repository
+  links llama.cpp, and design 0038 rules out shipping llama.cpp binaries. Upstream `llama-server` never calls
+  `llama_model_init_from_user` (row 10).
+- **Problem:** A worker without the model file cannot run the model without a copy on its disk first.
+- **Do:** As design 0062 D3, after R21 and R17, by Q46 (recommended: way 1):
+  1. A patch to `llama-server` that loads from a stream, offered upstream and kept as a patch file for
+     one named commit, in a directory outside the Cargo workspace. The worker's owner builds it.
+  2. Two loopback ports, the API and a load port, both named with `worker --serve` (LLM-9).
+  3. The runner counts and checks the bytes, refuses an offer above the owner's bound before it
+     allocates, and ends its own process on a failed fetch or a wrong digest.
+  4. Close the item if R17 or R21 meets its stop rule. If R15 reaches 95 % of the local baseline, LLM-12 is
+     not needed for speed and LLM-4 serves case 1 (the stop rule of R15); weigh the item again then.
+- **Done when:** A quantised model loads from a stream on each target system, a record shows G2 of design
+  0062 (at least 95 % of the tokens per second of a local file), and a stopped runner leaves the GPU
+  memory free.
+
+### LLM-13: `llm push`: weights by tensor through the tunnel, with a cache on the target
+
+- **Evidence:** Design 0062 D4. `BlobId` is a BLAKE3 digest (`crates/core/src/blob.rs`), transfers run
+  in 4 MiB parts (`BLOB_CHUNK_BYTES`, `crates/core/src/blob_transfer.rs`), and the worker's cache
+  verifies an entry when it reads it (`crates/worker/src/blob_cache.rs`). A file sent with
+  `submit --input` is written to the master's store, the worker's cache and the sandbox before a task
+  reads it.
+- **Problem:** Sending a model with `submit --input` writes it three times, and the master stores a copy.
+- **Do:** As design 0062 D4, after R21 (Q54): `oxideswarm llm push --service <NAME> --model <GGUF>`
+  indexes the GGUF with one `BlobId` per tensor, sends the header bytes and the list through a tunnel of
+  LLM-9, receives the list of what the target lacks, and sends each tensor when the loader asks for it. The
+  runner checks each BLAKE3 digest before use and writes set tensors to a bounded cache after the load. The
+  first frame carries a version. No new grid message.
+- **Done when:** The integration tests of design 0062's test plan pass with a stub runner (a first push
+  sends every tensor, a second sends none, a cut leaves the finished tensors in the cache, a changed byte
+  is refused), and a record shows G1 and G3.
+
+### LLM-2: Service tasks
+
+- **Evidence:** [Design 0038](design/0038-large-language-model-inference.md) D2, refined by design 0064
+  (finding 13), design 0062 (D5, item 6) and design 0067 (D3). `TaskSpec` (`crates/core/src/task.rs`)
+  has `Command`, `ShellScript`, `RustCompilation`, `GpuCompute`, `BuiltinTest`, `Generative3D` and
+  `AutoRig`, and each ends before its result is sent (`crates/worker/src/runner.rs`). FEAT-1 and FEAT-8,
+  which design 0038 names as needs, are Implemented.
+- **Problem:** A model server has to keep running, say when it is ready, and stop with its whole process
+  tree. No task kind does that.
+- **Do:**
+  1. A task kind that runs until it is cancelled, with a readiness check on a loopback port or an HTTP
+     path, and `Starting`, `Ready` and `Failed` reports.
+  2. A bounded restart policy with backoff, time limits on the start and between reply tokens, liveness
+     read from the process and never from an RPC port.
+  3. A cancel kills the process tree (`crates/worker/src/process_tree.rs`), and a lost worker requeues
+     the service. A readiness port bound beyond loopback is refused.
+  4. Wire change: the variant in both mirror enums and all four `From` impls, behind a
+     `ProtocolCapabilities` bit, with a design record. By Q54 (decided yes on 2026-11-24), build items wait
+     for R21 and close where Mesh-LLM already covers them in favour of running Mesh-LLM as a service.
+- **Done when:** The tests of design 0038 D2 pass (start, readiness, restart limit, cancel of the process
+  tree, requeue after worker loss), and a service survives a worker restart by requeue.
+
+### LLM-4: Authenticated tunnel for llama.cpp RPC traffic
+
+- **Evidence:** [Design 0038](design/0038-large-language-model-inference.md) D4. Design 0061 D7 proposes
+  that LLM-4 reuses the tunnel of LLM-9 (Q41, decided yes on 2026-11-24). Design 0062 rows 5, 24, 27, 28 and
+  30 bear on it, and R16 gates its size. `crates/core/src/transport.rs` defines `STREAM_CONTROL`,
+  `STREAM_DATA` and `STREAM_CLIENT`, and nothing forwards a TCP port.
+- **Problem:** The head of a split model has to reach `ggml-rpc-server` on other workers, and that port
+  has no authentication, so it must never leave loopback.
+- **Do:** As design 0038 D4, with the connection of LLM-9 (Q41): RPC servers on loopback, one tunnel for each
+  server and no probe of its port (design 0062 row 28), the handshake and AEAD records on TCP, a stream kind of
+  its own on iroh, and no 64 MiB message frame as the unit. Size it after R16 has a record. Add a script that
+  measures the tunnel against plain loopback.
+- **Done when:** The tests of design 0038 D4 pass (an echo through the tunnel with and without the secret,
+  and the remote port is unreachable without the tunnel), and a committed script records the tunnel's
+  throughput.
+
+### LLM-5: `llm up` and `llm down` for a split model, with the head on a worker
+
+- **Evidence:** Design 0038 D5. Design 0062 D5 proposes the head rule (Q45) and the master on the head's
+  machine (Q47). Design 0067 D4 proposes direct links between workers (Q63, decided on 2026-11-24: after
+  single-hop LLM-9 works, not part of the first `0.5.0`). The `Commands` enum of
+  `crates/cli/src/cli_app.rs` has no `llm` subcommand.
+- **Problem:** A model larger than one machine runs today only by hand-edited commands on each machine and
+  an RPC port without authentication.
+- **Do:**
+  1. `oxideswarm llm up --model <GGUF> [--workers <N>]` picks workers by free memory (LLM-3), starts
+     `ggml-rpc-server` as a service task on each (LLM-2), opens the tunnels (LLM-4), starts the head and
+     prints the local URL of its API. `llm down` stops all of it.
+  2. If Q45 accepts design 0062 D5: the head is the chosen worker with a GPU of its own and the most
+     free memory, and not the asking machine unless it is that worker. The supervisor starts the whole
+     pipeline again in order, with time limits on the load and between reply tokens.
+  3. Refuse a set of llama.cpp builds from different commits. Never split a model that one worker can
+     hold. Q47 decides where the master runs.
+- **Done when:** The live run of design 0038's test plan (llama.cpp on a Mac and a Windows machine) is
+  recorded with its commands and output.
+
+### LLM-7: Model distribution and model choice by probe
+
+- **Evidence:** Design 0056 D5. A worker fetches blobs only from the master's store
+  (`crates/worker/src/blob_client.rs`, `crates/master/src/blob_store.rs`), bounded to 4096 MiB by
+  default. Worker-to-worker fetch is SCALE-3, Planned in Phase 7.
+- **Problem:** A model file sent to N workers leaves the master N times.
+- **Do:** `oxideswarm llm pull <model> --workers <selector>` moves a model file as a blob. With SCALE-3
+  the workers fetch from each other. A probe of memory and GPU memory (FEAT-9b) picks the largest listed
+  model a worker can hold. R14 says whether the fetch is the slowest segment. Q44 made the path with no
+  file on the target (LLM-12, LLM-13) the one to develop, so this item is P3.
+- **Done when:** A 4 GiB model reaches N workers while the master sends each chunk once (the check of
+  SCALE-3), with the time recorded.
+
+### LLM-8: Batch inference
+
+- **Evidence:** Design 0056 D5. No `llm` subcommand exists (`crates/cli/src/cli_app.rs`).
+- **Problem:** Grading, labelling, embeddings and evaluation runs over many prompts have no command that
+  keeps input order and survives a lost worker.
+- **Do:** `oxideswarm llm batch --input <prompts.jsonl> --model <name>` splits the prompts into tasks on
+  workers tagged with the model (LLM-1), retries each shard, and merges the replies in input order.
+- **Done when:** 10,000 prompts complete on three workers, and stopping a worker in the middle loses no
+  prompt and adds no duplicate.
+
+### LLM-10: Usage records for tunnels
+
+- **Evidence:** [Design 0061](design/0061-first-application-model-tunnel.md) D5. ENROLL-1 is Partial;
+  machine keys exist (`crates/core/src/noise_auth.rs`, `crates/master/src/members.rs`). No tunnel exists
+  to record (LLM-9).
+- **Problem:** The master cannot say whose machine served whose client.
+- **Do:** One record when a tunnel closes: tunnel id, service, worker id, the client's machine key, start
+  and end times, bytes each way, and the reason. No content of the traffic. A bounded file on the master,
+  read by `oxideswarm llm usage` and a dashboard view. Nothing sends it off the master (Q39).
+- **Done when:** Each closed tunnel leaves one record that names the client's machine key and the worker,
+  and holds no content.
+
+### LLM-11: A balance per member, display only
+
+- **Evidence:** Design 0061 D6. Q43 was closed as display only on 2026-11-19 by Q96
+  ([design 0094](design/0094-road-to-a-shared-research-grid.md)); Q14 (credits, money or tokens) stays
+  open in [ROADMAP.md](ROADMAP.md).
+- **Problem:** Members who serve each other have no account of it.
+- **Do:** A view over the records of LLM-10: what a member's machines served, less what its clients used.
+  Each record credits one member and debits another by the same amount. The first version displays and
+  refuses nobody. The unit waits for real usage records.
+- **Done when:** The balances of all members sum to zero, and the view shows them.
+
 ## Phase 19: Stage 1 of the research grid, trusted circles and the first campaign
 
 From [design 0094](design/0094-road-to-a-shared-research-grid.md) (Accepted, 2026-11-19). The owner's
@@ -2536,3 +3061,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-87 Implemented (pull request 429, branch `win/test-87-portal-lan-bind`, text moved to the archive): reproduced the `AddrInUse` false failure first, updated `crates/worker/src/client/tests.rs` (`assert_portal_not_listening_on_lan`, keeping the `127.0.0.1` check) to probe `GET /api/status` on `AddrInUse` and fail only on the worker portal JSON body (plus negative control rejecting a live portal); passed `50/50` runs of `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops on Windows (`ff832b0e`, `14` physical / `20` logical cores, `83` tests/run, `6.72–7.91 s`, median `6.81 s`, total `342.20 s`) and `50/50` runs under `4` Python CPU busy loops on Apple Silicon M5 macOS (`d3103d30`, `agent-mac-ag`, `10` logical cores, `84` tests/run, `9.52–11.65 s`, median `9.75 s`, total `490.43 s`).
 - 2026-11-24: AX-1 Implemented (`mac/ax1-ax2-live-records`, text moved to `docs/BACKLOG-ARCHIVE.md`) via live 3-OS MCP `submit` matrix call (`os=macos,windows,linux` over `--workspace ax1-live-2026-11-24`, `3/3` cells passed in `102.221 s`, `machines = 3`, `0` failed cells); AX-2 updated (`Partial | In`) with the 3-worker LAN TCP + Docker Linux live record `benchmarks/grid/results/2026-11-24-r2-m1-3workers-macos-windows-linux.json` (Spike R2 `27.18 %` savings triggering the `< 30 %` stop rule; Measure M1 `0.6499x` at `--count 3` and `0.5928x` at `--count 6`). Index recount deferred to stage D (`M9`).
 - 2026-11-24: TEST-24 Partial updated (`mac/test-24-two-machines`): added Mac loopback missing scenarios (`2026-11-23-loopback-macos-arm64-apple-m5.json`, `T1 8 GiB`/`T2 100k`/`T5`/`T9`, `4/4` PASS) and two-machine `lan-tcp` record (`2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, `T1`–`T9`, `9/9` PASS, `worker_reaped = false` on `T7`); `lan-quic`/`quic-relay` and `Q58` await owner P2P ticket carry (`AGENT_RULES.md` Rule 2) and separate-network routing. Index recount deferred to stage D (`M9`).
+- 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
