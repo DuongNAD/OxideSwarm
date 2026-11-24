@@ -1341,7 +1341,9 @@ mod tests {
         use std::process::Command;
 
         fn make_junction(link: &Path, target: &Path) {
+            use std::os::windows::process::CommandExt;
             let status = Command::new("cmd")
+                .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
                 .args(["/c", "mklink", "/J"])
                 .arg(link)
                 .arg(target)

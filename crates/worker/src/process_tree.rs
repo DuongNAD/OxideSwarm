@@ -366,8 +366,11 @@ pub(crate) fn configure_command(
         let _ = task_id;
         let run_token = uuid::Uuid::new_v4();
         cmd.env("RUSTY_GRID_RUN_TOKEN", run_token.to_string());
-        let flag =
-            priority.windows_class_flag() | rusty_grid_core::capabilities::WINDOWS_CREATE_SUSPENDED;
+        // `CREATE_NO_WINDOW` (design 0108): a task never opens a visible console window, also
+        // when the worker itself has no console; the AppContainer path adds the same flag.
+        let flag = priority.windows_class_flag()
+            | rusty_grid_core::capabilities::WINDOWS_CREATE_SUSPENDED
+            | rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW;
         cmd.creation_flags(flag);
         ConfiguredCommand {
             run_token,

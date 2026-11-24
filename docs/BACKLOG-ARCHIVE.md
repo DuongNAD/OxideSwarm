@@ -4323,6 +4323,57 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
   `README.md`, `CHANGELOG.md`, `docs/guides/offload-cargo-test.md`, and `docs/design/0059-first-users.md`.
 
+### ADOPT-3: Install scripts and the scripted time to first result
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D6. `scripts/install.sh` and
+  `scripts/install.ps1` do not exist. `README.md` tells a user to download an archive, compare
+  `SHA256SUMS` and unpack by hand. No record gives the time from the release page to a first
+  result.
+- **Problem:** The install is the first thing a stranger does, and it is the step with the most
+  manual commands.
+- **Do:** As D6 of design 0059, with its rules: no `sudo`, no service, no start of a master or a
+  worker, a pinned release, a checksum comparison before unpacking, `--version`, `--dir` and
+  `--dry-run`, and no pipe into a shell in `README.md`. Verify the attestation of the archive
+  when LV-5 has landed and `gh` is present. Then write the scripted measure of M15, which times
+  the Quick start from an empty home directory, with its records in `benchmarks/grid/`.
+- **Done when:** The ADOPT-3 cases in `tests/test_launcher_scripts.py` pass (a matching checksum
+  installs, a mismatch refuses and leaves no file, an unknown architecture is named, `--dry-run`
+  writes nothing, a second run replaces the binaries), and M15 by script is recorded for macOS,
+  Windows and Linux.
+- **Status (2026-11-24, Implemented, pull request 431):**
+  - Added `scripts/install.sh` (macOS/Linux, bash 3.2 compatible, LF) and `scripts/install.ps1`
+    (Windows PowerShell, CRLF, pure ASCII) with `--version` (pinned `0.4.4`), `--dir`, `--gpu`,
+    `--dry-run` (plus PowerShell `-Version`, `-Dir`, `-Gpu`, `-DryRun`, `-Help`),
+    `OXIDESWARM_DOWNLOAD_BASE`, `SHA256SUMS` verification before unpacking, `gh attestation verify`
+    against `DuongNAD/OxideSwarm/.github/workflows/release.yml` (`refs/tags/v<VERSION>`) when
+    `gh` is on `PATH` and authenticated (printing a notice or warning and continuing after
+    `SHA256SUMS` when `gh` is absent or not logged in; failing closed when authenticated
+    attestation fails), atomic binary replacement, and no `sudo`/elevation/service/daemon start
+    or `~/.oxideswarm` access; updated `README.md`, `docs/reference.md`,
+    `docs/design/0059-first-users.md`, and `CHANGELOG.md`.
+  - Added `Adopt3StaticChecks`, `InstallShTests`, and `InstallPs1Tests` to
+    `tests/test_launcher_scripts.py`, plus `benchmarks/grid/bench_m15_quickstart.py` (preserving
+    `GH_CONFIG_DIR` for `install.sh` only on Unix while keeping `HOME`/`OXIDESWARM_HOME` isolated)
+    and `benchmarks/grid/test_bench_m15.py`. Verified on `2738cc00` across Windows (`agent-win`
+    full `test_launcher_scripts.py`: `32` passed, `62` Unix skipped, `0` failed) and macOS
+    (`agent-mac-ag`: `94` OK / `11` Windows skipped including `InstallShTests`, plus CI
+    `launcher scripts (macos-latest)`); after review fixes for `GH_CONFIG_DIR` isolation and
+    unauthenticated `gh` handling, verified locally on Windows (`Adopt3StaticChecks` `1/1`,
+    `InstallPs1Tests` `8/8`, `test_bench_m15.py` `4/4`) alongside Linux/macOS CI (`InstallShTests`
+    `8/8`).
+  - Recorded macOS quarantine check (`2026-11-24`, `agent-mac-ag`, Apple Silicon M5 Darwin
+    `27.2.0`): `scripts/install.sh --version 0.4.4` against real GitHub Releases passed
+    `SHA256SUMS` and `gh attestation verify`; `xattr -l` showed `com.apple.provenance` only (no
+    `com.apple.quarantine`) and `oxideswarm --version` ran directly (`rusty-grid 0.4.4`), confirming
+    `xattr -dr com.apple.quarantine` applies to browser downloads only.
+  - Recorded M15 across all three systems (`3` cold runs each from empty `HOME`, `dirty_tree: false`):
+    Windows 11 `AMD64` (`benchmarks/grid/results/2026-11-24-m15-windows-amd64.json`, commit
+    `c0d86c6a`, median `8.551 s`, `attestation_checked: true` `3/3`), macOS `arm64`
+    (`benchmarks/grid/results/2026-11-24-m15-macos-arm64.json`, commit `2738cc00`, median
+    `8.727 s`, `attestation_checked: true` `3/3`), and Linux `amd64` Docker/Rosetta
+    (`benchmarks/grid/results/2026-11-24-m15-linux-amd64.json`, commit `2738cc00`, no `gh`,
+    `SHA256SUMS` `3/3`, median `1.434 s`).
+
 ### CI-1: Keep runs for pushes on `master` from ending red or cancelled without a failing test
 
 - **Evidence:** Read through `gh run list --branch master --workflow CI --event push --limit 60` and
