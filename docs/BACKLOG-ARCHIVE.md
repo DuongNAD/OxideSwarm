@@ -3868,6 +3868,41 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `cargo +1.96.0 fmt --all -- --check` and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed (`0` warnings).
   - **macOS loop (`d3103d30`, `agent-mac-ag`, Apple Silicon M5, `10` logical cores, isolated temporary `HOME`/`USERPROFILE`/`OXIDESWARM_HOME` per run, real `RUSTUP_HOME`/`CARGO_HOME`):**
     - `cargo test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops: `50/50` passed (`84` tests/run; `0` failures; min `9.52 s`, median `9.75 s`, max `11.65 s`, total `490.43 s`).
+### TEST-92: Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses
+- **Claim:** `claims/item/TEST-92__mac-ag__20261123T213209566518Z__f60d0e83.json`
+- **CI scan and root cause:**
+  - Pull request 421 CI (`run 45180089954`, `unit tests (macos-latest)`, `job 137711364019`) emitted `WARN rusty_grid_core::capabilities: Host tool version probe timed out; treating tool as unavailable` for `tool=cargo` (`timeout_secs=3.0`) and `tool=rustc` (`timeout_secs=3.0`).
+  - Scanning the last `20` `master` push `ci.yml` runs (`280` jobs) found `0` probe timeout log hits on passing logs (where `unittest` suppresses stderr), while `unit tests (macos-latest)` Wave 2 (`n=12`: `551.0–644.0 s`, median `578.0 s`, mean `584.3 s`) and Wave 3 (`n=11`: `543.0–588.0 s`, median `554.0 s`, mean `558.4 s`) ran `5–7.5x` slower than `ubuntu-latest` (Wave 2 `n=12`: `70.0–81.0 s`, median `78.0 s`, mean `76.8 s`; Wave 3 `n=11`: `88.0–134.0 s`, median `119.0 s`, mean `112.8 s`).
+  - `dtolnay/rust-toolchain@1.96.0` sets `RUSTUP_TOOLCHAIN=1.96.0` without explicitly exporting `RUSTUP_HOME` or `CARGO_HOME`. Isolated E2E harnesses overwrote `HOME` and `USERPROFILE` to a fresh empty temp dir (or scrubbed env), causing `rustup`'s `cargo`/`rustc` shims on `PATH` to look in an empty `$HOME/.rustup` and stall on every worker startup until hitting the 3 s probe timeout in `rusty_grid_core::capabilities`.
+- **Single-worker reproduction (`720106d8da69eb5c42bc0e9c0ee4f862e7e72781`):**
+  - `without_rustup_home_toolchain_1_96` (`RUSTUP_TOOLCHAIN=1.96.0`, private `HOME`, `RUSTUP_HOME`/`CARGO_HOME` unset): `connect_s=3.205s`, `tool_tags=['tool:git']`, `probe_timeouts=1` (`tool=cargo timeout_secs=3.0`).
+  - `without_rustup_home_unset_toolchain`: `connect_s=0.075s`, `tool_tags=['tool:git']`, `probe_timeouts=0`.
+  - `with_rustup_home`: `connect_s=0.183s`, `tool_tags=['tool:cargo', 'tool:rustc', 'tool:git']`, `probe_timeouts=0`.
+- **Scope and `tool:cargo` test audit (zero product code changes, zero PR #409 overlap):**
+  - Fixed in test harnesses and CI steps rather than changing production probe logic (`0` edits under `crates/*/src/`, `0` edits to PR #409 files). Audited all `tool:cargo`/`tool:rustc` assertions across `crates/cli/src/cli_app.rs`, `crates/worker/src/client/tests.rs`, `crates/master` placement, `tests/cli_isolation_e2e.rs`, `tests/test_wave3_e2e.py`, and `tests/test_bench_grid.py`; confirmed `crates/cli` `runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo` (`1/1`, `1.55 s`) passes under `env -u RUSTUP_HOME -u CARGO_HOME RUSTUP_TOOLCHAIN=1.96.0`.
+  - **22 modified harness and CI files (`4252c7bc5ba38eb4e8451f5a651d51a8f323d084`):** `.github/workflows/ci.yml`, `test_integration.sh`, `tests/test_wave2_e2e.py`, `tests/test_wave3_e2e.py`, `crates/agent_mesh/tests/grid_remote_master_e2e.rs`, `crates/cli/tests/e2e_opaque_suite.rs`, `crates/cli/tests/e2e_tier5_hardening.rs`, `crates/cli/tests/test_feat5_cli_e2e.rs`, `crates/core/tests/m1_3d_adversarial_stress.rs`, `tests/cli_dashboard_policy_e2e.rs`, `tests/cli_enroll_e2e.rs`, `tests/cli_isolation_e2e.rs`, `tests/cli_join_e2e.rs`, `tests/cli_pair_e2e.rs`, `tests/cli_revoke_e2e.rs`, `tests/cli_secret_e2e.rs`, `tests/cli_usb_kit_e2e.rs`, `tests/cli_worker_identity_e2e.rs`, `tests/cli_worker_signals_e2e.rs`, `tests/cluster_record_layer_e2e.rs`, `tests/enroll_v3_e2e.rs`, `tests/rendezvous_discovery_e2e.rs`.
+- **20-run loaded before/after comparison (Apple Silicon M5, macOS, 10 logical cores, non-elevated, 4 Python CPU busy loops, outer `RUSTUP_TOOLCHAIN=1.96.0` with `RUSTUP_HOME` and `CARGO_HOME` unset; before=`720106d8da69eb5c42bc0e9c0ee4f862e7e72781`, after=`4252c7bc5ba38eb4e8451f5a651d51a8f323d084`):**
+  - `bash test_integration.sh`:
+    - Before: `20/20`, wall `7.472–11.489 s` (median `9.510 s`, total `191.419 s`); 3-worker reg `5.097–6.741 s` (median `5.576 s`, total `116.686 s`).
+    - After: `20/20`, wall `3.010–3.636 s` (median `3.084 s`, total `62.373 s`); 3-worker reg `0.726–0.981 s` (median `0.735 s`, total `15.009 s`).
+  - `python3 -B -m unittest tests.test_wave2_e2e.Tier1FeatureCoverageTests.test_t1_f1_04_worker_isolation_tags_advertised_accurately` (`3` workers):
+    - Before: `20/20`, wall `10.126–11.210 s` (median `10.451 s`, total `210.343 s`).
+    - After: `20/20`, wall `0.579–2.175 s` (median `0.625 s`, total `14.147 s`); per-worker connect (`60` connects) `0.14–0.22 s` (median `0.15 s`, total `9.33 s`).
+  - `python3 -B -m unittest tests.test_wave3_e2e.Tier1FeatureCoverageTests.test_t1_3d2_01_worker_blender_and_vram_capability_advertisement` (`2` workers):
+    - Before: `20/20`, wall `6.904–7.956 s` (median `7.285 s`, total `146.161 s`).
+    - After: `20/20`, wall `0.539–0.697 s` (median `0.611 s`, total `12.099 s`).
+  - `cargo test --locked -p rusty_grid_cli --test test_feat5_cli_e2e -- --nocapture`:
+    - Before: `20/20`, wall `3.267–4.092 s` (median `3.326 s`, total `67.699 s`).
+    - After: `20/20`, wall `3.192–3.739 s` (median `3.361 s`, total `67.328 s`).
+  - `cargo test --locked --test cli_worker_signals_e2e -- --nocapture`:
+    - Before: `20/20`, wall `2.048–2.709 s` (median `2.143 s`, total `43.390 s`).
+    - After: `20/20`, wall `2.057–2.848 s` (median `2.137 s`, total `43.233 s`).
+- **Full-suite verification after `4252c7bc` (`RUSTUP_TOOLCHAIN=1.96.0`, `RUSTUP_HOME`/`CARGO_HOME` unset in outer env):**
+  - `python3 -m unittest tests/test_wave2_e2e.py -v` (with CI `pmset` stub + preserved `RUSTUP_HOME`/`CARGO_HOME`): `73/73` in `79.564 s` (worker connects `0.07–0.17 s`).
+  - `python3 -B -m unittest tests/test_wave3_e2e.py -v` (after `--bin oxideswarm --features 3d` + `agent-mesh`): `63/63` in `88.548 s`.
+  - `bash test_integration.sh`: `9/9` checks in `2.894 s` (`[timing] 3 workers registered in 0.525s`).
+  - All `18` modified Rust E2E binaries passed individually: `m1_3d_adversarial_stress` (`21/21`, `87.12 s`), `grid_remote_master_e2e` (`5/5`, `11.71 s`), `e2e_opaque_suite` (`97/97`, `24.72 s`), `e2e_tier5_hardening` (`8/8`, `13.74 s`), `test_feat5_cli_e2e` (`2/2`, `1.93 s`), `cli_dashboard_policy_e2e` (`9/9`, `1.85 s`), `cli_enroll_e2e` (`5/5`, `11.42 s`), `cli_isolation_e2e` (`4/4`, `1.45 s`), `cli_join_e2e` (`6/6`, `2.61 s`), `cli_pair_e2e` (`4/4`, `0.67 s`), `cli_revoke_e2e` (`2/2`, `2.02 s`), `cli_secret_e2e` (`13/13`, `2.80 s`), `cli_usb_kit_e2e` (`2/2`, `5.10 s`), `cli_worker_identity_e2e` (`3/3`, `1.08 s`), `cli_worker_signals_e2e` (`4/4`, `0.65 s`), `cluster_record_layer_e2e` (`3/3`, `2.02 s`), `enroll_v3_e2e` (`1/1`, `2.47 s`), `rendezvous_discovery_e2e` (`3/3`, `8.24 s`).
+- **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `python3 tests/test_m1_challenger_hygiene.py` (`5/5`, `0.098 s`), and `python3 tests/test_launcher_scripts.py -v` (`79` total: `75` passed, `4` Windows skipped, `111.695 s`) passed.
 
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 

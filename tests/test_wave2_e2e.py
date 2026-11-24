@@ -325,6 +325,16 @@ class IsolatedEnv:
                 continue
             env[k] = v
 
+        orig_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if "RUSTUP_HOME" not in env and orig_home:
+            cand = os.path.join(orig_home, ".rustup")
+            if os.path.isdir(cand):
+                env["RUSTUP_HOME"] = cand
+        if "CARGO_HOME" not in env and orig_home:
+            cand = os.path.join(orig_home, ".cargo")
+            if os.path.isdir(cand):
+                env["CARGO_HOME"] = cand
+
         h = str(home_dir or self.home)
         oxh = str(ox_home_dir or self.ox_home)
         env["HOME"] = h
@@ -926,6 +936,7 @@ class OxideCluster:
         if extra_args:
             argv.extend(extra_args)
 
+        t_spawn = time.monotonic()
         mp = self.env.spawn(
             name=f"worker-{name}",
             argv=argv,
@@ -944,6 +955,7 @@ class OxideCluster:
                     wlist = self.workers_json(master_addr, secret_file=secret_file)
                     for w in wlist:
                         if w.get("name") == name and "state:connected" in w.get("tags", []):
+                            print(f"[timing] {name} connected after {time.monotonic() - t_spawn:.2f} s", flush=True)
                             return WorkerInstance(proc=mp, name=name, sandbox_dir=sb)
                 except Exception:
                     pass

@@ -96,10 +96,24 @@ cd "$SCRIPT_DIR"
 log_section "PHASE 0: Isolating the test environment"
 # Children get a private HOME and no inherited grid settings. Existing masters/workers on this
 # machine are left alone (the test uses its own ephemeral ports).
+REAL_RUSTUP_HOME="${RUSTUP_HOME:-}"
+if [[ -z "$REAL_RUSTUP_HOME" && -n "${HOME:-}" && -d "$HOME/.rustup" ]]; then
+    REAL_RUSTUP_HOME="$HOME/.rustup"
+fi
+REAL_CARGO_HOME="${CARGO_HOME:-}"
+if [[ -z "$REAL_CARGO_HOME" && -n "${HOME:-}" && -d "$HOME/.cargo" ]]; then
+    REAL_CARGO_HOME="$HOME/.cargo"
+fi
 GRID_ENV=(env)
 for var in $(env | sed -n 's/^\(RUSTY_GRID_[A-Za-z0-9_]*\)=.*/\1/p') OXIDESWARM_SECRET OXIDESWARM_SECRET_FILE OXIDE_DEV_MODE OXIDE_SWARM_DASHBOARD_PORT OXIDE_SWARM_DASHBOARD_PORT_FILE; do
     GRID_ENV+=(-u "$var")
 done
+if [[ -n "$REAL_RUSTUP_HOME" ]]; then
+    GRID_ENV+=(RUSTUP_HOME="$REAL_RUSTUP_HOME")
+fi
+if [[ -n "$REAL_CARGO_HOME" ]]; then
+    GRID_ENV+=(CARGO_HOME="$REAL_CARGO_HOME")
+fi
 GRID_ENV+=(HOME="$TEST_HOME" USERPROFILE="$TEST_HOME" RUSTY_GRID_CONFIG="$EMPTY_CONFIG" RUSTY_GRID_NO_BATTERY=1)
 log_info "Private HOME ${TEST_HOME}; the real ~/.oxideswarm is not used"
 
@@ -154,6 +168,7 @@ MASTER_ADDR="127.0.0.1:${MASTER_PORT}"
 log_pass "Master online and listening at ${MASTER_ADDR} (PID: ${MASTER_PID})"
 
 log_section "PHASE 3: Starting 3 Worker Nodes with Hardware Overrides"
+WORKERS_T0=$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "$SECONDS")
 # Worker 1: Standard CPU Worker (2 cores, 2048 MB RAM, No GPU)
 log_info "Spawning Worker 1 (CPU-only: 2 cores, 2048 MB RAM)..."
 "${GRID_ENV[@]}" "$BIN" worker \
@@ -217,7 +232,8 @@ while [[ $WORKER_COUNT -lt 3 ]]; do
     fi
 done
 
-log_pass "All 3 workers successfully registered with Master!"
+WORKERS_REG_SECS=$(python3 -c "import time; print(f'{time.monotonic() - float(${WORKERS_T0}):.3f}')" 2>/dev/null || echo "$((SECONDS - ${WORKERS_T0%.*}))")
+log_pass "All 3 workers successfully registered with Master! [timing] 3 workers registered in ${WORKERS_REG_SECS}s"
 
 # Verify GPU capabilities advertised for Worker 3
 if echo "$STATUS_JSON" | grep -q '"is_simulated_gpu": true' || echo "$STATUS_JSON" | grep -q '"has_gpu": true'; then
