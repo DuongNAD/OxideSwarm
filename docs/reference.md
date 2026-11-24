@@ -28,10 +28,40 @@ writing standard in [docs/README.md](README.md#writing-standard)).
 
 ## Install
 
-Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.4.4`), or [build from source](#build-from-source).
+Use the two-step installer scripts (`scripts/install.sh` on macOS/Linux, `scripts/install.ps1` on
+Windows), download the archives by hand from the
+[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.4`), or
+[build from source](#build-from-source).
 
-Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
+`scripts/install.sh` (bash 3.2 compatible) and `scripts/install.ps1` (Windows PowerShell) install
+`oxideswarm`, `rusty-grid`, and `ox-mode` for the current user only (no `sudo` or elevation, no
+service setup, no daemon start, and no edits to `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`):
+
+```bash
+# macOS / Linux (defaults: --version 0.4.4, --dir "$HOME/.local/bin")
+curl -fsSLO https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.sh
+bash install.sh [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
+```
+
+```powershell
+# Windows (defaults: --version 0.4.4, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
+Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
+# PowerShell flag names (-Version, -Dir, -Gpu, -DryRun, -Help) are also accepted.
+```
+
+Both scripts verify `SHA256SUMS` before unpacking, run `gh attestation verify` against
+`DuongNAD/OxideSwarm/.github/workflows/release.yml` (`refs/tags/v<VERSION>`) when `gh` is on `PATH`
+and authenticated (if `gh` is absent or not logged in, they print a notice or warning and continue
+after `SHA256SUMS` verification; if `gh` is authenticated and attestation fails, they fail closed),
+and atomically replace existing binaries in `--dir`. `--dry-run` prints the resolved target, URLs,
+and destination without downloading or writing files; unsupported OS/architecture pairs fail with
+both names printed. `OXIDESWARM_DOWNLOAD_BASE` overrides the download base URL (default
+`https://github.com/DuongNAD/OxideSwarm/releases/download`). On macOS (Darwin `27.2.0`), binaries
+fetched by `scripts/install.sh` via `curl` carry `com.apple.provenance` only and no
+`com.apple.quarantine` flag, so `xattr -dr com.apple.quarantine` applies to browser downloads only.
+
+For manual downloads, each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
 do work. Targets: `x86_64-unknown-linux-gnu` (built on Ubuntu 22.04, needs glibc 2.35 or newer), `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-pc-windows-msvc`. An archive holds `oxideswarm`, `rusty-grid`, `ox-mode`, the licences and the
@@ -1004,6 +1034,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `OXIDESWARM_EVENT_KIND` / `OXIDESWARM_EVENT_FILE` / `OXIDESWARM_EVENT_TITLE` / `OXIDESWARM_EVENT_PRIORITY` / `OXIDESWARM_EVENT_FROM` | Agent Bridge | Event metadata variables passed to `--on-event` hooks by `scripts/agent_bridge.py watch` |
 | `OXIDESWARM_SYNC_DIR` | Sync Probe | Base directory override for `scripts/sync_network/sync_network.py` |
 | `OXIDE_ROOT` | Benchmarks | Root workspace directory override used by benchmark runners |
+| `OXIDESWARM_DOWNLOAD_BASE` | Install Scripts | Download base URL override for `scripts/install.sh` and `scripts/install.ps1` (default: `https://github.com/DuongNAD/OxideSwarm/releases/download`; [design 0059](design/0059-first-users.md)) |
 | `OX_SCRIPT_ROOT` | Test Suite | Custom script root used by `test_launcher_scripts.py` for regression verification |
 
 ### Workflow modes (`ox-mode`)

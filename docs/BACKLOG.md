@@ -188,6 +188,7 @@ Recounted on 2026-11-23 after TEST-69 Implemented (pull request 421): 250 items,
 Recounted on 2026-11-23 after TEST-89 was added (Planned, In): 251 items, 183 Implemented, 20 Partial and 48 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 from the rows after TEST-41 Implemented (pull request 426) and TEST-87 Planned (In): 252 items, 184 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-88 was added as Implemented (pull request 424): 253 items, 185 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows with pull request 431: 253 items, 186 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -418,7 +419,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | study kit ready (PR 393), (design 0059) |
 | ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350, (design 0059) |
-| ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
+| ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Implemented |  | 431, (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
@@ -1407,24 +1408,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** "Study records" holds at least three sessions of the first round with measures
   M15 to M17. The item is Partial from then until the second round is recorded.
 - **Status (2026-11-19, Planned):** study kit ready (PR 393): `docs/study/2026-11-adopt-1/` (English and Vietnamese participant guide, facilitator sheet, consent template, and round-one record procedure), `scripts/study_timer.py` (`P1`–`P5` labels only, standard library), and `tests/test_study_timer.py` (wired into CI `agent-bridge`); no session has run yet and nothing in the kit is a result.
-
-### ADOPT-3: Install scripts and the scripted time to first result
-
-- **Evidence:** [Design 0059](design/0059-first-users.md), D6. `scripts/install.sh` and
-  `scripts/install.ps1` do not exist. `README.md` tells a user to download an archive, compare
-  `SHA256SUMS` and unpack by hand. No record gives the time from the release page to a first
-  result.
-- **Problem:** The install is the first thing a stranger does, and it is the step with the most
-  manual commands.
-- **Do:** As D6 of design 0059, with its rules: no `sudo`, no service, no start of a master or a
-  worker, a pinned release, a checksum comparison before unpacking, `--version`, `--dir` and
-  `--dry-run`, and no pipe into a shell in `README.md`. Verify the attestation of the archive
-  when LV-5 has landed and `gh` is present. Then write the scripted measure of M15, which times
-  the Quick start from an empty home directory, with its records in `benchmarks/grid/`.
-- **Done when:** The ADOPT-3 cases in `tests/test_launcher_scripts.py` pass (a matching checksum
-  installs, a mismatch refuses and leaves no file, an unknown architecture is named, `--dry-run`
-  writes nothing, a second run replaces the binaries), and M15 by script is recorded for macOS,
-  Windows and Linux.
 
 ### ADOPT-4: Guides for common jobs, each with a recorded run
 
@@ -2530,3 +2513,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 - 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.
 - 2026-11-23: TEST-88 Implemented (pull request 424): the case PC ran the Windows loop of "Done when" at `012dc68c`: 20/20 runs of `rusty_grid_worker` and 5/5 of `m3_challenger_2_stress` passed with 0 new console windows and 0 leftover processes (master baseline: 11 new `OpenConsole.exe` in one run). INC-20261123-001 closed.
+- 2026-11-24: ADOPT-3 Implemented (pull request 431, text moved to the archive): added `scripts/install.sh` (bash 3.2, LF) and `scripts/install.ps1` (Windows PowerShell, CRLF, pure ASCII) with `OXIDESWARM_DOWNLOAD_BASE`, `SHA256SUMS` verification, `gh attestation verify` when authenticated (notice/warning + SHA-256 fallback when `gh` is absent or unauthenticated; review fix), docs (`README.md`, `docs/reference.md`, `docs/design/0059-first-users.md`, `CHANGELOG.md`), `Adopt3StaticChecks` / `InstallShTests` / `InstallPs1Tests` in `tests/test_launcher_scripts.py`, `benchmarks/grid/bench_m15_quickstart.py` (with `GH_CONFIG_DIR` preserved for `install.sh` on Unix under isolated `HOME`; review fix) + `test_bench_m15.py` (`4/4`), the macOS quarantine check (`agent-mac-ag` on Apple Silicon M5 Darwin `27.2.0`: `com.apple.provenance` only, no `com.apple.quarantine`), and M15 records across all three systems (Windows `8.551 s`, macOS `8.727 s`, Linux Docker `1.434 s`).
