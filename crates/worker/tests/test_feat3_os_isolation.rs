@@ -3053,6 +3053,16 @@ mod windows {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
+    /// A `Command` whose console child gets a console with no window (TEST-88). Run from a parent
+    /// without a console (a CI service, a script that captures output), a plain `Command` opens a
+    /// visible console window for every `cmd`, `powershell`, `reg` or `icacls` child.
+    fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(program);
+        cmd.creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW);
+        cmd
+    }
+
     /// Verifies that Windows AppContainer isolation (`userenv.dll` + capability SIDs) is
     /// supported on this host, or returns `false` (after a notice) when unavailable and the
     /// environment does not demand it (`RUSTY_GRID_REQUIRE_APPCONTAINER`).
@@ -3893,7 +3903,7 @@ try {
                 }
             }
         }
-        if let Ok(out) = std::process::Command::new("rustc")
+        if let Ok(out) = hidden_command("rustc")
             .args(["--print", "sysroot"])
             .output()
         {
@@ -4408,7 +4418,7 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
 }
 "#;
         let mut host_server_guard = ChildKillGuard(Some(
-            std::process::Command::new(
+            hidden_command(
                 r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             )
             .args([
@@ -4549,8 +4559,11 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
     #[tokio::test]
     async fn test_a_task_cannot_signal_or_inspect_foreign_processes() {
         skip_if_duplicate_ci_pass!();
-        let mut victim = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
-            .args(["/C", "ping -n 120 127.0.0.1 >nul"])
+        // `PING.EXE` itself, not `cmd /C ping`: killing `cmd.exe` left `PING.EXE` running for up
+        // to 120 s (TEST-88).
+        let mut victim = hidden_command(r"C:\Windows\System32\PING.EXE")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn victim");
         let victim_pid = victim.id().to_string();
@@ -4710,18 +4723,19 @@ try {{
     /// M4 on Windows: console / Windows Terminal keystroke injection (`TIOCSTI` equivalent via
     /// `AttachConsole(pid)` + `WriteConsoleInputW` or inherited `CONIN$`) is blocked because
     /// AppContainer tasks are spawned with `CREATE_NO_WINDOW` and run at Low Mandatory Integrity
-    /// Level. Includes a positive `IsolationLevel::Off` control spawning a helper console process
-    /// with `CREATE_NEW_CONSOLE`.
+    /// Level. Includes a positive `IsolationLevel::Off` control against a helper console process
+    /// spawned with `CREATE_NO_WINDOW` (a console without a window, TEST-88).
     #[tokio::test]
     async fn test_console_and_terminal_injection_is_blocked() {
         skip_if_duplicate_ci_pass!();
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let mut console_helper = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
-            .args(["/C", "ping -n 120 127.0.0.1 >nul"])
-            .creation_flags(CREATE_NEW_CONSOLE)
+        // The helper needs a console of its own for `AttachConsole(helper)`. `CREATE_NO_WINDOW`
+        // gives it one without a window; `CREATE_NEW_CONSOLE` opened a visible window per run, and
+        // `cmd /C ping` left `PING.EXE` running after the kill (TEST-88).
+        let mut console_helper = hidden_command(r"C:\Windows\System32\PING.EXE")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
             .spawn()
-            .expect("spawn helper with CREATE_NEW_CONSOLE");
+            .expect("spawn helper console process");
         tokio::time::sleep(Duration::from_millis(300)).await;
         let helper_pid = console_helper.id().to_string();
         let worker_pid = std::process::id().to_string();
@@ -4809,7 +4823,7 @@ public static class WinConsoleProbe {{
         let read_key = format!(r"HKCU\Software\OxideSwarmFeat3Read_{pid}");
         let write_key = format!(r"HKCU\Software\OxideSwarmFeat3Write_{pid}");
         let reg = |args: &[&str]| {
-            std::process::Command::new(r"C:\Windows\System32\reg.exe")
+            hidden_command(r"C:\Windows\System32\reg.exe")
                 .args(args)
                 .output()
         };
@@ -5271,7 +5285,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
         ] {
             let world_ac_secret = etc_dir.join(filename);
             std::fs::write(&world_ac_secret, "LEAKED-BY-LEFTOVER-ACE").unwrap();
-            let grant_status = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            let grant_status = hidden_command(r"C:\Windows\System32\icacls.exe")
                 .arg(&world_ac_secret)
                 .args(["/grant", &format!("*{sid_str}:(R)"), "/q"])
                 .status()
@@ -5302,7 +5316,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
             .join(".oxideswarm")
             .join("cluster.secret");
         for sid_grant in ["*S-1-1-0:(R)", "*S-1-15-2-1:(R)"] {
-            let grant_home_secret = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            let grant_home_secret = hidden_command(r"C:\Windows\System32\icacls.exe")
                 .arg(&home_secret)
                 .args(["/grant", sid_grant, "/q"])
                 .status()
@@ -5318,7 +5332,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
         .await
         .expect_err("live probe must refuse readable home cluster.secret");
         for sid_remove in ["*S-1-1-0", "*S-1-15-2-1"] {
-            let _ = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            let _ = hidden_command(r"C:\Windows\System32\icacls.exe")
                 .arg(&home_secret)
                 .args(["/remove", sid_remove, "/q"])
                 .status();
@@ -5332,7 +5346,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     }
 
     fn sddl_of(path: &Path) -> String {
-        let out = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+        let out = hidden_command(r"C:\Windows\System32\icacls.exe")
             .arg(path)
             .output()
             .expect("icacls");
@@ -5735,7 +5749,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let j_path = sb_dir2.join("j_ssh");
                 let hl_path = sb_dir2.join("hl_secret.txt");
-                let ps_mklink = std::process::Command::new(
+                let ps_mklink = hidden_command(
                     r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
                 )
                 .args([
@@ -6023,22 +6037,20 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let script_path = repo_root.join("windows/revoke-isolation-acls.ps1");
         assert!(script_path.is_file(), "missing {}", script_path.display());
 
-        let out = std::process::Command::new(
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-        )
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script_path)
-        .arg("-DryRun")
-        .arg("-ManifestPath")
-        .arg(&manifest)
-        .output()
-        .expect("run revoke-isolation-acls.ps1 -DryRun");
+        let out = hidden_command(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script_path)
+            .arg("-DryRun")
+            .arg("-ManifestPath")
+            .arg(&manifest)
+            .output()
+            .expect("run revoke-isolation-acls.ps1 -DryRun");
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -6440,7 +6452,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 
         let tamper_tree = ws_root.join("tamper_ws").join("tree");
         std::fs::remove_dir_all(&tamper_tree).unwrap();
-        let j_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+        let j_status = hidden_command(r"C:\Windows\System32\cmd.exe")
             .args([
                 "/C",
                 "mklink",
@@ -6482,7 +6494,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         );
 
         std::fs::remove_dir_all(&tamper_tree).unwrap();
-        let j_status2 = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+        let j_status2 = hidden_command(r"C:\Windows\System32\cmd.exe")
             .args([
                 "/C",
                 "mklink",
@@ -6639,7 +6651,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         struct SubstGuard(String);
         impl Drop for SubstGuard {
             fn drop(&mut self) {
-                let _ = std::process::Command::new(r"C:\Windows\System32\subst.exe")
+                let _ = hidden_command(r"C:\Windows\System32\subst.exe")
                     .args([&self.0, "/D"])
                     .status();
             }
@@ -6675,7 +6687,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let real_sandboxes = real_parent.join("sandboxes");
         std::fs::create_dir_all(&real_sandboxes).unwrap();
         let junc_parent = temp_root.path().join("junc_parent");
-        let j_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+        let j_status = hidden_command(r"C:\Windows\System32\cmd.exe")
             .args([
                 "/C",
                 "mklink",
@@ -6716,7 +6728,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
             .find(|ch| !Path::new(&format!("{ch}:\\")).exists())
             .expect("free drive letter for SUBST test");
         let drive = format!("{drive_letter}:");
-        let subst_status = std::process::Command::new(r"C:\Windows\System32\subst.exe")
+        let subst_status = hidden_command(r"C:\Windows\System32\subst.exe")
             .arg(&drive)
             .arg(&real_parent)
             .status()
@@ -6771,7 +6783,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let real_sb_direct = temp_root.path().join("real_sb_direct");
         std::fs::create_dir_all(&real_sb_direct).unwrap();
         let junc_sb_self = temp_root.path().join("junc_sb_self");
-        let j_self_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+        let j_self_status = hidden_command(r"C:\Windows\System32\cmd.exe")
             .args([
                 "/C",
                 "mklink",
@@ -6837,7 +6849,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let exe_path = out_dir.join(format!("{name}.exe"));
         std::fs::write(&rs_path, src).expect("write helper rust source");
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-        let output = std::process::Command::new(rustc)
+        let output = hidden_command(rustc)
             .arg(&rs_path)
             .arg("-o")
             .arg(&exe_path)
