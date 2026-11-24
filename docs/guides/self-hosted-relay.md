@@ -129,9 +129,9 @@ oxideswarm doctor --master <TICKET> --relay-url https://<RELAY_HOST>
 
 Expected output:
 
-- Check `C1 (master reachable)` and `C2 (worker count)` pass (`[OK]`).
-- The worker table shows each P2P worker with its `LINK` column (`direct (<RTT>ms)` when QUIC hole punching succeeded via the relay, or `relay (<RTT>ms)` when traffic stays relayed through `https://<RELAY_HOST>`).
-- Check `C8 (throughput)` transfers an 8 MiB blob to each worker and reports MB/s.
+- Checks `C1 Connect` and `C2 Workers` pass (`PASS`).
+- The worker table shows each P2P worker with its `LINK` column (`direct <RTT>ms` when QUIC hole punching succeeded via the relay, or `relay <RTT>ms` when traffic stays relayed through `https://<RELAY_HOST>`).
+- Check `C8 Blob throughput` transfers an 8 MiB blob to each worker and reports MB/s.
 
 ## Troubleshooting
 

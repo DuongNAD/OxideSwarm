@@ -444,7 +444,9 @@ async fn test_assign_refuses_a_task_before_touching_a_replaced_sandbox_base_on_w
     let elsewhere = temp.path().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
     let base_junction = temp.path().join("sandboxes_junction");
+    use std::os::windows::process::CommandExt;
     let mk = std::process::Command::new("cmd")
+        .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
         .args(["/C", "mklink", "/J"])
         .arg(&base_junction)
         .arg(&elsewhere)
