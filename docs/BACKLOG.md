@@ -195,6 +195,7 @@ Recounted on 2026-11-24 from the rows after the batch merge of pull requests 423
 Recounted on 2026-11-24 from the rows with pull request 409: 259 items, 195 Implemented, 17 Partial and 47 Planned; 19 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 368: 283 items, 195 Implemented, 18 Partial and 70 Planned; 19 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 444: 284 items, 195 Implemented, 18 Partial and 71 Planned; 20 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with TEST-96: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -313,6 +314,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
 | TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Planned | In |  |
+| TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -847,6 +849,32 @@ The full suite must pass on a clean machine before CI can require it.
      `4783`) only see complete `*.pid` files.
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
+
+### TEST-96: CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master
+
+- **Evidence:** CI run `45349647014` (push to `master`, `016f39c4`, 2026-11-24 07:39 UTC), job
+  `unit tests (ubuntu-latest)` (`138292591350`): `71` of `72` `agent_mesh` unit tests passed (`12.01 s`), and
+  `client::tests::test_corrupt_and_multi_chunk_data_delivery` panicked at `crates/agent_mesh/src/client.rs:2147`
+  with `called Result::unwrap() on an Err value: Elapsed(())`, the 5 s `tokio::time::timeout` on `rx3`, the
+  final `DeliveryAck` of part 3 (a 5000-byte payload sent as 5 chunks of 1024 bytes in reverse order). Parts 1
+  and 2 (single-envelope NACKs, 3 s timeouts) passed in the same run. The next master push (`ee3590ea`) passed.
+  This failure reset the Q80 clean-push streak. Claimed via `agent_bridge.py claim`
+  (`claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`).
+- **Problem:** The test asserts a wall-clock window (an ACK within 5 s), which the lessons of design 0087 rule
+  out, and it does not say why the ACK was late. Two explanations are open: (a) a starved runner delayed the
+  hub, the consumer's reassembly and the atomic inbox write past 5 s; (b) the ACK was lost, for example a chunk
+  dropped or a pending entry evicted on the hub's routing path (`Outbox::push` in `crates/agent_mesh/src/hub.rs`
+  kicks a peer whose queue is full; the in-flight data table of design 0107 evicts a sender's oldest entries)
+  or the consumer's out-of-order reassembly not completing. Under (b) a longer wait only hides a bug.
+- **Do:** (Code fix and loop verification wait until after the Stage C `S7` 24-hour soak finishes.)
+  1. Read the chunk path end to end (sender `send_envelope`, hub routing and in-flight table, consumer
+     reassembly and inbox write) and decide between (a) and (b); run the test in a 200-iteration loop under a
+     CPU load generator on Linux and record the result.
+  2. Under (b), fix the lost ACK with a failing check first. Under (a), wait on state instead of a short window:
+     keep a generous cap (60 s) only as a hang guard, and print the elapsed time on success.
+- **Done when:** the root cause is written here, the test has no short wall-clock window, and
+  `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
+  loop runs under load on Linux.
 
 ## Phase 3: make the documents true
 
@@ -3090,3 +3118,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-24 Partial updated (`mac/test-24-two-machines`): added Mac loopback missing scenarios (`2026-11-23-loopback-macos-arm64-apple-m5.json`, `T1 8 GiB`/`T2 100k`/`T5`/`T9`, `4/4` PASS) and two-machine `lan-tcp` record (`2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, `T1`–`T9`, `9/9` PASS, `worker_reaped = false` on `T7`); `lan-quic`/`quic-relay` and `Q58` await owner P2P ticket carry (`AGENT_RULES.md` Rule 2) and separate-network routing. Index recount deferred to stage D (`M9`).
 - 2026-11-24: TEST-95 added (Planned, In; claim `claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`): in `tests/test_wave3_e2e.py`, `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed in pull request 432 CI (run `45272824360`, job `138036810990`) with `ValueError: invalid literal for int() with base 10: ''` reading an empty `shard_*.pid` written non-atomically under `--fail-fast`; code fix and 20-run loop wait until after Stage C `S7` (Index header recounted: 259 items, 194 Implemented, 16 Partial and 49 Planned; 20 open items are In and 45 are Out).
 - 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
+- 2026-11-24: TEST-96 added (Planned, In; claim `claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`): `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` timed out waiting 5 s for the multi-chunk `DeliveryAck` on master push `016f39c4` (CI run `45349647014`, job `138292591350`, `unit tests (ubuntu-latest)`); root cause (starved runner or lost ACK) and fix wait until after Stage C `S7` (Index header recounted: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out).
