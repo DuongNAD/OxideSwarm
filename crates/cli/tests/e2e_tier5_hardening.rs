@@ -55,9 +55,32 @@ fn txt(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+fn preserve_toolchain_env(cmd: &mut Command) {
+    let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".rustup"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", p);
+    }
+    if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".cargo"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("CARGO_HOME", p);
+    }
+}
+
 fn cmd_for(bin: &str, h: &Path) -> Command {
     let mut c = Command::new(bin);
     scrub_env(&mut c);
+    preserve_toolchain_env(&mut c);
     let path_env = std::env::var_os("PATH")
         .map(|p| format!("{}:{}", h.join(".fake_bin").display(), p.to_string_lossy()))
         .unwrap_or_else(|| h.join(".fake_bin").display().to_string());
