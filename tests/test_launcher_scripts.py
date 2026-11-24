@@ -3605,6 +3605,430 @@ public class Program {
             )
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_windows_usb_bug38_static_prompt_and_update_wait(self):
+        uninstall_text = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        self.assertIn("in ${InstallRoot}? [y/N]", uninstall_text)
+        self.assertNotIn("in $InstallRoot? [y/N]", uninstall_text)
+
+        install_text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("OXIDESWARM_USB_STOP_WAIT_MS", install_text)
+        self.assertIn("OXIDESWARM_USB_COPY_WAIT_MS", install_text)
+        self.assertIn("did not exit within", install_text)
+        self.assertIn("could not replace $dst after waiting", install_text)
+        self.assertLess(
+            install_text.index("Get-Process -Id $spid"),
+            install_text.index("Remove-Item $pidFile"),
+        )
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell USB kit test")
+    def test_windows_usb_bug38_uninstall_prompt_and_update_retry_live(self):
+        import ctypes
+        from ctypes import wintypes
+
+        tmp = tempfile.mkdtemp(prefix="ox_usb_bug38_")
+        tmp_home = os.path.join(tmp, "home")
+        tmp_localappdata = os.path.join(tmp, "localappdata")
+        tmp_appdata = os.path.join(tmp, "appdata")
+        tmp_temp = os.path.join(tmp, "tmp")
+        for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+            os.makedirs(d, exist_ok=True)
+        suffix = f"Bug38_{os.getpid()}"
+        test_run_val = f"OxideSwarmUsbWorkerLiveTest{suffix}"
+        test_pointer_key = f"HKCU:\\Software\\OxideSwarm\\UsbKitLiveTest{suffix}"
+        pids_log = os.path.join(tmp, "worker_pids.log")
+        args_log = os.path.join(tmp, "args.log")
+        ps_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "OXIDESWARM_HOME")
+        }
+        ps_env.update(
+            USERPROFILE=tmp_home,
+            HOME=tmp_home,
+            LOCALAPPDATA=tmp_localappdata,
+            APPDATA=tmp_appdata,
+            TEMP=tmp_temp,
+            TMP=tmp_temp,
+            OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+            FAKE_OXIDE_PIDS_LOG=pids_log,
+            FAKE_ARGS_LOG=args_log,
+            FAKE_WORKER_NAME="bug38-win-worker",
+        )
+        if not shutil.which("cargo", path=ps_env.get("PATH")):
+            fake_cargo_dir = os.path.join(tmp, "fake_cargo_bin")
+            os.makedirs(fake_cargo_dir, exist_ok=True)
+            with open(os.path.join(fake_cargo_dir, "cargo.cmd"), "w", encoding="utf-8") as cf:
+                cf.write("@echo off\r\necho cargo 1.90.0\r\n")
+            ps_env["PATH"] = fake_cargo_dir + os.pathsep + ps_env.get("PATH", "")
+        root = os.path.join(tmp_localappdata, "OxideSwarm-USB")
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("lpReserved", wintypes.LPWSTR),
+                ("lpDesktop", wintypes.LPWSTR),
+                ("lpTitle", wintypes.LPWSTR),
+                ("dwX", wintypes.DWORD),
+                ("dwY", wintypes.DWORD),
+                ("dwXSize", wintypes.DWORD),
+                ("dwYSize", wintypes.DWORD),
+                ("dwXCountChars", wintypes.DWORD),
+                ("dwYCountChars", wintypes.DWORD),
+                ("dwFillAttribute", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("wShowWindow", wintypes.WORD),
+                ("cbReserved2", wintypes.WORD),
+                ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+                ("hStdInput", wintypes.HANDLE),
+                ("hStdOutput", wintypes.HANDLE),
+                ("hStdError", wintypes.HANDLE),
+            ]
+
+        class STARTUPINFOEXW(ctypes.Structure):
+            _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("hProcess", wintypes.HANDLE),
+                ("hThread", wintypes.HANDLE),
+                ("dwProcessId", wintypes.DWORD),
+                ("dwThreadId", wintypes.DWORD),
+            ]
+
+        kernel32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p, wintypes.DWORD]
+        kernel32.CreatePipe.restype = wintypes.BOOL
+        kernel32.CreatePseudoConsole.argtypes = [COORD, wintypes.HANDLE, wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        kernel32.CreatePseudoConsole.restype = ctypes.c_long
+        kernel32.ClosePseudoConsole.argtypes = [ctypes.c_void_p]
+        kernel32.ClosePseudoConsole.restype = None
+        kernel32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
+        kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+        kernel32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+        kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+        kernel32.DeleteProcThreadAttributeList.restype = None
+        kernel32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(PROCESS_INFORMATION)]
+        kernel32.CreateProcessW.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        kernel32.ReadFile.restype = wintypes.BOOL
+        kernel32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        kernel32.WriteFile.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+
+        def run_conpty_prompt(cmd_args, env_dict, wait_for, reply_bytes, timeout_sec=60):
+            cmd_line = subprocess.list2cmdline(cmd_args)
+            env_bytes = ("\0".join(f"{k}={v}" for k, v in env_dict.items()) + "\0\0").encode("utf-16-le")
+            env_buf = ctypes.create_string_buffer(env_bytes)
+            in_r, in_w, out_r, out_w = wintypes.HANDLE(), wintypes.HANDLE(), wintypes.HANDLE(), wintypes.HANDLE()
+            if not kernel32.CreatePipe(ctypes.byref(in_r), ctypes.byref(in_w), None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.CreatePipe(ctypes.byref(out_r), ctypes.byref(out_w), None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            hpc = ctypes.c_void_p()
+            hr = kernel32.CreatePseudoConsole(COORD(260, 40), in_r, out_w, 0, ctypes.byref(hpc))
+            kernel32.CloseHandle(in_r)
+            kernel32.CloseHandle(out_w)
+            if hr != 0:
+                kernel32.CloseHandle(in_w)
+                kernel32.CloseHandle(out_r)
+                raise OSError(f"CreatePseudoConsole failed HRESULT=0x{hr & 0xffffffff:08x}")
+            attr_size = ctypes.c_size_t(0)
+            kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
+            attr_buf = (ctypes.c_byte * attr_size.value)()
+            if not kernel32.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(attr_size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.UpdateProcThreadAttribute(attr_buf, 0, 0x00020016, hpc.value, ctypes.sizeof(ctypes.c_void_p), None, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            si = STARTUPINFOEXW()
+            si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
+            si.StartupInfo.dwFlags = 0x00000100
+            si.lpAttributeList = ctypes.cast(attr_buf, ctypes.c_void_p)
+            pi = PROCESS_INFORMATION()
+            cmd_buf = ctypes.create_unicode_buffer(cmd_line)
+            ok = kernel32.CreateProcessW(
+                None, cmd_buf, None, None, False,
+                0x00080000 | 0x00000400,
+                ctypes.cast(env_buf, ctypes.c_void_p),
+                tmp, ctypes.byref(si), ctypes.byref(pi),
+            )
+            kernel32.DeleteProcThreadAttributeList(attr_buf)
+            if not ok:
+                err = ctypes.get_last_error()
+                kernel32.ClosePseudoConsole(hpc)
+                kernel32.CloseHandle(in_w)
+                kernel32.CloseHandle(out_r)
+                raise ctypes.WinError(err)
+            chunks = []
+            chunks_lock = threading.Lock()
+
+            def _reader():
+                buf = ctypes.create_string_buffer(4096)
+                n = wintypes.DWORD(0)
+                while kernel32.ReadFile(out_r, buf, 4096, ctypes.byref(n), None) and n.value > 0:
+                    with chunks_lock:
+                        chunks.append(buf.raw[:n.value])
+
+            rd = threading.Thread(target=_reader, daemon=True)
+            rd.start()
+            vt_re = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")
+            sent = False
+            deadline = time.monotonic() + timeout_sec
+            rc = 255
+            try:
+                while True:
+                    with chunks_lock:
+                        raw = b"".join(chunks).decode("utf-8", errors="replace")
+                    cleaned = vt_re.sub("", raw).replace("\r\n", "\n").replace("\r", "")
+                    if not sent and wait_for in cleaned:
+                        written = wintypes.DWORD(0)
+                        kernel32.WriteFile(in_w, reply_bytes, len(reply_bytes), ctypes.byref(written), None)
+                        sent = True
+                    w = kernel32.WaitForSingleObject(pi.hProcess, 50)
+                    if w == 0:
+                        code = wintypes.DWORD(0)
+                        kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
+                        rc = int(code.value)
+                        break
+                    if time.monotonic() >= deadline:
+                        kernel32.TerminateProcess(pi.hProcess, 1)
+                        raise AssertionError(f"ConPTY timed out waiting on uninstall prompt; output={cleaned!r}")
+            finally:
+                kernel32.ClosePseudoConsole(hpc)
+                kernel32.CloseHandle(in_w)
+                rd.join(timeout=5)
+                kernel32.CloseHandle(out_r)
+                kernel32.CloseHandle(pi.hThread)
+                kernel32.CloseHandle(pi.hProcess)
+            with chunks_lock:
+                raw = b"".join(chunks).decode("utf-8", errors="replace")
+            return rc, vt_re.sub("", raw).replace("\r\n", "\n").replace("\r", "")
+
+        def open_write_blocking_handle(path):
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_DELETE = 0x00000004
+            OPEN_EXISTING = 3
+            handle = kernel32.CreateFileW(
+                path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if handle == INVALID_HANDLE_VALUE or not handle:
+                raise OSError(f"CreateFileW lock failed for {path}: winerr={ctypes.get_last_error()}")
+            return handle
+
+        lock_handle = None
+        try:
+            kit_dir = os.path.join(tmp, "kit")
+            os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+            for name in ("install.ps1", "uninstall.ps1"):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+            shutil.copyfile(
+                os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1"),
+                os.path.join(kit_dir, "revoke-isolation-acls.ps1"),
+            )
+            with open(os.path.join(kit_dir, "invite.oxs"), "wb") as f:
+                f.write(b"OXSINV01fake-encrypted-payload")
+            with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                f.write("off\n")
+            meta = {
+                "kit_format": 1,
+                "version": "9.9.9",
+                "created_at": 1700000000,
+                "expires_at": 1900000000,
+                "machines": 2,
+                "roles": ["worker"],
+                "workspaces": False,
+                "gpu": False,
+                "require_approval": True,
+                "invite_id": "0123456789abcdef0123456789abcdef",
+            }
+            with open(os.path.join(kit_dir, "kit.json"), "w", encoding="utf-8") as mf:
+                json.dump(meta, mf)
+
+            fake_exe = os.path.join(tmp, "oxideswarm.exe")
+            cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string argsLog = Environment.GetEnvironmentVariable("FAKE_ARGS_LOG");
+        if (!string.IsNullOrEmpty(argsLog)) {
+            try { File.AppendAllText(argsLog, string.Join(" ", args) + Environment.NewLine); } catch {}
+        }
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            string pass = Console.In.ReadLine() ?? "";
+            if (string.IsNullOrEmpty(pass)) {
+                Console.Error.WriteLine("empty passphrase");
+                return 3;
+            }
+            string oxHome = Environment.GetEnvironmentVariable("OXIDESWARM_HOME");
+            if (string.IsNullOrEmpty(oxHome)) {
+                oxHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".oxideswarm");
+            }
+            Directory.CreateDirectory(oxHome);
+            File.WriteAllText(Path.Combine(oxHome, "node.key"), "fake-node-key\n");
+            File.WriteAllText(Path.Combine(oxHome, "rusty-grid.toml"), "[worker]\nmaster_key = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'\n");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            Thread.Sleep(60000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            string wname = Environment.GetEnvironmentVariable("FAKE_WORKER_NAME") ?? "bug38-win-worker";
+            Console.WriteLine("[{\"name\":\"" + wname + "\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+            cs_file = os.path.join(tmp, "FakeOxideBug38.cs")
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(cs_code)
+            compile_res = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+
+            zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+            zip_path = os.path.join(kit_dir, "archives", zip_name)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.write(fake_exe, "oxideswarm.exe")
+            zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+            with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                f.write(f"{zip_sha}  {zip_name}\n")
+
+            install_ps1 = os.path.join(kit_dir, "install.ps1")
+            uninstall_ps1 = os.path.join(kit_dir, "uninstall.ps1")
+            bin_exe = os.path.join(root, "bin", "oxideswarm.exe")
+            pid_file = os.path.join(root, "run", "worker.pid")
+
+            # 1. Fresh install starts worker cleanly.
+            res_install = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "bug38-win-worker", "-InstallRoot", root, "-NoAutostart"],
+                env=ps_env, input="correct horse battery staple\r\ny\r\n",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            self.assertEqual(res_install.returncode, 0, res_install.stdout)
+            self.assertTrue(os.path.isfile(bin_exe), res_install.stdout)
+            self.assertTrue(os.path.isfile(pid_file), res_install.stdout)
+            pid1 = read(pid_file).strip()
+            self.assertTrue(pid1.isdigit(), pid1)
+
+            # 2. Interactive uninstall prompt in a real console renders full $InstallRoot before "? [y/N]" and aborts on "n".
+            prompt_rc, prompt_out = run_conpty_prompt(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", uninstall_ps1, "-InstallRoot", root],
+                ps_env,
+                "[y/N]",
+                b"n\r",
+            )
+            self.assertEqual(prompt_rc, 0, prompt_out)
+            self.assertIn(f"Remove the OxideSwarm install in {root}? [y/N]", prompt_out)
+            self.assertIn("Nothing removed.", prompt_out)
+            self.assertTrue(os.path.isfile(bin_exe))
+
+            # 3. Update succeeds over live worker + ~1.5s write-blocking lock held past Stop-Process.
+            lock_handle = open_write_blocking_handle(bin_exe)
+
+            def release_after_worker_stop():
+                deadline = time.time() + 45.0
+                while os.path.exists(pid_file) and time.time() < deadline:
+                    time.sleep(0.1)
+                time.sleep(1.5)
+                nonlocal lock_handle
+                if lock_handle is not None:
+                    kernel32.CloseHandle(lock_handle)
+                    lock_handle = None
+
+            releaser = threading.Thread(target=release_after_worker_stop, daemon=True)
+            releaser.start()
+            res_upd = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-InstallRoot", root, "-Update", "-NoAutostart"],
+                env=ps_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            releaser.join(timeout=10)
+            self.assertEqual(res_upd.returncode, 0, res_upd.stdout)
+            self.assertTrue(os.path.isfile(pid_file), res_upd.stdout)
+            pid2 = read(pid_file).strip()
+            self.assertTrue(pid2.isdigit() and pid2 != pid1, (pid1, pid2, res_upd.stdout))
+
+            # 4. Bounded Copy-Item wait fails cleanly when lock outlives OXIDESWARM_USB_COPY_WAIT_MS.
+            lock_handle = open_write_blocking_handle(bin_exe)
+            fail_env = dict(ps_env, OXIDESWARM_USB_COPY_WAIT_MS="1000")
+            res_fail = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-InstallRoot", root, "-Update", "-NoAutostart"],
+                env=fail_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+            )
+            kernel32.CloseHandle(lock_handle)
+            lock_handle = None
+            self.assertNotEqual(res_fail.returncode, 0, res_fail.stdout)
+            self.assertIn("could not replace", res_fail.stdout)
+            self.assertIn("file still in use", res_fail.stdout)
+        finally:
+            if lock_handle is not None:
+                try:
+                    kernel32.CloseHandle(lock_handle)
+                except Exception:
+                    pass
+            for pid_candidate in (pids_log, os.path.join(root, "run", "worker.pid")):
+                if os.path.isfile(pid_candidate):
+                    for line in read(pid_candidate).splitlines():
+                        if line.strip().isdigit():
+                            subprocess.run(
+                                ["powershell", "-NoProfile", "-Command",
+                                 f"Stop-Process -Id {line.strip()} -Force -ErrorAction SilentlyContinue"],
+                                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=30,
+                            )
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_windows_ci_feat3_dedup_cannot_drop_step7_or_new_tests(self):
         ci_text = read(os.path.join(ROOT, ".github", "workflows", "ci.yml"))
         step7_marker = "- name: Windows AppContainer isolation tests (--test-threads=1 --nocapture)"

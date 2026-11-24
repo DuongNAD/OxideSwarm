@@ -928,30 +928,95 @@ try {
     if (-not $src) { Fail "the archive holds no oxideswarm.exe" }
 
     # 3. Stop a worker that an earlier run of this installer started (by its PID, never by name).
+    $stopWaitMs = 15000
+    if (-not [string]::IsNullOrWhiteSpace($env:OXIDESWARM_USB_STOP_WAIT_MS)) {
+        $parsedStop = 0
+        if ([int]::TryParse($env:OXIDESWARM_USB_STOP_WAIT_MS, [ref]$parsedStop) -and $parsedStop -ge 0) {
+            $stopWaitMs = $parsedStop
+        }
+    }
+    $copyWaitMs = 15000
+    if (-not [string]::IsNullOrWhiteSpace($env:OXIDESWARM_USB_COPY_WAIT_MS)) {
+        $parsedCopy = 0
+        if ([int]::TryParse($env:OXIDESWARM_USB_COPY_WAIT_MS, [ref]$parsedCopy) -and $parsedCopy -ge 0) {
+            $copyWaitMs = $parsedCopy
+        }
+    }
+    $stoppedPids = New-Object System.Collections.Generic.List[int]
     $pidFile = Join-Path $RunDir 'worker.pid'
     if (Test-Path $pidFile) {
-        $old = Get-Content $pidFile -ErrorAction SilentlyContinue
-        if ($old) {
-            $p = Get-Process -Id ([int]$old) -ErrorAction SilentlyContinue
-            if ($p -and $p.Path -like "$Bin*") {
-                Write-Host "  stopping the worker started earlier (PID $old)"
-                Stop-Process -Id ([int]$old) -Force
-                Start-Sleep -Seconds 2
+        $oldRaw = (Get-Content $pidFile -ErrorAction SilentlyContinue | Out-String).Trim()
+        $oldPid = 0
+        if ([int]::TryParse($oldRaw, [ref]$oldPid) -and $oldPid -gt 0) {
+            $p = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+            if ($p -and $p.Path -and $p.Path -like "$Bin*") {
+                Write-Host "  stopping the worker started earlier (PID $oldPid)"
+                Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+                $stoppedPids.Add($oldPid)
             }
         }
-        Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
     }
     # A worker started at logon by an earlier install has no PID file entry: match it by the exact
     # path of this install's binary, never by process name.
     $installedExe = Join-Path $Bin 'oxideswarm.exe'
-    Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $installedExe } | ForEach-Object {
-        Write-Host "  stopping the worker started earlier (PID $($_.ProcessId))"
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
+    $cimProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $installedExe })
+    foreach ($cp in $cimProcs) {
+        $cpid = [int]$cp.ProcessId
+        if ($cpid -gt 0 -and -not $stoppedPids.Contains($cpid)) {
+            Write-Host "  stopping the worker started earlier (PID $cpid)"
+            Stop-Process -Id $cpid -Force -ErrorAction SilentlyContinue
+            $stoppedPids.Add($cpid)
+        }
+    }
+    if ($stoppedPids.Count -gt 0) {
+        $stopDeadline = [DateTime]::UtcNow.AddMilliseconds($stopWaitMs)
+        $remainingPids = @($stoppedPids)
+        while ($remainingPids.Count -gt 0) {
+            $stillAlive = @()
+            foreach ($spid in $remainingPids) {
+                if (Get-Process -Id $spid -ErrorAction SilentlyContinue) {
+                    $stillAlive += $spid
+                }
+            }
+            if ($stillAlive.Count -eq 0) { break }
+            if ([DateTime]::UtcNow -ge $stopDeadline) {
+                $waitSecs = [Math]::Round($stopWaitMs / 1000.0, 1)
+                Fail "the earlier worker (PID $($stillAlive -join ', ')) did not exit within ${waitSecs}s; stop it and re-run Update."
+            }
+            Start-Sleep -Milliseconds 250
+            $remainingPids = $stillAlive
+        }
+    }
+    if (Test-Path $pidFile) {
+        Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
     }
     foreach ($b in @('oxideswarm.exe', 'rusty-grid.exe', 'ox-mode.exe')) {
         $f = Join-Path $src.DirectoryName $b
-        if (Test-Path $f) { Copy-Item $f (Join-Path $Bin $b) -Force }
+        if (Test-Path $f) {
+            $dst = Join-Path $Bin $b
+            $copyDeadline = [DateTime]::UtcNow.AddMilliseconds($copyWaitMs)
+            while ($true) {
+                try {
+                    Copy-Item -LiteralPath $f -Destination $dst -Force -ErrorAction Stop
+                    break
+                } catch {
+                    $ex = $_.Exception
+                    $msg = $ex.Message
+                    $isLock = ($ex -is [System.IO.IOException]) -or
+                              ($ex -is [System.UnauthorizedAccessException]) -or
+                              ($ex.InnerException -is [System.IO.IOException]) -or
+                              ($msg -match 'being used by another process|user-mapped section|access is denied|sharing violation')
+                    if (-not $isLock) {
+                        Fail "could not replace ${dst}: $msg"
+                    }
+                    if ([DateTime]::UtcNow -ge $copyDeadline) {
+                        $waitSecs = [Math]::Round($copyWaitMs / 1000.0, 1)
+                        Fail "could not replace $dst after waiting ${waitSecs}s (file still in use): $msg"
+                    }
+                    Start-Sleep -Milliseconds 250
+                }
+            }
+        }
     }
     foreach ($revCand in @(
         (Join-Path $Kit 'revoke-isolation-acls.ps1'),
