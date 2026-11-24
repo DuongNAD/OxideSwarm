@@ -303,6 +303,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 (open) |
 | TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Planned | In | (unlanded claim `TEST-70`) |
+| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -757,6 +758,24 @@ The full suite must pass on a clean machine before CI can require it.
   2. Replace `avg_latency < Duration::from_millis(50)` with a structural QUIC multiplexing / control-lane anti-HOL proof (matching `TEST-83`'s `zero_copy_quic_test` `test_quic_stream_multiplexing_isolation_and_anti_hol_blocking`, printing `avg_latency` / `max_latency` as `[timing]` lines instead of failing on debug CPU jitter).
   3. Verify `cargo test --locked -p rusty_grid_master --test m2_challenger_1_stress` passes `20/20` runs under 6 Python CPU busy loops on macOS.
 - **Done when:** `tests/m2_challenger_1_stress.rs` uses structural multiplexing proofs instead of `< 50 ms` and passes `20/20` loaded runs.
+
+### TEST-90: Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700`
+
+- **Evidence:** Scheduled CI run `45180525786` (`2026-11-23T13:05:51Z`, `edd82f64`), job `endurance (loopback)`
+  (`137725714467`) on `ubuntu-latest`: step 8 (`Run short transfer suite`) passed, and step 9
+  (`Run 45-minute loopback soak`) exited 1 immediately when `w0` failed to open persistent workspaces:
+  `Configuration error: Workspace store cannot be opened: workspace root '.../soak/cluster/workspaces-w0' cannot be used: Task sandboxes cannot use '.../workspaces-w0' safely: its mode is 755: other users can enter it (it must be 700)`.
+  Because this was a `schedule` run (not a `master` push run), it does not reset the Q80 7-day push streak;
+  `TEST-26` remains `0/2` green scheduled runs.
+- **Problem:** `SoakCluster._start_worker_locked` in `benchmarks/endurance/endurance.py:2950` creates
+  `self.workspace_dirs[idx]` with `os.makedirs(self.workspace_dirs[idx], exist_ok=True)`, which uses default
+  `0o777` masked by the process umask (`0o022` on Ubuntu CI -> `0o755`), while `rusty_grid_worker` rejects any
+  Unix `--workspace-root` whose mode is not `0o700` (and `sandbox_dirs[idx]` at line 2932 has the same pattern).
+- **Do:** Create `workspace_dirs[idx]` (and `sandbox_dirs[idx]`) with `mode=0o700` and enforce `os.chmod(..., 0o700)`
+  on Unix in `benchmarks/endurance/endurance.py`; add a unit check in `tests/test_endurance_harness.py` that
+  fails under `umask 0o022` without the fix.
+- **Done when:** `tests/test_endurance_harness.py` verifies `0o700` permissions on created soak directories under
+  a `0o022` umask, and a Linux `endurance.py soak` smoke run starts and connects workers cleanly.
 
 ## Phase 3: make the documents true
 
@@ -2552,3 +2571,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: ADOPT-3 Implemented (pull request 431, text moved to the archive): added `scripts/install.sh` (bash 3.2, LF) and `scripts/install.ps1` (Windows PowerShell, CRLF, pure ASCII) with `OXIDESWARM_DOWNLOAD_BASE`, `SHA256SUMS` verification, `gh attestation verify` when authenticated (notice/warning + SHA-256 fallback when `gh` is absent or unauthenticated; review fix), docs (`README.md`, `docs/reference.md`, `docs/design/0059-first-users.md`, `CHANGELOG.md`), `Adopt3StaticChecks` / `InstallShTests` / `InstallPs1Tests` in `tests/test_launcher_scripts.py`, `benchmarks/grid/bench_m15_quickstart.py` (with `GH_CONFIG_DIR` preserved for `install.sh` on Unix under isolated `HOME`; review fix) + `test_bench_m15.py` (`4/4`), the macOS quarantine check (`agent-mac-ag` on Apple Silicon M5 Darwin `27.2.0`: `com.apple.provenance` only, no `com.apple.quarantine`), and M15 records across all three systems (Windows `8.551 s`, macOS `8.727 s`, Linux Docker `1.434 s`).
 - 2026-11-24: S5 daily CI streak & scheduled `endurance` check (`scripts/ci_push_runs.py --days 7`: `window 2026-11-17 .. 2026-11-24: 114 completed run(s), 25 not green (11 failing test, 10 never acquired, 4 other); 11 run(s) WITH a failing test`): seven consecutive completed `master` push runs since `45054272288` (`2026-11-22 18:17 UTC`, `TEST-86`) had zero failing tests (`45115961792`, `45134450405`, `45165953706`, `45172886853`, `45179919508`, `45225801199`, `45238617497` all `success`), and `45250047708` (`2026-11-23 19:32 UTC`, `c0232e2b`, job `137956953506`, `launcher scripts (macos-latest)`) ended `never acquired` (stale head, not rerun), but push run `45261621774` (`2026-11-23 20:39 UTC`, `720106d8`, pull request `426`) failed in `workspace tests (macos-latest)` (`137997584352`) at `tests/m2_challenger_1_stress.rs:472` (`test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation`: `avg_latency=73.508552ms` vs `< 50 ms`, `launcher scripts (macos-latest)` and `gpu-wgpu (macos-latest)` still queued), filed as `TEST-93` (pull request `432`), resetting the Q80 clean streak from `2026-11-23 21:35 UTC`; scheduled run `45180525786` (`2026-11-23 13:05 UTC`, `edd82f64`, job `137725714467`, `endurance (loopback)`) failed in step 9 (`soak`, `workspaces-w0` created with mode `0755` instead of `0700`) and is filed as `TEST-90` (pull request `428`; all other scheduled jobs passed); `TEST-26` remains `0/2` green scheduled runs.
 - 2026-11-24: TEST-93 added (`Planned | In`, claimed via `claims/item/TEST-93`): `master` push CI run `45261621774` (`720106d8`, pull request 426) failed in `workspace tests (macos-latest)` (`137997584352`) at `tests/m2_challenger_1_stress.rs:472` (`test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation`: `avg_latency=73.508552ms` vs `< 50 ms` wall-clock bound skipped in `TEST-83` under unlanded claim `TEST-70`), resetting the Q80 clean streak from `2026-11-23 21:35 UTC`.
+- 2026-11-24: TEST-90 added (`Planned | In`, claimed via `claims/item/TEST-90`): scheduled CI run `45180525786` (`2026-11-23T13:05:51Z`, `edd82f64`), job `endurance (loopback)` (`137725714467`) failed in step 9 (`soak`) because `benchmarks/endurance/endurance.py:2950` creates `workspaces-w0` with `os.makedirs(..., exist_ok=True)` (mode `0755` under default `ubuntu-latest` umask instead of `0700`); `schedule` event does not reset the Q80 push streak, and `TEST-26` remains `0/2` green scheduled runs.
