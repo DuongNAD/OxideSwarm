@@ -424,7 +424,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
-| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
+| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
@@ -1554,49 +1554,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
   queue time, and that test passes.
 
-### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
-
-- **Evidence:** [Design 0058](design/0058-lasting-value.md), D2. A search for `unsafe {`,
-  `unsafe fn`, `unsafe impl` and `unsafe extern` in `crates/*/src` finds 285 sites: 176 in
-  `crates/worker`, 77 in `crates/core`, 29 in `crates/cli`, 2 in `crates/agent_mesh` and 1 in
-  `crates/master`. A search for `// SAFETY` finds 103 comments, 23 of them in `crates/worker`. No
-  crate sets `clippy::undocumented_unsafe_blocks`, `forbid(unsafe_code)` or `deny(unsafe_code)`,
-  and no workflow runs Miri.
-- **Problem:** Most `unsafe` sites are in the code that confines tasks and kills process trees. A
-  reviewer cannot tell which invariant each one relies on, and nothing stops a new site without a
-  comment.
-- **Do:**
-  1. Give every `unsafe` site a `SAFETY:` comment that states the invariant it relies on. Read
-     the site before writing the comment. Where the invariant does not hold, write the failing
-     test first, then the fix (rule 4), and use the private route of `docs/SECURITY.md` if a
-     remote peer can reach it.
-  2. Turn on `clippy::undocumented_unsafe_blocks` for the workspace, as an error.
-  3. Add `#![forbid(unsafe_code)]` to every crate and module that has no `unsafe` site.
-  4. Add a CI job on Linux that runs Miri on the unit tests it can run, and list in the job's
-     comment which tests it skips and why. Miri cannot run calls into the operating system.
-  5. Start with `crates/worker/src/isolation.rs`, together with MAINT-2.
-- **Done when:** Measure M11 of design 0058 is met: every `unsafe` site has a `SAFETY:` comment.
-  The clippy job fails on a site without one, and that job is a required check. The Miri job has
-  run once on `master`.
-- **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
-  request 324, 145 sites documented.
-- **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
-- **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
-- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
-- **Note (2026-11-18):** Do steps 2 and 4: pull request 340. `clippy::undocumented_unsafe_blocks`
-  is `deny` in `[workspace.lints.clippy]`, and every crate has `[lints] workspace = true`; the clippy
-  jobs are required checks. The `miri (rusty_grid_core)` CI job runs `cargo miri test -p
-  rusty_grid_core --lib` on Linux; 93 of the 295 tests that Miri cannot run carry
-  `#[cfg_attr(miri, ignore = "Miri: <reason>")]`. Open: the Miri job has not run on GitHub yet.
-- **Note (2026-11-19):** Do step 3 (`win/lv-4-forbid-unsafe`): `#![forbid(unsafe_code)]` added at the
-  root of all 4 zero-`unsafe` binaries (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`), and
-  `#![deny(unsafe_code)]` at the root of all 6 library crates (`android_bridge`, `agent_mesh`,
-  `master`, `core`, `cli`, `worker`) with `#[allow(unsafe_code)]` (one-line `// LV-4:` reason on
-  each) limited to the modules/test submodules/10 `#[no_mangle]` JNI functions that require it, plus
-  `#[forbid(unsafe_code)]` on `master::store::fuzzing`; production code in `core::{blob,task}` and
-  `worker::{client,runner,staging}` stays denied. Complete module inventory is recorded in
-  [design 0058](design/0058-lasting-value.md). Open: CI Miri job run on `master`.
-
 ### LV-15: Release runbook, secret inventory and a second releaser
 
 - **Evidence:** [Design 0058](design/0058-lasting-value.md), D5 and proof run V3. Six releases
@@ -2530,3 +2487,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 - 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.
 - 2026-11-23: TEST-88 Implemented (pull request 424): the case PC ran the Windows loop of "Done when" at `012dc68c`: 20/20 runs of `rusty_grid_worker` and 5/5 of `m3_challenger_2_stress` passed with 0 new console windows and 0 leftover processes (master baseline: 11 new `OpenConsole.exe` in one run). INC-20261123-001 closed.
+- 2026-11-24: LV-4 Implemented (`mac/lv-4-close`, text moved to `docs/BACKLOG-ARCHIVE.md`): audited `origin/master` (`abff2514`) — all `384` non-comment `unsafe` sites (`352` blocks, `32` fns/impl/extern) across `crates/` and `tests/` carry `SAFETY:` / `# Safety` documentation, all `6` workspace member crates inherit `[lints] workspace = true` (`undocumented_unsafe_blocks = "deny"`), `cargo clippy --workspace --all-targets --locked -- -D warnings` passes (`0` warnings), all three `clippy (*)` jobs are required status checks on `master`, and `miri (rusty_grid_core)` passed on `master` push CI (`run 45297098266`, job `138120143503`: `203 passed; 0 failed; 93 ignored` in `491.91 s`). Index recount deferred to stage D (`M9`).

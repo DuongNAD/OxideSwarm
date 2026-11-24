@@ -4386,6 +4386,59 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
     test, 1 never acquired. The exit check of Q80 is read from its last line.
 - **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** steps 1, 3, 4 and 5 are in pull request 306; step 2 (rerun a never-acquired macOS job on the current head, record it) is a standing rule and is now part of prompt S5 of [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The output for 2026-11-16 names 5 runs as never acquired, not 6, because run `43952618376` also holds a failing test and is counted under that class.
 
+### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
+
+- **Evidence:** [Design 0058](design/0058-lasting-value.md), D2. A search for `unsafe {`,
+  `unsafe fn`, `unsafe impl` and `unsafe extern` in `crates/*/src` finds 285 sites: 176 in
+  `crates/worker`, 77 in `crates/core`, 29 in `crates/cli`, 2 in `crates/agent_mesh` and 1 in
+  `crates/master`. A search for `// SAFETY` finds 103 comments, 23 of them in `crates/worker`. No
+  crate sets `clippy::undocumented_unsafe_blocks`, `forbid(unsafe_code)` or `deny(unsafe_code)`,
+  and no workflow runs Miri.
+- **Problem:** Most `unsafe` sites are in the code that confines tasks and kills process trees. A
+  reviewer cannot tell which invariant each one relies on, and nothing stops a new site without a
+  comment.
+- **Do:**
+  1. Give every `unsafe` site a `SAFETY:` comment that states the invariant it relies on. Read
+     the site before writing the comment. Where the invariant does not hold, write the failing
+     test first, then the fix (rule 4), and use the private route of `docs/SECURITY.md` if a
+     remote peer can reach it.
+  2. Turn on `clippy::undocumented_unsafe_blocks` for the workspace, as an error.
+  3. Add `#![forbid(unsafe_code)]` to every crate and module that has no `unsafe` site.
+  4. Add a CI job on Linux that runs Miri on the unit tests it can run, and list in the job's
+     comment which tests it skips and why. Miri cannot run calls into the operating system.
+  5. Start with `crates/worker/src/isolation.rs`, together with MAINT-2.
+- **Done when:** Measure M11 of design 0058 is met: every `unsafe` site has a `SAFETY:` comment.
+  The clippy job fails on a site without one, and that job is a required check. The Miri job has
+  run once on `master`.
+- **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
+  request 324, 145 sites documented.
+- **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
+- **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
+- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
+- **Note (2026-11-18):** Do steps 2 and 4: pull request 340. `clippy::undocumented_unsafe_blocks`
+  is `deny` in `[workspace.lints.clippy]`, and every crate has `[lints] workspace = true`; the clippy
+  jobs are required checks. The `miri (rusty_grid_core)` CI job runs `cargo miri test -p
+  rusty_grid_core --lib` on Linux; 93 of the 295 tests that Miri cannot run carry
+  `#[cfg_attr(miri, ignore = "Miri: <reason>")]`. Open: the Miri job has not run on GitHub yet.
+- **Note (2026-11-19):** Do step 3 (`win/lv-4-forbid-unsafe`): `#![forbid(unsafe_code)]` added at the
+  root of all 4 zero-`unsafe` binaries (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`), and
+  `#![deny(unsafe_code)]` at the root of all 6 library crates (`android_bridge`, `agent_mesh`,
+  `master`, `core`, `cli`, `worker`) with `#[allow(unsafe_code)]` (one-line `// LV-4:` reason on
+  each) limited to the modules/test submodules/10 `#[no_mangle]` JNI functions that require it, plus
+  `#[forbid(unsafe_code)]` on `master::store::fuzzing`; production code in `core::{blob,task}` and
+  `worker::{client,runner,staging}` stays denied. Complete module inventory is recorded in
+  [design 0058](design/0058-lasting-value.md). Open: CI Miri job run on `master`.
+- **Implemented (2026-11-24, verified on `origin/master` `abff2514`):** Audited the workspace at
+  `origin/master` (`abff2514`): all `384` non-comment `unsafe` sites (`352` blocks, `32` `fn`/`impl`/`extern`
+  items) across `crates/` and `tests/` carry `SAFETY:` / `# Safety` documentation (`0` missing); `[workspace.lints.clippy]`
+  sets `undocumented_unsafe_blocks = "deny"` and all `6` workspace member crates inherit `[lints] workspace = true`;
+  all `4` zero-`unsafe` binary roots keep `#![forbid(unsafe_code)]` and all `6` library crate roots keep
+  `#![deny(unsafe_code)]` with `#[allow(unsafe_code)]` limited to the inventoried modules/functions;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings; `master` branch
+  protection requires `clippy (ubuntu-latest)`, `clippy (macos-latest)`, and `clippy (windows-latest)`; and
+  `miri (rusty_grid_core)` passed on `master` push CI (`run 45297098266`, job `138120143503`: `203 passed; 0 failed;
+  93 ignored` in `491.91 s`, alongside green `clippy` on all three OSes).
+
 ## Phase 15: coordination between agents
 
 From [design 0087](design/0087-shared-coordination-state.md) (accepted on 2026-11-17, Q84 to Q86). Several
