@@ -1785,6 +1785,7 @@ class StaticRepositoryChecks(unittest.TestCase):
                 OXIDESWARM_USB_RUN_VALUE=test_run_val,
                 OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
                 OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+                OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT=tmp,
             )
             pids_log = os.path.join(tmp, "spawned_workers.pids")
             ps_env["FAKE_OXIDE_PIDS_LOG"] = pids_log
@@ -2056,6 +2057,42 @@ public class Program {
                 self.assertIn("Refusing SDDL restore on non-sandbox/workspace base path", uninst_fs.stdout)
                 self.assertFalse(os.path.exists(inst_root_fs))
                 self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed by uninstall.ps1")
+
+                # Verify scope filtering still refuses ACL revocation when a worker inside $OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT runs.
+                scoped_dir = os.path.join(tmp, "scoped_worker_check")
+                os.makedirs(scoped_dir, exist_ok=True)
+                scoped_bin = os.path.join(scoped_dir, "oxideswarm.exe")
+                shutil.copyfile(fake_exe, scoped_bin)
+                scoped_manifest = os.path.join(scoped_dir, "windows_acl_grants.txt")
+                with open(scoped_manifest, "w", encoding="utf-8") as smf:
+                    smf.write(os.path.join(tmp, "already-deleted-sandbox-base") + "\n")
+                scoped_proc = subprocess.Popen(
+                    [scoped_bin, "worker"],
+                    env=ps_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    rev_scoped_busy = subprocess.run(
+                        [
+                            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", revoke_ps1,
+                            "-ManifestPath", scoped_manifest, "-RemoveManifest",
+                        ],
+                        env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, timeout=60,
+                    )
+                    self.assertEqual(rev_scoped_busy.returncode, 2, rev_scoped_busy.stdout)
+                    self.assertIn("while another worker is running", rev_scoped_busy.stdout)
+                    self.assertTrue(os.path.isfile(scoped_manifest))
+                finally:
+                    scoped_proc.terminate()
+                    try:
+                        scoped_proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        scoped_proc.kill()
+                        scoped_proc.wait(timeout=5)
 
                 # 2b. Install with explicit -Isolation off overriding baked isolation=fs.
                 inst_root_off = os.path.join(tmp_localappdata, "installed-off")
