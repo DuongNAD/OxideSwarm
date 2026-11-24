@@ -29,6 +29,23 @@ pub fn export_rigged_glb(
     animations: &[ProceduralClip],
     material: Option<&BakedMaterial>,
 ) -> Result<Vec<u8>, String> {
+    export_rigged_glb_cancellable(mesh, armature, skin_weights, animations, material, &|| {
+        false
+    })
+}
+
+/// Exports a skinned mesh, armature, and animation clips to `.glb` with cooperative cancellation.
+pub fn export_rigged_glb_cancellable(
+    mesh: &RawMesh,
+    armature: &Armature,
+    skin_weights: &SkinWeights,
+    animations: &[ProceduralClip],
+    material: Option<&BakedMaterial>,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     if mesh.positions.is_empty() || mesh.indices.is_empty() {
         return Err("Cannot export empty skinned mesh".to_string());
     }
@@ -45,7 +62,10 @@ pub fn export_rigged_glb(
     // 1. POSITION BufferView & Accessor
     let pos_offset = bin_data.len();
     let pos_len = mesh.positions.len() * 12;
-    for p in &mesh.positions {
+    for (idx, p) in mesh.positions.iter().enumerate() {
+        if idx % 8192 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         bin_data.extend_from_slice(&p[0].to_le_bytes());
         bin_data.extend_from_slice(&p[1].to_le_bytes());
         bin_data.extend_from_slice(&p[2].to_le_bytes());
@@ -73,7 +93,10 @@ pub fn export_rigged_glb(
     let normal_acc_idx = if !mesh.normals.is_empty() {
         let norm_offset = bin_data.len();
         let norm_len = mesh.normals.len() * 12;
-        for n in &mesh.normals {
+        for (idx, n) in mesh.normals.iter().enumerate() {
+            if idx % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&n[0].to_le_bytes());
             bin_data.extend_from_slice(&n[1].to_le_bytes());
             bin_data.extend_from_slice(&n[2].to_le_bytes());
@@ -103,7 +126,10 @@ pub fn export_rigged_glb(
     let uv_acc_idx = if !mesh.uvs.is_empty() {
         let uv_offset = bin_data.len();
         let uv_len = mesh.uvs.len() * 8;
-        for uv in &mesh.uvs {
+        for (idx, uv) in mesh.uvs.iter().enumerate() {
+            if idx % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&uv[0].to_le_bytes());
             bin_data.extend_from_slice(&uv[1].to_le_bytes());
         }
@@ -179,15 +205,24 @@ pub fn export_rigged_glb(
     }));
 
     // 6. INDICES BufferView & Accessor
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let idx_offset = bin_data.len();
     let max_v = mesh.positions.len() as u32;
     let (idx_component_type, idx_len) = if max_v <= 65535 {
-        for &idx in &mesh.indices {
+        for (i, &idx) in mesh.indices.iter().enumerate() {
+            if i % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&(idx as u16).to_le_bytes());
         }
         (COMPONENT_TYPE_UNSIGNED_SHORT, mesh.indices.len() * 2)
     } else {
-        for &idx in &mesh.indices {
+        for (i, &idx) in mesh.indices.iter().enumerate() {
+            if i % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&idx.to_le_bytes());
         }
         (COMPONENT_TYPE_UNSIGNED_INT, mesh.indices.len() * 4)

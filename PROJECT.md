@@ -1,6 +1,6 @@
 # Project: OxideSwarm Architecture & Specification
 
-OxideSwarm is a zero-broker distributed computing framework and cross-platform agent mesh written in Rust (edition 2021). A Master coordinator dispatches computational workloads (commands, shell scripts, compile jobs, map/reduce chunks, and hardware GPU matrix kernels) to worker nodes spanning macOS (Apple Silicon / Intel), Windows (x86_64), Linux servers, and Android devices (ARM64).
+OxideSwarm is a zero-broker distributed computing framework and cross-platform agent mesh written in Rust (edition 2021). A Master coordinator dispatches computational workloads (commands, shell scripts, compile jobs, map/reduce chunks, and built-in `GpuCompute` matrix-multiply benchmarks, benchmark only) to worker nodes spanning macOS (Apple Silicon / Intel), Windows (x86_64), Linux servers, and Android devices (ARM64).
 
 Purpose, as [docs/ROADMAP.md](docs/ROADMAP.md) states it: a coding agent runs builds and tests on the machines its owner already has.
 
@@ -37,7 +37,8 @@ The repository is organized into four layers:
 OxideSwarm/
 ├── Cargo.toml                       # Workspace root (6 member crates)
 ├── Cargo.lock
-├── README.md                        # Overview, install, quick start, CLI and environment reference
+├── README.md                        # Overview, install, quick start
+├── docs/reference.md                # CLI flags, ports, environment variables, platform support, limits
 ├── PROJECT.md                       # Architecture, layout and feature inventory (this file)
 ├── CLAUDE.md                        # Architecture map for AI coding assistants
 ├── docs/ROADMAP.md                  # Direction and order of work (the roadmap)
@@ -97,7 +98,7 @@ The table covers the subsystems of milestones M1 to M5. Later work has no row he
 | **CLI** | Task Inputs | `submit --stdin-file`, `--script-file`, `--interpreter`, `--env`; `--matrix-dim` / `--work-group-size` for GPU tasks | Implemented |
 | **Worker Engine** | Execution Runner | Bounded head-and-tail stdout/stderr capture ([design 0022](docs/design/0022-head-and-tail-stream-capture.md)), cancellation, configurable process priority | Implemented |
 | **Worker Engine** | Child Containment | Windows Job Objects (`kill-on-close` via `CREATE_SUSPENDED`, with a `taskkill /F /T` fallback if job assignment fails) and Unix process groups with a double-forked lifeline-pipe supervisor, optional Linux cgroup v2 leaf, and per-attempt `RUSTY_GRID_RUN_TOKEN` `setsid()` sweep ([design 0031](docs/design/0031-containment-after-worker-crash.md)) | Implemented |
-| **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback | Implemented |
+| **Worker Engine** | GPU Acceleration | Hardware `wgpu` compute engine (Metal, Vulkan, DX12) and simulated CPU SIMD fallback for the built-in `GpuCompute` matrix-multiply benchmark (benchmark only; user GPU workloads run as `Command` tasks) | Implemented |
 | **Android Bridge** | In-Process JNI | `liboxideworker.so` cdylib running the Android worker inside Tokio runtime threads (the Android app is a worker only) | Implemented |
 | **Android Bridge** | Cluster Secret Auth | Native secret injection (`nativeSetClusterSecret`) | Partial |
 | **Agent Mesh** | Relay Hub | Axum WebSocket hub routing envelopes with token authentication and SHA-256 validation | Implemented |

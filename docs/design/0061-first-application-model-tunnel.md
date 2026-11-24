@@ -1,7 +1,7 @@
 # 0061: A first application for the model track: trial, client tunnel and usage records
 
-Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 to Q43 are open)
-Created: 2026-11-11    Updated: 2026-11-12
+Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 was decided on 2026-11-24 at its default; Q42 is open; Q43 was closed by Q96 of design 0094 on 2026-11-19: display only; Q98 decided on 2026-11-24: the trial uses a coding agent while LIVA is on hold)
+Created: 2026-11-11    Updated: 2026-11-24
 
 ## Summary
 
@@ -11,7 +11,8 @@ desktop assistant, gives people a reason to use that path. This record writes th
 sets an order:
 
 1. a trial of LIVA on a Mac with the language model on another machine, which needs nothing from
-   the grid (APP-1);
+   the grid (APP-1). Since 2026-11-24 (Q98) the trial's application is a coding agent, and LIVA
+   follows later;
 2. a client tunnel to a model server that listens on loopback on a worker (LLM-9);
 3. usage records for tunnels (LLM-10) and a balance per member (LLM-11).
 
@@ -134,6 +135,24 @@ Checked on 2026-11-11 in LIVA's repository, at `main` `3057d35c` and at branch `
 Steps 3 to 6 are proposals. Only step 1 is decided (Q40).
 
 ### D3 The trial (APP-1)
+
+**Changed by Q98 (2026-11-24).** The owner put LIVA on hold until after the current projects: a
+check of LIVA's `main` on 2026-11-24 found that its desktop build most likely stops at start-up and
+that its "Cloud" provider (KH-1) has no code. The trial therefore runs first with a coding agent
+that sends requests to an OpenAI-compatible endpoint (for example aider or opencode; the choice
+is recorded with the trial), on the Mac, with the model on the second machine. This also serves the
+purpose of Q1 and the agents of release `0.6.0`. Part A and the record format below stay; where
+they name `liva_eval`, a load generator against the same endpoint (AIPerf, as in spike R22, or a
+streaming request sent with `curl`) takes its place. Part B becomes:
+
+1. The coding agent on the Mac makes a real change in a repository (an edit that a test checks),
+   once with the model on the second machine and once, where the Mac can hold it, on the Mac.
+2. The second machine is stopped in the middle of an answer. What the agent does is written down.
+3. The record adds: the agent and its version, the task, whether the test passed, and how many
+   requests the agent sent.
+
+The LIVA steps below run later, as a second application, after LIVA starts on macOS and has KH-1.
+They then use LLM-9 instead of SSH if it exists by then.
 
 The trial answers one question: is LIVA on a machine without the model good enough to use when
 another machine computes the model?
@@ -302,7 +321,7 @@ backlog's S, M and L. No item is in [BACKLOG.md](../BACKLOG.md).
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
-| APP-1 | Trial: LIVA on a Mac, the model on another machine, over an SSH forward | S, owner | Nothing for Part A. KH-1 of LIVA and a build that starts on macOS for Part B | This record | "Trial records" holds a dated entry for Part A and one for Part B | Planned |
+| APP-1 | Trial: a coding agent on a Mac (LIVA later, Q98), the model on another machine, over an SSH forward | S, owner | Nothing for Part A or Part B. The LIVA run needs KH-1 of LIVA and a build that starts on macOS | This record | "Trial records" holds a dated entry for Part A and one for Part B | Planned |
 | LLM-9 | Named model services (`worker --serve`) and `llm connect` | L | APP-1, Q41. ENROLL-1 before a cluster of several owners uses it (Q42) | `crates/core/src/protocol.rs`, `crates/core/src/placement.rs`, `crates/master/src/`, `crates/worker/src/`, `crates/cli/src/`, `README.md`, `docs/SECURITY.md` | An unchanged OpenAI client on one machine streams a reply from a loopback model server on another, the integration tests of the test plan pass, and a worker without `--serve` refuses | Planned |
 | LLM-10 | Usage records for tunnels, `llm usage`, a dashboard view | M | LLM-9, ENROLL-1 | `crates/master/src/`, `crates/cli/src/`, `README.md` | Each closed tunnel leaves one record that names the client's machine key and the worker, and holds no content | Planned |
 | LLM-11 | A balance per member, display only | S | LLM-10, Q14, Q43 | `crates/master/src/`, `crates/cli/src/` | The balances of all members sum to zero, and the view shows them | Planned |
@@ -315,9 +334,10 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q40 to Q43.
 | ID | Question | Recommended default |
 |---|---|---|
 | Q40 | Does a trial of LIVA on the Mac, with the model on another machine, come before any build item of this record? | Decided on 2026-11-11: yes, the owner asked for it |
-| Q41 | After the trial: build the client tunnel (LLM-9) before the gateway (LLM-6), and let LLM-4 reuse it? | Yes, if the trial records show that the remote model is worth using |
+| Q41 | After the trial: build the client tunnel (LLM-9) before the gateway (LLM-6), and let LLM-4 reuse it? | Decided on 2026-11-24: yes, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough, so that the master can read model traffic it relays? | Yes while every machine has one owner. End to end, with ENROLL-1, before a cluster of several owners uses LLM-9 |
 | Q43 | Does a balance only display, or does it refuse a member whose balance is below zero? | Display only in the first version |
+| Q98 | Does the trial run with another application while LIVA is on hold? | Decided on 2026-11-24: yes, a coding agent that uses an OpenAI-compatible endpoint; LIVA follows as the second application |
 
 Q14 (credits, money or tokens) stays open in the roadmap. This record follows its default.
 
@@ -349,3 +369,14 @@ None yet.
   model server (LLM-12) is a named service, and its client command (LLM-13) sends model
   weights through a tunnel. The text of LLM-9 is unchanged. The spike that D3 names is R14;
   it was numbered R11 on 2026-11-11.
+- 2026-11-19: The owner decided Q96 of [design 0094](0094-road-to-a-shared-research-grid.md): credits
+  only display, are never spent or transferred and have no cash value. It closes Q43 at its default:
+  the balance of LLM-11 displays and refuses nobody.
+- 2026-11-24: The owner decided Q41 at its default: after the trial, the client tunnel (LLM-9) comes
+  before the gateway (LLM-6), and LLM-4 reuses it, if the trial records show that the remote model is
+  worth using. No trial has run yet; the texts of LLM-4 and LLM-6 are unchanged until it has.
+- 2026-11-24: The owner decided Q98: LIVA is on hold until after the current projects, and trial
+  APP-1 runs with a coding agent against an OpenAI-compatible endpoint (D3, "Changed by Q98").
+  The check of LIVA `main` (`3057d35c`) that led to it: the desktop build most likely stops at
+  start-up (Tokio runtime missing in `build_app_state`, not run on Windows), the Windows CI job has
+  never run on that code, and the Cloud provider has no code.

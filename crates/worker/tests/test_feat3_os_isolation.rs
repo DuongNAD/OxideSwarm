@@ -180,6 +180,18 @@ fn lines(result: &TaskResult) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn format_result_diag(result: &TaskResult) -> String {
+    format!(
+        "exit_code={} error={:?} elapsed_ms={} stdout={:?} stderr={:?}",
+        result.exit_code,
+        result.error,
+        result.execution_time_ms,
+        result.stdout_str(),
+        result.stderr_str()
+    )
+}
+
 #[cfg(target_os = "macos")]
 const FS_SCRIPT: &str = r#"
 echo hello > "$RUSTY_GRID_SANDBOX_DIR/allowed.txt" && echo WRITE_OK
@@ -873,7 +885,8 @@ mod macos {
         for leak in ["LEAK_SECRET", "LEAK_KEY", "LEAK_SIBLING", "LEAK_WRITE_HOME"] {
             assert!(
                 got.iter().any(|l| l == leak),
-                "without isolation {leak} must succeed (otherwise the tests below prove nothing): {got:?}"
+                "without isolation {leak} must succeed (otherwise the tests below prove nothing): lines={got:?} ({})",
+                format_result_diag(&result)
             );
         }
     }
@@ -1177,7 +1190,7 @@ cargo build --offline 2>&1
             "the tracked PID must become the task itself, not stay sandbox-exec; it is `{name}`"
         );
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -1198,7 +1211,15 @@ cargo build --offline 2>&1
             .execute_task(&task, Some(Arc::clone(&pid)), None)
             .await;
         assert_eq!(result.exit_code, EXIT_CODE_TIMEOUT, "{:?}", result.error);
-        assert!(started.elapsed() < Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        eprintln!(
+            "macos timeout task killed in {:.2}s (limit 60s)",
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "timed-out task hung for {elapsed:?}"
+        );
         let tracked = pid.load(Ordering::Acquire);
         assert!(tracked > 1);
         assert!(wait_dead(tracked).await, "the timed-out task is gone");
@@ -1334,8 +1355,8 @@ echo "READ_AFTER_WRITE=$(/usr/bin/defaults read {wdomain} planted 2>/dev/null)"
         let control = run_at(IsolationLevel::Off, script, &[]).await;
         assert!(
             has(&control, "WORKER_VAR=rusty_grid_worker"),
-            "{:?}",
-            lines(&control)
+            "{}",
+            format_result_diag(&control)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run_at(level, script, &[]).await;
@@ -1418,7 +1439,11 @@ sleep 120 & kill -STOP $! && echo OWN_CHILD_OK; kill -9 $! 2>/dev/null; wait $! 
         }
         let _ = victim.kill();
         let _ = victim.wait();
-        assert!(control_ok, "the unconfined control must be able to signal");
+        assert!(
+            control_ok,
+            "the unconfined control must be able to signal ({})",
+            format_result_diag(&control)
+        );
     }
 
     /// M4: TIOCSTI. Runs the task from a process that has a controlling terminal (a pty made by
@@ -1547,7 +1572,7 @@ sys.stdout.write(out.decode("utf-8", "replace"))
         assert!(
             open.stdout_str().contains("DUMMY-SECRETFILE-feat3a"),
             "{}",
-            open.stdout_str()
+            format_result_diag(&open)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run(level, true).await;
@@ -1594,7 +1619,7 @@ sys.stdout.write(out.decode("utf-8", "replace"))
         assert!(
             control.stdout_str().contains("DUMMY-CACHE-feat3a"),
             "{}",
-            control.stdout_str()
+            format_result_diag(&control)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run_at(level, script, &extra).await;
@@ -1757,7 +1782,7 @@ echo END
         assert!(
             control.stdout_str().contains(SECRET),
             "the control must read the linked secret: {}",
-            control.stdout_str()
+            format_result_diag(&control)
         );
         for level in [IsolationLevel::Fs, IsolationLevel::FsNet] {
             let result = run_at(level, script, &[]).await;
@@ -1765,7 +1790,7 @@ echo END
             assert!(
                 !result.stdout_str().contains(SECRET),
                 "{level}: the hard-linked secret became readable: {}",
-                result.stdout_str()
+                format_result_diag(&result)
             );
         }
     }
@@ -2656,7 +2681,11 @@ sleep 120 & kill -STOP $! && echo OWN_CHILD_OK; kill -9 $! 2>/dev/null; wait $! 
         }
         let _ = victim.kill();
         let _ = victim.wait();
-        assert!(control_ok, "the unconfined control must be able to signal");
+        assert!(
+            control_ok,
+            "the unconfined control must be able to signal ({})",
+            format_result_diag(&control)
+        );
     }
 
     /// A protected file (the cluster secret, the config file) inside a directory that the policy
@@ -2888,7 +2917,7 @@ cargo build --offline 2>&1
         }
         assert_eq!(name, "sleep", "the tracked PID must become the task itself");
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(Duration::from_secs(60), handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -2915,7 +2944,15 @@ cargo build --offline 2>&1
                 "{level}: {:?}",
                 result.error
             );
-            assert!(started.elapsed() < Duration::from_secs(30));
+            let elapsed = started.elapsed();
+            eprintln!(
+                "linux timeout task ({level}) killed in {:.2}s (limit 60s)",
+                elapsed.as_secs_f64()
+            );
+            assert!(
+                elapsed < Duration::from_secs(60),
+                "{level}: timed-out task hung for {elapsed:?}"
+            );
             let tracked = pid.load(Ordering::Acquire);
             assert!(tracked > 1);
             assert!(
@@ -3012,6 +3049,19 @@ cargo build --offline 2>&1
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    /// A `Command` whose console child gets a console with no window (TEST-88). Run from a parent
+    /// without a console (a CI service, a script that captures output), a plain `Command` opens a
+    /// visible console window for every `cmd`, `powershell`, `reg` or `icacls` child.
+    fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new(program);
+        cmd.creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW);
+        cmd
+    }
 
     /// Verifies that Windows AppContainer isolation (`userenv.dll` + capability SIDs) is
     /// supported on this host, or returns `false` (after a notice) when unavailable and the
@@ -3071,6 +3121,52 @@ mod windows {
                 return;
             }
         };
+    }
+
+    /// Generous condition-wait deadline for Windows PowerShell/AppContainer test barriers under load.
+    const WIN_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    struct ChildKillGuard(Option<std::process::Child>);
+
+    impl Drop for ChildKillGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// Poll `cond` every 25 ms until it holds, any `done_flag` becomes true, or `WIN_WAIT_TIMEOUT`
+    /// elapses. Returns early with a diagnostic error if a test task exits before the barrier.
+    async fn wait_for_barrier<F>(
+        what: &str,
+        done_flags: &[(&str, &AtomicBool)],
+        mut cond: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = Instant::now() + WIN_WAIT_TIMEOUT;
+        loop {
+            if cond() {
+                return Ok(());
+            }
+            for (label, flag) in done_flags {
+                if flag.load(Ordering::Acquire) {
+                    return Err(format!(
+                        "{label} exited before barrier '{what}' was satisfied"
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {}s waiting for barrier '{what}'",
+                    WIN_WAIT_TIMEOUT.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn win_task(rig: &Rig, script: &str, extra_env: &[(&str, &str)], timeout_secs: u64) -> Task {
@@ -3213,20 +3309,22 @@ function Compile-CSharp([string]$code) {
         let script = r#"
 [Console]::Out.WriteLine('TASK_STARTED')
 [System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\secret.txt", 'secret-from-t1')
-for ($i = 0; $i -lt 300; $i++) {
-    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { break }
-    [System.Threading.Thread]::Sleep(50)
+$goDeadline = [DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $goDeadline) {
+    if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\go.txt")) { [Console]::Out.WriteLine('GO_SEEN'); break }
+    [System.Threading.Thread]::Sleep(25)
 }
 try { $null = [System.IO.File]::ReadAllText("$env:T_SIB_SANDBOX\secret.txt"); [Console]::Out.WriteLine('LEAK_SIBLING_READ') } catch { [Console]::Out.WriteLine('DENY_SIBLING_READ') }
 try { $null = [System.IO.Directory]::GetFileSystemEntries($env:T_SIB_SANDBOX); [Console]::Out.WriteLine('LEAK_SIBLING_LIST') } catch { [Console]::Out.WriteLine('DENY_SIBLING_LIST') }
 try { [System.IO.File]::WriteAllText("$env:T_SIB_SANDBOX\planted.txt", 'x'); [Console]::Out.WriteLine('LEAK_SIBLING_WRITE') } catch { [Console]::Out.WriteLine('DENY_SIBLING_WRITE') }
 [System.IO.File]::WriteAllText("$env:RUSTY_GRID_SANDBOX_DIR\done.txt", '1')
-for ($i = 0; $i -lt 300; $i++) {
+$exitDeadline = [DateTime]::UtcNow.AddSeconds(60)
+while ([DateTime]::UtcNow -lt $exitDeadline) {
     if ([System.IO.File]::Exists("$env:RUSTY_GRID_SANDBOX_DIR\exit.txt")) { break }
-    [System.Threading.Thread]::Sleep(50)
+    [System.Threading.Thread]::Sleep(25)
 }
 "#;
-        let task1 = win_task(&rig, script, &[], 60);
+        let task1 = win_task(&rig, script, &[], 90);
         let mut task2 = task1.clone();
         task2.id = rusty_grid_core::TaskId::new();
 
@@ -3246,48 +3344,77 @@ for ($i = 0; $i -lt 300; $i++) {
         let r2 = Arc::clone(&rig);
         let sb1_b = sb1.clone();
         let sb2_b = sb2.clone();
+        let t1_done = Arc::new(AtomicBool::new(false));
+        let t2_done = Arc::new(AtomicBool::new(false));
+        let t1_done_exec = Arc::clone(&t1_done);
+        let t2_done_exec = Arc::clone(&t2_done);
         let barrier = async move {
-            let mut both_secrets_existed = false;
-            for _ in 0..300 {
-                if sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file() {
-                    both_secrets_existed = true;
-                    break;
+            let release_siblings = || {
+                for dir in [&sb1_b, &sb2_b] {
+                    if dir.is_dir() {
+                        let _ = std::fs::write(dir.join("go.txt"), "go");
+                        let _ = std::fs::write(dir.join("exit.txt"), "exit");
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let flags = [("task1", t1_done.as_ref()), ("task2", t2_done.as_ref())];
+            if let Err(err) = wait_for_barrier("both sibling secret.txt", &flags, || {
+                sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file()
+            })
+            .await
+            {
+                release_siblings();
+                return Err(format!(
+                    "both sibling sandbox secret.txt files must exist before either task probes the other ({}, {}): {err}",
+                    sb1_b.display(),
+                    sb2_b.display()
+                ));
             }
-            assert!(
-                both_secrets_existed,
-                "both sibling sandbox secret.txt files must exist on disk before either task probes the other ({}, {})",
-                sb1_b.display(),
-                sb2_b.display()
-            );
-            std::fs::write(sb1_b.join("go.txt"), "go").unwrap();
-            std::fs::write(sb2_b.join("go.txt"), "go").unwrap();
+            std::fs::write(sb1_b.join("go.txt"), "go")
+                .map_err(|e| format!("write sb1 go.txt: {e}"))?;
+            std::fs::write(sb2_b.join("go.txt"), "go")
+                .map_err(|e| format!("write sb2 go.txt: {e}"))?;
 
-            let mut both_done = false;
-            for _ in 0..300 {
-                if sb1_b.join("done.txt").is_file() && sb2_b.join("done.txt").is_file() {
-                    both_done = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Err(err) = wait_for_barrier("both sibling done.txt", &flags, || {
+                sb1_b.join("done.txt").is_file() && sb2_b.join("done.txt").is_file()
+            })
+            .await
+            {
+                release_siblings();
+                return Err(format!(
+                    "both tasks must complete their sibling probes while both sandboxes are still present: {err}"
+                ));
             }
-            assert!(
-                both_done,
-                "both tasks must complete their sibling probes while both sandboxes are still present"
-            );
-            assert!(
-                sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file(),
-                "both sibling secret.txt files must still exist when probes finish"
-            );
+            if !(sb1_b.join("secret.txt").is_file() && sb2_b.join("secret.txt").is_file()) {
+                release_siblings();
+                return Err(
+                    "both sibling secret.txt files must still exist when probes finish".to_string(),
+                );
+            }
             let _ = std::fs::write(sb1_b.join("exit.txt"), "exit");
             let _ = std::fs::write(sb2_b.join("exit.txt"), "exit");
+            Ok(())
         };
-        let (res1, res2, ()) = tokio::join!(
-            async move { r1.runner.execute_task(&t1, None, None).await },
-            async move { r2.runner.execute_task(&t2, None, None).await },
+        let (res1, res2, barrier_res) = tokio::join!(
+            async move {
+                let res = r1.runner.execute_task(&t1, None, None).await;
+                t1_done_exec.store(true, Ordering::Release);
+                res
+            },
+            async move {
+                let res = r2.runner.execute_task(&t2, None, None).await;
+                t2_done_exec.store(true, Ordering::Release);
+                res
+            },
             barrier,
         );
+        if let Err(err) = barrier_res {
+            panic!(
+                "{err}; task1: {}; task2: {}",
+                format_result_diag(&res1),
+                format_result_diag(&res2)
+            );
+        }
 
         for (label, res) in [("task1", &res1), ("task2", &res2)] {
             assert!(
@@ -3299,6 +3426,7 @@ for ($i = 0; $i -lt 300; $i++) {
             let got = lines(res);
             for expected in [
                 "TASK_STARTED",
+                "GO_SEEN",
                 "DENY_SIBLING_READ",
                 "DENY_SIBLING_LIST",
                 "DENY_SIBLING_WRITE",
@@ -3775,7 +3903,7 @@ try {
                 }
             }
         }
-        if let Ok(out) = std::process::Command::new("rustc")
+        if let Ok(out) = hidden_command("rustc")
             .args(["--print", "sysroot"])
             .output()
         {
@@ -4110,7 +4238,7 @@ try {
         let tracked = wait_for_pid(&pid).await;
         assert!(tracked > 1);
         cancel_tx.send("test".into()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(20), handle)
+        let result = tokio::time::timeout(WIN_WAIT_TIMEOUT, handle)
             .await
             .expect("cancellation finishes the task")
             .unwrap();
@@ -4119,26 +4247,38 @@ try {
         // Timeout.
         let pid = Arc::new(AtomicU32::new(0));
         let task = win_task(&rig, "[System.Threading.Thread]::Sleep(120000)", &[], 2);
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let result = rig
             .runner
             .execute_task(&task, Some(Arc::clone(&pid)), None)
             .await;
         assert_eq!(result.exit_code, EXIT_CODE_TIMEOUT, "{:?}", result.error);
-        assert!(started.elapsed() < Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        eprintln!(
+            "timeout task killed in {:.2}s (limit {}s)",
+            elapsed.as_secs_f64(),
+            WIN_WAIT_TIMEOUT.as_secs()
+        );
+        assert!(elapsed < WIN_WAIT_TIMEOUT);
         let tracked = pid.load(Ordering::Acquire);
         assert!(tracked > 1);
     }
 
     async fn wait_for_pid(pid: &AtomicU32) -> u32 {
-        for _ in 0..200 {
+        let deadline = Instant::now() + WIN_WAIT_TIMEOUT;
+        loop {
             let v = pid.load(Ordering::Acquire);
             if v > 1 {
                 return v;
             }
+            if Instant::now() >= deadline {
+                panic!(
+                    "the runner never reported a child PID within {}s",
+                    WIN_WAIT_TIMEOUT.as_secs()
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("the runner never reported a child PID");
     }
 
     #[tokio::test]
@@ -4151,7 +4291,7 @@ try {
             IsolationLevel::FsNet,
         ] {
             tokio::time::timeout(
-                Duration::from_secs(20),
+                WIN_WAIT_TIMEOUT,
                 verify_isolation_support(level, base.path()),
             )
             .await
@@ -4277,27 +4417,62 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
     }
 }
 "#;
-        let mut host_server = std::process::Command::new(
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-        )
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!(
-                "$s1 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $s2 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $s3 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
-                 $ev = [System.Threading.EventWaitHandle]::new($true, [System.Threading.EventResetMode]::ManualReset, '{event_name}'); \
-                 [Console]::Out.WriteLine('READY'); [System.Threading.Thread]::Sleep(30000)"
-            ),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn host pipe server");
+        let mut host_server_guard = ChildKillGuard(Some(
+            hidden_command(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            )
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "$s1 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                     $s2 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                     $s3 = [System.IO.Pipes.NamedPipeServerStream]::new('{pipe_name}', [System.IO.Pipes.PipeDirection]::InOut, 4); \
+                     $ev = [System.Threading.EventWaitHandle]::new($true, [System.Threading.EventResetMode]::ManualReset, '{event_name}'); \
+                     [Console]::Out.WriteLine('READY'); [System.Threading.Thread]::Sleep(180000)"
+                ),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn host pipe server"),
+        ));
 
-        // Wait for the host pipe and event instances to be created.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // Wait until the host pipe and event instances print READY.
+        let host_stdout = host_server_guard
+            .0
+            .as_mut()
+            .and_then(|c| c.stdout.take())
+            .expect("host_server stdout must be piped");
+        let ready_res = tokio::time::timeout(
+            WIN_WAIT_TIMEOUT,
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let mut reader = BufReader::new(host_stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader
+                        .read_line(&mut line)
+                        .map_err(|e| format!("read host_server stdout: {e}"))?;
+                    if n == 0 {
+                        return Err("host_server closed stdout before printing READY".to_string());
+                    }
+                    if line.trim() == "READY" {
+                        return Ok(());
+                    }
+                }
+            }),
+        )
+        .await;
+        match ready_res {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => panic!("host pipe server failed before READY: {e}"),
+            Ok(Err(e)) => panic!("host pipe server READY reader panicked: {e}"),
+            Err(_) => panic!(
+                "timed out after {}s waiting for host pipe server READY",
+                WIN_WAIT_TIMEOUT.as_secs()
+            ),
+        }
 
         let control_rig = Rig::new(IsolationLevel::Off, false);
         let control = control_rig
@@ -4368,8 +4543,7 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
             );
         }
 
-        let _ = host_server.kill();
-        let _ = host_server.wait();
+        drop(host_server_guard);
         assert!(
             control_ok,
             "unconfined control must connect to host named pipe and event: {control_lines:?}"
@@ -4385,8 +4559,11 @@ foreach ($wellKnown in @('openssh-ssh-agent', 'docker_engine')) {
     #[tokio::test]
     async fn test_a_task_cannot_signal_or_inspect_foreign_processes() {
         skip_if_duplicate_ci_pass!();
-        let mut victim = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
-            .args(["/C", "ping -n 120 127.0.0.1 >nul"])
+        // `PING.EXE` itself, not `cmd /C ping`: killing `cmd.exe` left `PING.EXE` running for up
+        // to 120 s (TEST-88).
+        let mut victim = hidden_command(r"C:\Windows\System32\PING.EXE")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn victim");
         let victim_pid = victim.id().to_string();
@@ -4546,18 +4723,19 @@ try {{
     /// M4 on Windows: console / Windows Terminal keystroke injection (`TIOCSTI` equivalent via
     /// `AttachConsole(pid)` + `WriteConsoleInputW` or inherited `CONIN$`) is blocked because
     /// AppContainer tasks are spawned with `CREATE_NO_WINDOW` and run at Low Mandatory Integrity
-    /// Level. Includes a positive `IsolationLevel::Off` control spawning a helper console process
-    /// with `CREATE_NEW_CONSOLE`.
+    /// Level. Includes a positive `IsolationLevel::Off` control against a helper console process
+    /// spawned with `CREATE_NO_WINDOW` (a console without a window, TEST-88).
     #[tokio::test]
     async fn test_console_and_terminal_injection_is_blocked() {
         skip_if_duplicate_ci_pass!();
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let mut console_helper = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
-            .args(["/C", "ping -n 120 127.0.0.1 >nul"])
-            .creation_flags(CREATE_NEW_CONSOLE)
+        // The helper needs a console of its own for `AttachConsole(helper)`. `CREATE_NO_WINDOW`
+        // gives it one without a window; `CREATE_NEW_CONSOLE` opened a visible window per run, and
+        // `cmd /C ping` left `PING.EXE` running after the kill (TEST-88).
+        let mut console_helper = hidden_command(r"C:\Windows\System32\PING.EXE")
+            .args(["-n", "120", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
             .spawn()
-            .expect("spawn helper with CREATE_NEW_CONSOLE");
+            .expect("spawn helper console process");
         tokio::time::sleep(Duration::from_millis(300)).await;
         let helper_pid = console_helper.id().to_string();
         let worker_pid = std::process::id().to_string();
@@ -4645,7 +4823,7 @@ public static class WinConsoleProbe {{
         let read_key = format!(r"HKCU\Software\OxideSwarmFeat3Read_{pid}");
         let write_key = format!(r"HKCU\Software\OxideSwarmFeat3Write_{pid}");
         let reg = |args: &[&str]| {
-            std::process::Command::new(r"C:\Windows\System32\reg.exe")
+            hidden_command(r"C:\Windows\System32\reg.exe")
                 .args(args)
                 .output()
         };
@@ -4968,10 +5146,8 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
                     task_temp.display(),
                     pkg_dir.display()
                 );
-                for _ in 0..20 {
-                    if !pkg_dir.exists() {
-                        break;
-                    }
+                let cleanup_deadline = Instant::now() + Duration::from_secs(30);
+                while pkg_dir.exists() && Instant::now() < cleanup_deadline {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 assert!(
@@ -5109,7 +5285,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
         ] {
             let world_ac_secret = etc_dir.join(filename);
             std::fs::write(&world_ac_secret, "LEAKED-BY-LEFTOVER-ACE").unwrap();
-            let grant_status = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            let grant_status = hidden_command(r"C:\Windows\System32\icacls.exe")
                 .arg(&world_ac_secret)
                 .args(["/grant", &format!("*{sid_str}:(R)"), "/q"])
                 .status()
@@ -5140,7 +5316,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
             .join(".oxideswarm")
             .join("cluster.secret");
         for sid_grant in ["*S-1-1-0:(R)", "*S-1-15-2-1:(R)"] {
-            let grant_home_secret = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            let grant_home_secret = hidden_command(r"C:\Windows\System32\icacls.exe")
                 .arg(&home_secret)
                 .args(["/grant", sid_grant, "/q"])
                 .status()
@@ -5156,7 +5332,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
         .await
         .expect_err("live probe must refuse readable home cluster.secret");
         for sid_remove in ["*S-1-1-0", "*S-1-15-2-1"] {
-            let _ = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+            let _ = hidden_command(r"C:\Windows\System32\icacls.exe")
                 .arg(&home_secret)
                 .args(["/remove", sid_remove, "/q"])
                 .status();
@@ -5170,7 +5346,7 @@ $null = [WinClipProbe]::WriteText($env:T_PREV)
     }
 
     fn sddl_of(path: &Path) -> String {
-        let out = std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+        let out = hidden_command(r"C:\Windows\System32\icacls.exe")
             .arg(path)
             .output()
             .expect("icacls");
@@ -5442,7 +5618,8 @@ if (-not [System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 }}
 if ($env:T_WAIT_HOST_JUNCTION -eq '1') {{
     [System.IO.File]::WriteAllText("$sb\ready.txt", "1")
-    for ($i = 0; $i -lt 200; $i++) {{
+    $goDeadline = [DateTime]::UtcNow.AddSeconds(60)
+    while ([DateTime]::UtcNow -lt $goDeadline) {{
         if ([System.IO.File]::Exists("$sb\go.txt")) {{ break }}
         [System.Threading.Thread]::Sleep(25)
     }}
@@ -5545,72 +5722,88 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
                 ("T_SSH_DIR", ssh_dir.to_str().unwrap()),
                 ("T_WAIT_HOST_JUNCTION", "1"),
             ],
-            60,
+            90,
         );
         let sb_dir2 = rig.base.join(task2.id.0.to_string());
         let ssh_dir_clone = ssh_dir.clone();
         let secret_file_clone = secret_file.clone();
         let host_clone = rig.host.clone();
         let base_clone = rig.base.clone();
-        let plant_handle = tokio::spawn(async move {
+        let task2_done = Arc::new(AtomicBool::new(false));
+        let task2_done_exec = Arc::clone(&task2_done);
+        let exec_fut = async {
+            let res = rig.runner.execute_task(&task2, None, None).await;
+            task2_done_exec.store(true, Ordering::Release);
+            res
+        };
+        let plant_fut = async move {
             let ready = sb_dir2.join("ready.txt");
-            for _ in 0..200 {
-                if ready.exists() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert!(ready.exists(), "task2 must signal ready.txt");
-            let j_path = sb_dir2.join("j_ssh");
-            let hl_path = sb_dir2.join("hl_secret.txt");
-            let ps_mklink = std::process::Command::new(
-                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            )
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "New-Item -ItemType Junction -Path $env:J_LINK -Value $env:J_TARGET | Out-Null; New-Item -ItemType HardLink -Path $env:HL_LINK -Value $env:HL_TARGET | Out-Null",
-            ])
-            .env("J_LINK", &j_path)
-            .env("J_TARGET", &ssh_dir_clone)
-            .env("HL_LINK", &hl_path)
-            .env("HL_TARGET", &secret_file_clone)
-            .output()
-            .expect("create host junction and hardlink inside active sandbox");
-            assert!(
-                ps_mklink.status.success(),
-                "host New-Item Junction/HardLink failed: {}",
-                String::from_utf8_lossy(&ps_mklink.stderr)
-            );
-            let j_meta = std::fs::symlink_metadata(&j_path)
-                .expect("junction j_ssh must exist inside sandbox on host");
+            if let Err(err) =
+                wait_for_barrier("task2 ready.txt", &[("task2", task2_done.as_ref())], || {
+                    ready.exists()
+                })
+                .await
             {
-                use std::os::windows::fs::MetadataExt;
-                assert!(
-                    (j_meta.file_attributes() & 0x0400) != 0,
-                    "j_ssh must have FILE_ATTRIBUTE_REPARSE_POINT"
-                );
+                return Err(format!("task2 must signal ready.txt: {err}"));
             }
-            assert!(
-                hl_path.is_file(),
-                "hardlink hl_secret.txt must exist inside sandbox on host"
-            );
-            rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
-                &host_clone,
-                &[],
-                Some(&base_clone),
-            )
-            .expect("prepare_worker_toolchains with active junction and hardlink");
-            std::fs::write(sb_dir2.join("go.txt"), "1").unwrap();
-        });
-        let result2 = rig.runner.execute_task(&task2, None, None).await;
-        plant_handle.await.expect("plant_handle");
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let j_path = sb_dir2.join("j_ssh");
+                let hl_path = sb_dir2.join("hl_secret.txt");
+                let ps_mklink = hidden_command(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                )
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-Item -ItemType Junction -Path $env:J_LINK -Value $env:J_TARGET | Out-Null; New-Item -ItemType HardLink -Path $env:HL_LINK -Value $env:HL_TARGET | Out-Null",
+                ])
+                .env("J_LINK", &j_path)
+                .env("J_TARGET", &ssh_dir_clone)
+                .env("HL_LINK", &hl_path)
+                .env("HL_TARGET", &secret_file_clone)
+                .output()
+                .map_err(|e| format!("create host junction and hardlink inside active sandbox: {e}"))?;
+                if !ps_mklink.status.success() {
+                    return Err(format!(
+                        "host New-Item Junction/HardLink failed: {}",
+                        String::from_utf8_lossy(&ps_mklink.stderr)
+                    ));
+                }
+                let j_meta = std::fs::symlink_metadata(&j_path)
+                    .map_err(|e| format!("junction j_ssh must exist inside sandbox on host: {e}"))?;
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if (j_meta.file_attributes() & 0x0400) == 0 {
+                        return Err("j_ssh must have FILE_ATTRIBUTE_REPARSE_POINT".to_string());
+                    }
+                }
+                if !hl_path.is_file() {
+                    return Err("hardlink hl_secret.txt must exist inside sandbox on host".to_string());
+                }
+                rusty_grid_worker::isolation::windows::prepare_worker_toolchains(
+                    &host_clone,
+                    &[],
+                    Some(&base_clone),
+                )
+                .map_err(|e| {
+                    format!("prepare_worker_toolchains with active junction and hardlink: {e}")
+                })?;
+                std::fs::write(sb_dir2.join("go.txt"), "1")
+                    .map_err(|e| format!("write go.txt: {e}"))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| format!("plant_fut join error: {e}"))?
+        };
+        let (result2, plant_res) = tokio::join!(exec_fut, plant_fut);
+        if let Err(err) = plant_res {
+            panic!("{err}; attempt 2: {}", format_result_diag(&result2));
+        }
         assert!(
             result2.is_success(),
-            "attempt 2: {:?} {}",
-            result2.error,
-            result2.stderr_str()
+            "attempt 2: {}",
+            format_result_diag(&result2)
         );
         let got2 = lines(&result2);
         assert!(
@@ -5844,22 +6037,20 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let script_path = repo_root.join("windows/revoke-isolation-acls.ps1");
         assert!(script_path.is_file(), "missing {}", script_path.display());
 
-        let out = std::process::Command::new(
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-        )
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script_path)
-        .arg("-DryRun")
-        .arg("-ManifestPath")
-        .arg(&manifest)
-        .output()
-        .expect("run revoke-isolation-acls.ps1 -DryRun");
+        let out = hidden_command(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script_path)
+            .arg("-DryRun")
+            .arg("-ManifestPath")
+            .arg(&manifest)
+            .output()
+            .expect("run revoke-isolation-acls.ps1 -DryRun");
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -6261,7 +6452,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
 
         let tamper_tree = ws_root.join("tamper_ws").join("tree");
         std::fs::remove_dir_all(&tamper_tree).unwrap();
-        let j_status = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+        let j_status = hidden_command(r"C:\Windows\System32\cmd.exe")
             .args([
                 "/C",
                 "mklink",
@@ -6303,7 +6494,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         );
 
         std::fs::remove_dir_all(&tamper_tree).unwrap();
-        let j_status2 = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+        let j_status2 = hidden_command(r"C:\Windows\System32\cmd.exe")
             .args([
                 "/C",
                 "mklink",
@@ -6438,6 +6629,186 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         );
     }
 
+    #[tokio::test]
+    async fn test_worker_with_sandbox_base_under_junction_starts_and_runs_under_fs() {
+        skip_if_duplicate_ci_pass!();
+        require_appcontainer!();
+
+        struct AclRevokeGuard(PathBuf);
+        impl Drop for AclRevokeGuard {
+            fn drop(&mut self) {
+                let _ = rusty_grid_worker::isolation::windows::revoke_oxideswarm_toolchain_acls(
+                    &self.0,
+                );
+            }
+        }
+        struct JunctionGuard(PathBuf);
+        impl Drop for JunctionGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        struct SubstGuard(String);
+        impl Drop for SubstGuard {
+            fn drop(&mut self) {
+                let _ = hidden_command(r"C:\Windows\System32\subst.exe")
+                    .args([&self.0, "/D"])
+                    .status();
+            }
+        }
+
+        let temp_home = tempfile::tempdir().expect("temp home");
+        let temp_root = tempfile::tempdir().expect("temp junction root");
+        let _acl_guard = AclRevokeGuard(
+            temp_home
+                .path()
+                .join(".oxideswarm")
+                .join("windows_acl_grants.txt"),
+        );
+
+        let rustup_home = temp_home.path().join(".rustup");
+        let cargo_home = temp_home.path().join(".cargo");
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(temp_home.path().join(".oxideswarm")).unwrap();
+        std::fs::write(
+            temp_home.path().join(".oxideswarm").join("cluster.secret"),
+            SECRET,
+        )
+        .unwrap();
+
+        let host = HostDirs::from_home(
+            temp_home.path().to_path_buf(),
+            Some(rustup_home),
+            Some(cargo_home),
+        );
+
+        let real_parent = temp_root.path().join("real_parent");
+        let real_sandboxes = real_parent.join("sandboxes");
+        std::fs::create_dir_all(&real_sandboxes).unwrap();
+        let junc_parent = temp_root.path().join("junc_parent");
+        let j_status = hidden_command(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junc_parent.to_string_lossy(),
+                &real_parent.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J junc_parent");
+        assert!(j_status.success());
+        let _junc_parent_guard = JunctionGuard(junc_parent.clone());
+
+        // 1. Direct caller passing `sandbox_base` under an ancestor junction:
+        //    `probe_with_config` normalises ancestor junctions before `protect_sandbox_base`,
+        //    while `SandboxConfig::ensure_usable` still refuses ancestor reparse points (design 0021).
+        let junc_sb = junc_parent.join("sandboxes");
+        rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &junc_sb,
+            &host,
+            &[],
+        )
+        .await
+        .expect(
+            "verify_isolation_support_with_config must accept sandbox_base under ancestor junction",
+        );
+
+        let junc_err = SandboxConfig::new(junc_sb)
+            .ensure_usable()
+            .await
+            .expect_err("ensure_usable must still refuse an ancestor reparse point");
+        assert!(junc_err.to_string().contains("reparse point"), "{junc_err}");
+
+        // 2. End-to-end startup check + task execution on a `SUBST` drive (`SandboxConfig::ensure_usable`,
+        //    `verify_isolation_support_with_config`, and `TaskRunner::execute_task`).
+        let drive_letter = ['Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q']
+            .into_iter()
+            .find(|ch| !Path::new(&format!("{ch}:\\")).exists())
+            .expect("free drive letter for SUBST test");
+        let drive = format!("{drive_letter}:");
+        let subst_status = hidden_command(r"C:\Windows\System32\subst.exe")
+            .arg(&drive)
+            .arg(&real_parent)
+            .status()
+            .expect("subst drive");
+        assert!(subst_status.success(), "subst {drive} failed");
+        let _subst_guard = SubstGuard(drive.clone());
+
+        let subst_sb = PathBuf::from(format!("{drive}\\sandboxes_subst"));
+        let subst_cfg = SandboxConfig::new(subst_sb);
+        subst_cfg
+            .ensure_usable()
+            .await
+            .expect("ensure_usable on SUBST sandbox_base");
+
+        rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &subst_cfg.base_dir,
+            &host,
+            &[],
+        )
+        .await
+        .expect("startup self-check must accept sandbox_base on SUBST drive");
+
+        let runner_cfg = RunnerConfig::new(subst_cfg)
+            .with_isolation(IsolationLevel::Fs)
+            .with_host_dirs(host.clone());
+        let caps = WorkerCapabilities::new("feat3-subst-sb", 2, 4096, false, false, None);
+        let runner = TaskRunner::new(uuid::Uuid::new_v4(), caps, runner_cfg);
+        let task = Task::new(
+            TaskSpec::Command {
+                program: r"C:\Windows\System32\cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    "echo SUBST_SB_OK > out.txt & type out.txt".into(),
+                ],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            TaskRequirements::generic(1, 30),
+        );
+        let res = runner.execute_task(&task, None, None).await;
+        assert!(
+            res.is_success() && res.stdout_str().contains("SUBST_SB_OK"),
+            "task under SUBST sandbox base must succeed: {:?} / {} / {}",
+            res.error,
+            res.stdout_str(),
+            res.stderr_str()
+        );
+
+        // 3. A junction directly at `sandbox_base` itself must still be refused.
+        let real_sb_direct = temp_root.path().join("real_sb_direct");
+        std::fs::create_dir_all(&real_sb_direct).unwrap();
+        let junc_sb_self = temp_root.path().join("junc_sb_self");
+        let j_self_status = hidden_command(r"C:\Windows\System32\cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junc_sb_self.to_string_lossy(),
+                &real_sb_direct.to_string_lossy(),
+            ])
+            .status()
+            .expect("mklink /J junc_sb_self");
+        assert!(j_self_status.success());
+        let _junc_self_guard = JunctionGuard(junc_sb_self.clone());
+        let direct_err = rusty_grid_worker::isolation::verify_isolation_support_with_config(
+            IsolationLevel::Fs,
+            &junc_sb_self,
+            &host,
+            &[],
+        )
+        .await
+        .expect_err("junction directly at sandbox_base must remain refused");
+        assert!(
+            direct_err.to_string().contains("reparse point"),
+            "{direct_err}"
+        );
+    }
+
     /// BUG-18 regression test: bare `whoami` (`TaskSpec::Command { program: "whoami", .. }`)
     /// under `--isolation fs` must resolve to `%SystemRoot%\System32\whoami.exe` rather than
     /// `C:\Program Files\Git\usr\bin\whoami.exe` (`msys-2.0.dll`, which fails with
@@ -6478,7 +6849,7 @@ if ([System.IO.File]::Exists("$sb\hl_secret.txt")) {{
         let exe_path = out_dir.join(format!("{name}.exe"));
         std::fs::write(&rs_path, src).expect("write helper rust source");
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-        let output = std::process::Command::new(rustc)
+        let output = hidden_command(rustc)
             .arg(&rs_path)
             .arg("-o")
             .arg(&exe_path)

@@ -143,6 +143,8 @@ impl Cluster {
             "127.0.0.1:0",
             "--heartbeat-interval",
             "1",
+            "--max-host-cpu-pct",
+            "100",
         ])
         .arg("--port-file")
         .arg(&port_file)

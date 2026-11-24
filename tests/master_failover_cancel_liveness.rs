@@ -68,7 +68,7 @@ async fn spawn_master() -> MasterHandle {
 async fn spawn_master_with_reaper(reaper: ReaperConfig) -> MasterHandle {
     MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap()),
-        SchedulerConfig::default(),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         reaper,
     )
     .await
@@ -1319,9 +1319,13 @@ mod quic {
             .with_p2p(true)
             .with_p2p_minimal_preset(true)
             .with_ephemeral_key(true);
-        let master = MasterServer::spawn_with_config(config, SchedulerConfig::default(), reaper)
-            .await
-            .expect("spawn p2p master");
+        let master = MasterServer::spawn_with_config(
+            config,
+            SchedulerConfig::default().without_host_cpu_backpressure(),
+            reaper,
+        )
+        .await
+        .expect("spawn p2p master");
         let ticket = master.p2p_ticket().expect("p2p ticket").to_string();
         let mut master_addr = parse_p2p_ticket(&ticket).expect("parse ticket");
         master_addr.addrs.retain(|a| !a.is_relay());

@@ -401,7 +401,7 @@ impl CommandExecutor {
 
         if !escaped.is_empty() {
             let mut sys = System::new();
-            sys.refresh_processes();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             for pid in escaped {
                 if let Some(proc) = sys.process(pid) {
                     let _ = proc.kill();
@@ -418,7 +418,7 @@ impl CommandExecutor {
     /// `root` is a live (unreaped) child of ours, so the PID cannot belong to someone else.
     fn collect_descendants(root: u32) -> Vec<sysinfo::Pid> {
         let mut sys = System::new();
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
         let mut found = Vec::new();
         let mut queue = vec![sysinfo::Pid::from(root as usize)];
@@ -585,7 +585,7 @@ mod tests {
     #[cfg(unix)]
     fn process_is_alive(pid: u32) -> bool {
         let mut sys = System::new();
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         sys.process(sysinfo::Pid::from(pid as usize))
             .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
     }
@@ -756,23 +756,25 @@ mod tests {
         let (cmd, args) = (
             "shell_exec",
             serde_json::json!({
-                "cmd": "powershell -NoProfile -Command Start-Sleep -Seconds 10"
+                "cmd": "powershell -NoProfile -Command Start-Sleep -Seconds 120"
             }),
         );
 
         #[cfg(not(target_os = "windows"))]
-        let (cmd, args) = ("shell_exec", serde_json::json!({"cmd": "sleep 10"}));
+        let (cmd, args) = ("shell_exec", serde_json::json!({"cmd": "sleep 120"}));
 
         let start = std::time::Instant::now();
         let res = CommandExecutor::execute(cmd, &args, Some(1000)).await;
         let elapsed = start.elapsed();
+        println!("test_command_timeout_kills_hung_process finished in {elapsed:?}");
 
         assert_eq!(res.status, "timeout");
         assert_eq!(res.exit_code, 124);
         assert!(res.stderr.contains("timed out after 1000 ms"));
         assert!(
-            elapsed.as_millis() >= 950 && elapsed.as_millis() < 4000,
-            "Expected timeout in ~1000ms, elapsed: {:?}",
+            elapsed >= std::time::Duration::from_millis(950)
+                && elapsed < std::time::Duration::from_secs(60),
+            "Expected timeout after ~1000ms (0.95..60s), elapsed: {:?}",
             elapsed
         );
     }

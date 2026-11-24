@@ -24,6 +24,7 @@ use rusty_grid_core::blob::{
 };
 
 use crate::blob_cache::{BlobCache, CachePin};
+use crate::runner::is_reserved_checkpoint_rel;
 
 /// Default cap on the total size of a task's output files: 1 GiB.
 pub const DEFAULT_OUTPUT_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -188,6 +189,15 @@ fn collect_outputs_inner(
     let mut visited = 0usize;
     'patterns: for pattern in &patterns {
         let prefix = pattern.literal_prefix();
+        if is_reserved_checkpoint_rel(&prefix) {
+            if pattern.is_literal() {
+                return Err(format!(
+                    "output '{}' targets the reserved checkpoint directory",
+                    pattern.as_str()
+                ));
+            }
+            continue 'patterns;
+        }
         let start = if prefix.is_empty() {
             root.clone()
         } else {
@@ -292,6 +302,13 @@ fn describe_sandbox_root(root: &Path) -> String {
     let mut read = 0usize;
     let mut capped = false;
     for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_reserved_checkpoint_rel)
+        {
+            continue;
+        }
         if read == MAX_ROOT_ENTRIES_READ {
             capped = true;
             break;
@@ -442,6 +459,9 @@ fn walk(
                 format!("{rel_dir}/{lossy_name}")
             };
             let entry_utf8 = dir_utf8 && name_utf8;
+            if is_reserved_checkpoint_rel(&rel) {
+                continue;
+            }
             if file_type.is_dir() {
                 stack.push((entry.path(), rel, entry_utf8));
             } else if file_type.is_file() && pattern.selects(&rel) {
@@ -498,7 +518,9 @@ pub fn human_bytes(bytes: u64) -> String {
     format!("{value:.1} {unit}")
 }
 
+// LV-4: cfg(unix) libc::mkfifo fixture in staging tests (production staging.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use rusty_grid_core::blob::{BlobId, SANDBOX_ROOT};
@@ -1167,5 +1189,115 @@ mod tests {
         assert!(err.contains("out/grown.bin"), "{err}");
         assert!(err.contains("--output-limit-mb"), "{err}");
         assert!(!cache.contains(&BlobId::of(&vec![7u8; 4096])));
+    }
+
+    #[test]
+    fn output_globs_and_star_star_exclude_checkpoint_directory() {
+        let (_dir, sandbox, cache) = setup();
+        write(&sandbox, "result.txt", b"ok");
+        write(&sandbox, "nested/data.bin", b"123");
+        write(&sandbox, ".oxideswarm_checkpoint/state.bin", b"secret-cp");
+        write(&sandbox, ".oxideswarm_checkpoint/sub/step.txt", b"step1");
+
+        let outputs = collect_outputs(
+            &sandbox,
+            &["**/*".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap();
+        let paths: Vec<&str> = outputs.iter().map(|o| o.path.as_str()).collect();
+        assert_eq!(paths, ["nested/data.bin", "result.txt"]);
+
+        // Wildcard targeting checkpoint dir directly returns nothing.
+        let cp_glob = collect_outputs(
+            &sandbox,
+            &[".oxideswarm_checkpoint/*".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap();
+        assert!(cp_glob.is_empty());
+
+        // Literal targeting checkpoint dir is refused.
+        let err = collect_outputs(
+            &sandbox,
+            &[".oxideswarm_checkpoint/state.bin".to_string()],
+            &cache,
+            OutputLimits::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("reserved checkpoint directory"), "{err}");
+
+        // Mixed-case, Unicode case-folded, & `./`-normalized wildcards return nothing
+        // (even on case-insensitive APFS/NTFS).
+        for wildcard in [
+            ".OXIDESWARM_CHECKPOINT/*",
+            ".Oxideswarm_Checkpoint/**",
+            "./.Oxideswarm_Checkpoint/*",
+            ".\\.OXIDESWARM_CHECKPOINT\\**",
+            ".oxideswarm_chec\u{212a}point/*",
+            ".oxide\u{017f}warm_checkpoint/*",
+            "./.oxideswarm_chec\u{212a}point/**",
+            ".\\.oxide\u{017f}warm_checkpoint\\**",
+        ] {
+            let mixed_glob = collect_outputs(
+                &sandbox,
+                &[wildcard.to_string()],
+                &cache,
+                OutputLimits::default(),
+                false,
+            )
+            .unwrap();
+            assert!(
+                mixed_glob.is_empty(),
+                "wildcard '{wildcard}' must not leak checkpoint files: {mixed_glob:?}"
+            );
+        }
+
+        // Mixed-case, Unicode case-folded, & `./`-normalized literal paths targeting checkpoint dir are refused.
+        for literal in [
+            ".OXIDESWARM_CHECKPOINT/state.bin",
+            "./.Oxideswarm_Checkpoint/state.bin",
+            ".\\.Oxideswarm_Checkpoint\\sub\\step.txt",
+            ".OXIDESWARM_CHECKPOINT",
+            ".oxideswarm_chec\u{212a}point/state.bin",
+            "./.oxideswarm_chec\u{212a}point/state.bin",
+            ".oxide\u{017f}warm_checkpoint/state.bin",
+            ".oxideswarm_chec\u{212a}point",
+        ] {
+            let err = collect_outputs(
+                &sandbox,
+                &[literal.to_string()],
+                &cache,
+                OutputLimits::default(),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("reserved checkpoint directory"),
+                "literal '{literal}' must be rejected, got: {err}"
+            );
+        }
+
+        // `describe_sandbox_root` omits checkpoint directory even under mixed-case or Unicode case folding.
+        for variant in [
+            ".OXIDESWARM_CHECKPOINT",
+            ".oxideswarm_chec\u{212a}point",
+            ".oxide\u{017f}warm_checkpoint",
+        ] {
+            let mixed_dir = tempfile::tempdir().unwrap();
+            write(mixed_dir.path(), &format!("{variant}/secret.bin"), b"x");
+            write(mixed_dir.path(), "visible.txt", b"ok");
+            let desc = describe_sandbox_root(mixed_dir.path());
+            assert!(
+                !desc.to_ascii_lowercase().contains("oxideswarm") && !desc.contains(variant),
+                "unexpected checkpoint dir variant '{variant}' in: {desc}"
+            );
+            assert!(desc.contains("visible.txt"), "{desc}");
+        }
     }
 }

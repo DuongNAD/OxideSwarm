@@ -224,10 +224,17 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::transport::GRID_ALPN;
 
-    // 1. Bind two independent Iroh QUIC endpoints on loopback
+    // 1. Bind two independent Iroh QUIC endpoints on loopback with a 64 KiB stream receive window
+    //    (4 MiB connection window) so pausing the data sink saturates STREAM_DATA flow control while
+    //    leaving STREAM_CONTROL unblocked.
+    let server_quic = iroh::endpoint::QuicTransportConfig::builder()
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(64 * 1024))
+        .receive_window(iroh::endpoint::VarInt::from_u32(4 * 1024 * 1024))
+        .build();
     let ep_server = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .transport_config(server_quic)
         .bind()
         .await
         .expect("bind server endpoint");
@@ -240,6 +247,8 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
         .expect("bind client endpoint");
 
     let server_addr = ep_server.addr();
+    let release_data_sink = Arc::new(Notify::new());
+    let release_sink_srv = Arc::clone(&release_data_sink);
 
     // 2. Server task accepts connection and incoming bi-directional streams
     let server_handle = tokio::spawn(async move {
@@ -274,8 +283,9 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
         let ctrl_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
         let mut ctrl_transport = MessageTransport::new(ctrl_stream);
 
-        // Spawn a background data sink on the server reading heavy data
+        // Data sink pauses until `release_sink_srv` fires so STREAM_DATA saturates its window.
         let data_sink_task = tokio::spawn(async move {
+            release_sink_srv.notified().await;
             let mut total_read = 0usize;
             let mut buf = vec![0u8; 16 * 1024];
             loop {
@@ -333,8 +343,10 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
     data_send.flush().await.expect("flush data tag");
 
     // 4. Anti-Head-of-Line Blocking Simulation:
-    // Concurrently stream 256KB of heavy data on the Data Lane while sending heartbeats on Control Lane
+    // Stream 256KB of heavy data on the Data Lane while sink is paused so STREAM_DATA is backpressured
     let heavy_payload_size = 256 * 1024;
+    let data_started = Arc::new(Notify::new());
+    let data_started_tx = Arc::clone(&data_started);
     let data_producer_task = tokio::spawn(async move {
         let chunk = vec![0xAAu8; 16 * 1024];
         let mut sent = 0;
@@ -343,16 +355,23 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
                 .write_all(&chunk)
                 .await
                 .expect("write heavy chunk");
-            data_send.flush().await.expect("flush heavy chunk");
+            if sent == 0 {
+                data_started_tx.notify_one();
+            }
             sent += chunk.len();
-            tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        data_send.flush().await.expect("flush heavy chunk");
         data_send.shutdown().await.expect("shutdown data send");
     });
 
-    // Measure heartbeat RTT while data is actively streaming
+    tokio::time::timeout(Duration::from_secs(60), data_started.notified())
+        .await
+        .expect("data producer started within 60 s");
+
+    // Measure heartbeat RTT while data lane is flow-control blocked
     let worker_id = Uuid::new_v4();
     let mut heartbeat_latencies = Vec::new();
+    let hb_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     for i in 0..10 {
         let t0 = Instant::now();
@@ -363,8 +382,15 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
             cpu_usage_pct: 50.0,
             ram_available_mb: 8192,
         };
-        ctrl_transport.send_msg(&hb).await.expect("send hb");
-        let ack: Option<MasterMessage> = ctrl_transport.recv_msg().await.expect("recv ack");
+        tokio::time::timeout_at(hb_deadline, ctrl_transport.send_msg(&hb))
+            .await
+            .expect("control heartbeat send hung under data backpressure")
+            .expect("send hb");
+        let ack: Option<MasterMessage> =
+            tokio::time::timeout_at(hb_deadline, ctrl_transport.recv_msg())
+                .await
+                .expect("control heartbeat ack hung under data backpressure")
+                .expect("recv ack");
         let elapsed = t0.elapsed();
         heartbeat_latencies.push(elapsed);
 
@@ -377,6 +403,13 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
+    // Structural HoL proof: all 10 heartbeats succeeded while data stream remained flow-control blocked!
+    assert!(
+        !data_producer_task.is_finished(),
+        "data stream must still be backpressured while heartbeats completed on control lane"
+    );
+    release_data_sink.notify_one();
+
     // Clean disconnect on control lane
     let disc = WorkerMessage::Disconnecting {
         worker_id,
@@ -387,24 +420,24 @@ async fn test_quic_stream_multiplexing_isolation_and_anti_hol_blocking() {
         .await
         .expect("send disconnecting");
 
-    data_producer_task.await.expect("data producer finish");
-    let total_server_read = server_handle.await.expect("server finish");
+    tokio::time::timeout(Duration::from_secs(60), data_producer_task)
+        .await
+        .expect("data producer hung after sink release")
+        .expect("data producer finish");
+    let total_server_read = tokio::time::timeout(Duration::from_secs(60), server_handle)
+        .await
+        .expect("server finish hung after sink release")
+        .expect("server finish");
 
     assert_eq!(
         total_server_read, heavy_payload_size,
         "Server must receive all streamed data"
     );
 
-    // Assert that average heartbeat latency is under 50ms despite concurrent data streaming
     let avg_latency: Duration =
         heartbeat_latencies.iter().sum::<Duration>() / heartbeat_latencies.len() as u32;
     println!(
         "Control Lane Avg Heartbeat Latency under Heavy Data Stream: {:?}",
-        avg_latency
-    );
-    assert!(
-        avg_latency < Duration::from_millis(50),
-        "Heartbeat latency over multiplexed control stream must remain sub-50ms (got: {:?})",
         avg_latency
     );
 }

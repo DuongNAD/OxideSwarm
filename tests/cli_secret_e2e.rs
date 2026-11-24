@@ -106,9 +106,16 @@ fn start_master(home: &Path, listen: &str, args: &[&str]) -> Master {
     let id = SEQ.fetch_add(1, Ordering::SeqCst);
     let port_file = home.join(format!("master-{id}.port"));
     let mut cmd = cli(home);
-    cmd.args(["master", "--listen", listen, "--port-file"])
-        .arg(&port_file)
-        .args(args);
+    cmd.args([
+        "master",
+        "--listen",
+        listen,
+        "--max-host-cpu-pct",
+        "100",
+        "--port-file",
+    ])
+    .arg(&port_file)
+    .args(args);
     let service = Service::spawn(cmd, home.join(format!("master-{id}.log")));
     let mut port = None;
     assert!(

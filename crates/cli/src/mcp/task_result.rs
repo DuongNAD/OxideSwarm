@@ -54,7 +54,7 @@ pub(super) async fn tool_task_result(
         if let Err(e) = state.resolve_target_addr().await {
             return ToolCallResult::error(e);
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let deadline = crate::matrix::safe_deadline(Duration::from_secs(timeout_secs));
         let mut transport = match state.connect_dedicated_until(deadline).await {
             Ok(t) => t,
             Err(e) => return ToolCallResult::error(e),

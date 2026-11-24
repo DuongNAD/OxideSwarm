@@ -330,7 +330,14 @@ fn test_cli_submit_staged_relative_executable_under_off_and_fs_isolation() {
     let master_err = master_out.try_clone().unwrap();
     let mut master_cmd = cli_for_bug21(home);
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .arg("--blob-dir")
         .arg(&blob_dir)

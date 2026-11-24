@@ -386,8 +386,24 @@ mod middleware {
             {
                 Some(AuthScope::Observer)
             }
+            (&Method::GET, p)
+                if p == "/api/members"
+                    || p.starts_with("/api/members/")
+                    || p == "/api/invites"
+                    || p.starts_with("/api/invites/") =>
+            {
+                Some(AuthScope::Admin)
+            }
             (&Method::POST, p) if p.starts_with("/api/tasks") => Some(AuthScope::Submitter),
             (&Method::POST, p) if p.starts_with("/api/modes/run") => Some(AuthScope::Admin),
+            (&Method::POST, p)
+                if p.starts_with("/api/members/")
+                    || p == "/api/invites"
+                    || p.starts_with("/api/invites/") =>
+            {
+                Some(AuthScope::Admin)
+            }
+            (&Method::DELETE, p) if p.starts_with("/api/invites/") => Some(AuthScope::Admin),
             (&Method::GET, _) => Some(AuthScope::Observer),
             _ => Some(AuthScope::Admin),
         }
@@ -996,6 +1012,35 @@ mod tests {
                     "GET {path}"
                 );
             }
+            for path in [
+                "/api/members",
+                "/api/members/abc",
+                "/api/invites",
+                "/api/invites/abc",
+            ] {
+                assert_eq!(
+                    route_required_scope(&Method::GET, path),
+                    Some(AuthScope::Admin),
+                    "GET {path}"
+                );
+            }
+            for path in [
+                "/api/members/abc/approve",
+                "/api/members/abc/reject",
+                "/api/members/abc/revoke",
+                "/api/members/abc/rename",
+                "/api/invites",
+            ] {
+                assert_eq!(
+                    route_required_scope(&Method::POST, path),
+                    Some(AuthScope::Admin),
+                    "POST {path}"
+                );
+            }
+            assert_eq!(
+                route_required_scope(&Method::DELETE, "/api/invites/abc"),
+                Some(AuthScope::Admin)
+            );
             assert_eq!(
                 route_required_scope(&Method::POST, "/metrics"),
                 Some(AuthScope::Admin)

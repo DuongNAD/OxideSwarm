@@ -5,16 +5,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
-use rusty_grid_core::task::{TaskId, TaskResult};
+use rusty_grid_core::protocol::WorkerMessage;
+use rusty_grid_core::task::{Bytes, TaskId, TaskResult};
 
 use crate::isolation::IsolationLevel;
 use crate::process_tree::{configure_command, ProcessTree};
 use crate::sandbox::sanitize_relative_path;
 
 use super::capture::{append_note, cancellation, check_cancelled_now, AbortOnDrop, OutputReaders};
+use super::checkpoint::{
+    pack_checkpoint_if_changed, ProcessCheckpointCtx, CHECKPOINT_ENV_VAR,
+    MIN_CHECKPOINT_POLL_INTERVAL,
+};
 use super::{
     TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_INTERRUPTED,
     EXIT_CODE_TIMEOUT, POST_KILL_DRAIN, REAP_TIMEOUT, SECRET_ENV_VARS,
@@ -446,9 +452,44 @@ impl TaskRunner {
         stdin_data: Option<Vec<u8>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
+        cancel_rx: Option<oneshot::Receiver<String>>,
+        start_time: Instant,
+        workspace_ctx: Option<WorkspaceProcessCtx<'_>>,
+    ) -> TaskResult {
+        self.execute_process_supervised_with_checkpoint(
+            task_id,
+            sandbox_path,
+            program,
+            args,
+            cwd,
+            env,
+            stdin_data,
+            timeout,
+            child_pid,
+            cancel_rx,
+            start_time,
+            workspace_ctx,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_process_supervised_with_checkpoint(
+        &self,
+        task_id: TaskId,
+        sandbox_path: &Path,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        stdin_data: Option<Vec<u8>>,
+        timeout: Duration,
+        child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
         workspace_ctx: Option<WorkspaceProcessCtx<'_>>,
+        mut checkpoint_ctx: Option<ProcessCheckpointCtx>,
     ) -> TaskResult {
         if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
             return TaskResult::failure(
@@ -763,6 +804,21 @@ impl TaskRunner {
             }
         }
 
+        if let Some(ref cp_ctx) = checkpoint_ctx {
+            #[cfg(windows)]
+            let eff_cp_dir = if self.config.isolation != IsolationLevel::Off
+                && cp_ctx.checkpoint_dir.exists()
+                && !crate::isolation::windows::is_reparse_point(&cp_ctx.checkpoint_dir)
+            {
+                crate::isolation::windows::normalize_win_path(&cp_ctx.checkpoint_dir)
+            } else {
+                cp_ctx.checkpoint_dir.clone()
+            };
+            #[cfg(not(windows))]
+            let eff_cp_dir = cp_ctx.checkpoint_dir.clone();
+            cmd.env(CHECKPOINT_ENV_VAR, eff_cp_dir.to_string_lossy().to_string());
+        }
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -930,11 +986,88 @@ impl TaskRunner {
             TimedOut,
         }
 
-        let ended = tokio::select! {
-            status = child.wait() => Ended::Exited(status),
-            reason = cancellation(&mut cancel_rx) => Ended::Cancelled(reason),
-            _ = tokio::time::sleep(timeout) => Ended::TimedOut,
+        let sleep_timeout = tokio::time::sleep(timeout);
+        tokio::pin!(sleep_timeout);
+        let poll_interval = checkpoint_ctx
+            .as_ref()
+            .map(|c| c.poll_interval.max(MIN_CHECKPOINT_POLL_INTERVAL))
+            .unwrap_or(Duration::from_secs(3600));
+        let mut poll_ticker = tokio::time::interval(poll_interval);
+        poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut has_cp_tx = checkpoint_ctx
+            .as_ref()
+            .and_then(|c| c.checkpoint_tx.as_ref())
+            .is_some();
+        if has_cp_tx {
+            // Skip immediate t=0 tick so periodic scans start after `poll_interval`.
+            poll_ticker.tick().await;
+        }
+        type CheckpointPackOutcome = Result<Option<([u8; 32], Bytes)>, String>;
+        let mut in_flight_pack: Option<JoinHandle<CheckpointPackOutcome>> = None;
+
+        let ended = loop {
+            tokio::select! {
+                status = child.wait() => break Ended::Exited(status),
+                reason = cancellation(&mut cancel_rx) => break Ended::Cancelled(reason),
+                _ = &mut sleep_timeout => break Ended::TimedOut,
+                _ = poll_ticker.tick(), if has_cp_tx && in_flight_pack.is_none() => {
+                    if let Some(ref cp_ctx) = checkpoint_ctx {
+                        let cp_dir = cp_ctx.checkpoint_dir.clone();
+                        let last_hash = cp_ctx.last_emitted_hash;
+                        in_flight_pack = Some(tokio::task::spawn_blocking(move || {
+                            pack_checkpoint_if_changed(&cp_dir, last_hash)
+                                .map_err(|e| e.to_string())
+                        }));
+                    }
+                }
+                pack_res = async {
+                    in_flight_pack
+                        .as_mut()
+                        .expect("in_flight_pack guarded by is_some()")
+                        .await
+                }, if in_flight_pack.is_some() => {
+                    in_flight_pack = None;
+                    match pack_res {
+                        Ok(Ok(Some((new_hash, delta_state)))) => {
+                            if let Some(ref mut cp_ctx) = checkpoint_ctx {
+                                if let Some(ref tx) = cp_ctx.checkpoint_tx {
+                                    let seq = cp_ctx.next_sequence;
+                                    let msg = WorkerMessage::Checkpoint {
+                                        task_id: cp_ctx.task_id,
+                                        sequence: seq,
+                                        delta_state,
+                                    };
+                                    match tx.try_send(msg) {
+                                        Ok(()) => {
+                                            cp_ctx.last_emitted_hash = new_hash;
+                                            cp_ctx.next_sequence = seq.saturating_add(1);
+                                        }
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            debug!(task_id = %cp_ctx.task_id, "Checkpoint channel full; deferring periodic checkpoint emission");
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            has_cp_tx = false;
+                                            cp_ctx.checkpoint_tx = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(err)) => {
+                            warn!(task_id = %task_id, error = %err, "Skipping periodic process checkpoint");
+                        }
+                        Err(join_err) => {
+                            warn!(task_id = %task_id, error = %join_err, "Checkpoint packing task failed");
+                        }
+                    }
+                }
+            }
         };
+
+        if let Some(handle) = in_flight_pack.take() {
+            let _ = handle.await;
+        }
 
         match ended {
             Ended::Exited(status_res) => {
@@ -946,6 +1079,9 @@ impl TaskRunner {
                 tree.kill_async(None).await;
                 if !drained {
                     readers.wait(POST_KILL_DRAIN).await;
+                }
+                if !status_res.as_ref().is_ok_and(|s| s.success()) {
+                    emit_final_process_checkpoint(&mut checkpoint_ctx).await;
                 }
                 let (stdout_bytes, mut stderr_bytes) = readers.finish();
                 if !drained {
@@ -996,6 +1132,7 @@ impl TaskRunner {
             Ended::Cancelled(reason) => {
                 info!(task_id = %task_id, "Aborting child process per cancellation signal");
                 self.stop_tree(&mut child, &tree).await;
+                emit_final_process_checkpoint(&mut checkpoint_ctx).await;
                 readers.wait(POST_KILL_DRAIN).await;
                 let (stdout_bytes, stderr_bytes) = readers.finish();
                 TaskResult::failure(
@@ -1012,6 +1149,7 @@ impl TaskRunner {
             Ended::TimedOut => {
                 warn!(task_id = %task_id, timeout_secs = timeout.as_secs(), "Killing runaway process after watchdog timeout");
                 self.stop_tree(&mut child, &tree).await;
+                emit_final_process_checkpoint(&mut checkpoint_ctx).await;
                 readers.wait(POST_KILL_DRAIN).await;
                 let (stdout_bytes, stderr_bytes) = readers.finish();
                 let msg = format!("Task timed out after {}s", timeout.as_secs());
@@ -1045,5 +1183,48 @@ impl TaskRunner {
         #[cfg(not(windows))]
         let _ = child.start_kill();
         let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+    }
+}
+
+async fn emit_final_process_checkpoint(checkpoint_ctx: &mut Option<ProcessCheckpointCtx>) {
+    let Some(ref mut cp_ctx) = checkpoint_ctx else {
+        return;
+    };
+    let Some(ref tx) = cp_ctx.checkpoint_tx else {
+        return;
+    };
+    if tx.is_closed() {
+        return;
+    }
+    let cp_dir = cp_ctx.checkpoint_dir.clone();
+    let last_hash = cp_ctx.last_emitted_hash;
+    let task_id = cp_ctx.task_id;
+    let packed = tokio::task::spawn_blocking(move || {
+        pack_checkpoint_if_changed(&cp_dir, last_hash).map_err(|e| e.to_string())
+    })
+    .await;
+    match packed {
+        Ok(Ok(Some((new_hash, delta_state)))) => {
+            let seq = cp_ctx.next_sequence;
+            let msg = WorkerMessage::Checkpoint {
+                task_id,
+                sequence: seq,
+                delta_state,
+            };
+            if tokio::time::timeout(Duration::from_millis(500), tx.send(msg))
+                .await
+                .is_ok_and(|r| r.is_ok())
+            {
+                cp_ctx.last_emitted_hash = new_hash;
+                cp_ctx.next_sequence = seq.saturating_add(1);
+            }
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(err)) => {
+            warn!(task_id = %task_id, error = %err, "Skipping final process checkpoint");
+        }
+        Err(join_err) => {
+            warn!(task_id = %task_id, error = %join_err, "Final checkpoint packing task failed");
+        }
     }
 }

@@ -55,8 +55,23 @@ use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
 use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+fn test_scheduler_config() -> SchedulerConfig {
+    SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure()
+}
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(config, test_scheduler_config(), ReaperConfig::default())
+        .await
+        .expect("spawn master")
+}
 
 /// Asynchronously polls `condition` until it returns true or `timeout` expires.
 async fn wait_for<F, Fut>(timeout: Duration, step: Duration, mut condition: F) -> bool
@@ -141,7 +156,7 @@ fn make_builtin_task(name: &str, duration_ms: u64, max_retries: Option<u32>) -> 
 #[tokio::test]
 async fn test_stress_multi_worker_concurrent_crashes() {
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(5);
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let master_addr = master.server_addr().to_string();
 
     // Spawn 5 workers
@@ -290,7 +305,7 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
         .with_max_retries(3)
         .with_heartbeat_interval(60);
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let master_addr = master.server_addr();
 
     // 1. Worker 1: Graceful worker (starts first)
@@ -538,7 +553,7 @@ async fn test_stress_tcp_rst_vs_graceful_disconnect() {
 #[tokio::test]
 async fn test_stress_immediate_failover_latency_under_load() {
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let master_addr = master.server_addr().to_string();
 
     let (w1_tx, w1_rx) = watch::channel(false);
@@ -673,7 +688,7 @@ async fn test_stress_immediate_failover_latency_under_load() {
 #[tokio::test]
 async fn test_stress_high_volume_worker_churn() {
     let config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(10);
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master(config).await;
     let master_addr = master.server_addr().to_string();
 
     // Spawn 4 initial workers
@@ -829,9 +844,7 @@ async fn test_stress_high_volume_worker_churn() {
 #[tokio::test]
 async fn test_stress_concurrent_max_retries_and_waiters_resolution() {
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(2);
-    let master = MasterServer::spawn(server_config)
-        .await
-        .expect("spawn master");
+    let master = spawn_test_master(server_config).await;
     let master_addr = master.server_addr().to_string();
 
     // Spawn Worker 1
@@ -1055,9 +1068,10 @@ async fn test_stress_reaper_detection_and_failover() {
     let reaper_timeout = Duration::from_secs(2);
     let reaper_config = ReaperConfig::new(Duration::from_millis(25), reaper_timeout);
     let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3);
-    let master = MasterServer::spawn_with_config(server_config, Default::default(), reaper_config)
-        .await
-        .expect("master spawn");
+    let master =
+        MasterServer::spawn_with_config(server_config, test_scheduler_config(), reaper_config)
+            .await
+            .expect("master spawn");
     let master_addr = master.server_addr();
 
     // 1. Worker 1: Raw TCP connection that registers then HALTS all heartbeats (simulating silent freeze)

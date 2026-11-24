@@ -2,11 +2,11 @@
 
 use super::WINDOWS_SPAWN_LOCK;
 use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows_sys::Win32::Storage::FileSystem::{GetLongPathNameW, FILE_ATTRIBUTE_REPARSE_POINT};
 
 const WINDOWS_EXEC_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
 
@@ -16,7 +16,7 @@ pub(super) fn to_wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn strip_verbatim_prefix(raw: PathBuf) -> PathBuf {
+pub(super) fn strip_verbatim_prefix(raw: PathBuf) -> PathBuf {
     let s = raw.to_string_lossy();
     if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{stripped}"))
@@ -27,7 +27,7 @@ fn strip_verbatim_prefix(raw: PathBuf) -> PathBuf {
     }
 }
 
-fn lexically_resolve_dots(p: &Path) -> PathBuf {
+pub(super) fn lexically_resolve_dots(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {
@@ -43,6 +43,62 @@ fn lexically_resolve_dots(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+pub(super) fn abs_win_no_canon(p: &Path) -> PathBuf {
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    strip_verbatim_prefix(abs)
+}
+
+pub(super) fn components_ci_eq(a: &Path, b: &Path) -> bool {
+    let mut ia = a.components();
+    let mut ib = b.components();
+    loop {
+        match (ia.next(), ib.next()) {
+            (None, None) => return true,
+            (Some(ca), Some(cb)) => {
+                if !ca
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&cb.as_os_str().to_string_lossy())
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Expands 8.3 short filename components (such as `RUNNER~1`) via `GetLongPathNameW` without
+/// dereferencing symlinks or NTFS junctions.
+pub(super) fn expand_short_names_lexical(path: &Path) -> PathBuf {
+    let wide_in = to_wide(path.as_os_str());
+    let mut buf = vec![0u16; 260];
+    // SAFETY: `wide_in` is a NUL-terminated UTF-16 `Vec<u16>` alive for this call, and `buf` has
+    // `buf.len()` writable `u16` elements.
+    let mut len = unsafe { GetLongPathNameW(wide_in.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 {
+        return path.to_path_buf();
+    }
+    if (len as usize) >= buf.len() {
+        buf.resize(len as usize + 1, 0);
+        // SAFETY: `wide_in` remains NUL-terminated and `buf` was resized to hold `len` UTF-16 code units.
+        len = unsafe { GetLongPathNameW(wide_in.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    }
+    if len == 0 || (len as usize) >= buf.len() {
+        return path.to_path_buf();
+    }
+    let long = OsString::from_wide(&buf[..len as usize]);
+    strip_verbatim_prefix(PathBuf::from(long))
+}
+
+/// Computes the expected lexical long path for `path` (`std::path::absolute`, lexical `.` / `..`
+/// resolution, and 8.3 short-name expansion) without resolving symlinks or NTFS junctions.
+pub(super) fn expected_lexical_long_path(path: &Path) -> PathBuf {
+    let raw_abs = abs_win_no_canon(path);
+    let lex_abs = lexically_resolve_dots(&raw_abs);
+    expand_short_names_lexical(&lex_abs)
 }
 
 /// Canonicalizes `p` (or its longest existing ancestor prefix when `p` does not exist yet) and

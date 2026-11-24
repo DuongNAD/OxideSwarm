@@ -30,7 +30,11 @@ use rusty_grid_core::protocol::{
 };
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_core::GridError;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::WorkerClient;
 use rusty_grid_worker::WorkerConfig;
 
@@ -43,9 +47,15 @@ async fn spawn_test_master(secret: Option<&ClusterSecret>) -> MasterHandle {
     if let Some(s) = secret {
         config = config.with_cluster_secret(s.clone());
     }
-    MasterServer::spawn(config)
-        .await
-        .expect("spawn test master")
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn test master")
 }
 
 fn test_register_msg(worker_id: Uuid, name: &str) -> WorkerMessage {

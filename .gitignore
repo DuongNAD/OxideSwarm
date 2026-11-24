@@ -110,6 +110,7 @@ tests/empirical_results.json
 tests/m7_challenger_2_results.json
 tests/*_results.json
 windows/*.log
+benchmarks/endurance/results/*.quarantine.json
 
 # >>> smart-drive managed (do not edit inside) >>>
 # Base patterns (exFAT, OS metadata, agent scratch, secrets, runtime)

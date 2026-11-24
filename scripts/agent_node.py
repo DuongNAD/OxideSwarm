@@ -18,6 +18,7 @@ Features:
 
 import argparse
 import asyncio
+import collections
 import hashlib
 import ipaddress
 import json
@@ -177,6 +178,112 @@ SECRET_ENV_VARS = (
 
 _UNSET_TIMEOUT = object()
 
+# MESH-2 verified data delivery (design 0107). Same limits as the Rust consumer in
+# crates/agent_mesh/src/delivery.rs.
+ACK_STATUS_CHUNK_RECEIVED = "chunk_received"
+ACK_STATUS_DATA_VERIFIED = "data_received_verified"
+ERR_PAYLOAD_CORRUPT = "ERR_PAYLOAD_CORRUPT"
+MAX_PENDING_ASSEMBLIES = 64
+MAX_CHUNKS_PER_TRANSFER = 1024
+MAX_ASSEMBLED_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_REASSEMBLER_BYTES = 128 * 1024 * 1024
+CHUNK_ASSEMBLY_TTL_S = 60.0
+MAX_REMEMBERED_REFUSALS = 256
+MAX_RECEIVED_PAYLOADS = 256
+
+
+class PayloadRejected(Exception):
+    """A DataPayload chunk or transfer that must be answered with DeliveryNack(ERR_PAYLOAD_CORRUPT)."""
+
+
+class ChunkReassembler:
+    """Bounded reassembly of multi-chunk DataPayload transfers, keyed by (sender, correlation id).
+
+    Mirrors the Rust `ChunkReassembler`: at most `max_pending` transfers and `max_total_bytes`
+    buffered (the oldest transfer is evicted first), at most `max_assembled_bytes` per transfer,
+    and a transfer that receives no chunk for `ttl_s` seconds is dropped. `clock` is injectable so
+    tests do not sleep.
+    """
+
+    def __init__(
+        self,
+        max_pending=MAX_PENDING_ASSEMBLIES,
+        max_assembled_bytes=MAX_ASSEMBLED_BYTES,
+        max_total_bytes=MAX_TOTAL_REASSEMBLER_BYTES,
+        ttl_s=CHUNK_ASSEMBLY_TTL_S,
+        clock=time.monotonic,
+    ):
+        self.max_pending = max_pending
+        self.max_assembled_bytes = max_assembled_bytes
+        self.max_total_bytes = max_total_bytes
+        self.ttl_s = ttl_s
+        self.clock = clock
+        self.inflight = collections.OrderedDict()  # key -> dict, oldest first
+        self.total_bytes = 0
+
+    def _remove(self, key):
+        asm = self.inflight.pop(key, None)
+        if asm is not None:
+            self.total_bytes -= asm["bytes"]
+        return asm
+
+    def _prune_expired(self, now):
+        for key in [k for k, a in self.inflight.items() if now - a["updated"] > self.ttl_s]:
+            self._remove(key)
+
+    def _evict_oldest(self, exclude=None):
+        for key in self.inflight:
+            if key != exclude:
+                self._remove(key)
+                return True
+        return False
+
+    def insert(self, sender, corr_id, seq, total, total_sha, data):
+        """Stores one verified chunk. Returns the whole payload when `data` completes the
+        transfer, else None. Raises PayloadRejected when the transfer must be refused."""
+        now = self.clock()
+        self._prune_expired(now)
+        key = (sender, corr_id)
+        if len(data) > min(self.max_assembled_bytes, self.max_total_bytes):
+            self._remove(key)
+            raise PayloadRejected(f"Chunk size {len(data)} exceeds the cap")
+        asm = self.inflight.get(key)
+        if asm is None:
+            while len(self.inflight) >= self.max_pending or self.total_bytes + len(data) > self.max_total_bytes:
+                if not self._evict_oldest():
+                    break
+            asm = {"total": total, "sha": total_sha, "chunks": {}, "bytes": 0, "updated": now}
+            self.inflight[key] = asm
+        if asm["total"] != total:
+            self._remove(key)
+            raise PayloadRejected(
+                f"Inconsistent total_chunks in multi-chunk transfer (expected {asm['total']}, got {total})"
+            )
+        if asm["sha"].lower() != total_sha.lower():
+            self._remove(key)
+            raise PayloadRejected("Inconsistent total_sha256 in multi-chunk transfer")
+        prev = len(asm["chunks"].get(seq, b""))
+        new_total = asm["bytes"] - prev + len(data)
+        if new_total > self.max_assembled_bytes:
+            self._remove(key)
+            raise PayloadRejected(
+                f"Assembled payload size {new_total} exceeds cap of {self.max_assembled_bytes} bytes"
+            )
+        while self.total_bytes - prev + len(data) > self.max_total_bytes:
+            if not self._evict_oldest(exclude=key):
+                self._remove(key)
+                raise PayloadRejected(
+                    f"Aggregate reassembler buffer cap of {self.max_total_bytes} bytes exceeded"
+                )
+        asm["chunks"][seq] = data
+        asm["bytes"] = new_total
+        asm["updated"] = now
+        self.total_bytes += len(data) - prev
+        if len(asm["chunks"]) < total:
+            return None
+        self._remove(key)
+        return b"".join(asm["chunks"][i] for i in range(total))
+
 
 async def _read_capped_stream(stream: asyncio.StreamReader, cap: int = MAX_CAPTURED_OUTPUT_BYTES) -> tuple:
     """Reads from stream up to cap bytes, draining the remainder to EOF so the child never blocks."""
@@ -263,7 +370,11 @@ class OxideAgentNode:
         self.pending_commands = {}  # corr_id -> asyncio.Future (CommandResponse / terminal DeliveryNack)
         self.pending_acks = {}      # corr_id -> asyncio.Future (DeliveryAck / NodeListResponse)
         self.pending_futures = self.pending_acks  # Backwards compatibility alias
-        self.received_data_payloads = []
+        # Verified payloads (multi-chunk transfers reassembled), newest last, bounded like the
+        # Rust client's buffer.
+        self.received_data_payloads = collections.deque(maxlen=MAX_RECEIVED_PAYLOADS)
+        self._reassembler = ChunkReassembler()
+        self._refused_transfers = collections.OrderedDict()  # (sender, corr_id) -> None
         self.executed_commands_count = 0
         self.ignored_commands_count = 0
 
@@ -329,6 +440,10 @@ class OxideAgentNode:
                     if msg.get("type") == "DeliveryNack" and msg.get("error_code") in REGISTRATION_ERROR_CODES:
                         # Handled inline: the hub closes the socket right behind this frame, and the
                         # reconnect logic must already know why by the time the close is noticed.
+                        await self._dispatch_incoming(msg)
+                    elif msg.get("type") == "DataPayload":
+                        # Handled inline and in order: a sender counts the chunk ACKs that precede
+                        # the receipt for the whole payload (design 0107 D2).
                         await self._dispatch_incoming(msg)
                     else:
                         asyncio.create_task(self._dispatch_incoming(msg))
@@ -424,9 +539,10 @@ class OxideAgentNode:
                     fut.set_result(msg)
         elif msg_type == "DeliveryAck":
             status = msg.get("status")
-            if status == "target_forwarded":
-                # Intermediate hub hop acknowledgement: do NOT resolve command response future!
-                logger.debug(f"Hub forwarded ACK received for {corr_id} (awaiting CommandResponse)")
+            if status in ("target_forwarded", ACK_STATUS_CHUNK_RECEIVED):
+                # Intermediate acknowledgement (hub hop, or one chunk of a data transfer): it does
+                # not answer the request, so do NOT resolve its future.
+                logger.debug(f"Intermediate ACK '{status}' received for {corr_id}")
             else:
                 if corr_id in self.pending_acks:
                     fut = self.pending_acks.pop(corr_id)
@@ -611,50 +727,121 @@ class OxideAgentNode:
         if self.ws:
             await self.ws.send(json.dumps(res))
 
+    def _verify_data_payload(self, msg: dict):
+        """Verifies one DataPayload like the Rust consumer (design 0107 D1).
+
+        Returns ("chunk", None) for a verified chunk of a transfer that is not complete yet,
+        ("complete", envelope) for a whole payload whose SHA-256 matched (a multi-chunk transfer is
+        returned reassembled), or ("drop", None) for a late chunk of a refused transfer. Raises
+        PayloadRejected when the payload must be NACKed.
+        """
+        sender = msg.get("from")
+        corr_id = msg.get("correlation_id") or msg.get("id")
+        if (sender, corr_id) in self._refused_transfers:
+            return "drop", None
+
+        data_str = msg.get("data")
+        if isinstance(data_str, str):
+            try:
+                data_bytes = data_str.encode("latin1")  # one character per byte
+            except UnicodeEncodeError:
+                raise PayloadRejected("Data payload contains non-Latin-1 code points")
+        elif data_str is None and msg.get("payload") is not None:
+            data_bytes = json.dumps(
+                msg["payload"], separators=(",", ":"), sort_keys=True, ensure_ascii=False
+            ).encode("utf-8")
+        else:
+            raise PayloadRejected("Missing data payload")
+
+        claimed_hash = msg.get("checksum_sha256")
+        if not isinstance(claimed_hash, str) or not claimed_hash:
+            raise PayloadRejected("Missing SHA-256 checksum")
+        calc_hash = hashlib.sha256(data_bytes).hexdigest()
+        if calc_hash != claimed_hash.lower():
+            raise PayloadRejected(f"SHA-256 mismatch: calculated {calc_hash}, expected {claimed_hash}")
+
+        seq = msg.get("sequence_number", 0) or 0
+        total = msg.get("total_chunks", 0) or 0
+        if not isinstance(seq, int) or not isinstance(total, int):
+            raise PayloadRejected("Invalid chunk metadata")
+        effective_total = 1 if (total == 0 and seq == 0) else total
+        if effective_total <= 0 or seq < 0 or seq >= effective_total or effective_total > MAX_CHUNKS_PER_TRANSFER:
+            raise PayloadRejected(f"Invalid chunk metadata: sequence_number={seq}, total_chunks={total}")
+        metadata = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+        total_sha = metadata.get("total_sha256")
+
+        if effective_total == 1:
+            if isinstance(total_sha, str) and hashlib.sha256(data_bytes).hexdigest() != total_sha.lower():
+                raise PayloadRejected("Payload total_sha256 mismatch")
+            return "complete", msg
+
+        if not isinstance(total_sha, str) or not total_sha:
+            raise PayloadRejected("Multi-chunk transfer carries no metadata total_sha256")
+        assembled = self._reassembler.insert(sender, corr_id, seq, effective_total, total_sha, data_bytes)
+        if assembled is None:
+            return "chunk", None
+        whole_hash = hashlib.sha256(assembled).hexdigest()
+        if whole_hash != total_sha.lower():
+            raise PayloadRejected("Assembled payload SHA-256 mismatch")
+        envelope = dict(msg)
+        envelope.update({
+            "sequence_number": 0,
+            "total_chunks": effective_total,
+            "chunk_size_bytes": len(assembled),
+            "data": assembled.decode("latin1"),
+            "checksum_sha256": whole_hash,
+        })
+        return "complete", envelope
+
+    def _remember_refusal(self, sender, corr_id):
+        self._refused_transfers[(sender, corr_id)] = None
+        while len(self._refused_transfers) > MAX_REMEMBERED_REFUSALS:
+            self._refused_transfers.popitem(last=False)
+
     async def _handle_data_payload(self, msg: dict):
         corr_id = msg.get("correlation_id") or msg.get("id")
         sender = msg.get("from")
-        data_str = msg.get("data", "")
-        claimed_hash = msg.get("checksum_sha256")
+        now_ms = int(time.time() * 1000)
 
-        self.received_data_payloads.append(msg)
-
-        # Latin1 byte preservation for raw binary transport over JSON
-        data_bytes = data_str.encode("latin1")
-        calc_hash = hashlib.sha256(data_bytes).hexdigest()
-
-        if claimed_hash and calc_hash.lower() != claimed_hash.lower():
-            logger.error(f"Data corruption detected from {sender}! Hash mismatch: {calc_hash} != {claimed_hash}")
-            nack = {
+        try:
+            kind, envelope = self._verify_data_payload(msg)
+        except PayloadRejected as e:
+            self._remember_refusal(sender, corr_id)
+            logger.error(f"Refusing DataPayload {corr_id} from {sender}: {e}")
+            reply = {
                 "version": "1.0",
                 "correlation_id": corr_id,
                 "type": "DeliveryNack",
                 "from": self.node_id,
                 "to": sender,
-                "error_code": "ERR_PAYLOAD_CORRUPT",
-                "reason": f"SHA-256 mismatch: calculated {calc_hash}, expected {claimed_hash}",
-                "timestamp": int(time.time() * 1000),
+                "error_code": ERR_PAYLOAD_CORRUPT,
+                "reason": str(e),
+                "timestamp": now_ms,
             }
-            if self.ws:
-                await self.ws.send(json.dumps(nack))
         else:
-            logger.info(f"Received valid DataPayload ({len(data_bytes)} bytes, SHA-256 verified) from {sender}")
-            ack = {
+            if kind == "drop":
+                return
+            if kind == "chunk":
+                # Flow control for the sender, not a delivery receipt.
+                status = ACK_STATUS_CHUNK_RECEIVED
+            else:
+                self.received_data_payloads.append(envelope)
+                logger.info(
+                    f"Received valid DataPayload ({envelope.get('chunk_size_bytes', 0)} bytes, "
+                    f"SHA-256 verified) from {sender}"
+                )
+                status = ACK_STATUS_DATA_VERIFIED
+            reply = {
                 "version": "1.0",
                 "correlation_id": corr_id,
                 "type": "DeliveryAck",
                 "from": self.node_id,
                 "to": sender,
-                "status": "data_received_verified",
-                "timestamp": int(time.time() * 1000),
+                "status": status,
+                "timestamp": now_ms,
             }
-            if self.ws:
-                await self.ws.send(json.dumps(ack))
-
-        if corr_id in self.pending_acks:
-            fut = self.pending_acks.pop(corr_id)
-            if not fut.done():
-                fut.set_result(msg)
+        if self.ws:
+            await self.ws.send(json.dumps(reply))
 
     async def send_command(
         self,

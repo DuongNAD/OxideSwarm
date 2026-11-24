@@ -5,7 +5,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use tokio::sync::watch;
 
@@ -43,7 +45,15 @@ async fn spawn_test_cluster() -> (
         .expect("server config")
         .with_discovery_port(0)
         .with_blob_store(blob_dir, 64 * 1024 * 1024);
-    let master = MasterServer::spawn(server_cfg).await.expect("spawn master");
+    let master = MasterServer::spawn_with_config(
+        server_cfg,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)

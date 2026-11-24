@@ -1,3 +1,5 @@
+#![cfg(feature = "dashboard")]
+
 //! Integration test suite for Zero-Trust RBAC security and role permissions (R5).
 //!
 //! Validates:

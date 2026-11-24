@@ -21,7 +21,11 @@ use rusty_grid_core::protocol::{
 };
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_core::GridResult;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::backoff::BackoffConfig;
 use rusty_grid_worker::client::{ActiveTaskTable, WorkerClient, WorkerConfig};
 use rusty_grid_worker::heartbeat::MobileTelemetryHandle;
@@ -334,13 +338,18 @@ async fn test_master_shutdown_frame_makes_the_worker_wait_and_reconnect() {
     })
     .await;
 
-    // The worker says goodbye...
+    // The worker must NOT send `WorkerMessage::Disconnecting` when the Master announced its own
+    // shutdown (sending `Disconnecting` would trigger task evacuation instead of `SESSION_RESUME`
+    // hold): it closes the transport cleanly (EOF) and reconnects.
     let farewell = conn
         .wait_for(Duration::from_secs(5), |m| {
             matches!(m, WorkerMessage::Disconnecting { .. })
         })
         .await;
-    assert!(farewell.is_some(), "the worker announces its departure");
+    assert!(
+        farewell.is_none(),
+        "the worker must not send WorkerMessage::Disconnecting on MasterMessage::Shutdown, got {farewell:?}"
+    );
     drop(conn);
 
     // ...and keeps running: it comes back as the same worker, promptly (a restarted master is
@@ -791,9 +800,16 @@ async fn test_a_stalled_upload_to_a_master_that_stopped_reading_is_detected() {
 // ------------------------------------------------------------------------------------------
 
 async fn spawn_real_master() -> MasterHandle {
-    MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_handshake_timeout(2))
-        .await
-        .expect("spawn master")
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_handshake_timeout(2),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool

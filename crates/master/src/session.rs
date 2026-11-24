@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf};
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit};
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -421,6 +421,8 @@ pub(crate) enum ActiveLanes<
     Single {
         reader: MessageReader<ReadHalf<StampedStream<C>>>,
         ctrl_reply_tx: mpsc::Sender<MasterMessage>,
+        shutdown_flush_tx: Option<oneshot::Sender<MasterMessage>>,
+        ctrl_writer_join: Option<JoinHandle<()>>,
         _writer_guard: AbortOnDrop,
     },
     Multiplexed {
@@ -428,6 +430,8 @@ pub(crate) enum ActiveLanes<
         data_reader: MessageReader<ReadHalf<StampedStream<D>>>,
         data_writer_err_rx: mpsc::Receiver<ProtocolError>,
         ctrl_reply_tx: mpsc::Sender<MasterMessage>,
+        shutdown_flush_tx: Option<oneshot::Sender<MasterMessage>>,
+        ctrl_writer_join: Option<JoinHandle<()>>,
         _router_guard: AbortOnDrop,
         _ctrl_writer_guard: AbortOnDrop,
         _data_writer_guard: AbortOnDrop,
@@ -450,6 +454,26 @@ impl<
         match self {
             Self::Single { ctrl_reply_tx, .. } | Self::Multiplexed { ctrl_reply_tx, .. } => {
                 ctrl_reply_tx
+            }
+        }
+    }
+
+    async fn send_shutdown_and_flush(&mut self, msg: MasterMessage) {
+        let (tx, join) = match self {
+            Self::Single {
+                shutdown_flush_tx,
+                ctrl_writer_join,
+                ..
+            }
+            | Self::Multiplexed {
+                shutdown_flush_tx,
+                ctrl_writer_join,
+                ..
+            } => (shutdown_flush_tx.take(), ctrl_writer_join.take()),
+        };
+        if let (Some(tx), Some(join)) = (tx, join) {
+            if tx.send(msg).is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(1), join).await;
             }
         }
     }
@@ -856,24 +880,34 @@ impl<
             }
         };
 
-        // Tags only the master may set (design 0083 M1): the master adds its own `proto:<n>`, so a
-        // worker-supplied `proto:*` is dropped for every worker; `ext:*` is dropped from a worker
-        // below the extension protocol, which cannot enforce an extension whatever it claims (a
-        // v0.3.0 worker does not reserve the prefix and may carry `--tag ext:<id>`).
+        // Tags only the master may set (design 0083 M1, design 0060 D3/D4, M5 Tier-5): the master
+        // adds `proto:<n>`, `speed:<factor>`, `link:<path>`, `id:<uuid>`, `state:<state>`, and
+        // `feat:<feature>` itself, and `opt:*` is reserved for task options, so worker-supplied
+        // values for any of those prefixes are dropped; `ext:*` is dropped from a worker below the
+        // extension protocol, which cannot enforce an extension whatever it claims (a v0.3.0
+        // worker does not reserve the prefix and may carry `--tag ext:<id>`).
         let mut capabilities = capabilities;
         let tags_before = capabilities.tags.len();
         capabilities.tags.retain(|t| {
             let ext_forged = peer_version < rusty_grid_core::task::EXTENSION_PROTOCOL_VERSION
                 && t.starts_with(rusty_grid_core::placement::EXT_TAG_PREFIX);
-            !(t.starts_with(rusty_grid_core::placement::PROTO_TAG_PREFIX) || ext_forged)
+            !(t.starts_with(rusty_grid_core::placement::PROTO_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::SPEED_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::OPT_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::STATE_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::ID_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::LINK_TAG_PREFIX)
+                || t.starts_with(rusty_grid_core::placement::FEAT_TAG_PREFIX)
+                || ext_forged)
         });
         if capabilities.tags.len() != tags_before {
             warn!(
                 worker_id = %worker_id,
                 peer_version,
                 dropped = tags_before - capabilities.tags.len(),
-                "Dropped worker-supplied master-only tags (proto:*, and ext:* from a worker below \
-                 the extension protocol) at registration"
+                "Dropped worker-supplied master-only tags (proto:*, speed:*, opt:*, state:*, \
+                 id:*, link:*, feat:*, and ext:* from a worker below the extension protocol) at \
+                 registration"
             );
         }
 
@@ -1105,38 +1139,63 @@ impl<
                 let writer_blob_store = blob_store.clone();
                 #[cfg(feature = "dashboard")]
                 let writer_broadcast_tx = broadcast_tx.clone();
+                let (shutdown_flush_tx, shutdown_flush_rx) = oneshot::channel::<MasterMessage>();
+                let mut shutdown_flush_rx = Some(shutdown_flush_rx);
                 let writer_task = tokio::spawn(async move {
-                    while let Some(msg) = outbound_rx.recv().await {
-                        match writer.send_msg(&msg).await {
-                            Ok(()) => {}
-                            Err(ProtocolError::FrameTooLarge { size, max }) => {
-                                handle_oversized_master_message(
-                                    msg,
-                                    size,
-                                    max,
-                                    &writer_registry,
-                                    &writer_queue,
-                                    &writer_sched_notify,
-                                    &writer_waiters,
-                                    worker_id,
-                                    session_id,
-                                    writer_blob_store.as_ref(),
-                                    #[cfg(feature = "dashboard")]
-                                    writer_broadcast_tx.as_ref(),
-                                )
-                                .await;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            res = async {
+                                match shutdown_flush_rx.as_mut() {
+                                    Some(rx) => rx.await.ok(),
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                shutdown_flush_rx = None;
+                                if let Some(msg) = res {
+                                    let _ = writer.send_msg(&msg).await;
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                debug!(error = %e, "Outbound message write failed; terminating writer task");
-                                break;
+                            maybe_msg = outbound_rx.recv() => {
+                                let Some(msg) = maybe_msg else {
+                                    break;
+                                };
+                                match writer.send_msg(&msg).await {
+                                    Ok(()) => {}
+                                    Err(ProtocolError::FrameTooLarge { size, max }) => {
+                                        handle_oversized_master_message(
+                                            msg,
+                                            size,
+                                            max,
+                                            &writer_registry,
+                                            &writer_queue,
+                                            &writer_sched_notify,
+                                            &writer_waiters,
+                                            worker_id,
+                                            session_id,
+                                            writer_blob_store.as_ref(),
+                                            #[cfg(feature = "dashboard")]
+                                            writer_broadcast_tx.as_ref(),
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "Outbound message write failed; terminating writer task");
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
                 });
+                let writer_abort = writer_task.abort_handle();
                 ActiveLanes::Single {
                     reader,
                     ctrl_reply_tx: outbound_tx.clone(),
-                    _writer_guard: AbortOnDrop(writer_task.abort_handle()),
+                    shutdown_flush_tx: Some(shutdown_flush_tx),
+                    ctrl_writer_join: Some(writer_task),
+                    _writer_guard: AbortOnDrop(writer_abort),
                 }
             }
             PreAuthSession::Multiplexed {
@@ -1258,23 +1317,45 @@ impl<
                     }
                 });
 
+                let (shutdown_flush_tx, shutdown_flush_rx) = oneshot::channel::<MasterMessage>();
+                let mut shutdown_flush_rx = Some(shutdown_flush_rx);
                 let ctrl_writer_task = tokio::spawn(async move {
-                    while let Some(msg) = ctrl_out_rx.recv().await {
-                        match ctrl_writer.send_msg(&msg).await {
-                            Ok(()) => {}
-                            Err(ProtocolError::FrameTooLarge { size, max }) => {
-                                warn!(
-                                    worker_id = %worker_id,
-                                    session_id = session_id,
-                                    variant = %msg.variant_name(),
-                                    size = size,
-                                    max = max,
-                                    "Control frame exceeds frame limit; dropping frame without closing session"
-                                );
+                    loop {
+                        tokio::select! {
+                            biased;
+                            res = async {
+                                match shutdown_flush_rx.as_mut() {
+                                    Some(rx) => rx.await.ok(),
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                shutdown_flush_rx = None;
+                                if let Some(msg) = res {
+                                    let _ = ctrl_writer.send_msg(&msg).await;
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                debug!(error = %e, "Control writer send error; terminating");
-                                break;
+                            maybe_msg = ctrl_out_rx.recv() => {
+                                let Some(msg) = maybe_msg else {
+                                    break;
+                                };
+                                match ctrl_writer.send_msg(&msg).await {
+                                    Ok(()) => {}
+                                    Err(ProtocolError::FrameTooLarge { size, max }) => {
+                                        warn!(
+                                            worker_id = %worker_id,
+                                            session_id = session_id,
+                                            variant = %msg.variant_name(),
+                                            size = size,
+                                            max = max,
+                                            "Control frame exceeds frame limit; dropping frame without closing session"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug!(error = %e, "Control writer send error; terminating");
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1339,13 +1420,16 @@ impl<
                     }
                 });
 
+                let ctrl_writer_abort = ctrl_writer_task.abort_handle();
                 ActiveLanes::Multiplexed {
                     ctrl_reader,
                     data_reader,
                     data_writer_err_rx,
                     ctrl_reply_tx,
+                    shutdown_flush_tx: Some(shutdown_flush_tx),
+                    ctrl_writer_join: Some(ctrl_writer_task),
                     _router_guard: AbortOnDrop(router_task.abort_handle()),
-                    _ctrl_writer_guard: AbortOnDrop(ctrl_writer_task.abort_handle()),
+                    _ctrl_writer_guard: AbortOnDrop(ctrl_writer_abort),
                     _data_writer_guard: AbortOnDrop(data_writer_task.abort_handle()),
                 }
             }
@@ -1381,69 +1465,76 @@ impl<
         }))
     }
 
+    async fn send_shutdown_and_flush(&mut self) {
+        self.lanes
+            .send_shutdown_and_flush(MasterMessage::Shutdown {
+                reason: "Master server shutting down".into(),
+                grace_period_secs: Some(5),
+            })
+            .await;
+    }
+
     async fn run(&mut self) -> GridResult<()> {
         let default_lane = self.lanes.default_lane_kind();
-        loop {
-            tokio::select! {
-                inbound = self.lanes.recv_next() => {
-                    match inbound {
-                        Ok((lane, Some(msg))) => {
-                            if !self.handle_inbound_message(lane, msg).await {
+        if *self.shutdown_rx.borrow_and_update() {
+            info!(worker_id = %self.worker_id, "Master shutting down; notifying worker");
+            self.send_shutdown_and_flush().await;
+        } else {
+            loop {
+                tokio::select! {
+                    inbound = self.lanes.recv_next() => {
+                        match inbound {
+                            Ok((lane, Some(msg))) => {
+                                if !self.handle_inbound_message(lane, msg).await {
+                                    break;
+                                }
+                            }
+                            Ok((lane, None)) => {
+                                let reason = lane.eof_reason();
+                                info!(worker_id = %self.worker_id, ?lane, "{reason}");
+                                handle_worker_disconnect_with_broadcast(
+                                    &self.registry,
+                                    &self.queue,
+                                    &self.scheduler_notify,
+                                    Some(&self.waiters),
+                                    &self.worker_id,
+                                    Some(self.session_id),
+                                    reason,
+                                    false,
+                                    #[cfg(feature = "dashboard")]
+                                    self.broadcast_tx.as_ref(),
+                                )
+                                .await;
+                                break;
+                            }
+                            Err((lane, e)) => {
+                                let reason = lane.error_reason(&e);
+                                warn!(worker_id = %self.worker_id, ?lane, error = %e, "Worker stream read error");
+                                handle_worker_disconnect_with_broadcast(
+                                    &self.registry,
+                                    &self.queue,
+                                    &self.scheduler_notify,
+                                    Some(&self.waiters),
+                                    &self.worker_id,
+                                    Some(self.session_id),
+                                    &reason,
+                                    false,
+                                    #[cfg(feature = "dashboard")]
+                                    self.broadcast_tx.as_ref(),
+                                )
+                                .await;
                                 break;
                             }
                         }
-                        Ok((lane, None)) => {
-                            let reason = lane.eof_reason();
-                            info!(worker_id = %self.worker_id, ?lane, "{reason}");
-                            handle_worker_disconnect_with_broadcast(
-                                &self.registry,
-                                &self.queue,
-                                &self.scheduler_notify,
-                                Some(&self.waiters),
-                                &self.worker_id,
-                                Some(self.session_id),
-                                reason,
-                                false,
-                                #[cfg(feature = "dashboard")]
-                                self.broadcast_tx.as_ref(),
-                            )
-                            .await;
-                            break;
-                        }
-                        Err((lane, e)) => {
-                            let reason = lane.error_reason(&e);
-                            warn!(worker_id = %self.worker_id, ?lane, error = %e, "Worker stream read error");
-                            handle_worker_disconnect_with_broadcast(
-                                &self.registry,
-                                &self.queue,
-                                &self.scheduler_notify,
-                                Some(&self.waiters),
-                                &self.worker_id,
-                                Some(self.session_id),
-                                &reason,
-                                false,
-                                #[cfg(feature = "dashboard")]
-                                self.broadcast_tx.as_ref(),
-                            )
-                            .await;
-                            break;
-                        }
                     }
-                }
-                res = self.shutdown_rx.changed() => {
-                    if res.is_ok() && *self.shutdown_rx.borrow() {
-                        info!(worker_id = %self.worker_id, "Master shutting down; notifying worker");
-                        let _ = self
-                            .lanes
-                            .ctrl_reply_tx()
-                            .send(MasterMessage::Shutdown {
-                                reason: "Master server shutting down".into(),
-                                grace_period_secs: Some(5),
-                            })
-                            .await;
-                        break;
-                    } else if res.is_err() {
-                        break;
+                    res = self.shutdown_rx.changed() => {
+                        if res.is_ok() && *self.shutdown_rx.borrow() {
+                            info!(worker_id = %self.worker_id, "Master shutting down; notifying worker");
+                            self.send_shutdown_and_flush().await;
+                            break;
+                        } else if res.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -1691,15 +1782,51 @@ impl<
                     .queue
                     .adopt_session_tasks(worker_id, session_id, &running)
                     .await;
-                if !outcome.adopted.is_empty() {
-                    self.registry
-                        .add_adopted_tasks(&worker_id, session_id, outcome.adopted.len())
-                        .await;
+                let mut to_bind =
+                    Vec::with_capacity(outcome.newly_adopted.len() + outcome.already_owned.len());
+                to_bind.extend_from_slice(&outcome.newly_adopted);
+                to_bind.extend_from_slice(&outcome.already_owned);
+
+                if !outcome.newly_adopted.is_empty() {
+                    let live = match self
+                        .registry
+                        .add_adopted_tasks(&worker_id, session_id, outcome.newly_adopted.len())
+                        .await
+                    {
+                        Some(live) => Some(live),
+                        None => {
+                            self.registry
+                                .session_live_handle(&worker_id, session_id)
+                                .await
+                        }
+                    };
+                    if let Some(live) = live {
+                        self.queue
+                            .set_assigned_session_live(&to_bind, worker_id, session_id, live)
+                            .await;
+                    }
                     info!(
                         worker_id = %worker_id,
                         session_id = session_id,
-                        adopted = ?outcome.adopted,
+                        adopted = ?outcome.newly_adopted,
+                        already_owned = ?outcome.already_owned,
                         "Worker resumed session and adopted in-flight task(s)"
+                    );
+                } else if !outcome.already_owned.is_empty() {
+                    if let Some(live) = self
+                        .registry
+                        .session_live_handle(&worker_id, session_id)
+                        .await
+                    {
+                        self.queue
+                            .set_assigned_session_live(&to_bind, worker_id, session_id, live)
+                            .await;
+                    }
+                    debug!(
+                        worker_id = %worker_id,
+                        session_id = session_id,
+                        already_owned = ?outcome.already_owned,
+                        "Worker ResumeSession reported task(s) already owned by this session"
                     );
                 }
                 for stale_id in outcome.stale_to_cancel {
@@ -1727,7 +1854,11 @@ impl<
                 }
                 #[cfg(feature = "dashboard")]
                 if let Some(ref b_tx) = self.broadcast_tx {
-                    for tid in outcome.adopted.iter().chain(outcome.newly_failed.iter()) {
+                    for tid in outcome
+                        .newly_adopted
+                        .iter()
+                        .chain(outcome.newly_failed.iter())
+                    {
                         if let Some(info) = self.queue.get_task(tid).await {
                             let _ = b_tx.send(
                                 crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(info),
@@ -2126,7 +2257,7 @@ mod tests {
         );
 
         let session_id = info.session_id;
-        let outbound_tx = registry
+        let (outbound_tx, _) = registry
             .reserve_dispatch(&worker_id, session_id)
             .await
             .unwrap();
@@ -2779,7 +2910,7 @@ mod tests {
                 other => panic!("expected RegisterAck, got {other:?}"),
             }
             let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
-            let outbound_tx = registry
+            let (outbound_tx, _) = registry
                 .reserve_dispatch(&worker_id, session_id)
                 .await
                 .unwrap();
@@ -2951,7 +3082,7 @@ mod tests {
                 other => panic!("expected RegisterAck, got {other:?}"),
             }
             let session_id = registry.get_worker(worker_id).await.unwrap().session_id;
-            let outbound_tx = registry
+            let (outbound_tx, _) = registry
                 .reserve_dispatch(&worker_id, session_id)
                 .await
                 .unwrap();
@@ -3197,6 +3328,337 @@ mod tests {
                 .contains("Data stream socket error: I/O error: data lane write timed out"),
             "expected disconnect reason from LaneKind::Data error path, got: {}",
             history[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn tier5_wire_register_strips_all_master_reserved_tags() {
+        use rusty_grid_core::protocol::ProtocolCapabilities;
+
+        // 1. v10 peer: strips opt:*, speed:*, proto:*, state:*, id:*, link:*, feat:*, while
+        //    preserving ext:32770, slots:4, and user:legit.
+        let (ctrl_master, ctrl_worker) = tokio::io::duplex(64 * 1024);
+        let (data_master, _data_worker) = tokio::io::duplex(64 * 1024);
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let temp = tempfile::tempdir().unwrap();
+        let blob_store = BlobStore::open(&BlobStoreConfig::new(
+            temp.path().join("blobs"),
+            DEFAULT_BLOB_STORE_MAX_BYTES,
+        ))
+        .unwrap();
+
+        let handle = spawn_test_multiplexed_session(
+            ctrl_master,
+            data_master,
+            registry.clone(),
+            queue.clone(),
+            notify.clone(),
+            waiters.clone(),
+            stop_rx,
+            Some(Arc::clone(&blob_store)),
+        );
+
+        let worker_id = Uuid::new_v4();
+        let victim_id = Uuid::new_v4();
+        let mut caps = WorkerCapabilities::new("spoof-wire-worker", 4, 4096, false, false, None);
+        caps.tags = vec![
+            "opt:repeatable".into(),
+            "speed:0.01".into(),
+            "proto:99".into(),
+            "state:disconnected".into(),
+            format!("id:{victim_id}"),
+            "link:Relay (DERP):999.0ms".into(),
+            "feat:workspaces".into(),
+            "ext:32770".into(),
+            "slots:4".into(),
+            "user:legit".into(),
+        ];
+
+        let mut worker_transport = MessageTransport::with_codec(ctrl_worker, WireCodec::Json);
+        worker_transport
+            .send_msg(&WorkerMessage::Register {
+                worker_id,
+                capabilities: caps.clone(),
+                protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+
+        let ack = worker_transport.recv_msg::<MasterMessage>().await.unwrap();
+        assert!(matches!(
+            ack,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+
+        let stored = registry
+            .get_worker(worker_id)
+            .await
+            .expect("worker registered");
+        for forbidden in [
+            "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:",
+        ] {
+            assert!(
+                !stored
+                    .capabilities
+                    .tags
+                    .iter()
+                    .any(|t| t.starts_with(forbidden)),
+                "forged prefix `{forbidden}` survived Register sanitization: {:?}",
+                stored.capabilities.tags
+            );
+        }
+        assert!(stored.capabilities.tags.iter().any(|t| t == "ext:32770"));
+        assert!(stored.capabilities.tags.iter().any(|t| t == "slots:4"));
+        assert!(stored.capabilities.tags.iter().any(|t| t == "user:legit"));
+        assert!(stored.capabilities.tags.iter().any(|t| {
+            t == &format!(
+                "proto:{}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT
+            )
+        }));
+
+        let _ = stop_tx.send(true);
+        let _ = handle.await;
+
+        // 2. v9 peer: also strips ext:* in addition to all other master-owned prefixes.
+        let (ctrl_master_v9, ctrl_worker_v9) = tokio::io::duplex(64 * 1024);
+        let (data_master_v9, _data_worker_v9) = tokio::io::duplex(64 * 1024);
+        let (stop_tx_v9, stop_rx_v9) = watch::channel(false);
+        let pre_auth_v9 = PreAuthSession::new_multiplexed(
+            ctrl_master_v9,
+            data_master_v9,
+            SocketAddr::from(([127, 0, 0, 1], 55_001)),
+            WireCodec::Json,
+            #[cfg(feature = "p2p")]
+            None,
+            #[cfg(feature = "p2p")]
+            None,
+        );
+        let reg_v9 = registry.clone();
+        let q_v9 = queue.clone();
+        let n_v9 = notify.clone();
+        let w_v9 = waiters.clone();
+        let b_v9 = Arc::clone(&blob_store);
+        let handle_v9 = tokio::spawn(async move {
+            WorkerSession::run_connection(
+                pre_auth_v9,
+                reg_v9,
+                q_v9,
+                n_v9,
+                w_v9,
+                10,
+                Duration::from_secs(5),
+                stop_rx_v9,
+                None,
+                WireCodec::Json,
+                None,
+                MasterAuthContext::default(),
+                None,
+                Some(b_v9),
+                #[cfg(feature = "dashboard")]
+                None,
+            )
+            .await
+        });
+
+        let wid_v9 = Uuid::new_v4();
+        let mut wt_v9 = MessageTransport::with_codec(ctrl_worker_v9, WireCodec::Json);
+        wt_v9
+            .send_msg(&WorkerMessage::Register {
+                worker_id: wid_v9,
+                capabilities: caps,
+                protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
+                features: ProtocolCapabilities::empty(),
+            })
+            .await
+            .unwrap();
+        let ack_v9 = wt_v9.recv_msg::<MasterMessage>().await.unwrap();
+        assert!(matches!(
+            ack_v9,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        let stored_v9 = registry
+            .get_worker(wid_v9)
+            .await
+            .expect("v9 worker registered");
+        for forbidden in [
+            "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:", "ext:",
+        ] {
+            assert!(
+                !stored_v9
+                    .capabilities
+                    .tags
+                    .iter()
+                    .any(|t| t.starts_with(forbidden)),
+                "v9 forged prefix `{forbidden}` survived Register sanitization: {:?}",
+                stored_v9.capabilities.tags
+            );
+        }
+        assert!(stored_v9.capabilities.tags.iter().any(|t| t == "slots:4"));
+        assert!(stored_v9
+            .capabilities
+            .tags
+            .iter()
+            .any(|t| t == "user:legit"));
+        assert!(stored_v9.capabilities.tags.iter().any(|t| t == "proto:9"));
+
+        let _ = stop_tx_v9.send(true);
+        let _ = handle_v9.await;
+    }
+
+    #[tokio::test]
+    async fn test_worker_session_run_entry_sends_shutdown_when_already_signaled() {
+        use rusty_grid_core::protocol::ProtocolCapabilities;
+
+        let registry = WorkerRegistry::new();
+        let queue = TaskQueue::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let waiters: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        stop_tx.send(true).unwrap();
+
+        // 1. Single-stream (TCP) transport: clone `stop_rx` AFTER `stop_tx.send(true)` so `true`
+        //    is already marked as seen by the cloned `watch::Receiver`.
+        let (single_master, single_worker) = tokio::io::duplex(64 * 1024);
+        let single_pre_auth = PreAuthSession::new_single(
+            single_master,
+            SocketAddr::from(([127, 0, 0, 1], 55_100)),
+            WireCodec::Json,
+            1,
+            #[cfg(feature = "p2p")]
+            None,
+            #[cfg(feature = "p2p")]
+            None,
+        );
+        let single_handle = tokio::spawn({
+            let reg = registry.clone();
+            let q = queue.clone();
+            let n = Arc::clone(&notify);
+            let w = Arc::clone(&waiters);
+            let conn_stop_rx = stop_rx.clone();
+            async move {
+                WorkerSession::run_connection(
+                    single_pre_auth,
+                    reg,
+                    q,
+                    n,
+                    w,
+                    10,
+                    Duration::from_secs(5),
+                    conn_stop_rx,
+                    None,
+                    WireCodec::Json,
+                    None,
+                    MasterAuthContext::default(),
+                    None,
+                    None,
+                    #[cfg(feature = "dashboard")]
+                    None,
+                )
+                .await
+            }
+        });
+
+        let wid_single = Uuid::new_v4();
+        let mut wt_single = MessageTransport::with_codec(single_worker, WireCodec::Json);
+        wt_single
+            .send_msg(&WorkerMessage::Register {
+                worker_id: wid_single,
+                capabilities: WorkerCapabilities::new("single-shut", 2, 2048, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let ack_single = tokio::time::timeout(
+            Duration::from_secs(2),
+            wt_single.recv_msg::<MasterMessage>(),
+        )
+        .await
+        .expect("single RegisterAck timeout")
+        .unwrap();
+        assert!(matches!(
+            ack_single,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        let shut_single = tokio::time::timeout(
+            Duration::from_secs(2),
+            wt_single.recv_msg::<MasterMessage>(),
+        )
+        .await
+        .expect("single Shutdown timeout")
+        .unwrap();
+        assert!(
+            matches!(shut_single, Some(MasterMessage::Shutdown { .. })),
+            "single transport must receive MasterMessage::Shutdown on entry when shutdown_rx is already true, got {shut_single:?}"
+        );
+        let res_single = tokio::time::timeout(Duration::from_secs(2), single_handle)
+            .await
+            .expect("single session exit timeout")
+            .unwrap();
+        assert!(res_single.is_ok());
+        assert_eq!(
+            registry.get_worker(wid_single).await.unwrap().status,
+            crate::registry::WorkerStatus::Disconnected
+        );
+
+        // 2. Multiplexed (QUIC) transport: same pre-signaled `stop_rx.clone()`.
+        let (ctrl_master, ctrl_worker) = tokio::io::duplex(64 * 1024);
+        let (data_master, _data_worker) = tokio::io::duplex(64 * 1024);
+        let mux_handle = spawn_test_multiplexed_session(
+            ctrl_master,
+            data_master,
+            registry.clone(),
+            queue.clone(),
+            Arc::clone(&notify),
+            Arc::clone(&waiters),
+            stop_rx.clone(),
+            None,
+        );
+
+        let wid_mux = Uuid::new_v4();
+        let mut wt_mux = MessageTransport::with_codec(ctrl_worker, WireCodec::Bincode);
+        wt_mux
+            .send_msg(&WorkerMessage::Register {
+                worker_id: wid_mux,
+                capabilities: WorkerCapabilities::new("mux-shut", 2, 2048, false, false, None),
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let ack_mux =
+            tokio::time::timeout(Duration::from_secs(2), wt_mux.recv_msg::<MasterMessage>())
+                .await
+                .expect("mux RegisterAck timeout")
+                .unwrap();
+        assert!(matches!(
+            ack_mux,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        let shut_mux =
+            tokio::time::timeout(Duration::from_secs(2), wt_mux.recv_msg::<MasterMessage>())
+                .await
+                .expect("mux Shutdown timeout")
+                .unwrap();
+        assert!(
+            matches!(shut_mux, Some(MasterMessage::Shutdown { .. })),
+            "multiplexed transport must receive MasterMessage::Shutdown on entry when shutdown_rx is already true, got {shut_mux:?}"
+        );
+        let res_mux = tokio::time::timeout(Duration::from_secs(2), mux_handle)
+            .await
+            .expect("mux session exit timeout")
+            .unwrap();
+        assert!(res_mux.is_ok());
+        assert_eq!(
+            registry.get_worker(wid_mux).await.unwrap().status,
+            crate::registry::WorkerStatus::Disconnected
         );
     }
 }

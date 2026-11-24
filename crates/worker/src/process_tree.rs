@@ -366,8 +366,11 @@ pub(crate) fn configure_command(
         let _ = task_id;
         let run_token = uuid::Uuid::new_v4();
         cmd.env("RUSTY_GRID_RUN_TOKEN", run_token.to_string());
-        let flag =
-            priority.windows_class_flag() | rusty_grid_core::capabilities::WINDOWS_CREATE_SUSPENDED;
+        // `CREATE_NO_WINDOW` (design 0108): a task never opens a visible console window, also
+        // when the worker itself has no console; the AppContainer path adds the same flag.
+        let flag = priority.windows_class_flag()
+            | rusty_grid_core::capabilities::WINDOWS_CREATE_SUSPENDED
+            | rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW;
         cmd.creation_flags(flag);
         ConfiguredCommand {
             run_token,
@@ -423,6 +426,40 @@ mod imp {
         spawn_tvsec: u64,
         #[cfg(target_os = "linux")]
         pub(super) cgroup_leaf: Option<CgroupLeaf>,
+    }
+
+    impl PreparedUnix {
+        #[cfg(test)]
+        pub(super) fn lifeline_read(&self) -> Option<&OwnedFd> {
+            self.lifeline_read.as_ref()
+        }
+    }
+
+    impl Drop for PreparedUnix {
+        fn drop(&mut self) {
+            // If the command was dropped without `ProcessTree::attach` taking `lifeline_write`
+            // (for example when `cmd.spawn()` failed after `pre_exec` forked the detached
+            // supervisor), dismiss the supervisor with `b"0"` instead of letting EOF look like a
+            // worker crash and trigger `killpg` / a process-table sweep.
+            if let Some(w) = self.lifeline_write.take() {
+                dismiss_lifeline(w);
+            }
+        }
+    }
+
+    /// Writes the one-byte dismissal marker (`b"0"`) to the lifeline pipe write end and closes it
+    /// so the detached supervisor exits without signalling `task_pgid` or sweeping processes.
+    pub(super) fn dismiss_lifeline(write_fd: OwnedFd) {
+        // SAFETY: `write_fd` owns the open write end of the lifeline pipe and lives across the
+        // call; the buffer is a 1-byte static slice and the length is 1.
+        unsafe {
+            let _ = libc::write(
+                write_fd.as_raw_fd(),
+                b"0".as_ptr().cast::<libc::c_void>(),
+                1,
+            );
+        }
+        drop(write_fd);
     }
 
     /// Metadata of an active Unix task tree stored in [`super::LIVE`] so signal handlers and
@@ -652,7 +689,13 @@ mod imp {
         }
         if procs_fd >= 0 && libc::lseek(procs_fd, 0, libc::SEEK_SET) >= 0 {
             let mut buf = [0u8; 4096];
-            let n = libc::read(procs_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+            let n = loop {
+                let r = libc::read(procs_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+                if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break r;
+            };
             if n > 0 {
                 let mut pid: libc::pid_t = 0;
                 let mut has_digit = false;
@@ -678,17 +721,78 @@ mod imp {
         rmdir_cgroup_leaf_with_retry(path_cstr);
     }
 
-    /// Closes every descriptor of the calling process except those in `keep`.
+    fn fd_is_kept(fd: libc::c_int, keep: &[libc::c_int]) -> bool {
+        let mut i = 0;
+        while i < keep.len() {
+            if keep[i] == fd {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Closes every open descriptor of the calling macOS process except those in `keep` by asking
+    /// the kernel for the open descriptor list (`proc_pidinfo(PROC_PIDLISTFDS)`) into a fixed
+    /// stack buffer. Returns `true` when all non-kept open descriptors are closed, or `false` if
+    /// `proc_pidinfo` fails or descriptors remain after 8 full rounds (about 8,184 descriptors)
+    /// so the caller falls back to [`close_fds_range_fallback`].
     ///
     /// # Safety
     ///
-    /// Only for the freshly forked, single-threaded lifeline supervisor, which never returns into
-    /// Rust code that owns descriptors (it ends with `_exit`). The function closes descriptors
-    /// that `OwnedFd`, `File` and the runtime own, so in any other process those owners would
-    /// later use or close a number that is closed or reused. `max_nofile` bounds the fallback
-    /// loop. Only `close` (and the raw `close_range` system call on Linux) is used and nothing is
-    /// allocated.
-    unsafe fn close_fds_except(keep: &[libc::c_int], max_nofile: libc::c_int) {
+    /// Same preconditions as [`close_fds_except`]: only for the freshly forked, single-threaded
+    /// lifeline supervisor before `_exit`. Uses a fixed stack buffer and raw `getpid`,
+    /// `proc_pidinfo`, and `close` system calls only (no heap allocation, no locks).
+    #[cfg(target_os = "macos")]
+    pub(super) unsafe fn close_open_fds_macos(keep: &[libc::c_int]) -> bool {
+        const BUF_CAP: usize = 1024;
+        const MAX_ROUNDS: usize = 8;
+
+        let pid = libc::getpid();
+        let mut buf: [libc::proc_fdinfo; BUF_CAP] = std::mem::zeroed();
+        let buf_bytes = std::mem::size_of_val(&buf) as libc::c_int;
+        let entry_bytes = std::mem::size_of::<libc::proc_fdinfo>();
+
+        let mut round = 0;
+        while round < MAX_ROUNDS {
+            let ret = libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf_bytes,
+            );
+            if ret <= 0 {
+                return false;
+            }
+            let count = ((ret as usize) / entry_bytes).min(BUF_CAP);
+            let mut closed_any = false;
+            let mut i = 0;
+            while i < count {
+                let fd = buf[i].proc_fd;
+                if fd >= 0 && !fd_is_kept(fd, keep) && libc::close(fd) == 0 {
+                    closed_any = true;
+                }
+                i += 1;
+            }
+            if count < BUF_CAP {
+                return true;
+            }
+            if !closed_any {
+                return false;
+            }
+            round += 1;
+        }
+        false
+    }
+
+    /// Fallback descriptor closer: closes `0..=max_keep` skipping `keep`, then uses
+    /// `SYS_close_range` on Linux or loops `close` up to `max_nofile` elsewhere.
+    ///
+    /// # Safety
+    ///
+    /// Same preconditions as [`close_fds_except`].
+    unsafe fn close_fds_range_fallback(keep: &[libc::c_int], max_nofile: libc::c_int) {
         let mut max_keep: libc::c_int = -1;
         for &fd in keep {
             if fd > max_keep {
@@ -698,14 +802,7 @@ mod imp {
 
         let mut fd: libc::c_int = 0;
         while fd <= max_keep {
-            let mut should_keep = false;
-            for &k in keep {
-                if k == fd {
-                    should_keep = true;
-                    break;
-                }
-            }
-            if !should_keep {
+            if !fd_is_kept(fd, keep) {
                 let _ = libc::close(fd);
             }
             fd += 1;
@@ -729,6 +826,31 @@ mod imp {
             let _ = libc::close(fd);
             fd += 1;
         }
+    }
+
+    /// Closes every descriptor of the calling process except those in `keep`.
+    ///
+    /// On macOS, queries the open descriptors via `proc_pidinfo(PROC_PIDLISTFDS)` into a fixed
+    /// stack buffer and closes only those, falling back to [`close_fds_range_fallback`] if the
+    /// call fails or descriptors remain after 8 full rounds. On Linux, uses `SYS_close_range` with
+    /// the bounded loop as fallback; on Android and other Unixes, uses the bounded loop up to
+    /// `max_nofile`.
+    ///
+    /// # Safety
+    ///
+    /// Only for the freshly forked, single-threaded lifeline supervisor, which never returns into
+    /// Rust code that owns descriptors (it ends with `_exit`). The function closes descriptors
+    /// that `OwnedFd`, `File` and the runtime own, so in any other process those owners would
+    /// later use or close a number that is closed or reused. `max_nofile` bounds the fallback
+    /// loop. Each call (`getpid`, `proc_pidinfo` on macOS, `SYS_close_range` on Linux, and
+    /// `close`) is a raw system-call wrapper that allocates nothing and takes no lock, and only a
+    /// fixed stack buffer is used.
+    unsafe fn close_fds_except(keep: &[libc::c_int], max_nofile: libc::c_int) {
+        #[cfg(target_os = "macos")]
+        if close_open_fds_macos(keep) {
+            return;
+        }
+        close_fds_range_fallback(keep, max_nofile);
     }
 
     /// SIGKILLs every process of this user whose environment holds `needle` (the per-attempt
@@ -766,12 +888,18 @@ mod imp {
         let mut dir_buf = [0u8; 4096];
         let mut env_buf = [0u8; 4096];
         loop {
-            let nread = libc::syscall(
-                libc::SYS_getdents64,
-                proc_fd,
-                dir_buf.as_mut_ptr().cast::<libc::c_void>(),
-                dir_buf.len(),
-            );
+            let nread = loop {
+                let n = libc::syscall(
+                    libc::SYS_getdents64,
+                    proc_fd,
+                    dir_buf.as_mut_ptr().cast::<libc::c_void>(),
+                    dir_buf.len(),
+                );
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break n;
+            };
             if nread <= 0 {
                 break;
             }
@@ -816,10 +944,17 @@ mod imp {
                 path_buf[6..6 + dec_len].copy_from_slice(&dec[..dec_len]);
                 path_buf[6 + dec_len..6 + dec_len + 9].copy_from_slice(b"/environ\0");
 
-                let env_fd = libc::open(
-                    path_buf.as_ptr().cast::<libc::c_char>(),
-                    libc::O_RDONLY | libc::O_CLOEXEC,
-                );
+                let env_fd = loop {
+                    let fd = libc::open(
+                        path_buf.as_ptr().cast::<libc::c_char>(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    );
+                    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                    {
+                        continue;
+                    }
+                    break fd;
+                };
                 if env_fd < 0 {
                     continue;
                 }
@@ -834,11 +969,19 @@ mod imp {
                 let mut carry = 0usize;
                 let mut first_chunk = true;
                 loop {
-                    let r = libc::read(
-                        env_fd,
-                        env_buf[carry..].as_mut_ptr().cast::<libc::c_void>(),
-                        env_buf.len() - carry,
-                    );
+                    let r = loop {
+                        let n = libc::read(
+                            env_fd,
+                            env_buf[carry..].as_mut_ptr().cast::<libc::c_void>(),
+                            env_buf.len() - carry,
+                        );
+                        if n < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                            continue;
+                        }
+                        break n;
+                    };
                     if r <= 0 {
                         break;
                     }
@@ -1476,13 +1619,7 @@ impl TreeInner {
         #[cfg(unix)]
         if let Ok(mut lifeline) = self.lifeline_write.lock() {
             if let Some(w) = lifeline.take() {
-                use std::os::unix::io::AsRawFd;
-                // SAFETY: `w` owns the open write end of the lifeline pipe and lives across the
-                // call; the buffer is a 1-byte static string and the length is 1.
-                unsafe {
-                    let _ = libc::write(w.as_raw_fd(), b"0".as_ptr().cast::<libc::c_void>(), 1);
-                }
-                drop(w);
+                imp::dismiss_lifeline(w);
             }
         }
     }
@@ -1778,5 +1915,385 @@ mod tests {
         assert!(!imp::request_stop(imp::RawId::for_pgid_only(-5)));
         imp::kill(imp::RawId::for_pgid_only(0));
         imp::kill(imp::RawId::for_pgid_only(1));
+    }
+
+    /// BUG-33: a high-numbered descriptor (`>= 5000` when `RLIMIT_NOFILE` allows) duplicated with
+    /// `F_DUPFD_CLOEXEC` before spawning a supervised task is closed by the child on `exec` and
+    /// must also be closed by the detached lifeline supervisor (which never `exec`s), delivering EOF
+    /// on the pipe read end while both the child and the supervisor are still alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_supervisor_closes_high_numbered_fd() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{Duration, Instant};
+
+        // SAFETY: `rlim` is a live `rlimit` written by `getrlimit`.
+        #[allow(clippy::unnecessary_cast)]
+        let soft_limit: u64 = unsafe {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim), 0);
+            rlim.rlim_cur as u64
+        };
+        let target_fd: libc::c_int = if soft_limit > 5005 {
+            5000
+        } else {
+            (soft_limit as libc::c_int).saturating_sub(32).max(64)
+        };
+
+        let (probe_read, probe_write) = imp::create_lifeline_pipe().expect("create probe pipe");
+        // SAFETY: `probe_write` is a valid open descriptor; `F_DUPFD_CLOEXEC` takes an integer
+        // floor (`target_fd`) and no pointer, returning a fresh descriptor with `FD_CLOEXEC`.
+        let high_raw =
+            unsafe { libc::fcntl(probe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, target_fd) };
+        assert!(
+            high_raw >= target_fd,
+            "F_DUPFD_CLOEXEC({target_fd}) failed: got {high_raw} ({})",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `high_raw` is a newly created descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`
+        // that nothing else owns.
+        let high_write = unsafe { OwnedFd::from_raw_fd(high_raw) };
+        drop(probe_write);
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut prepared = configure_command(
+            &mut cmd,
+            ProcessPriority::Normal,
+            rusty_grid_core::TaskId::new(),
+        );
+        let mut child = prepared.spawn(&mut cmd).expect("spawn sleep");
+        let tree = prepared.attach(&child);
+        assert!(tree.is_tracked(), "Unix task must attach to a ProcessTree");
+
+        // Drop the parent's copy while both the task child and the detached supervisor are alive.
+        drop(high_write);
+
+        let eof_seen = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut pfd = libc::pollfd {
+                fd: probe_read.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            let mut byte = [0u8; 1];
+            while Instant::now() < deadline {
+                // SAFETY: `pfd` points to a single live `pollfd` covering `probe_read`.
+                let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
+                if rc < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return false;
+                }
+                if rc > 0 {
+                    // SAFETY: `probe_read` is open and `byte` is a valid 1-byte mutable buffer.
+                    let n =
+                        unsafe { libc::read(probe_read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+                    if n == 0 {
+                        return true;
+                    }
+                    if n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        return false;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "task child must still be alive when EOF arrives on the probe pipe"
+        );
+        assert!(
+            eof_seen,
+            "supervisor must close high-numbered descriptor (fd {high_raw} >= {target_fd}) promptly"
+        );
+
+        // Prove the detached supervisor is still alive after closing `high_write`: drop the
+        // lifeline write end without writing `b"0"` so the supervisor wakes on EOF and kills the
+        // task child.
+        let lifeline = tree
+            .inner
+            .as_ref()
+            .expect("tracked ProcessTree has inner")
+            .lifeline_write
+            .lock()
+            .expect("lifeline_write lock")
+            .take();
+        assert!(lifeline.is_some(), "lifeline write end must be held");
+        drop(lifeline);
+
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("supervisor must kill task child once lifeline closes without dismissal")
+            .expect("wait on task child");
+        assert!(
+            !status.success() && matches!(status.signal(), Some(libc::SIGTERM | libc::SIGKILL)),
+            "supervisor-killed task child must exit via SIGTERM or SIGKILL, got {status:?}"
+        );
+
+        tree.kill_async(child.id()).await;
+    }
+
+    /// BUG-33: with ~1,500 open descriptors (exceeding one 1,024-entry `PROC_PIDLISTFDS` pass),
+    /// `close_open_fds_macos` in a forked child keeps the kept fd, closes the rest, and returns
+    /// `true`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_close_open_fds_macos_returns_true_with_1500_open_fds() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+        // SAFETY: `rlim` is a live `rlimit` initialized before and written by `getrlimit`/`setrlimit`.
+        let soft_limit = unsafe {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim), 0);
+            if rlim.rlim_cur < 1600 {
+                rlim.rlim_cur = 2048.min(rlim.rlim_max);
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &rlim), 0);
+            }
+            rlim.rlim_cur
+        };
+        assert!(
+            soft_limit >= 1600,
+            "RLIMIT_NOFILE ({soft_limit}) too small for 1500-fd test"
+        );
+
+        let (keep_read, keep_write) = imp::create_lifeline_pipe().expect("create keep pipe");
+        let mut extras: Vec<OwnedFd> = Vec::with_capacity(1_500);
+        for _ in 0..1_500 {
+            // SAFETY: `keep_write` is a live descriptor; `F_DUPFD_CLOEXEC` creates a new owned fd.
+            let raw = unsafe { libc::fcntl(keep_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                raw >= 0,
+                "F_DUPFD_CLOEXEC failed after {} extras: {}",
+                extras.len(),
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a fresh descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`.
+            extras.push(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+
+        let keep_raw = keep_read.as_raw_fd();
+        let keep = [keep_raw];
+        let closed_sample_raw = extras.last().expect("non-empty extras").as_raw_fd();
+
+        // SAFETY: `fork()` creates a child that immediately calls only raw non-allocating syscalls
+        // (`imp::close_open_fds_macos`, `libc::fcntl`, `libc::_exit`) and never returns to Rust.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: freshly forked child performing only raw syscalls before `_exit`.
+            unsafe {
+                let ok = imp::close_open_fds_macos(&keep);
+                let kept_open = libc::fcntl(keep_raw, libc::F_GETFD) >= 0;
+                let sample_closed = libc::fcntl(closed_sample_raw, libc::F_GETFD) < 0;
+                libc::_exit(if !ok {
+                    1
+                } else if !kept_open {
+                    2
+                } else if !sample_closed {
+                    3
+                } else {
+                    0
+                });
+            }
+        }
+
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: `status` is a live `c_int` written by `waitpid` for valid child `pid`.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == pid {
+                break;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR),
+                "waitpid failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        drop(extras);
+        drop(keep_write);
+        drop(keep_read);
+
+        assert!(
+            libc::WIFEXITED(status),
+            "forked child did not exit normally (status={status:#x})"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "forked child exit code (1=returned false, 2=kept fd closed, 3=extra fd still open)"
+        );
+    }
+
+    /// BUG-33 / TEST-61: proves that `close_open_fds_macos` (on macOS) and `close_fds_except` in
+    /// the detached lifeline supervisor never touch the task child's stdout pipe or race with
+    /// concurrent short-lived spawns even with extra elevated open descriptors in the worker.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_short_spawns_preserve_piped_stdout_under_supervisor_fd_close() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (probe_read, probe_write) = imp::create_lifeline_pipe().expect("create extra fd pipe");
+        let mut extra_fds: Vec<OwnedFd> = Vec::with_capacity(64);
+        for _ in 0..64 {
+            // SAFETY: `probe_write` is an open descriptor owned by this test; `F_DUPFD_CLOEXEC`
+            // creates an independent close-on-exec duplicate with no pointer argument.
+            let raw = unsafe { libc::fcntl(probe_write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            assert!(
+                raw >= 0,
+                "F_DUPFD_CLOEXEC failed after {} extras: {}",
+                extra_fds.len(),
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a fresh descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`.
+            extra_fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+        }
+
+        let mut workers = Vec::with_capacity(8);
+        for worker_idx in 0..8usize {
+            workers.push(tokio::spawn(async move {
+                for iter in 0..16usize {
+                    let mut cmd = tokio::process::Command::new("/bin/sh");
+                    cmd.args([
+                        "-c",
+                        r#"printf 'TASK_%s_%s\nEND\n' "$1" "$2""#,
+                        "sh",
+                        &worker_idx.to_string(),
+                        &iter.to_string(),
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+
+                    let mut prepared = configure_command(
+                        &mut cmd,
+                        ProcessPriority::Normal,
+                        rusty_grid_core::TaskId::new(),
+                    );
+                    let mut child = prepared.spawn(&mut cmd).expect("spawn /bin/sh");
+                    let tree = prepared.attach(&child);
+                    assert!(tree.is_tracked(), "Unix task must attach to a ProcessTree");
+
+                    let mut stdout = child.stdout.take().expect("piped stdout");
+                    let mut stderr = child.stderr.take().expect("piped stderr");
+                    let out_handle = tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        stdout.read_to_end(&mut buf).await.map(|_| buf)
+                    });
+                    let err_handle = tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        stderr.read_to_end(&mut buf).await.map(|_| buf)
+                    });
+
+                    let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+                        .await
+                        .expect("child exit timeout")
+                        .expect("wait on child");
+                    let out_bytes = tokio::time::timeout(Duration::from_secs(60), out_handle)
+                        .await
+                        .expect("stdout drain timeout")
+                        .expect("stdout reader join")
+                        .expect("stdout read");
+                    let err_bytes = tokio::time::timeout(Duration::from_secs(60), err_handle)
+                        .await
+                        .expect("stderr drain timeout")
+                        .expect("stderr reader join")
+                        .expect("stderr read");
+                    tree.kill_async(None).await;
+
+                    let expected = format!("TASK_{worker_idx}_{iter}\nEND\n");
+                    let got = String::from_utf8_lossy(&out_bytes);
+                    let err_text = String::from_utf8_lossy(&err_bytes);
+                    assert!(
+                        status.success(),
+                        "worker {worker_idx} iter {iter} failed ({status:?}): stdout={got:?} stderr={err_text:?}"
+                    );
+                    assert_eq!(
+                        got, expected,
+                        "worker {worker_idx} iter {iter} stdout mismatch (stderr={err_text:?})"
+                    );
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.await.expect("worker task joined");
+        }
+        drop(extra_fds);
+        drop(probe_write);
+        drop(probe_read);
+    }
+
+    /// TEST-61: dropping an unattached `ConfiguredCommand` (`PreparedUnix`, e.g., when
+    /// `cmd.spawn()` fails after `pre_exec` forked the supervisor) writes `b"0"` to the lifeline
+    /// pipe so the supervisor exits cleanly without signalling `task_pgid` or sweeping processes.
+    #[cfg(unix)]
+    #[test]
+    fn test_prepared_unix_drop_dismisses_lifeline_without_attach() {
+        use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+        let mut cmd = tokio::process::Command::new("/nonexistent-oxideswarm-binary-test-61");
+        let prepared = configure_command(
+            &mut cmd,
+            ProcessPriority::Normal,
+            rusty_grid_core::TaskId::new(),
+        );
+        let read_ref = prepared
+            .unix
+            .lifeline_read()
+            .expect("lifeline read fd present before spawn");
+        // SAFETY: `read_ref` is an open pipe descriptor owned by `prepared`; `F_DUPFD_CLOEXEC`
+        // returns an independent duplicate that outlives `prepared`.
+        let dup_raw = unsafe { libc::fcntl(read_ref.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(
+            dup_raw >= 0,
+            "F_DUPFD_CLOEXEC on lifeline read fd failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `dup_raw` is a fresh descriptor returned by `fcntl(F_DUPFD_CLOEXEC)`.
+        let dup_read = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+
+        drop(prepared);
+
+        let mut buf = [0u8; 2];
+        // SAFETY: `dup_read` is open and `buf` is a live 2-byte writable buffer.
+        let n = unsafe { libc::read(dup_read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(
+            n, 1,
+            "dropping unattached PreparedUnix must write 1 dismissal byte (got n={n})"
+        );
+        assert_eq!(buf[0], b'0');
+
+        let mut fail_cmd = tokio::process::Command::new("/nonexistent-oxideswarm-binary-test-61");
+        let mut fail_prepared = configure_command(
+            &mut fail_cmd,
+            ProcessPriority::Normal,
+            rusty_grid_core::TaskId::new(),
+        );
+        let err = fail_prepared
+            .spawn(&mut fail_cmd)
+            .expect_err("nonexistent binary must fail to spawn");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        drop(fail_prepared);
     }
 }

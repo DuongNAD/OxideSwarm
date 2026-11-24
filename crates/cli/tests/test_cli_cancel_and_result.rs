@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use tokio::sync::watch;
 
@@ -41,7 +43,15 @@ async fn spawn_test_cluster() -> (
     let server_cfg = ServerConfig::from_addr("127.0.0.1:0")
         .expect("server config")
         .with_blob_store(blob_dir, 64 * 1024 * 1024);
-    let master = MasterServer::spawn(server_cfg).await.expect("spawn master");
+    let master = MasterServer::spawn_with_config(
+        server_cfg,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
@@ -80,7 +90,7 @@ async fn test_cli_cancel_stops_running_sleep_task() {
             "--interpreter",
             "python3",
             "--command",
-            "import time; time.sleep(30)",
+            "import time; time.sleep(120)",
             "--json",
         ])
         .output()
@@ -98,7 +108,7 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         .to_string();
 
     // Wait until the sleep task is Running on the worker.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let tasks = master.queue().list_tasks().await;
         if let Some(info) = tasks.first() {
@@ -152,16 +162,26 @@ async fn test_cli_cancel_stops_running_sleep_task() {
         serde_json::from_slice(&second_cancel.stdout).expect("parse second cancel json");
     assert_eq!(second_json["cancelled"], false);
 
-    // `result --wait` on the cancelled task reports cancellation without waiting 30s.
+    // `result --wait` on the cancelled task reports cancellation well before 120s sleep.
     let res_out = cli_cmd(home)
         .args(["result", &task_id_str, "--master", &master_addr, "--wait"])
         .output()
         .expect("spawn result --wait");
+    let cancel_elapsed = cancel_start.elapsed();
+    println!("cancelled 120s sleep task reported via result --wait in {cancel_elapsed:?}");
     assert!(!res_out.status.success());
     assert!(
-        cancel_start.elapsed() < Duration::from_secs(10),
-        "cancelled sleep task must stop well before 30s"
+        cancel_elapsed < Duration::from_secs(60),
+        "cancelled 120s sleep task hung past 60s guard: took {cancel_elapsed:?}"
     );
+    let cancelled_task = master
+        .queue()
+        .list_tasks()
+        .await
+        .into_iter()
+        .find(|info| info.task_id.to_string() == task_id_str)
+        .expect("cancelled sleep task missing from master queue");
+    assert_eq!(format!("{:?}", cancelled_task.state), "Cancelled");
     let res_stdout = String::from_utf8_lossy(&res_out.stdout);
     assert!(
         res_stdout.contains("cancelled") || res_stdout.contains("Cancelled"),

@@ -499,6 +499,8 @@ fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
         }
     }
 
+    crate::blob_cache::sweep_dead_owner_tmp(&base_dir.join("cache").join("blobs"));
+
     let mut swept_sandboxes: usize = 0;
 
     let dir_entries = match std::fs::read_dir(base_dir) {
@@ -542,7 +544,7 @@ fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
                     swept_sandboxes += 1;
                 }
                 let _ = std::fs::remove_file(&lock_path);
-                drop(lock_file);
+                release_task_lock(lock_file);
             }
             Ok(None) => {
                 // Held by a live worker / Sandbox; leave the sandbox directory untouched.
@@ -626,7 +628,7 @@ fn sweep_leftover_sandboxes_sync(base_dir: &Path) {
                 ) {
                     let _ = std::fs::remove_file(&locked_path);
                 }
-                drop(lock_file);
+                release_task_lock(lock_file);
             }
         }
     }
@@ -1182,7 +1184,7 @@ pub fn set_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn is_real_owned_dir(path: &Path, meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_real_owned_dir(path: &Path, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return false;
     }
@@ -1240,7 +1242,7 @@ pub(crate) fn is_real_owned_file(path: &Path, meta: &std::fs::Metadata) -> bool 
     true
 }
 
-fn is_real_owned_open_file(file: &std::fs::File, meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_real_owned_open_file(file: &std::fs::File, meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return false;
     }
@@ -1267,6 +1269,331 @@ fn is_real_owned_open_file(file: &std::fs::File, meta: &std::fs::Metadata) -> bo
         let _ = file;
     }
     true
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinnedEntryKind {
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedDirEntry {
+    pub(crate) name: std::ffi::OsString,
+    pub(crate) kind: PinnedEntryKind,
+}
+
+/// Directory-descriptor-pinned handle for symlink-race-free traversal on Unix (`openat` /
+/// `fdopendir` / `fstatat`).
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct PinnedDir {
+    fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+fn clear_errno() {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    // SAFETY: `__error()` returns a valid thread-local pointer to `errno` on Darwin/BSD.
+    unsafe {
+        *libc::__error() = 0;
+    }
+    #[cfg(any(target_os = "linux", target_os = "emscripten"))]
+    // SAFETY: `__errno_location()` returns a valid thread-local pointer to `errno` on Linux.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(target_os = "android")]
+    // SAFETY: `__errno()` returns a valid thread-local pointer to `errno` on Android Bionic.
+    unsafe {
+        *libc::__errno() = 0;
+    }
+}
+
+#[cfg(unix)]
+fn fstat_raw(fd: std::os::fd::RawFd) -> std::io::Result<libc::stat> {
+    // SAFETY: `libc::stat` is plain-old-data (all integer fields); `fstat` initializes it on 0.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is an open descriptor and `st` points to stack memory of size `libc::stat`.
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+#[cfg(unix)]
+fn verify_owned_dir_stat(st: &libc::stat) -> std::io::Result<()> {
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a directory",
+        ));
+    }
+    if st.st_uid != current_euid() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "directory is not owned by the current user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+impl PinnedDir {
+    /// Opens `path` directly with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` and verifies
+    /// via `fstat` that it is a real directory owned by the current effective UID.
+    pub(crate) fn open_root_nofollow(path: &Path) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
+        let raw_fd = loop {
+            // SAFETY: `c_path` is a valid NUL-terminated string; flags specify read-only,
+            // directory-only, no final-symlink follow, and close-on-exec.
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("symbolic link or non-directory: {err}"),
+                ));
+            }
+            return Err(err);
+        };
+        // SAFETY: `open` succeeded and returned a newly allocated, unowned file descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let st = fstat_raw(fd.as_raw_fd())?;
+        verify_owned_dir_stat(&st)?;
+        Ok(Self { fd })
+    }
+
+    /// Returns `(st_dev, st_ino)` for this pinned directory descriptor.
+    pub(crate) fn dev_ino(&self) -> std::io::Result<(u64, u64)> {
+        use std::os::fd::AsRawFd;
+        let st = fstat_raw(self.fd.as_raw_fd())?;
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// Enumerates direct child entries of this pinned directory without path re-resolution.
+    // Used by the sandbox tests; production walks go through `read_entries_limited`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn read_entries(&self) -> std::io::Result<Vec<PinnedDirEntry>> {
+        self.read_entries_limited(usize::MAX)
+    }
+
+    /// Like [`Self::read_entries`], but fails with `ErrorKind::OutOfMemory` as soon as the
+    /// directory holds more than `max` entries, so a huge directory is never read in full.
+    pub(crate) fn read_entries_limited(&self, max: usize) -> std::io::Result<Vec<PinnedDirEntry>> {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStringExt;
+
+        struct DirGuard(*mut libc::DIR);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is a valid non-null `DIR*` obtained from `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+
+        let dup_raw = loop {
+            // SAFETY: `self.fd` is an open directory descriptor; `F_DUPFD_CLOEXEC` creates a
+            // separate close-on-exec descriptor so `fdopendir`/`closedir` cannot close `self.fd`.
+            let rc = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+            if rc >= 0 {
+                break rc;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        };
+        // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned file descriptor.
+        let dup_fd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+        // SAFETY: `dup_fd` is a valid open directory descriptor; if `fdopendir` returns null,
+        // `dup_fd` remains owned and is closed on drop.
+        let dir_ptr = unsafe { libc::fdopendir(dup_fd.as_raw_fd()) };
+        if dir_ptr.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Ownership of `dup_raw` transferred to `dir_ptr` (`closedir` will close it).
+        let _ = dup_fd.into_raw_fd();
+        let dir = DirGuard(dir_ptr);
+
+        let mut entries = Vec::new();
+        loop {
+            clear_errno();
+            // SAFETY: `dir.0` is a valid open `DIR*` stream exclusively borrowed by this loop.
+            let ent = unsafe { libc::readdir(dir.0) };
+            if ent.is_null() {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error().unwrap_or(0) != 0 {
+                    return Err(err);
+                }
+                break;
+            }
+            // SAFETY: `ent` is non-null from `readdir` and `d_name` is NUL-terminated.
+            let c_name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let name_bytes = c_name.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+
+            // SAFETY: `libc::stat` is plain-old-data; `fstatat` initializes it on 0.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            loop {
+                // SAFETY: `self.fd` is an open dirfd, `c_name` is NUL-terminated, and
+                // `AT_SYMLINK_NOFOLLOW` inspects the entry itself without following symlinks.
+                let rc = unsafe {
+                    libc::fstatat(
+                        self.fd.as_raw_fd(),
+                        c_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+            if entries.len() >= max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("directory holds more than {max} entries"),
+                ));
+            }
+            let kind = match st.st_mode & libc::S_IFMT {
+                libc::S_IFLNK => PinnedEntryKind::Symlink,
+                libc::S_IFDIR => PinnedEntryKind::Dir,
+                libc::S_IFREG => PinnedEntryKind::File,
+                _ => PinnedEntryKind::Other,
+            };
+            entries.push(PinnedDirEntry {
+                name: std::ffi::OsString::from_vec(name_bytes.to_vec()),
+                kind,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Opens a direct child directory using `openat(self.fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`
+    /// and verifies ownership via `fstat`.
+    pub(crate) fn open_dir_nofollow(&self, name: &std::ffi::OsStr) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry name contains NUL")
+        })?;
+        let raw_fd = loop {
+            // SAFETY: `self.fd` is an open directory fd and `c_name` is a valid NUL-terminated name.
+            let fd = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("symbolic link or non-directory: {err}"),
+                ));
+            }
+            return Err(err);
+        };
+        // SAFETY: `openat` succeeded and returned a newly allocated, unowned file descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let st = fstat_raw(fd.as_raw_fd())?;
+        verify_owned_dir_stat(&st)?;
+        Ok(Self { fd })
+    }
+
+    /// Opens a direct child regular file using `openat(self.fd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)`
+    /// and verifies via `fstat` (`file.metadata()`) that it is a regular file owned by the current user.
+    pub(crate) fn open_file_nofollow(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "entry name contains NUL")
+        })?;
+        let raw_fd = loop {
+            // SAFETY: `self.fd` is an open directory fd and `c_name` is a valid NUL-terminated name;
+            // `O_NOFOLLOW | O_NONBLOCK` prevents following leaf symlinks or blocking on FIFOs.
+            let fd = unsafe {
+                libc::openat(
+                    self.fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symbolic links are not sent",
+                ));
+            }
+            return Err(err);
+        };
+        // SAFETY: `openat` succeeded and returned a newly allocated, unowned file descriptor.
+        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        let meta = file.metadata()?;
+        if !is_real_owned_open_file(&file, &meta) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file owned by the current user",
+            ));
+        }
+        Ok((file, meta))
+    }
 }
 
 fn ensure_locks_dir(base_dir: &Path) -> std::io::Result<PathBuf> {
@@ -1384,12 +1711,24 @@ fn open_and_try_lock_task_with(
         if lock_file_is_still_named(&lock_path, &file, &file_meta) {
             return Ok(Some((lock_path, file)));
         }
-        drop(file);
+        release_task_lock(file);
     }
 }
 
+/// Explicitly unlocks a task lock file before closing it (TEST-58).
+///
+/// On Unix, `flock` locks belong to the open file description rather than the
+/// descriptor itself: a concurrent `fork()` (for example another task spawning its
+/// process-tree lifeline supervisor) duplicates the descriptor until `exec`/`close`,
+/// so `close` alone leaves the lock held. Calling `unlock()` (`LOCK_UN`) releases
+/// the lock immediately regardless of inherited descriptors.
+fn release_task_lock(lock_file: std::fs::File) {
+    let _ = lock_file.unlock();
+    drop(lock_file);
+}
+
 /// True when `lock_path` still names the file that `file` (already locked) refers to.
-fn lock_file_is_still_named(
+pub(crate) fn lock_file_is_still_named(
     lock_path: &Path,
     file: &std::fs::File,
     file_meta: &std::fs::Metadata,
@@ -1461,7 +1800,7 @@ impl Sandbox {
 
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
             let _ = tokio::fs::remove_file(&lock_path).await;
-            drop(lock_file);
+            release_task_lock(lock_file);
             return Err(SandboxError::Io { task_id, source: e });
         }
 
@@ -1618,7 +1957,9 @@ impl Sandbox {
         self.destroyed = true;
 
         if self.keep_sandboxes {
-            self.lock_file = None;
+            if let Some(lock_file) = self.lock_file.take() {
+                release_task_lock(lock_file);
+            }
             debug!(task_id = %self.task_id, path = %self.path.display(), "Sandbox retained per keep_sandboxes config");
             return Ok(());
         }
@@ -1632,7 +1973,9 @@ impl Sandbox {
                 })?;
         }
         let _ = tokio::fs::remove_file(&self.lock_path).await;
-        self.lock_file = None;
+        if let Some(lock_file) = self.lock_file.take() {
+            release_task_lock(lock_file);
+        }
         debug!(task_id = %self.task_id, "Sandbox destroyed");
         Ok(())
     }
@@ -1640,14 +1983,14 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if !self.destroyed {
-            if !self.keep_sandboxes {
-                if self.path.exists() {
-                    let _ = std::fs::remove_dir_all(&self.path);
-                }
-                let _ = std::fs::remove_file(&self.lock_path);
+        if !self.destroyed && !self.keep_sandboxes {
+            if self.path.exists() {
+                let _ = std::fs::remove_dir_all(&self.path);
             }
-            self.lock_file = None;
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+        if let Some(lock_file) = self.lock_file.take() {
+            release_task_lock(lock_file);
         }
     }
 }
@@ -1750,7 +2093,7 @@ mod tests {
                     .unwrap()
                     .expect("the sweeper takes the lock first");
                 std::fs::remove_file(&sweeper_path).unwrap();
-                drop(sweeper_file);
+                release_task_lock(sweeper_file);
             }
         })
         .unwrap()
@@ -1763,7 +2106,7 @@ mod tests {
                 .is_none(),
             "a second opener must see the lock as held"
         );
-        drop(owner);
+        release_task_lock(owner.1);
     }
 
     #[tokio::test]
@@ -2652,6 +2995,116 @@ mod tests {
                 .join(format!("{task_id}.lock"))
                 .exists(),
             "lock file of swept retained sandbox must be removed"
+        );
+    }
+
+    /// TEST-58, deterministic: `try_clone()` models a concurrent `fork()` inheriting the open lock
+    /// descriptor before `exec`/`close`. On Unix, `flock` locks live on the open file description,
+    /// so `destroy()` with `keep_sandboxes == true` must call `unlock()` (`LOCK_UN`) rather than
+    /// merely dropping the worker's own `File`; otherwise the subsequent default `ensure_usable()`
+    /// sees `WouldBlock` and leaves the retained sandbox unswept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_keep_sandboxes_destroy_unlocks_even_with_inherited_lock_fd() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_dir = temp.path().join("sandboxes");
+
+        let keep_config = SandboxConfig::new(&base_dir).with_keep_sandboxes(true);
+        keep_config.ensure_usable().await.unwrap();
+
+        let task_id = TaskId::new();
+        let mut sb = Sandbox::create(&keep_config, task_id).await.unwrap();
+        let sb_path = sb.path().to_path_buf();
+        let inherited_dup = sb
+            .lock_file
+            .as_ref()
+            .expect("live sandbox holds lock file")
+            .try_clone()
+            .expect("dup lock fd");
+
+        sb.destroy().await.unwrap();
+        assert!(
+            sb_path.is_dir(),
+            "destroy() with keep_sandboxes == true must retain the sandbox directory"
+        );
+
+        let default_config = SandboxConfig::new(&base_dir).with_keep_sandboxes(false);
+        default_config.ensure_usable().await.unwrap();
+        assert!(
+            !sb_path.exists(),
+            "subsequent ensure_usable() with keep_sandboxes == false must sweep retained sandbox even while an inherited fd copy exists"
+        );
+        assert!(
+            !base_dir
+                .join(".locks")
+                .join(format!("{task_id}.lock"))
+                .exists(),
+            "lock file of swept retained sandbox must be removed"
+        );
+        drop(inherited_dup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_dir_openat_never_follows_swapped_parent_symlink() {
+        use std::ffi::OsStr;
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"host-secret").unwrap();
+
+        let cp_dir = temp.path().join("cp_root");
+        let sub_dir = cp_dir.join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("legit.txt"), b"legit-data").unwrap();
+
+        // Pin `cp_root` and `sub` via `openat` before an attacker swaps `sub` on disk.
+        let root_pinned = PinnedDir::open_root_nofollow(&cp_dir).unwrap();
+        let sub_pinned = root_pinned.open_dir_nofollow(OsStr::new("sub")).unwrap();
+
+        // Swap `cp_root/sub` to a symlink pointing to `outside`.
+        let displaced = temp.path().join("displaced_sub");
+        std::fs::rename(&sub_dir, &displaced).unwrap();
+        std::os::unix::fs::symlink(&outside, &sub_dir).unwrap();
+
+        // The already-pinned fd still reads the original `legit.txt` and never sees `secret.txt`.
+        let entries = sub_pinned.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, OsStr::new("legit.txt"));
+        assert_eq!(entries[0].kind, PinnedEntryKind::File);
+
+        let (mut legit_file, _) = sub_pinned
+            .open_file_nofollow(OsStr::new("legit.txt"))
+            .unwrap();
+        let mut buf = Vec::new();
+        legit_file.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"legit-data");
+        assert_eq!(
+            sub_pinned
+                .open_file_nofollow(OsStr::new("secret.txt"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        // Fresh traversal from `root_pinned` refuses the newly swapped `sub` symlink.
+        let root_entries = root_pinned.read_entries().unwrap();
+        assert_eq!(root_entries.len(), 1);
+        assert_eq!(root_entries[0].kind, PinnedEntryKind::Symlink);
+        assert_eq!(
+            root_pinned
+                .open_dir_nofollow(OsStr::new("sub"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            PinnedDir::open_root_nofollow(&sub_dir)
+                .err()
+                .map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidInput)
         );
     }
 }

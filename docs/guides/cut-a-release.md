@@ -37,7 +37,8 @@ grep -n "STORE_FORMAT_VERSION" crates/master/src/store.rs
    - [Cargo.toml](../../Cargo.toml): set `[workspace.package] version = "<X.Y.Z>"`. Workspace crates inherit `version.workspace = true`; keep `version = "0.0.0"` in `fuzz/Cargo.toml`.
    - [Cargo.lock](../../Cargo.lock) and [fuzz/Cargo.lock](../../fuzz/Cargo.lock): refresh the OxideSwarm workspace package version entries and confirm `cargo check --workspace --all-targets --locked` passes.
    - [CHANGELOG.md](../../CHANGELOG.md): move the items under `## [Unreleased]` into `## [<X.Y.Z>] - <YYYY-MM-DD>`, write a summary paragraph naming protocol and store compatibility, and add `### Upgrading from <PREV>`. Leave an empty `## [Unreleased]` section at the top.
-   - [README.md](../../README.md): update `the latest is v<X.Y.Z>`, the archive filenames in `Install`, and `OxideSwarm <X.Y.Z> covers the user story above` in `Status and limits`.
+   - [README.md](../../README.md): update `the latest is v<X.Y.Z>` and the archive filenames in `Install`.
+   - [docs/reference.md](../reference.md): update `the latest is v<X.Y.Z>` and the archive filenames in `Install`, and `OxideSwarm <X.Y.Z> covers the user story above` in `Status and limits`.
    - [DEPLOYMENT.md](../../DEPLOYMENT.md): update the protocol release range line in section `3.5`.
    - [ROADMAP.md](../ROADMAP.md): update the dated `Releases (<YYYY-MM-DD>):` bullet under `Where the project stands` and add a row to the `Releases` table (no status-log entry).
    - [BACKLOG.md](../BACKLOG.md): append one dated line `Release <X.Y.Z> prepared (<wire and contents summary>)` to `## Status log`.
@@ -57,10 +58,10 @@ cargo check --workspace --all-targets --locked
 On the release author's workstation:
 
 ```bash
-git add Cargo.toml Cargo.lock fuzz/Cargo.lock CHANGELOG.md README.md DEPLOYMENT.md docs/ROADMAP.md docs/BACKLOG.md
+git add Cargo.toml Cargo.lock fuzz/Cargo.lock CHANGELOG.md README.md docs/reference.md DEPLOYMENT.md docs/ROADMAP.md docs/BACKLOG.md
 git commit -m "release: prepare <X.Y.Z> (no wire change)"
 git push -u origin <AUTHOR>/release-<X.Y.Z>
-gh pr create --title "release: prepare <X.Y.Z> (no wire change)" --body "Release preparation for <X.Y.Z>, approved by the owner in chat on <YYYY-MM-DD> (\"<OWNER_APPROVAL>\"). No wire change: protocol <P>, store format <S>; it mixes freely with <PREV>.\n\n- Versions: Cargo.toml, Cargo.lock, fuzz/Cargo.lock\n- CHANGELOG.md, README.md, DEPLOYMENT.md, docs/ROADMAP.md, docs/BACKLOG.md\n\nAfter merge: tag v<X.Y.Z> on the merge commit, then run the Mac and Windows release checks."
+gh pr create --title "release: prepare <X.Y.Z> (no wire change)" --body "Release preparation for <X.Y.Z>, approved by the owner in chat on <YYYY-MM-DD> (\"<OWNER_APPROVAL>\"). No wire change: protocol <P>, store format <S>; it mixes freely with <PREV>.\n\n- Versions: Cargo.toml, Cargo.lock, fuzz/Cargo.lock\n- CHANGELOG.md, README.md, docs/reference.md, DEPLOYMENT.md, docs/ROADMAP.md, docs/BACKLOG.md\n\nAfter merge: tag v<X.Y.Z> on the merge commit, then run the Mac and Windows release checks."
 ```
 
 ### 3. Merge and push the `v<X.Y.Z>` tag to run `.github/workflows/release.yml`
@@ -100,7 +101,7 @@ On a release verifier's workstation (macOS or Linux):
 
 ```bash
 mkdir -p "<VERIFY_DIR>" && cd "<VERIFY_DIR>"
-gh release download v<X.Y.Z>
+gh release download v<X.Y.Z> --repo DuongNAD/OxideSwarm
 shasum -a 256 -c SHA256SUMS          # Linux: sha256sum -c SHA256SUMS
 for archive in oxideswarm-*.tar.gz oxideswarm-*.zip; do
   gh attestation verify "$archive" --repo DuongNAD/OxideSwarm
@@ -121,7 +122,7 @@ On the macOS (`<ARCH>`) test machine:
   mkdir -p "$TEST_ROOT/home" "$TEST_ROOT/blobs" "$TEST_ROOT/sb1" "$TEST_ROOT/sb2" "$TEST_ROOT/verify"
   cd "$TEST_ROOT"
 
-  gh release download v<X.Y.Z> -p "oxideswarm-<X.Y.Z>-<ARCH>-apple-darwin.tar.gz" -p SHA256SUMS
+  gh release download v<X.Y.Z> --repo DuongNAD/OxideSwarm -p "oxideswarm-<X.Y.Z>-<ARCH>-apple-darwin.tar.gz" -p SHA256SUMS
   shasum -a 256 -c SHA256SUMS --ignore-missing
   gh attestation verify "oxideswarm-<X.Y.Z>-<ARCH>-apple-darwin.tar.gz" --repo DuongNAD/OxideSwarm   # releases after v0.4.3
   tar -xzf "oxideswarm-<X.Y.Z>-<ARCH>-apple-darwin.tar.gz"
@@ -159,11 +160,11 @@ Repeat the same isolated loopback check on Windows using ephemeral ports and sto
 On the Windows (`x86_64`) test machine:
 
 ```powershell
-$TestRoot = Join-Path $env:TEMP "ox-rel-smoke-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+$TestRoot = Join-Path $env:LOCALAPPDATA "OxideSwarm\ox-rel-smoke-$([guid]::NewGuid().ToString('N').Substring(0,8))"
 New-Item -ItemType Directory -Force -Path "$TestRoot\home","$TestRoot\blobs","$TestRoot\sb1","$TestRoot\sb2","$TestRoot\verify" | Out-Null
 Set-Location $TestRoot
 
-gh release download v<X.Y.Z> -p "oxideswarm-<X.Y.Z>-x86_64-pc-windows-msvc.zip" -p SHA256SUMS
+gh release download v<X.Y.Z> --repo DuongNAD/OxideSwarm -p "oxideswarm-<X.Y.Z>-x86_64-pc-windows-msvc.zip" -p SHA256SUMS
 $expected = (Select-String -Path SHA256SUMS -Pattern "oxideswarm-<X.Y.Z>-x86_64-pc-windows-msvc\.zip$").Line.Split()[0].ToUpper()
 $actual = (Get-FileHash ".\oxideswarm-<X.Y.Z>-x86_64-pc-windows-msvc.zip" -Algorithm SHA256).Hash.ToUpper()
 if ($actual -ne $expected) { throw "SHA256 mismatch: $actual != $expected" }
@@ -246,3 +247,4 @@ Skeleton inventory for `LV-15` step 2 ([design 0058](../design/0058-lasting-valu
 | `gh attestation verify` fails with no attestation found | Archive is from `v0.4.3` or earlier (before `LV-5` added `actions/attest`), or archive bytes differ from the CI build | Check `SHA256SUMS`; use attestation verification on releases after `v0.4.3` or a `release.yml` `attest-only` run |
 | `submit --verify 1` fails with fewer than 1 other worker | Only one worker connected to the smoke master, or both workers shared the same worker ID | Start two workers with distinct `--name` values and separate `--sandbox-base-dir` paths |
 | Second worker fails to bind port `8080` | Standby portal collides with the first worker or another process on `:8080` | Pass `--no-portal` to both smoke workers and `--dashboard-port 0` to the master |
+| Windows smoke worker exits with `Task sandboxes cannot use '...' safely` | `%TEMP%` (or `AppData` on multi-account hosts) carries write ACEs for another account or leftover SID (`ensure_private_dir`) | Keep `$TestRoot` under `%LOCALAPPDATA%` as above, or use a private folder directly under the drive root (for example `C:\OxideSwarm\rel-smoke`) when `AppData` itself is shared |

@@ -6,7 +6,7 @@ marked "not implemented".
 
 To check that a release archive is intact and was built by this repository's workflow, and from which commit,
 compare it with `SHA256SUMS` and run `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm`
-([README, Install](../README.md#install)).
+([reference, Install](reference.md#install)).
 
 ## 1. In one paragraph
 
@@ -84,7 +84,7 @@ implemented.
 | Port | Where it listens | What it exposes | Protection |
 | :--- | :--- | :--- | :--- |
 | **8088/tcp** (cluster) | `127.0.0.1` by default; `0.0.0.0` only with `--listen 0.0.0.0:8088` (what `switch_role.sh master` and `windows\start_master.cmd` pass) | Worker registration, task submission, status. This is the port that runs code on your workers. | Mutual cluster-secret handshake (version 2; a version 1 peer is refused); post-handshake traffic is encrypted via ChaCha20-Poly1305 (`0x04`) using directional session keys (unauthenticated loopback fallback uses plaintext `0x01`/`0x02`). |
-| **8080/tcp** (dashboard) | Loopback unless `--web-ui-addr` says otherwise (the launchers pass `--web-ui-addr 127.0.0.1:8080`, or `0.0.0.0:8080` only when you ask for phone / LAN access) | Web UI, REST (`/api/*`), WebSocket `/ws`, SSE. Can submit and cancel tasks. | Bearer token / `X-API-Key` / `?token=` for all routes except `GET /`, `GET /api/discovery/probe`, `GET /api/rendezvous/master`, and `POST /api/rendezvous/register` (section 6); same-origin only. |
+| **8080/tcp** (dashboard) | Loopback unless `--web-ui-addr` says otherwise (the launchers pass `--web-ui-addr 127.0.0.1:8080`, or `0.0.0.0:8080` only when you ask for phone / LAN access) | Web UI, REST (`/api/*`), WebSocket `/ws`, SSE. Can submit and cancel tasks, and (with `Admin` scope) manage enrolled members, pending enrollments, and invites (`/api/members*`, `/api/invites*`). | Bearer token / `X-API-Key` / `?token=` for all routes except `GET /`, `GET /api/discovery/probe`, `GET /api/rendezvous/master`, and `POST /api/rendezvous/register` (section 6); `Admin` scope required on all `/api/members*` and `/api/invites*` endpoints; same-origin only. |
 | **`oxideswarm mcp` (stdio only)** | No listening network port (`--sse` was removed in `SEC-1`). Spawned as a local child process by a coding client (`guides/mcp-client-setup.md`). | JSON-RPC 2.0 MCP tools (`status`, `workers`, `submit`, `task_result`, `doctor`, `cancel`) that talk to the master's cluster port (`8088/tcp`). | Uses the same fail-closed client secret policy as `status`: a non-loopback or `auto` master without a secret exits with code `6` before reading `stdin` unless `--insecure` is given, and `./rusty-grid.toml` / `./rusty-grid.json` in the working directory are skipped unless `--config` or `RUSTY_GRID_CONFIG` is passed explicitly. |
 | **8080/tcp** on a *worker* | `127.0.0.1` when the worker targets a loopback master (`127.0.0.1`, `[::1]`, `localhost`), or all interfaces (`0.0.0.0`) otherwise; disable with `oxideswarm worker --no-portal` (`RUSTY_GRID_NO_PORTAL=1` or `no_portal = true` under `[worker]`). If the port is taken, e.g. by a master on the same machine, the portal just does not start. | A tiny "standby" page and `/api/status` that say which master this worker follows and redirect browsers to it. | None. It only reveals the master's address. |
 | **8089/udp** | Loopback (`127.0.0.1`, answering local unicast probes only without broadcasting) when the master listens on loopback; `0.0.0.0` (broadcasting / answering on the LAN) when `--listen` is non-loopback | Discovery beacon (`--master auto`): the master's cluster address and, only if the dashboard listens on a non-loopback address, its URL (empty otherwise). | With a secret the beacon carries a MAC and workers/clients ignore beacons without a valid one. Not encrypted. |
@@ -111,7 +111,7 @@ Open the cluster port on your firewall only for the networks that should reach i
   and client, restart the master and the workers (a running process keeps the secret it started with; there is
   no hot reload). From that moment the old secret is useless and so is the dashboard token derived from it.
   Do this whenever a machine that had the secret is lost, sold or suspected of compromise.
-* **Enrolled machine.** `oxideswarm members revoke <ID>` (an admin) removes the member from `members.json`
+* **Enrolled machine.** `oxideswarm members revoke <ID>` or the dashboard **Members** tab (`POST /api/members/{name_or_id}/revoke`, an admin) removes the member from `members.json`
   and records its key as revoked, so its next OXS-AUTH v3 handshake is refused. At the same moment the master
   closes every connection the member holds, on every lane: its worker sessions (TCP, or both QUIC lanes) and
   its client connections over TCP or a P2P `STREAM_CLIENT` stream (CLI commands such as a waiting
@@ -154,7 +154,10 @@ Public routes on the dashboard listener (`8080/tcp`) that do not require a dashb
 Listener and bypass policy:
 
 1. **A bare loopback master** (`oxideswarm master`) serves its dashboard on `http://127.0.0.1:8080` for the
-   local user; if it asks for a token anyway, use the command above or start with `--dev`.
+   local user; if it asks for a token anyway, use the command above or start with `--dev`. A master in
+   `--auth members` mode that is reachable beyond loopback (or uses `--p2p`) has no cluster secret and gets no
+   such implicit access, because local Admin could mint invites: start it with `--dev` to use the local
+   dashboard.
 2. **The dashboard only listens on a non-loopback interface when `--web-ui-addr` says so explicitly**
    (for example `--web-ui-addr 0.0.0.0:8080` or `switch_role.sh master --dashboard-lan`). Binding the cluster port
    to `0.0.0.0` does not publish the dashboard.

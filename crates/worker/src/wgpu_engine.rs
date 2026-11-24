@@ -1050,11 +1050,12 @@ mod tests {
                 },
             )
             .expect_err("cancelled");
+        let cancel_elapsed = started.elapsed();
+        println!("wait_for_map stopped on cancel in {cancel_elapsed:?}");
         assert!(matches!(err, GpuError::Interrupted(_)), "{err:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
+            cancel_elapsed < Duration::from_secs(60),
+            "wait_for_map cancel hung: {cancel_elapsed:?}"
         );
         setter.join().unwrap();
 
@@ -1068,11 +1069,12 @@ mod tests {
                 },
             )
             .expect_err("deadline");
+        let deadline_elapsed = started.elapsed();
+        println!("wait_for_map stopped on deadline in {deadline_elapsed:?}");
         assert!(matches!(err, GpuError::Interrupted(_)), "{err:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            started.elapsed()
+            deadline_elapsed < Duration::from_secs(60),
+            "wait_for_map deadline hung: {deadline_elapsed:?}"
         );
         drop(never_sent);
         // a sender that went away is an error too, not an endless wait

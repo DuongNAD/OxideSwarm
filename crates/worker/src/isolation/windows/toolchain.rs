@@ -2,19 +2,23 @@
 
 use super::acl::{
     dacl_already_denies_sid, dacl_already_grants_sid, dacl_already_grants_sid_with_flags,
-    explicit_access, get_path_dacl_sddl, merge_entries_on_path, merge_entries_on_path_unprotected,
-    record_acl_grant, record_sddl_restore, remove_sid_aces_from_path, restore_path_dacl_sddl,
-    set_protected_dacl_on_path, OwnedSid,
+    explicit_access, get_handle_dacl_sddl, handle_dacl_grants_sid, merge_entries_on_path,
+    merge_entries_on_path_unprotected, open_verified_dacl_handle, record_acl_grant,
+    record_sddl_restore, remove_sid_aces_from_path, restore_path_dacl_sddl,
+    set_protected_dacl_on_handle, ExpectedHandleKind, OwnedSid,
 };
 use super::path::{
-    discover_msvc_details, is_reparse_point, normalize_win_path, path_starts_with_ci,
+    abs_win_no_canon, components_ci_eq, discover_msvc_details, is_reparse_point,
+    lexically_resolve_dots, normalize_win_path, path_starts_with_ci,
 };
 use super::spawn::ensure_process_token_default_dacl_grants_current_user;
 use super::PREPARE_LOCK;
 use crate::isolation::{acl_grant_manifest_path, HostDirs};
 use std::io;
 use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::Authorization::{DENY_ACCESS, GRANT_ACCESS, SET_ACCESS};
 use windows_sys::Win32::Security::{
     WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid, WinCapabilityInternetClientSid,
@@ -22,8 +26,10 @@ use windows_sys::Win32::Security::{
     NO_INHERITANCE, OBJECT_INHERIT_ACE, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE, SYNCHRONIZE,
+    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_TRAVERSE,
+    SYNCHRONIZE,
 };
 
 fn grant_rx_non_inherited(path: &Path, sid: PSID, manifest_path: Option<&Path>) -> io::Result<()> {
@@ -432,10 +438,475 @@ pub fn validate_sandbox_base_safe(sandbox_base: &Path, host: &HostDirs) -> Resul
     Ok(())
 }
 
+/// Checks every folder along `chain` from `home` down to the end of `chain` for NTFS reparse
+/// points (symlinks or junctions), without calling `canonicalize` below `home`. Returns `Ok(true)`
+/// if `chain` reaches or traverses `home` cleanly.
+fn check_chain_from_home(
+    chain: &Path,
+    ws_display: &Path,
+    home_lex: &Path,
+    home_norm: &Path,
+) -> Result<bool, String> {
+    let mut cur = PathBuf::new();
+    let mut in_home = false;
+    let mut matched_home = false;
+    let mut depth_below_home: usize = 0;
+
+    for comp in chain.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {
+                cur.push(comp.as_os_str());
+                // Match home only on Normal components so a bare drive prefix (`C:`) never
+                // expands via the worker's current working directory on that drive.
+                continue;
+            }
+            Component::ParentDir => {
+                if in_home {
+                    if depth_below_home == 0 {
+                        in_home = false;
+                        cur.pop();
+                    } else {
+                        depth_below_home -= 1;
+                        cur.pop();
+                    }
+                } else {
+                    cur.push(comp.as_os_str());
+                }
+                continue;
+            }
+            Component::Normal(c) => {
+                cur.push(c);
+                if in_home {
+                    depth_below_home += 1;
+                }
+            }
+        }
+
+        if !in_home
+            && (components_ci_eq(&cur, home_lex)
+                || (!is_reparse_point(&cur)
+                    && components_ci_eq(&normalize_win_path(&cur), home_norm)))
+        {
+            in_home = true;
+            matched_home = true;
+            depth_below_home = 0;
+        }
+
+        if in_home && is_reparse_point(&cur) {
+            return Err(format!(
+                "refusing '{}' as workspace_root because '{}' is a symlink or junction (reparse point); if your user home or AppData\\Local is redirected via a junction, pass --workspace-root pointing directly at the junction's target directory",
+                ws_display.display(),
+                cur.display()
+            ));
+        }
+    }
+
+    Ok(matched_home)
+}
+
+fn check_any_reparse_in_chain(chain: &Path, ws_display: &Path) -> Result<(), String> {
+    let mut cur = PathBuf::new();
+    for comp in chain.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {
+                cur.push(comp.as_os_str());
+            }
+            Component::ParentDir => {
+                if matches!(cur.components().next_back(), Some(Component::Normal(_))) {
+                    cur.pop();
+                }
+            }
+            Component::Normal(c) => {
+                cur.push(c);
+                if is_reparse_point(&cur) {
+                    return Err(format!(
+                        "refusing '{}' as workspace_root because '{}' is a symlink or junction (reparse point); if your user home or AppData\\Local is redirected via a junction, pass --workspace-root pointing directly at the junction's target directory",
+                        ws_display.display(),
+                        cur.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses `ws_root` when any directory from `home` down to `ws_root` (or any ancestor along
+/// the raw, lexical, or canonical path when `ws_root` is under or resolves into `home`) is a
+/// symlink or junction (`FILE_ATTRIBUTE_REPARSE_POINT`), before `normalize_win_path` /
+/// `path_starts_with_ci` canonicalises past it or `SetNamedSecurityInfoW` rewrites the
+/// target's DACL. Roots outside `home` that do not resolve into `home` have no ancestor check
+/// (only `ws_root` itself is checked).
+fn check_no_reparse_from_home(
+    ws_root: &Path,
+    raw_abs: &Path,
+    lex_abs: &Path,
+    home: &Path,
+) -> Result<(), String> {
+    if home.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let home_lex = lexically_resolve_dots(&abs_win_no_canon(home));
+    let home_norm = normalize_win_path(home);
+    let raw_matched = check_chain_from_home(raw_abs, ws_root, &home_lex, &home_norm)?;
+    let lex_matched = check_chain_from_home(lex_abs, ws_root, &home_lex, &home_norm)?;
+    if raw_matched || lex_matched || path_starts_with_ci(ws_root, home) {
+        check_any_reparse_in_chain(raw_abs, ws_root)?;
+        check_any_reparse_in_chain(lex_abs, ws_root)?;
+        check_any_reparse_in_chain(&normalize_win_path(ws_root), ws_root)?;
+    }
+    Ok(())
+}
+
+fn read_windows_file_info(file: &std::fs::File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    let handle = file.as_raw_handle() as HANDLE;
+    // SAFETY: `BY_HANDLE_FILE_INFORMATION` contains only plain integer and `FILETIME` fields.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` keeps `handle` valid for the duration of this call, and `&mut info` is a
+    // valid writable `BY_HANDLE_FILE_INFORMATION`.
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+pub(in crate::isolation) fn validate_single_link_file_info(
+    ws_root: &Path,
+    entry_name: &str,
+    info: io::Result<BY_HANDLE_FILE_INFORMATION>,
+) -> Result<(), String> {
+    let info = match info {
+        Ok(info) => info,
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because file link information (GetFileInformationByHandle) for '{}' could not be read: {e}",
+                ws_root.display(),
+                entry_name
+            ));
+        }
+    };
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' is a symlink or reparse point",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' is not a regular file",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    if info.nNumberOfLinks == 0 {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' reported nNumberOfLinks == 0 (cannot confirm a single hard link, nlink == 1)",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    if info.nNumberOfLinks != 1 {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' has {} hard links (must be a single-link regular file, nlink == 1)",
+            ws_root.display(),
+            entry_name,
+            info.nNumberOfLinks
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that `entry_path` is a real non-reparse directory, returning `Ok(false)` if the
+/// entry vanished concurrently (for example during another slot's workspace eviction/wipe) and
+/// `Ok(true)` if it exists and is valid.
+fn check_real_directory_allow_missing(
+    ws_root: &Path,
+    entry_name: &str,
+    entry_path: &Path,
+) -> Result<bool, String> {
+    let meta = match std::fs::symlink_metadata(entry_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because metadata for '{}' could not be read: {e}",
+                ws_root.display(),
+                entry_name
+            ));
+        }
+    };
+    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' is a symlink or reparse point",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' is not a directory",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    Ok(true)
+}
+
+/// Validates that `entry_path`, if still present, is a regular non-reparse file with
+/// `nNumberOfLinks == 1` (reading `nNumberOfLinks` directly from `GetFileInformationByHandle`),
+/// returning `Ok(())` when the entry vanished concurrently (e.g. eviction/wipe).
+fn check_single_link_regular_file_allow_missing(
+    ws_root: &Path,
+    entry_name: &str,
+    entry_path: &Path,
+) -> Result<(), String> {
+    let meta = match std::fs::symlink_metadata(entry_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because metadata for '{}' could not be read: {e}",
+                ws_root.display(),
+                entry_name
+            ));
+        }
+    };
+    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' is a symlink or reparse point",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' because '{}' is not a regular file",
+            ws_root.display(),
+            entry_name
+        ));
+    }
+    let file = match rusty_grid_core::blob::open_regular_file_nofollow(entry_path) {
+        Ok((file, _)) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+            let msg = e.to_string();
+            if msg.contains("symbolic links") {
+                return Err(format!(
+                    "refusing to rewrite the DACL of existing folder '{}' because '{}' is a symlink or reparse point",
+                    ws_root.display(),
+                    entry_name
+                ));
+            }
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because '{}' is not a regular file",
+                ws_root.display(),
+                entry_name
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because '{}' could not be opened without following reparse points: {e}",
+                ws_root.display(),
+                entry_name
+            ));
+        }
+    };
+    validate_single_link_file_info(ws_root, entry_name, read_windows_file_info(&file))
+}
+
+/// Validates one named workspace directory (`<ws_root>\<ws_name>`) and its direct entries
+/// (`tree`, `tmp` as real non-reparse directories; `state.json`, `lock`, and transient
+/// `state.json.tmp` as single-link non-reparse regular files). Entries removed concurrently by
+/// another slot's workspace eviction (`NotFound`) are skipped safely.
+pub(in crate::isolation) fn validate_workspace_dir_entries_safe(
+    ws_root: &Path,
+    ws_name: &str,
+    ws_dir: &Path,
+) -> Result<(), String> {
+    if !check_real_directory_allow_missing(ws_root, ws_name, ws_dir)? {
+        return Ok(());
+    }
+    let sub_entries = match std::fs::read_dir(ws_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' could not be read: {e}",
+                ws_root.display(),
+                ws_name
+            ));
+        }
+    };
+    for sub_res in sub_entries {
+        let sub = match sub_res {
+            Ok(sub) => sub,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "refusing to rewrite the DACL of existing folder '{}' because an entry in '{}' could not be read: {e}",
+                    ws_root.display(),
+                    ws_name
+                ));
+            }
+        };
+        let sub_name = sub.file_name();
+        let sub_s = sub_name.to_string_lossy();
+        let sub_path = sub.path();
+        let rel = format!("{ws_name}/{sub_s}");
+        match sub_s.as_ref() {
+            "tree" | "tmp" => {
+                let _ = check_real_directory_allow_missing(ws_root, &rel, &sub_path)?;
+            }
+            "state.json" | "lock" | "state.json.tmp" => {
+                check_single_link_regular_file_allow_missing(ws_root, &rel, &sub_path)?;
+            }
+            _ => {
+                return Err(format!(
+                    "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' contains non-workspace entry '{}'",
+                    ws_root.display(),
+                    ws_name,
+                    sub_s
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates every top-level entry of `ws_root` that a DACL rewrite can reach, failing closed on
+/// unexpected files, symlinks/junctions, hard-linked metadata or lock files, or unreadable
+/// directories (`Ok(())` when `ws_root` does not exist yet or an entry disappears mid-walk due
+/// to eviction).
+pub(in crate::isolation) fn validate_workspace_root_entries_safe(
+    ws_root: &Path,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(ws_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "refusing to rewrite the DACL of existing folder '{}' because it could not be read: {e}",
+                ws_root.display()
+            ));
+        }
+    };
+    for entry_res in entries {
+        let entry = match entry_res {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "refusing to rewrite the DACL of existing folder '{}' because an entry could not be read: {e}",
+                    ws_root.display()
+                ));
+            }
+        };
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        let entry_path = entry.path();
+        if s == ".oxideswarm-usb-workspaces" || s == "store.lock" {
+            check_single_link_regular_file_allow_missing(ws_root, &s, &entry_path)?;
+            continue;
+        }
+        if s == ".locks" {
+            if !check_real_directory_allow_missing(ws_root, &s, &entry_path)? {
+                continue;
+            }
+            let lock_entries = match std::fs::read_dir(&entry_path) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' could not be read: {e}",
+                        ws_root.display(),
+                        s
+                    ));
+                }
+            };
+            for sub_res in lock_entries {
+                let sub = match sub_res {
+                    Ok(sub) => sub,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(format!(
+                            "refusing to rewrite the DACL of existing folder '{}' because an entry in '{}' could not be read: {e}",
+                            ws_root.display(),
+                            s
+                        ));
+                    }
+                };
+                let sub_name = sub.file_name();
+                let sub_s = sub_name.to_string_lossy();
+                check_single_link_regular_file_allow_missing(
+                    ws_root,
+                    &format!(".locks/{sub_s}"),
+                    &sub.path(),
+                )?;
+            }
+            continue;
+        }
+        if rusty_grid_core::task::validate_workspace_name(&s).is_ok() {
+            validate_workspace_dir_entries_safe(ws_root, &s, &entry_path)?;
+            continue;
+        }
+        return Err(format!(
+            "refusing to rewrite the DACL of existing folder '{}' containing non-workspace entry '{}'; point --workspace-root at a dedicated OxideSwarm workspace subdirectory",
+            ws_root.display(),
+            s
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses `ws_root` if it is a reparse point or has a reparse point in any ancestor when it is
+/// under or resolves into `host.user_home` or `%USERPROFILE%`.
+pub(super) fn validate_workspace_root_ancestors_safe(
+    ws_root: &Path,
+    host: &HostDirs,
+) -> Result<(), String> {
+    let env_up = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    validate_workspace_root_ancestors_safe_with_env_home(ws_root, host, env_up.as_deref())
+}
+
+pub(super) fn validate_workspace_root_ancestors_safe_with_env_home(
+    ws_root: &Path,
+    host: &HostDirs,
+    env_userprofile: Option<&Path>,
+) -> Result<(), String> {
+    let raw_abs = abs_win_no_canon(ws_root);
+    let lex_abs = lexically_resolve_dots(&raw_abs);
+    if is_reparse_point(ws_root) || is_reparse_point(&raw_abs) || is_reparse_point(&lex_abs) {
+        return Err(format!(
+            "refusing '{}' as workspace_root because it is a symlink or junction (reparse point); pass --workspace-root pointing directly at the target directory",
+            ws_root.display()
+        ));
+    }
+    check_no_reparse_from_home(ws_root, &raw_abs, &lex_abs, &host.user_home)?;
+    if let Some(env_up) = env_userprofile {
+        check_no_reparse_from_home(ws_root, &raw_abs, &lex_abs, env_up)?;
+    }
+    Ok(())
+}
+
 /// Validates that `ws_root` is a dedicated OxideSwarm workspace root directory and not a
 /// drive root, home directory, toolchain directory, shared system `%TEMP%` root, or arbitrary
 /// user directory.
 pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(), String> {
+    let env_up = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    validate_workspace_root_safe_with_env_home(ws_root, host, env_up.as_deref())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::isolation) fn validate_workspace_root_safe_with_env_home(
+    ws_root: &Path,
+    host: &HostDirs,
+    env_userprofile: Option<&Path>,
+) -> Result<(), String> {
+    validate_workspace_root_ancestors_safe_with_env_home(ws_root, host, env_userprofile)?;
+
     let norm = normalize_win_path(ws_root);
     if norm.parent().is_none()
         || matches!(
@@ -544,10 +1015,10 @@ pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(
             ws_root.display()
         ));
     }
-    if let Some(env_up) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+    if let Some(env_up) = env_userprofile {
         if !env_up.as_os_str().is_empty()
-            && path_starts_with_ci(ws_root, &env_up)
-            && !is_allowed_under_home(&env_up)
+            && path_starts_with_ci(ws_root, env_up)
+            && !is_allowed_under_home(env_up)
         {
             return Err(format!(
                 "refusing to rewrite the DACL of user folder '{}' as workspace_root; point --workspace-root at a dedicated OxideSwarm workspace subdirectory",
@@ -555,56 +1026,7 @@ pub fn validate_workspace_root_safe(ws_root: &Path, host: &HostDirs) -> Result<(
             ));
         }
     }
-    if ws_root.exists() {
-        if let Ok(entries) = std::fs::read_dir(ws_root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let s = name.to_string_lossy();
-                let entry_path = entry.path();
-                let is_usb_ws_marker = s == ".oxideswarm-usb-workspaces"
-                    && std::fs::symlink_metadata(&entry_path).is_ok_and(|m| {
-                        m.file_type().is_file()
-                            && (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) == 0
-                    });
-                let is_ws_entry = s == "store.lock"
-                    || s == ".locks"
-                    || is_usb_ws_marker
-                    || rusty_grid_core::task::validate_workspace_name(&s).is_ok();
-                if !is_ws_entry {
-                    return Err(format!(
-                        "refusing to rewrite the DACL of existing folder '{}' containing non-workspace entry '{}'; point --workspace-root at a dedicated OxideSwarm workspace subdirectory",
-                        ws_root.display(),
-                        s
-                    ));
-                }
-                if s != "store.lock"
-                    && s != ".locks"
-                    && s != ".oxideswarm-usb-workspaces"
-                    && entry_path.is_dir()
-                {
-                    if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
-                        for sub in sub_entries.flatten() {
-                            let sub_name = sub.file_name();
-                            let sub_s = sub_name.to_string_lossy();
-                            let valid_sub = matches!(
-                                sub_s.as_ref(),
-                                "tree" | "tmp" | "state.json" | "state.json.tmp" | "lock"
-                            );
-                            if !valid_sub {
-                                return Err(format!(
-                                    "refusing to rewrite the DACL of existing folder '{}' because subdirectory '{}' contains non-workspace entry '{}'",
-                                    ws_root.display(),
-                                    s,
-                                    sub_s
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    validate_workspace_root_entries_safe(ws_root)
 }
 
 /// Protects `sandbox_base` so tasks holding `oxideswarm.toolchain` can traverse `sandbox_base`
@@ -618,16 +1040,22 @@ pub(super) fn protect_sandbox_base(
     toolchain_sid: PSID,
     manifest_path: Option<&Path>,
 ) -> io::Result<()> {
-    if !sandbox_base.exists() || is_reparse_point(sandbox_base) {
+    let Some((handle, _)) = open_verified_dacl_handle(
+        sandbox_base,
+        ExpectedHandleKind::Directory {
+            allow_missing: true,
+        },
+    )?
+    else {
         return Ok(());
-    }
+    };
     let traverse_mask = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-    if dacl_already_grants_sid(sandbox_base, toolchain_sid, traverse_mask)
-        && !dacl_already_grants_sid(sandbox_base, toolchain_sid, FILE_LIST_DIRECTORY)
+    if handle_dacl_grants_sid(handle.0, toolchain_sid, traverse_mask)
+        && !handle_dacl_grants_sid(handle.0, toolchain_sid, FILE_LIST_DIRECTORY)
     {
         return Ok(());
     }
-    if let Ok(orig_sddl) = get_path_dacl_sddl(sandbox_base) {
+    if let Ok(orig_sddl) = get_handle_dacl_sddl(handle.0) {
         record_sddl_restore(manifest_path, sandbox_base, &orig_sddl)?;
     }
     record_acl_grant(manifest_path, sandbox_base)?;
@@ -641,7 +1069,7 @@ pub(super) fn protect_sandbox_base(
         explicit_access(admins_sid.as_psid(), FILE_ALL_ACCESS, SET_ACCESS, inherit),
         explicit_access(toolchain_sid, traverse_mask, SET_ACCESS, NO_INHERITANCE),
     ];
-    set_protected_dacl_on_path(sandbox_base, &base_entries)
+    set_protected_dacl_on_handle(handle.0, &base_entries)
 }
 
 /// Prepares the worker's own toolchain directories (`host.rustup_home` and `host.cargo_home`)
