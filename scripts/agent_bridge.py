@@ -109,16 +109,17 @@ def hub_candidates():
             pass
 
     # Windows & standard Google Drive paths
-    for drive_letter in ("G:\\", "H:\\", "D:\\"):
-        if os.path.exists(drive_letter):
-            try:
-                for entry in os.listdir(drive_letter):
-                    full_entry = os.path.join(drive_letter, entry)
-                    if os.path.isdir(full_entry):
-                        candidates.append(os.path.join(full_entry, "OxideSwarm_Agent_Hub"))
-            except Exception:
-                pass
-            candidates.append(os.path.join(drive_letter, "My Drive", "OxideSwarm_Agent_Hub"))
+    if not os.environ.get(DISABLE_DRIVE_SCAN_ENV):
+        for drive_letter in ("G:\\", "H:\\", "D:\\"):
+            if os.path.exists(drive_letter):
+                try:
+                    for entry in os.listdir(drive_letter):
+                        full_entry = os.path.join(drive_letter, entry)
+                        if os.path.isdir(full_entry):
+                            candidates.append(os.path.join(full_entry, "OxideSwarm_Agent_Hub"))
+                except Exception:
+                    pass
+                candidates.append(os.path.join(drive_letter, "My Drive", "OxideSwarm_Agent_Hub"))
 
     for base in (user_home, user_profile):
         gdrive = os.path.join(base, "Google Drive")
@@ -186,6 +187,9 @@ AGENT_ID_ENV = "OXIDESWARM_AGENT_ID"
 # list of local ports to report as listening (empty string = none), so tests do not depend on what
 # runs on the machine (for example a real master on 8088). Unset, the ports are probed as usual.
 LOCAL_PORTS_ENV = "OXIDESWARM_BRIDGE_ASSUME_LISTENING"
+# Test seam: when set (non-empty), `hub_candidates` skips the hardcoded Windows drive-letter scan
+# (`G:\`, `H:\`, `D:\`), so isolated `use_hub=False` tests do not pick up a mounted Google Drive.
+DISABLE_DRIVE_SCAN_ENV = "OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN"
 
 
 def resolve_self_short(args=None):
