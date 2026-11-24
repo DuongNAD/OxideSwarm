@@ -309,7 +309,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
 | TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Planned | In | (unlanded claim `TEST-70`) |
-| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Planned | In |  |
+| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Partial | In |  |
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
@@ -819,9 +819,11 @@ The full suite must pass on a clean machine before CI can require it.
   `self.workspace_dirs[idx]` with `os.makedirs(self.workspace_dirs[idx], exist_ok=True)`, which uses default
   `0o777` masked by the process umask (`0o022` on Ubuntu CI -> `0o755`), while `rusty_grid_worker` rejects any
   Unix `--workspace-root` whose mode is not `0o700` (and `sandbox_dirs[idx]` at line 2932 has the same pattern).
-- **Do:** Create `workspace_dirs[idx]` (and `sandbox_dirs[idx]`) with `mode=0o700` and enforce `os.chmod(..., 0o700)`
-  on Unix in `benchmarks/endurance/endurance.py`; add a unit check in `tests/test_endurance_harness.py` that
-  fails under `umask 0o022` without the fix.
+- **Do:** Create `workspace_dirs[idx]` (and `sandbox_dirs[idx]`, `state_dir`, `blob_dir`, `workdir`, and isolated
+  process `home`/`tmp`/`oxideswarm` directories) via `_ensure_private_dir` (`mode=0o700` + `os.chmod(..., 0o700)` on
+  Unix) in `benchmarks/endurance/endurance.py`; add `test_soak_cluster_creates_0700_dirs_under_0022_umask` in
+  `tests/test_endurance_harness.py` that fails under `umask 0o022` without the fix. Linux `endurance.py soak`
+  smoke run waits until after Stage C `S7` (`loop after S7` / Linux verification).
 - **Done when:** `tests/test_endurance_harness.py` verifies `0o700` permissions on created soak directories under
   a `0o022` umask, and a Linux `endurance.py soak` smoke run starts and connects workers cleanly.
 
@@ -3119,3 +3121,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-95 added (Planned, In; claim `claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`): in `tests/test_wave3_e2e.py`, `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed in pull request 432 CI (run `45272824360`, job `138036810990`) with `ValueError: invalid literal for int() with base 10: ''` reading an empty `shard_*.pid` written non-atomically under `--fail-fast`; code fix and 20-run loop wait until after Stage C `S7` (Index header recounted: 259 items, 194 Implemented, 16 Partial and 49 Planned; 20 open items are In and 45 are Out).
 - 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
 - 2026-11-24: TEST-96 added (Planned, In; claim `claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`): `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` timed out waiting 5 s for the multi-chunk `DeliveryAck` on master push `016f39c4` (CI run `45349647014`, job `138292591350`, `unit tests (ubuntu-latest)`); root cause (starved runner or lost ACK) and fix wait until after Stage C `S7` (Index header recounted: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out).
+- 2026-11-24: TEST-90 Partial (`mac/test-90-soak-dir-0700`, `loop after S7`): added `_ensure_private_dir` (`os.makedirs(..., mode=0o700, exist_ok=True)` plus `os.chmod(..., 0o700)` on POSIX) in `benchmarks/endurance/endurance.py` across `SoakCluster._start_worker_locked` (`sandbox_dirs`, `workspace_dirs`), `SoakCluster._start_master_locked` (`state_dir`, `blob_dir`), `EnduranceCluster` / `RemoteEnduranceCluster` `workdir` & `sandbox_dirs`, and `_isolated_process_env` (`home`, `tmp`, `ox_home`), plus failing-first `test_soak_cluster_creates_0700_dirs_under_0022_umask` in `tests/test_endurance_harness.py` (failed `0o755 != 0o700` under `umask 0o022` before the fix); verified `5/5` sequential passes of `tests/test_endurance_harness.py` (`23` tests/run) and `tests/test_m1_challenger_hygiene.py` (`5/5 OK`); stays `Partial | In` until a Linux `endurance.py soak` smoke run runs after `S7` / in Linux CI.
