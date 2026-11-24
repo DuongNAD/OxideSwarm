@@ -76,6 +76,7 @@ use crate::workspace::WorkspaceError;
 use crate::workspace::{WorkspaceLimits, WorkspaceStore};
 
 mod capture;
+mod checkpoint;
 mod supervise;
 mod workloads;
 pub(crate) use workloads::base_refusal;
@@ -84,6 +85,11 @@ pub use capture::read_bounded_stream;
 #[cfg(any(feature = "3d", test))]
 pub(crate) use capture::read_output_file;
 pub(crate) use capture::{append_note, cancellation, check_cancelled_now};
+#[cfg(test)]
+pub(crate) use checkpoint::PROCESS_CHECKPOINT_DIR_NAME;
+pub(crate) use checkpoint::{
+    is_reserved_checkpoint_rel, DEFAULT_CHECKPOINT_POLL_INTERVAL, MIN_CHECKPOINT_POLL_INTERVAL,
+};
 #[allow(unused_imports)]
 pub(crate) use supervise::WorkspaceProcessCtx;
 
@@ -170,6 +176,9 @@ pub struct RunnerConfig {
     pub test_sleep_offset_ms: u64,
     /// Optional in-process simulated task runner (`SCALE-1` load harness and simulation tests).
     pub fake_runner: Option<crate::sim::FakeRunnerConfig>,
+    /// Periodic poll interval for `$OXIDESWARM_CHECKPOINT_DIR` on process tasks.
+    #[doc(hidden)]
+    pub checkpoint_poll_interval: Duration,
 }
 
 impl Default for RunnerConfig {
@@ -200,7 +209,15 @@ impl RunnerConfig {
             test_sleep_multiplier: 1,
             test_sleep_offset_ms: 0,
             fake_runner: None,
+            checkpoint_poll_interval: DEFAULT_CHECKPOINT_POLL_INTERVAL,
         }
+    }
+
+    /// Overrides the periodic poll interval for process-task checkpoints (test hook).
+    #[doc(hidden)]
+    pub fn with_checkpoint_poll_interval(mut self, interval: Duration) -> Self {
+        self.checkpoint_poll_interval = interval.max(MIN_CHECKPOINT_POLL_INTERVAL);
+        self
     }
 
     /// Scales `BuiltinTest` sleep durations by `multiplier.max(1)` (test hook for speed-aware
@@ -737,6 +754,8 @@ impl TaskRunner {
                 .execute_workspace_workload(
                     task,
                     ws,
+                    checkpoint,
+                    checkpoint_tx,
                     timeout_duration,
                     child_pid,
                     cancel_rx,
@@ -778,6 +797,8 @@ impl TaskRunner {
                     env,
                     working_dir.as_ref(),
                     stdin.as_deref(),
+                    checkpoint,
+                    checkpoint_tx,
                     timeout_duration,
                     child_pid,
                     cancel_rx,
@@ -796,6 +817,8 @@ impl TaskRunner {
                     script,
                     interpreter.as_deref(),
                     env,
+                    checkpoint,
+                    checkpoint_tx,
                     timeout_duration,
                     child_pid,
                     cancel_rx,
@@ -1327,12 +1350,16 @@ mod tests;
 
 /// Tests of exit-status mapping, the cancellation channel and the default shell; no processes of
 /// their own beyond `sh`, so they run everywhere `sh` does.
+// LV-4: cfg(unix) libc::getpgid/killpg check in outcome tests (production runner.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod outcome_tests;
 
 /// Real process trees: every test here spawns grandchildren (`sh -c` with a background `sleep`)
 /// and checks that they are gone, and that nothing unrelated is touched.
+// LV-4: cfg(unix) libc::kill process-tree probe in tests (production runner.rs stays denied).
 #[cfg(all(test, unix))]
+#[allow(unsafe_code)]
 mod process_tree_tests;
 
 #[cfg(test)]

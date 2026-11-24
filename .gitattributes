@@ -8,6 +8,7 @@
 *.sh                                       text eol=lf
 *.py                                       text eol=lf
 *.command                                  text eol=lf
+*.cff                                      text eol=lf
 packaging/android/termux/start-oxideswarm  text eol=lf
 packaging/android/app/gradlew              text eol=lf
 

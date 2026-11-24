@@ -17,6 +17,18 @@ pub const COMPONENT_TYPE_FLOAT: u32 = 5126;
 
 /// Packages a `RawMesh` and optional `BakedMaterial` into a compliant glTF 2.0 Binary (.glb) byte buffer.
 pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<u8>, String> {
+    pack_glb_cancellable(mesh, material, &|| false)
+}
+
+/// Packages a `RawMesh` and optional `BakedMaterial` into `.glb` with cooperative cancellation.
+pub fn pack_glb_cancellable(
+    mesh: &RawMesh,
+    material: Option<&BakedMaterial>,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     if mesh.positions.is_empty() || mesh.indices.is_empty() {
         return Err("Cannot pack empty mesh into glTF".to_string());
     }
@@ -30,7 +42,10 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
     // 1. POSITION BufferView & Accessor (0)
     let pos_offset = bin_data.len();
     let pos_len = mesh.positions.len() * 12;
-    for p in &mesh.positions {
+    for (idx, p) in mesh.positions.iter().enumerate() {
+        if idx % 8192 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         bin_data.extend_from_slice(&p[0].to_le_bytes());
         bin_data.extend_from_slice(&p[1].to_le_bytes());
         bin_data.extend_from_slice(&p[2].to_le_bytes());
@@ -57,7 +72,10 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
     let normal_accessor_idx = if has_normals {
         let norm_offset = bin_data.len();
         let norm_len = mesh.normals.len() * 12;
-        for n in &mesh.normals {
+        for (idx, n) in mesh.normals.iter().enumerate() {
+            if idx % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&n[0].to_le_bytes());
             bin_data.extend_from_slice(&n[1].to_le_bytes());
             bin_data.extend_from_slice(&n[2].to_le_bytes());
@@ -88,7 +106,10 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
     let uv_accessor_idx = if has_uvs {
         let uv_offset = bin_data.len();
         let uv_len = mesh.uvs.len() * 8;
-        for uv in &mesh.uvs {
+        for (idx, uv) in mesh.uvs.iter().enumerate() {
+            if idx % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&uv[0].to_le_bytes());
             bin_data.extend_from_slice(&uv[1].to_le_bytes());
         }
@@ -114,15 +135,24 @@ pub fn pack_glb(mesh: &RawMesh, material: Option<&BakedMaterial>) -> Result<Vec<
     };
 
     // 4. INDICES BufferView & Accessor (3)
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let idx_offset = bin_data.len();
     let use_u16 = mesh.positions.len() <= 65535;
     let (idx_len, comp_type) = if use_u16 {
-        for &idx in &mesh.indices {
+        for (i, &idx) in mesh.indices.iter().enumerate() {
+            if i % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&(idx as u16).to_le_bytes());
         }
         (mesh.indices.len() * 2, COMPONENT_TYPE_UNSIGNED_SHORT)
     } else {
-        for &idx in &mesh.indices {
+        for (i, &idx) in mesh.indices.iter().enumerate() {
+            if i % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             bin_data.extend_from_slice(&idx.to_le_bytes());
         }
         (mesh.indices.len() * 4, COMPONENT_TYPE_UNSIGNED_INT)

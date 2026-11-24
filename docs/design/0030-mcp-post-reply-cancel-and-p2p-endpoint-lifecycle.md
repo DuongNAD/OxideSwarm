@@ -143,7 +143,7 @@ receive `cancel_tx.send(true)` and have up to `500 ms` to send `CancelTask` befo
   `test_ticket_determinism_and_reconnection` verify that `master.shutdown()` alone closes the P2P
   endpoint (`is_closed()`) and that restarting with the same key preserves `NodeId`, publishes a
   relay-only ticket, and lets existing workers re-register.
-- `tests/test_m2_identity_scripts.rs`: `test_worker_auto_reconnect_under_3_seconds` verifies that a
+- `tests/test_m2_identity_scripts.rs`: `test_worker_auto_reconnect_preserves_identity` (formerly `test_worker_auto_reconnect_under_3_seconds`) verifies that a
   worker tuned with a `1.2 s` connect timeout (`with_connect_timeout(Duration::from_millis(1200))`)
   and a `100–400 ms` reconnect backoff (`BackoffConfig { initial: 100 ms, max: 400 ms, factor: 1.5, jitter_ratio: 0.1 }`)
   reconnects and re-registers in under `3.0 s` after master restart (with default worker settings,

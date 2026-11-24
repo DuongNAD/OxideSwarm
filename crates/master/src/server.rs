@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
-#[cfg(feature = "p2p")]
+#[cfg(any(feature = "p2p", test))]
 use uuid::Uuid;
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
@@ -43,10 +43,15 @@ mod persistence_tests;
 mod tests;
 
 pub(crate) use client_and_members::handle_client_connection;
+#[cfg(feature = "dashboard")]
+pub(crate) use client_and_members::revoke_member_with_teardown;
+#[cfg(feature = "dashboard")]
+pub(crate) use client_and_members::run_member_store_blocking;
 use client_and_members::{
-    run_member_store_blocking, spawn_member_store_resync, ENROLL_CONFIRM_TIMEOUT_SECS,
+    run_member_store_blocking as run_member_store_blocking_inner, spawn_member_store_resync,
+    ENROLL_CONFIRM_TIMEOUT_SECS,
 };
-#[cfg(feature = "p2p")]
+#[cfg(any(feature = "p2p", test))]
 use handshakes::handle_multiplexed_connection;
 #[cfg(feature = "p2p")]
 pub(crate) use handshakes::P2pConnGuard;
@@ -673,6 +678,8 @@ pub struct MasterServer {
     blob_store: Option<Arc<BlobStore>>,
     /// The opt-in content-addressed action cache, when `action_cache_max_bytes > 0`.
     action_cache: Option<Arc<ActionCache>>,
+    /// Shared OXS-AUTH v3 authentication, member store, and live member connection registry.
+    auth_ctx: MasterAuthContext,
 }
 
 impl MasterServer {
@@ -960,6 +967,18 @@ impl MasterServer {
             info!(port = local_addr.port(), path = %port_path.display(), "Port file published");
         }
 
+        let auth_ctx = MasterAuthContext {
+            auth_mode: config.auth_mode,
+            master_noise_key: config.master_noise_key.clone(),
+            master_noise_key_path: config.master_noise_key_path.clone(),
+            local_node_key_path: config.local_node_key_path.clone(),
+            ephemeral_without_state_dir: config.ephemeral_key && config.state_dir.is_none(),
+            members: Arc::clone(&config.members),
+            member_connections: crate::member_connections::MemberConnections::default(),
+            p2p_ticket: p2p_ticket.clone(),
+            enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
+        };
+
         Ok(Self {
             config,
             listener,
@@ -977,6 +996,7 @@ impl MasterServer {
             p2p_ticket,
             blob_store,
             action_cache,
+            auth_ctx,
         })
     }
 
@@ -1054,6 +1074,7 @@ impl MasterServer {
             .copied();
         let auth_mode = server.config.auth_mode;
         let members = Arc::clone(&server.config.members);
+        let auth_ctx = server.auth_ctx.clone();
 
         #[cfg(feature = "dashboard")]
         let (dashboard_server_opt, broadcast_tx) = if enable_web_ui
@@ -1111,6 +1132,8 @@ impl MasterServer {
         if let Some(ref b_tx) = broadcast_tx {
             server.broadcast_tx = Some(b_tx.clone());
         }
+
+        let reaper_config = reaper_config.with_scheduler_config(sched_config.clone());
 
         // Build scheduler before starting accept loop so its SpeedBook is attached to `registry`
         // before any worker connection is handled.
@@ -1301,6 +1324,7 @@ impl MasterServer {
             members,
             blob_store: blob_store.clone(),
             action_cache,
+            auth_ctx,
         };
 
         // Pins of finished tasks are released here when no result released them (failover out of
@@ -1739,18 +1763,7 @@ impl MasterServer {
             self.config.max_connections,
             self.config.max_pending_handshakes,
         );
-        let auth_ctx = MasterAuthContext {
-            auth_mode: self.config.auth_mode,
-            master_noise_key: self.config.master_noise_key.clone(),
-            master_noise_key_path: self.config.master_noise_key_path.clone(),
-            local_node_key_path: self.config.local_node_key_path.clone(),
-            ephemeral_without_state_dir: self.config.ephemeral_key
-                && self.config.state_dir.is_none(),
-            members: Arc::clone(&self.config.members),
-            member_connections: crate::member_connections::MemberConnections::default(),
-            p2p_ticket: self.p2p_ticket.clone(),
-            enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
-        };
+        let auth_ctx = self.auth_ctx.clone();
         if auth_ctx.auth_mode.allows_members() {
             spawn_member_store_resync(Arc::clone(&auth_ctx.members), shutdown_rx.clone());
         }
@@ -1782,6 +1795,13 @@ impl MasterServer {
                         break;
                     }
                     tokio::select! {
+                        biased;
+                        res = p2p_shutdown.changed() => {
+                            if res.is_err() || *p2p_shutdown.borrow() {
+                                endpoint.close().await;
+                                break;
+                            }
+                        }
                         incoming = endpoint.accept() => {
                             let Some(incoming) = incoming else {
                                 // The endpoint was closed: nothing will ever be accepted again.
@@ -1957,12 +1977,6 @@ impl MasterServer {
                             });
                             let _ = abort_tx.send(conn_task.abort_handle());
                         }
-                        res = p2p_shutdown.changed() => {
-                            if res.is_err() || *p2p_shutdown.borrow() {
-                                endpoint.close().await;
-                                break;
-                            }
-                        }
                     }
                 }
             });
@@ -1976,6 +1990,15 @@ impl MasterServer {
                 break;
             }
             tokio::select! {
+                biased;
+                res = shutdown_rx.changed() => {
+                    if res.is_ok() && *shutdown_rx.borrow() {
+                        info!("Master server received shutdown signal; stopping accept loop");
+                        break;
+                    } else if res.is_err() {
+                        break;
+                    }
+                }
                 accept_res = self.listener.accept() => {
                     match accept_res {
                         Ok((stream, remote_addr)) => {
@@ -2059,14 +2082,6 @@ impl MasterServer {
                         }
                     }
                 }
-                res = shutdown_rx.changed() => {
-                    if res.is_ok() && *shutdown_rx.borrow() {
-                        info!("Master server received shutdown signal; stopping accept loop");
-                        break;
-                    } else if res.is_err() {
-                        break;
-                    }
-                }
             }
         }
 
@@ -2093,7 +2108,7 @@ impl MasterServer {
         if auth_ctx.auth_mode.allows_members() && auth_ctx.members.is_dirty() {
             let members_for_shutdown = Arc::clone(&auth_ctx.members);
             if let Err(e) =
-                run_member_store_blocking(move || members_for_shutdown.flush_dirty()).await
+                run_member_store_blocking_inner(move || members_for_shutdown.flush_dirty()).await
             {
                 warn!(
                     error = %e,
@@ -2133,6 +2148,7 @@ pub struct MasterHandle {
     members: Arc<MemberStore>,
     blob_store: Option<Arc<BlobStore>>,
     action_cache: Option<Arc<ActionCache>>,
+    auth_ctx: MasterAuthContext,
 }
 
 impl MasterHandle {
@@ -2149,6 +2165,18 @@ impl MasterHandle {
     /// Returns the enrolled [`MemberStore`] for this master.
     pub fn members(&self) -> &Arc<MemberStore> {
         &self.members
+    }
+
+    /// Returns the shared OXS-AUTH v3 auth context (member store, connection registry, keys).
+    #[allow(dead_code)]
+    pub(crate) fn auth_ctx(&self) -> &MasterAuthContext {
+        &self.auth_ctx
+    }
+
+    /// Returns the shared terminal task waiter map.
+    #[allow(dead_code)]
+    pub(crate) fn waiters(&self) -> &WaiterMap {
+        &self.waiters
     }
 
     /// The blob store of task inputs and output files, if this master runs one.

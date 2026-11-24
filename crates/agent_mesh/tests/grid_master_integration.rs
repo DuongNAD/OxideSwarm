@@ -13,7 +13,11 @@ use tempfile::TempDir;
 use tokio::sync::watch;
 
 use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 // CLI parser imported from agent-mesh binary
@@ -102,9 +106,15 @@ impl TestCluster {
     pub async fn spawn() -> Self {
         // 1. Spawn embedded Master on dynamic port
         let server_config = ServerConfig::new("127.0.0.1:0".parse().unwrap());
-        let master = MasterServer::spawn(server_config)
-            .await
-            .expect("MasterServer::spawn failed");
+        let master = MasterServer::spawn_with_config(
+            server_config,
+            SchedulerConfig::default()
+                .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+                .without_host_cpu_backpressure(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("MasterServer::spawn failed");
         let master_addr = master.server_addr();
 
         // 2. Spawn Hub and attach bridge

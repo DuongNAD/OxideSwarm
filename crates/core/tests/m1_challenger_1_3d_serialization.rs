@@ -385,7 +385,7 @@ fn test_adv_03_auto_rig_32mb_payload_bincode_and_wire_framing() {
         .with_animations(vec![
             "idle".to_string(),
             "walk".to_string(),
-            "run".to_string(),
+            "turnaround".to_string(),
         ])
         .with_provider("builtin");
 

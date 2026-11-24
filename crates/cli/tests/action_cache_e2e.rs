@@ -108,60 +108,40 @@ fn counter_lines(path: &Path) -> usize {
     }
 }
 
-fn submit_cached_json(
+fn submit_cached_json_with_args(
     home: &Path,
     master_addr: &str,
     input_path: &Path,
     output_dir: &Path,
     counter_path: &Path,
     exit_code: i32,
+    extra_args: &[&str],
 ) -> Value {
     std::fs::create_dir_all(output_dir).expect("create output dir");
     let (prog, script) = copy_and_count_command(exit_code);
     let input_arg = format!("{}:in.bin", input_path.display());
     let counter_env = format!("COUNTER_FILE={}", counter_path.display());
     let out_dir_str = output_dir.display().to_string();
+    let mut args = vec![
+        "submit",
+        "--master",
+        master_addr,
+        "--cache",
+        "--json",
+        "--input",
+        &input_arg,
+        "--output",
+        "out.bin",
+        "--output-dir",
+        &out_dir_str,
+        "--env",
+        &counter_env,
+    ];
+    args.extend_from_slice(extra_args);
     #[cfg(unix)]
-    let args = [
-        "submit",
-        "--master",
-        master_addr,
-        "--cache",
-        "--json",
-        "--input",
-        &input_arg,
-        "--output",
-        "out.bin",
-        "--output-dir",
-        &out_dir_str,
-        "--env",
-        &counter_env,
-        "--",
-        prog,
-        "-c",
-        &script,
-    ];
+    args.extend_from_slice(&["--", prog, "-c", &script]);
     #[cfg(windows)]
-    let args = [
-        "submit",
-        "--master",
-        master_addr,
-        "--cache",
-        "--json",
-        "--input",
-        &input_arg,
-        "--output",
-        "out.bin",
-        "--output-dir",
-        &out_dir_str,
-        "--env",
-        &counter_env,
-        "--",
-        prog,
-        "-NoProfile",
-        "-Command",
-        &script,
-    ];
+    args.extend_from_slice(&["--", prog, "-NoProfile", "-Command", &script]);
 
     let out = cli_cmd(home).args(args).output().expect("run submit");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -181,6 +161,25 @@ fn submit_cached_json(
     }
     serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("invalid JSON stdout: {e}\nstdout={stdout}\nstderr={stderr}"))
+}
+
+fn submit_cached_json(
+    home: &Path,
+    master_addr: &str,
+    input_path: &Path,
+    output_dir: &Path,
+    counter_path: &Path,
+    exit_code: i32,
+) -> Value {
+    submit_cached_json_with_args(
+        home,
+        master_addr,
+        input_path,
+        output_dir,
+        counter_path,
+        exit_code,
+        &[],
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -327,6 +326,63 @@ async fn scenario_1_to_3_hit_input_mutation_miss_and_failed_not_cached() {
         4,
         "failed task must never populate action cache"
     );
+
+    let _ = shutdown_tx.send(true);
+    worker_handle.abort();
+    let _ = master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_2b_env_var_and_os_constraint_changes_miss_cache() {
+    let (master, master_addr, shutdown_tx, worker_handle, temp) =
+        spawn_cluster(64 * 1024 * 1024, None).await;
+    let home = temp.path();
+    let input_path = home.join("dim_input.bin");
+    let counter_path = home.join("dim_counter.txt");
+    let payload = b"cache-dimensions-v1\n";
+    std::fs::write(&input_path, payload).unwrap();
+
+    let host_os = std::env::consts::OS;
+    let cases: &[(&str, &[&str], bool, usize)] = &[
+        ("d_out1", &["--env", "CACHE_DIM=one"], false, 1),
+        ("d_out2", &["--env", "CACHE_DIM=one"], true, 1),
+        ("d_out3", &["--env", "CACHE_DIM=two"], false, 2),
+        (
+            "d_out4",
+            &["--env", "CACHE_DIM=two", "--os", host_os],
+            false,
+            3,
+        ),
+        (
+            "d_out5",
+            &["--env", "CACHE_DIM=two", "--os", host_os],
+            true,
+            3,
+        ),
+    ];
+    for &(out_dir, extra_args, expected_cached, expected_runs) in cases {
+        let out = home.join(out_dir);
+        let resp = submit_cached_json_with_args(
+            home,
+            &master_addr,
+            &input_path,
+            &out,
+            &counter_path,
+            0,
+            extra_args,
+        );
+        assert_eq!(
+            resp["cached"],
+            Value::Bool(expected_cached),
+            "unexpected cached flag for {out_dir} ({extra_args:?}): {resp}"
+        );
+        assert_eq!(
+            counter_lines(&counter_path),
+            expected_runs,
+            "unexpected worker execution count after {out_dir} ({extra_args:?})"
+        );
+        assert_eq!(std::fs::read(out.join("out.bin")).unwrap(), payload);
+    }
 
     let _ = shutdown_tx.send(true);
     worker_handle.abort();

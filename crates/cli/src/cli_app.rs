@@ -37,11 +37,13 @@ use crate::secret_cmd::{client_secret, peer_insecure, run_secret, SecretCliArgs,
 
 mod mapreduce;
 mod master;
+mod shard;
 mod submit;
 mod tasks;
 mod worker;
 mod workspaces;
 
+pub use shard::{run_shard, ShardArgs};
 pub(crate) use submit::normalize_workspace_cwd;
 pub use submit::{build_task_spec, run_submit, validate_glb_header};
 pub use tasks::{run_cancel, run_result};
@@ -135,6 +137,9 @@ pub enum Commands {
 
     /// Submit a task to the grid cluster
     Submit(SubmitArgs),
+
+    /// Run a command or test suite across N parallel shards
+    Shard(ShardArgs),
 
     /// Query cluster status or task execution state
     Status(StatusArgs),
@@ -450,7 +455,7 @@ pub struct WorkerArgs {
     #[arg(
         long = "tag",
         value_name = "TAG",
-        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso:, tool: and feat: are reserved"
+        help = "User tag advertised to the master, matched by `submit --require-tag` (repeatable; env RUSTY_GRID_WORKER_TAGS, comma-separated). The prefixes os:, arch:, slots:, link:, id:, state:, iso:, tool:, feat:, ext:, proto:, opt: and speed: are reserved"
     )]
     pub tags: Vec<String>,
 
@@ -939,6 +944,27 @@ pub struct SubmitArgs {
     )]
     pub cache: bool,
 
+    #[arg(
+        long,
+        help = "Mark this task as safe to re-run speculatively on another worker if a running attempt becomes a straggler"
+    )]
+    pub repeatable: bool,
+
+    #[arg(
+        long = "matrix",
+        value_name = "KEY=V1,V2",
+        help = crate::matrix::MATRIX_HELP
+    )]
+    pub matrix: Vec<String>,
+
+    #[arg(
+        long = "max-matrix-cells",
+        value_name = "N",
+        requires = "matrix",
+        help = crate::matrix::MAX_MATRIX_CELLS_HELP
+    )]
+    pub max_matrix_cells: Option<usize>,
+
     #[arg(last = true, help = "Command arguments (trailing args after --)")]
     pub args: Vec<String>,
 
@@ -1300,6 +1326,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Submit(args) => {
             submit::run_submit_with_secret(args, config_file, secret_opts).await
         }
+        Commands::Shard(args) => shard::run_shard_with_secret(args, config_file, secret_opts).await,
         Commands::Status(args) => tasks::run_status(args, config_file, secret_opts).await,
         Commands::Cancel(args) => run_cancel(args, config_file, secret_opts).await,
         Commands::Result(args) => run_result(args, config_file, secret_opts).await,
@@ -1496,61 +1523,127 @@ pub(crate) fn resolve_p2p_minimal() -> bool {
 /// system-shutdown events). Without them a plain `kill` ends the worker on the spot and leaves
 /// every running task process behind. SIGHUP is deliberately not handled, so `nohup` still works.
 pub(super) async fn wait_for_worker_shutdown_signal() {
+    ShutdownSignals::install().wait().await;
+}
+
+/// The stop signals of [`wait_for_worker_shutdown_signal`], installed up front.
+///
+/// The handlers exist from [`ShutdownSignals::install`] on, so a stop that arrives while the
+/// process is still starting (a service manager stopping a master right after it started) is
+/// kept and handled by [`ShutdownSignals::wait`] instead of killing the process with the default
+/// action before it can shut down cleanly.
+pub(super) struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut terminate = signal(SignalKind::terminate()).ok();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = async {
-                match terminate.as_mut() {
-                    Some(sigterm) => {
-                        sigterm.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
-        }
-    }
-
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
     #[cfg(windows)]
-    {
-        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
-        let mut brk = ctrl_break().ok();
-        let mut close = ctrl_close().ok();
-        let mut shutdown = ctrl_shutdown().ok();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = async {
-                match brk.as_mut() {
-                    Some(event) => {
-                        event.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
-            _ = async {
-                match close.as_mut() {
-                    Some(event) => {
-                        event.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
-            _ = async {
-                match shutdown.as_mut() {
-                    Some(event) => {
-                        event.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            } => {}
+    ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    #[cfg(windows)]
+    brk: Option<tokio::signal::windows::CtrlBreak>,
+    #[cfg(windows)]
+    close: Option<tokio::signal::windows::CtrlClose>,
+    #[cfg(windows)]
+    shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+impl ShutdownSignals {
+    /// Installs the handlers now (needs a Tokio runtime).
+    pub(super) fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Self {
+                interrupt: signal(SignalKind::interrupt()).ok(),
+                terminate: signal(SignalKind::terminate()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+            Self {
+                ctrl_c: ctrl_c().ok(),
+                brk: ctrl_break().ok(),
+                close: ctrl_close().ok(),
+                shutdown: ctrl_shutdown().ok(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
         }
     }
 
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    /// Resolves on the first stop signal, including one that arrived before this call.
+    pub(super) async fn wait(mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = async {
+                    match self.interrupt.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
+                        }
+                        None => {
+                            let _ = tokio::signal::ctrl_c().await;
+                        }
+                    }
+                } => {}
+                _ = async {
+                    match self.terminate.as_mut() {
+                        Some(sig) => {
+                            sig.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            tokio::select! {
+                _ = async {
+                    match self.ctrl_c.as_mut() {
+                        Some(event) => {
+                            event.recv().await;
+                        }
+                        None => {
+                            let _ = tokio::signal::ctrl_c().await;
+                        }
+                    }
+                } => {}
+                _ = async {
+                    match self.brk.as_mut() {
+                        Some(event) => {
+                            event.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+                _ = async {
+                    match self.close.as_mut() {
+                        Some(event) => {
+                            event.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+                _ = async {
+                    match self.shutdown.as_mut() {
+                        Some(event) => {
+                            event.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 

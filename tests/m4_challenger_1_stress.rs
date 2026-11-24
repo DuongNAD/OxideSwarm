@@ -30,8 +30,24 @@ use rusty_grid_master::registry::{WorkerInfo, WorkerStatus};
 use rusty_grid_master::scheduler::{
     ScheduleSkipReason, SchedulerConfig, SchedulingPolicy, WorkloadScheduler,
 };
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+async fn spawn_test_master() -> MasterHandle {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed")
+}
 
 /// Asynchronously polls `condition` until it returns true or `timeout` expires.
 async fn wait_for<F, Fut>(timeout: Duration, step: Duration, mut condition: F) -> bool
@@ -102,9 +118,7 @@ impl WorkerNode {
 
 #[tokio::test]
 async fn test_adversarial_strict_gpu_routing_high_concurrency_flood() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // Spawn mixed 4-worker cluster:
@@ -241,9 +255,7 @@ async fn test_adversarial_strict_gpu_routing_high_concurrency_flood() {
 
 #[tokio::test]
 async fn test_adversarial_gpu_saturation_queues_and_never_spills_to_cpu() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // Mixed cluster:
@@ -366,9 +378,7 @@ async fn test_adversarial_gpu_saturation_queues_and_never_spills_to_cpu() {
 
 #[tokio::test]
 async fn test_adversarial_batch_spread_scheduling_varied_topologies() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // Spawn 3 workers with differing core counts:
@@ -710,9 +720,7 @@ fn test_adversarial_pure_matchmake_spread_under_varied_topologies() {
 
 #[tokio::test]
 async fn test_adversarial_unsatisfiable_cpu_and_ram_requirements() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // Cluster with 2 modest workers:
@@ -804,9 +812,7 @@ async fn test_adversarial_unsatisfiable_cpu_and_ram_requirements() {
 
 #[tokio::test]
 async fn test_adversarial_unsatisfiable_gpu_and_head_of_line_blocking() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     // Cluster with ONLY CPU workers:
@@ -934,9 +940,7 @@ async fn test_adversarial_unsatisfiable_gpu_and_head_of_line_blocking() {
 
 #[tokio::test]
 async fn test_adversarial_task_validation_rejects_gpu_spec_without_gpu_requirement() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
 
     // Task specifies GpuCompute but requirements state gpu_required = false
     let invalid_task = Task::new(

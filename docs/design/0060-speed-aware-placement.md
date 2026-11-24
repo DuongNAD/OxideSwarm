@@ -1,7 +1,7 @@
 # 0060: Place tasks by measured worker speed and re-run stragglers (`SCHED-4`)
 
 Status: Partial
-Created: 2026-11-10    Updated: 2026-11-14
+Created: 2026-11-10    Updated: 2026-11-21
 
 ## Summary
 
@@ -108,8 +108,8 @@ it via `master --speed-hold-factor <FACTOR>`, `RUSTY_GRID_SPEED_HOLD_FACTOR`, or
 
 ### D3: Straggler re-run (opt-in)
 
-- `submit --repeatable` sets the task tag `opt:repeatable`. `opt:` becomes the tenth reserved tag
-  prefix in `crates/core/src/placement.rs`, set only through this flag.
+- `submit --repeatable` sets the task tag `opt:repeatable`. `opt:` becomes a reserved tag prefix in
+  `crates/core/src/placement.rs`, set only through this flag (`--repeatable` or MCP `repeatable`).
 - The reaper's periodic pass looks for running repeatable tasks whose elapsed time is above
   3 times the average of the fastest matching worker for their key and above 10 s. If a matching
   worker other than the current one has a free slot, the master assigns a copy there as a second
@@ -165,8 +165,8 @@ worker table.
 |---|---|---|---|---|
 | SCHED-4a | Speed history | `crates/master/src/speed.rs`, `server.rs` | Unit tests of D1 | Implemented |
 | SCHED-4b | Speed-aware placement | `crates/master/src/scheduler.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/config.rs` | Unit and integration tests of D2 | Implemented |
-| SCHED-4c | Straggler re-run | `crates/master/src/reaper.rs`, `queue.rs`, `crates/core/src/placement.rs`, `crates/cli/src/cli_app.rs` | Integration tests of D3 | Planned |
-| SCHED-4d | Speed in `workers` and the dashboard | `registry.rs`, `web_ui.rs`, `dashboard.html` | `workers --json` shows `speed:` | Planned |
+| SCHED-4c | Straggler re-run | `crates/master/src/reaper.rs`, `queue.rs`, `crates/core/src/placement.rs`, `crates/cli/src/cli_app.rs`, `crates/cli/src/mcp.rs` | Integration tests of D3 | Implemented |
+| SCHED-4d | Speed in `workers` and the dashboard | `crates/master/src/speed.rs`, `registry.rs`, `web_ui.rs`, `dashboard.html`, `crates/cli/src/cli_app/tasks.rs` | `workers --json` shows `speed:` | Implemented |
 
 ## Status log
 
@@ -174,3 +174,4 @@ worker table.
 - 2026-11-11: Implemented `SCHED-4a` (`SpeedBook` in `crates/master/src/speed.rs`, updated on terminal results in `crates/master/src/server.rs` and cleared on worker removal/pruning in `crates/master/src/registry.rs`) and `SCHED-4b` (D2 speed-aware placement and `ScheduleSkipReason::WaitingForFasterWorker` in `crates/master/src/scheduler.rs`, verified by `tests/sched4_speed_aware.rs`). `SCHED-4c` and `SCHED-4d` remain Planned.
 - 2026-11-14: Amended D1 and D2 for review round 1: excluded only candidates with `expected(c) >= speed_hold_factor * min_expected` while preserving `rank` order among near-equal workers, added `Engine::dead_speed` per-pass cache and `Arc<SpeedBook>` copy-on-write snapshots, restricted `hold_back` reservation of `best` to `full` slot waits, added `speed_hold_factor` validation (`0` or finite `> 1.0`) plus `--speed-hold-factor` (`RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`), treated `< speed_min_samples` candidates as unknown (`best_avg`), skipped recording checkpoint-resumed attempts (`AssignTaskWithCheckpoint`), and documented least-recently-recorded D1 eviction.
 - 2026-11-14: Amended D2 for review round 2b: cleared `Engine::dead_speed` whenever the pass places a task, newly reserves a worker in `hold_back`, or flips `gpu_waiting`.
+- 2026-11-21: Implemented `SCHED-4c` (reserved `opt:` prefix and `opt:repeatable`, CLI `--repeatable`, MCP `repeatable`, in-memory `SpeculativeAttempt` + sibling cancel/failure tolerance in `TaskQueue`, bounded `(total_cluster_slots / 10).max(1)` straggler pass in `crates/master/src/reaper.rs`) and `SCHED-4d` (reserved `speed:` prefix, `SpeedBook::relative_speed_factors` median over shared keys, `speed:<factor>` tags in `WorkerRegistry::list_all_workers`, `workers --json` `speed` field, `WorkerUiInfo::speed_factor`, and `.badge-speed` / `#mSpeed` in `dashboard.html`). Design stays `Partial` pending a dated live two-machine hardware batch (`<= 1.5x` the fast machine's own time).

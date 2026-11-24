@@ -8,8 +8,19 @@ pub const DEDUPLICATION_EPSILON: f32 = 1e-5;
 /// Sanitizes mesh topology, deduplicates coincident vertices, prunes zero-area triangles,
 /// compacts the vertex buffer, and calculates area-weighted smooth normals.
 pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
+    repair_manifold_mesh_cancellable(raw, &|| false).unwrap_or_else(|_| raw.clone())
+}
+
+/// Sanitizes mesh topology with cooperative cancellation checks.
+pub fn repair_manifold_mesh_cancellable(
+    raw: &RawMesh,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<RawMesh, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     if raw.positions.is_empty() || raw.indices.is_empty() {
-        return raw.clone();
+        return Ok(raw.clone());
     }
 
     // 1. Spatial hashing vertex deduplication
@@ -19,7 +30,10 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
     let eps = DEDUPLICATION_EPSILON;
     let eps_sq = eps * eps;
 
-    for p in &raw.positions {
+    for (v_idx, p) in raw.positions.iter().enumerate() {
+        if v_idx % 1024 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let kx = (p[0] / eps).round() as i64;
         let ky = (p[1] / eps).round() as i64;
         let kz = (p[2] / eps).round() as i64;
@@ -56,7 +70,10 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
 
     // 2. Initial index remapping and collapsed face pruning
     let mut current_indices = Vec::with_capacity(raw.indices.len());
-    for chunk in raw.indices.chunks_exact(3) {
+    for (f_idx, chunk) in raw.indices.chunks_exact(3).enumerate() {
+        if f_idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let i0 = remap[chunk[0] as usize];
         let i1 = remap[chunk[1] as usize];
         let i2 = remap[chunk[2] as usize];
@@ -71,10 +88,16 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
     // Collapsing the shortest edge preserves the closed 2-manifold property and eliminates open boundary holes.
     let mut iteration = 0;
     while iteration < 500 {
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
         iteration += 1;
         let mut sliver_edge = None;
 
-        for chunk in current_indices.chunks_exact(3) {
+        for (tri_idx, chunk) in current_indices.chunks_exact(3).enumerate() {
+            if tri_idx % 4096 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
+            }
             let i0 = chunk[0] as usize;
             let i1 = chunk[1] as usize;
             let i2 = chunk[2] as usize;
@@ -155,7 +178,10 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
 
     // 4. Calculate Area-Weighted Smooth Normals
     let mut normal_acc = vec![[0.0f32; 3]; compact_positions.len()];
-    for chunk in final_indices.chunks_exact(3) {
+    for (tri_idx, chunk) in final_indices.chunks_exact(3).enumerate() {
+        if tri_idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let i0 = chunk[0] as usize;
         let i1 = chunk[1] as usize;
         let i2 = chunk[2] as usize;
@@ -190,11 +216,11 @@ pub fn repair_manifold_mesh(raw: &RawMesh) -> RawMesh {
         })
         .collect();
 
-    RawMesh {
+    Ok(RawMesh {
         positions: compact_positions,
         normals,
         uvs: Vec::new(),
         indices: final_indices,
         colors: raw.colors.clone(),
-    }
+    })
 }

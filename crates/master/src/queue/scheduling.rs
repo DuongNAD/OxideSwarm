@@ -3,6 +3,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,10 +17,24 @@ use crate::fair_share::{FairWalkCursor, SubmitterId};
 use crate::store::JournalRecord;
 
 use super::{
-    is_schedulable_queued, mark_entry_scheduled, owned_by, task_active_bytes, task_has_tree_input,
-    AssignedLoad, QueueOrderKey, RetryAttempt, TaskEntry, TaskQueue, TaskQueueInner, TaskState,
-    TaskView, WorkspaceAffinity,
+    is_schedulable_queued, mark_entry_scheduled, owned_by, owned_by_speculative, task_active_bytes,
+    task_has_tree_input, AssignedLoad, QueueOrderKey, RetryAttempt, SpeculativeAttempt,
+    StragglerCandidate, TaskEntry, TaskQueue, TaskQueueInner, TaskState, TaskView,
+    WorkspaceAffinity,
 };
+
+/// Outcome of [`TaskQueue::try_start_speculative_and_deliver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeStartOutcome {
+    /// Speculative attempt was recorded and `deliver` succeeded inside the same write lock.
+    Delivered,
+    /// Task was no longer `Running`/eligible for a speculative attempt; queue state unchanged.
+    NotEligible,
+    /// Task carries a critical worker extension unsupported by `peer_version`; queue state unchanged.
+    WithheldFromPeer,
+    /// `deliver` returned `false` (channel full or closed); queue state unchanged.
+    DeliveryFailed,
+}
 
 impl TaskQueue {
     // --- Task Submission ---
@@ -156,6 +171,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                assigned_session_live: None,
                 resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
@@ -166,6 +182,9 @@ impl TaskQueue {
                 cold_result: None,
                 error_message: None,
                 requires_tree_v2,
+                speculative: None,
+                speculative_spawned: false,
+                last_large_checkpoint_at: None,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -343,6 +362,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                assigned_session_live: None,
                 resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
@@ -353,6 +373,9 @@ impl TaskQueue {
                 cold_result: None,
                 error_message: None,
                 requires_tree_v2,
+                speculative: None,
+                speculative_spawned: false,
+                last_large_checkpoint_at: None,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -509,6 +532,7 @@ impl TaskQueue {
                 rejection_count: 0,
                 avoid_workers: Vec::new(),
                 assigned_session: None,
+                assigned_session_live: None,
                 resumed_from_checkpoint: false,
                 adoptable_by: None,
                 fail_if_not_adopted: false,
@@ -519,6 +543,9 @@ impl TaskQueue {
                 cold_result: None,
                 error_message: None,
                 requires_tree_v2: false,
+                speculative: None,
+                speculative_spawned: false,
+                last_large_checkpoint_at: None,
             };
 
             inner.tasks.insert(task_id, entry);
@@ -742,12 +769,23 @@ impl TaskQueue {
                 let Some(entry) = inner.tasks.get(task_id) else {
                     continue;
                 };
-                if !entry.state.is_active() {
+                let attempt_state = if entry.assigned_worker_id == Some(*worker_id) {
+                    entry.state
+                } else if let Some(ref spec) = entry.speculative {
+                    if spec.worker_id == *worker_id {
+                        spec.state
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                if !attempt_state.is_active() {
                     continue;
                 };
                 load.tasks += 1;
                 load.slots += entry.task.requirements.cpu_cores.max(1);
-                if entry.state == TaskState::Scheduled {
+                if attempt_state == TaskState::Scheduled {
                     load.unstarted_ram_mb += entry.task.requirements.ram_mb;
                 }
                 load.vram_mb = load
@@ -793,13 +831,20 @@ impl TaskQueue {
                 let Some(entry) = inner.tasks.get(task_id) else {
                     continue;
                 };
-                if !entry.state.is_active() {
+                let started = if entry.assigned_worker_id == Some(*worker_id) {
+                    if !entry.state.is_active() {
+                        continue;
+                    }
+                    entry.started_instant.or(entry.scheduled_instant)
+                } else if let Some(ref spec) = entry.speculative {
+                    if spec.worker_id != *worker_id || !spec.state.is_active() {
+                        continue;
+                    }
+                    spec.started_instant.or(Some(spec.scheduled_instant))
+                } else {
                     continue;
-                }
-                let elapsed = entry
-                    .started_instant
-                    .or(entry.scheduled_instant)
-                    .map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+                };
+                let elapsed = started.map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
                 items.push((entry.task_key, elapsed));
             }
             if !items.is_empty() {
@@ -1237,6 +1282,7 @@ impl TaskQueue {
                     });
                 }
                 entry.assigned_session = None;
+                entry.assigned_session_live = None;
                 entry.assigned_worker_id.take()
             };
 
@@ -1312,6 +1358,27 @@ impl TaskQueue {
         Some(deliver())
     }
 
+    /// Like [`deliver_if_scheduled`](Self::deliver_if_scheduled), but atomically records the
+    /// `WorkerRegistry` reservation's `session_live` handle on [`TaskEntry`] when `deliver`
+    /// returns `Some(r)`.
+    pub async fn deliver_if_scheduled_with_live<R>(
+        &self,
+        task_id: &TaskId,
+        worker_id: &Uuid,
+        session_id: u64,
+        session_live: Arc<AtomicBool>,
+        deliver: impl FnOnce() -> Option<R>,
+    ) -> Option<R> {
+        let mut inner = self.inner.write().await;
+        let entry = inner.tasks.get_mut(task_id)?;
+        if entry.state != TaskState::Scheduled || !owned_by(entry, worker_id, Some(session_id)) {
+            return None;
+        }
+        let out = deliver()?;
+        entry.assigned_session_live = Some(session_live);
+        Some(out)
+    }
+
     /// Puts back a task whose `AssignTask` could not be delivered to `worker_id`'s `session_id`.
     ///
     /// The task never reached the worker, so no retry or failover budget is charged. It is only
@@ -1336,6 +1403,7 @@ impl TaskQueue {
             entry.state = TaskState::Queued;
             entry.assigned_worker_id = None;
             entry.assigned_session = None;
+            entry.assigned_session_live = None;
             entry.scheduled_instant = None;
             let record = JournalRecord::TaskRequeued {
                 task_id: *task_id,
@@ -1387,29 +1455,57 @@ impl TaskQueue {
     ) -> GridResult<()> {
         let ack = {
             let mut inner = self.inner.write().await;
-            let zero_retries = {
+            let (is_speculative, zero_retries) = {
                 let entry = inner
                     .tasks
                     .get(task_id)
                     .ok_or(GridError::TaskNotFound(task_id.0))?;
 
-                if !owned_by(entry, &worker_id, session_id) {
-                    return Err(GridError::InvalidTaskState {
-                        task_id: task_id.0,
-                        current: format!("{:?} (not assigned to this worker/session)", entry.state),
-                        attempted: "Running".into(),
-                    });
-                }
+                if owned_by_speculative(entry, &worker_id, session_id) {
+                    let spec_state = entry
+                        .speculative
+                        .as_ref()
+                        .map_or(TaskState::Running, |s| s.state);
+                    if !spec_state.can_transition_to(TaskState::Running) {
+                        return Err(GridError::InvalidTaskState {
+                            task_id: task_id.0,
+                            current: format!("{spec_state:?}"),
+                            attempted: "Running".into(),
+                        });
+                    }
+                    (true, false)
+                } else {
+                    if !owned_by(entry, &worker_id, session_id) {
+                        return Err(GridError::InvalidTaskState {
+                            task_id: task_id.0,
+                            current: format!(
+                                "{:?} (not assigned to this worker/session)",
+                                entry.state
+                            ),
+                            attempted: "Running".into(),
+                        });
+                    }
 
-                if !entry.state.can_transition_to(TaskState::Running) {
-                    return Err(GridError::InvalidTaskState {
-                        task_id: task_id.0,
-                        current: format!("{:?}", entry.state),
-                        attempted: "Running".into(),
-                    });
+                    if !entry.state.can_transition_to(TaskState::Running) {
+                        return Err(GridError::InvalidTaskState {
+                            task_id: task_id.0,
+                            current: format!("{:?}", entry.state),
+                            attempted: "Running".into(),
+                        });
+                    }
+                    (false, inner.retry_policy.zero_retries_for(entry))
                 }
-                inner.retry_policy.zero_retries_for(entry)
             };
+
+            if is_speculative {
+                if let Some(entry) = inner.tasks.get_mut(task_id) {
+                    if let Some(ref mut spec) = entry.speculative {
+                        spec.state = TaskState::Running;
+                        spec.started_instant = Some(Instant::now());
+                    }
+                }
+                return Ok(());
+            }
 
             let mut run_attempt = None;
             if let Some(entry) = inner.tasks.get_mut(task_id) {
@@ -1454,5 +1550,149 @@ impl TaskQueue {
             }
         }
         Ok(())
+    }
+
+    /// Returns `(in_flight_speculative_slots, running_repeatable_candidates)` for the reaper's
+    /// periodic straggler pass (`0060` D3).
+    pub async fn speculative_snapshot(&self) -> (usize, Vec<StragglerCandidate>) {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut in_flight_spec_slots = 0usize;
+        let mut candidates = Vec::new();
+        for entry in inner.tasks.values() {
+            if !entry.state.is_active() {
+                continue;
+            }
+            if entry.speculative.is_some() {
+                in_flight_spec_slots += entry.task.requirements.cpu_cores.max(1);
+                continue;
+            }
+            if entry.state != TaskState::Running
+                || entry.speculative_spawned
+                || entry.task.workspace.is_some()
+                || !entry.task.is_repeatable()
+            {
+                continue;
+            }
+            let (Some(primary_worker_id), Some(started)) =
+                (entry.assigned_worker_id, entry.started_instant)
+            else {
+                continue;
+            };
+            let mut view = TaskView::of_with_key(&entry.task, entry.task_key);
+            if entry.requires_tree_v2 {
+                view.required_features.insert(ProtocolCapabilities::TREE_V2);
+            }
+            view.avoid = entry.avoid_workers.clone();
+            candidates.push(StragglerCandidate {
+                view,
+                primary_worker_id,
+                elapsed: now.saturating_duration_since(started),
+            });
+        }
+        (in_flight_spec_slots, candidates)
+    }
+
+    /// Attempts to register a speculative straggler copy on `(worker_id, session_id)` for a
+    /// currently `Running` repeatable task (`0060` D3). Returns `Some(task)` on success.
+    #[cfg(test)]
+    pub async fn try_start_speculative(
+        &self,
+        task_id: TaskId,
+        worker_id: Uuid,
+        session_id: u64,
+    ) -> Option<Task> {
+        let mut inner = self.inner.write().await;
+        let task = {
+            let entry = inner.tasks.get_mut(&task_id)?;
+            if entry.state != TaskState::Running
+                || entry.speculative.is_some()
+                || entry.speculative_spawned
+                || entry.task.workspace.is_some()
+                || !entry.task.is_repeatable()
+                || entry.assigned_worker_id == Some(worker_id)
+            {
+                return None;
+            }
+            entry.speculative_spawned = true;
+            entry.speculative = Some(SpeculativeAttempt {
+                worker_id,
+                session_id,
+                session_live: Arc::new(AtomicBool::new(true)),
+                scheduled_instant: Instant::now(),
+                started_instant: None,
+                state: TaskState::Scheduled,
+            });
+            entry.task.clone()
+        };
+        inner
+            .worker_assignments
+            .entry(worker_id)
+            .or_default()
+            .insert(task_id);
+        inner.refresh_worker_resume_protection(worker_id);
+        Some(task)
+    }
+
+    /// Atomically checks eligibility, checks `peer_version` extension compatibility, delivers the
+    /// prepared `Task` via non-blocking `deliver`, and records `entry.speculative` under a single
+    /// `queue.inner.write()` lock. Because no `.await` occurs between recording `entry.speculative`
+    /// and queuing `AssignTask`, a concurrent primary failure/promotion cannot strand the task in
+    /// `Scheduled` without delivery, and a concurrent primary completion/cancel cannot double-call
+    /// `release_dispatch`.
+    pub async fn try_start_speculative_and_deliver(
+        &self,
+        task_id: TaskId,
+        worker_id: Uuid,
+        session_id: u64,
+        session_live: Arc<AtomicBool>,
+        peer_version: Option<u32>,
+        deliver: impl FnOnce(Task) -> bool,
+    ) -> SpeculativeStartOutcome {
+        let mut inner = self.inner.write().await;
+        let prepared = {
+            let Some(entry) = inner.tasks.get(&task_id) else {
+                return SpeculativeStartOutcome::NotEligible;
+            };
+            if entry.state != TaskState::Running
+                || entry.speculative.is_some()
+                || entry.speculative_spawned
+                || entry.task.workspace.is_some()
+                || !entry.task.is_repeatable()
+                || entry.assigned_worker_id == Some(worker_id)
+            {
+                return SpeculativeStartOutcome::NotEligible;
+            }
+            if peer_version.is_some_and(|v| entry.task.withheld_from_peer(v)) {
+                return SpeculativeStartOutcome::WithheldFromPeer;
+            }
+            let mut task = entry.task.clone();
+            task.latest_checkpoint = None;
+            task.strip_master_extensions();
+            task
+        };
+
+        if !deliver(prepared) {
+            return SpeculativeStartOutcome::DeliveryFailed;
+        }
+
+        if let Some(entry) = inner.tasks.get_mut(&task_id) {
+            entry.speculative_spawned = true;
+            entry.speculative = Some(SpeculativeAttempt {
+                worker_id,
+                session_id,
+                session_live,
+                scheduled_instant: Instant::now(),
+                started_instant: None,
+                state: TaskState::Scheduled,
+            });
+        }
+        inner
+            .worker_assignments
+            .entry(worker_id)
+            .or_default()
+            .insert(task_id);
+        inner.refresh_worker_resume_protection(worker_id);
+        SpeculativeStartOutcome::Delivered
     }
 }

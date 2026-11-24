@@ -3,8 +3,10 @@
 //! once per task. Design record: `docs/design/0006-content-addressed-data-plane.md`.
 //!
 //! * **Layout.** `<sandbox base>/cache/blobs/objects/<first two hex digits>/<64 hex digits>`, one
-//!   verified blob per file, and `<sandbox base>/cache/blobs/tmp/` for blobs being written. Task
-//!   sandboxes are siblings of `cache/`, so moving an output file into the cache is a rename.
+//!   verified blob per file, `<sandbox base>/cache/blobs/tmp/` for blobs being written
+//!   (`<owner_uuid>.<part_uuid>.part`), and `<sandbox base>/cache/blobs/owners/` for per-cache
+//!   advisory owner lock files (`<owner_uuid>.lock`). Task sandboxes are siblings of `cache/`, so
+//!   moving an output file into the cache is a rename.
 //! * **Copies, not links.** A blob is copied into a sandbox ([`BlobCache::materialize`]): a task
 //!   that rewrites one of its inputs in place must not change the blob the next task gets. The
 //!   copy is hashed on the way; a blob that no longer matches its id is dropped and the task fails
@@ -104,17 +106,34 @@ impl Inner {
     }
 }
 
+struct OwnerLockGuard {
+    owner_id: Uuid,
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl Drop for OwnerLockGuard {
+    fn drop(&mut self) {
+        if let Some(lock_file) = self.file.take() {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = lock_file.unlock();
+            drop(lock_file);
+        }
+    }
+}
+
 /// A worker's bounded, content-addressed cache of blobs. Shared as `Arc<BlobCache>`.
 pub struct BlobCache {
     objects: PathBuf,
     tmp: PathBuf,
     max_bytes: u64,
+    _owner_lock: OwnerLockGuard,
     inner: Mutex<Inner>,
 }
 
 impl BlobCache {
     /// Opens (creating it if needed) the cache in `dir` (`<sandbox base>/cache/blobs`), indexing
-    /// the blobs already there and removing stale temporary files.
+    /// the blobs already there and removing dead-owner and stale temporary files.
     pub fn open(dir: &Path, max_bytes: u64) -> io::Result<Arc<Self>> {
         Self::open_with_dir_check(dir, max_bytes, ensure_private_cache_dir)
     }
@@ -135,47 +154,13 @@ impl BlobCache {
 
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
+        let owners = dir.join("owners");
         check_dir(&objects, true)?;
         check_dir(&tmp, true)?;
+        check_dir(&owners, true)?;
 
-        // Another worker process may be writing into `tmp/` right now: only old files go.
-        for entry in std::fs::read_dir(&tmp)?.flatten() {
-            let entry_path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
-                continue;
-            };
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-                if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                    || !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(&entry_path)
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "Task sandboxes cannot use '{}' safely: cache entry is a link or \
-                             belongs to an untrusted account",
-                            entry_path.display()
-                        ),
-                    ));
-                }
-            }
-            if !crate::sandbox::is_real_owned_file(&entry_path, &meta) {
-                continue;
-            }
-            let stale = meta
-                .modified()
-                .map(|t| {
-                    SystemTime::now()
-                        .duration_since(t)
-                        .is_ok_and(|age| age > STALE_TMP_AGE)
-                })
-                .unwrap_or(false);
-            if stale {
-                let _ = std::fs::remove_file(&entry_path);
-            }
-        }
+        let owner_lock = acquire_owner_lock(&owners)?;
+        sweep_tmp_and_owners(&tmp, &owners, Some(owner_lock.owner_id), true, true)?;
 
         let mut found = Vec::new();
         for fanout in std::fs::read_dir(&objects)?.flatten() {
@@ -201,25 +186,7 @@ impl BlobCache {
                 let Ok(meta) = std::fs::symlink_metadata(&object_path) else {
                     continue;
                 };
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::MetadataExt;
-                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-                    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                        || !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(
-                            &object_path,
-                        )
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Task sandboxes cannot use '{}' safely: cached blob entry is a \
-                                 link or belongs to an untrusted account",
-                                object_path.display()
-                            ),
-                        ));
-                    }
-                }
+                check_trusted_leaf_entry(&object_path, &meta, "cached blob entry")?;
                 let id = object
                     .file_name()
                     .to_str()
@@ -250,6 +217,7 @@ impl BlobCache {
             objects,
             tmp,
             max_bytes,
+            _owner_lock: owner_lock,
             inner: Mutex::new(inner),
         }))
     }
@@ -319,7 +287,11 @@ impl BlobCache {
 
     /// A fresh path in the cache's temporary directory, for a blob being written.
     pub fn temp_path(&self) -> PathBuf {
-        self.tmp.join(format!("{}.part", Uuid::new_v4()))
+        self.tmp.join(format!(
+            "{}.{}.part",
+            self._owner_lock.owner_id,
+            Uuid::new_v4()
+        ))
     }
 
     /// Takes over the temporary file `tmp`, which holds blob `id` (`size` bytes), already
@@ -579,6 +551,320 @@ impl Drop for CachePin {
         let mut inner = self.cache.lock();
         inner.unpin_ids(self.ids.drain(..));
     }
+}
+
+fn check_trusted_leaf_entry(path: &Path, meta: &std::fs::Metadata, label: &str) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || !rusty_grid_core::private_file::is_path_trusted_owner_no_follow(path)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Task sandboxes cannot use '{}' safely: {label} is a link or belongs to an \
+                     untrusted account",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (path, meta, label);
+    Ok(())
+}
+
+fn parse_owned_part_owner(file_name: &str) -> Option<Uuid> {
+    let stem = file_name.strip_suffix(".part")?;
+    let (owner_str, part_str) = stem.split_once('.')?;
+    let owner = Uuid::parse_str(owner_str).ok()?;
+    let _part = Uuid::parse_str(part_str).ok()?;
+    Some(owner)
+}
+
+fn parse_owner_lock_id(file_name: &str) -> Option<Uuid> {
+    let stem = file_name.strip_suffix(".lock")?;
+    Uuid::parse_str(stem).ok()
+}
+
+fn acquire_owner_lock(owners: &Path) -> io::Result<OwnerLockGuard> {
+    acquire_owner_lock_with(owners, &mut |_| {})
+}
+
+fn acquire_owner_lock_with(
+    owners: &Path,
+    after_open: &mut dyn FnMut(&Path),
+) -> io::Result<OwnerLockGuard> {
+    for _ in 0..16 {
+        let owner_id = Uuid::new_v4();
+        let path = owners.join(format!("{owner_id}.lock"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        after_open(&path);
+        match file.try_lock() {
+            Ok(()) => {
+                let file_meta = match file.metadata() {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&path);
+                        let _ = file.unlock();
+                        drop(file);
+                        return Err(err);
+                    }
+                };
+                if crate::sandbox::lock_file_is_still_named(&path, &file, &file_meta) {
+                    return Ok(OwnerLockGuard {
+                        owner_id,
+                        path,
+                        file: Some(file),
+                    });
+                }
+                let _ = file.unlock();
+                drop(file);
+                continue;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                drop(file);
+                continue;
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                let _ = std::fs::remove_file(&path);
+                drop(file);
+                return Err(err);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "exhausted attempts creating a unique blob cache owner lock",
+    ))
+}
+
+fn open_existing_owner_lock(lock_path: &Path) -> io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: never follow a symbolic link or reparse point at lock_path.
+        opts.custom_flags(0x0020_0000);
+    }
+    opts.open(lock_path)
+}
+
+enum OwnerProbe {
+    Alive,
+    Dead(Option<(PathBuf, File)>),
+    Unknown,
+}
+
+fn try_claim_dead_owner_lock(lock_path: &Path, strict_security: bool) -> io::Result<OwnerProbe> {
+    let meta = match std::fs::symlink_metadata(lock_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(OwnerProbe::Dead(None)),
+        Err(e) => {
+            return if strict_security && e.kind() == io::ErrorKind::PermissionDenied {
+                Err(e)
+            } else {
+                Ok(OwnerProbe::Unknown)
+            };
+        }
+    };
+    if strict_security {
+        check_trusted_leaf_entry(lock_path, &meta, "owner lock entry")?;
+    }
+    if !crate::sandbox::is_real_owned_file(lock_path, &meta) {
+        return Ok(OwnerProbe::Unknown);
+    }
+    let file = match open_existing_owner_lock(lock_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(OwnerProbe::Dead(None)),
+        Err(_) => return Ok(OwnerProbe::Unknown),
+    };
+    let Ok(file_meta) = file.metadata() else {
+        return Ok(OwnerProbe::Unknown);
+    };
+    if !crate::sandbox::is_real_owned_open_file(&file, &file_meta) {
+        return if strict_security {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Task sandboxes cannot use '{}' safely: owner lock is a link or belongs to \
+                     an untrusted account",
+                    lock_path.display()
+                ),
+            ))
+        } else {
+            Ok(OwnerProbe::Unknown)
+        };
+    }
+    match file.try_lock() {
+        Ok(()) => {
+            if crate::sandbox::lock_file_is_still_named(lock_path, &file, &file_meta) {
+                Ok(OwnerProbe::Dead(Some((lock_path.to_path_buf(), file))))
+            } else {
+                let _ = file.unlock();
+                drop(file);
+                Ok(OwnerProbe::Dead(None))
+            }
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(OwnerProbe::Alive),
+        Err(std::fs::TryLockError::Error(_)) => Ok(OwnerProbe::Unknown),
+    }
+}
+
+fn is_stale_tmp_file(meta: &std::fs::Metadata) -> bool {
+    meta.modified()
+        .map(|t| {
+            SystemTime::now()
+                .duration_since(t)
+                .is_ok_and(|age| age > STALE_TMP_AGE)
+        })
+        .unwrap_or(false)
+}
+
+fn sweep_tmp_and_owners(
+    tmp: &Path,
+    owners: &Path,
+    self_owner: Option<Uuid>,
+    strict_security: bool,
+    sweep_legacy_stale: bool,
+) -> io::Result<()> {
+    let mut probed: HashMap<Uuid, OwnerProbe> = HashMap::new();
+
+    for entry in std::fs::read_dir(tmp)?.flatten() {
+        let entry_path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        if strict_security {
+            check_trusted_leaf_entry(&entry_path, &meta, "cache entry")?;
+        }
+        if !crate::sandbox::is_real_owned_file(&entry_path, &meta) {
+            continue;
+        }
+        let owner_opt = entry.file_name().to_str().and_then(parse_owned_part_owner);
+        let should_remove = match owner_opt {
+            Some(owner_id) => {
+                if self_owner == Some(owner_id) {
+                    false
+                } else {
+                    let probe = match probed.entry(owner_id) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let lock_path = owners.join(format!("{owner_id}.lock"));
+                            let res = try_claim_dead_owner_lock(&lock_path, strict_security)?;
+                            entry.insert(res)
+                        }
+                    };
+                    match probe {
+                        OwnerProbe::Dead(_) => true,
+                        OwnerProbe::Alive => false,
+                        OwnerProbe::Unknown => sweep_legacy_stale && is_stale_tmp_file(&meta),
+                    }
+                }
+            }
+            None => sweep_legacy_stale && is_stale_tmp_file(&meta),
+        };
+        if should_remove {
+            let _ = std::fs::remove_file(&entry_path);
+        }
+    }
+
+    let mut handled_owners: Vec<Uuid> = Vec::with_capacity(probed.len());
+    for (owner_id, probe) in probed {
+        handled_owners.push(owner_id);
+        if let OwnerProbe::Dead(Some((lock_path, lock_file))) = probe {
+            let _ = std::fs::remove_file(&lock_path);
+            let _ = lock_file.unlock();
+            drop(lock_file);
+        }
+    }
+
+    let owner_entries = match std::fs::read_dir(owners) {
+        Ok(rd) => rd,
+        Err(e) if !strict_security && e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in owner_entries.flatten() {
+        let lock_path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&lock_path) else {
+            continue;
+        };
+        if strict_security {
+            check_trusted_leaf_entry(&lock_path, &meta, "owner lock entry")?;
+        }
+        if !crate::sandbox::is_real_owned_file(&lock_path, &meta) {
+            continue;
+        }
+        let Some(owner_id) = entry.file_name().to_str().and_then(parse_owner_lock_id) else {
+            continue;
+        };
+        if self_owner == Some(owner_id) || handled_owners.contains(&owner_id) {
+            continue;
+        }
+        if let Ok(OwnerProbe::Dead(Some((dead_path, lock_file)))) =
+            try_claim_dead_owner_lock(&lock_path, strict_security)
+        {
+            let _ = std::fs::remove_file(&dead_path);
+            let _ = lock_file.unlock();
+            drop(lock_file);
+        }
+    }
+
+    Ok(())
+}
+
+/// Sweeps dead-owner `.part` files and orphan dead owner locks under an existing
+/// `<sandbox base>/cache/blobs` directory at worker startup without creating any directories.
+pub(crate) fn sweep_dead_owner_tmp(blobs_dir: &Path) {
+    let Some(cache_dir) = blobs_dir.parent() else {
+        return;
+    };
+    let Ok(cache_meta) = std::fs::symlink_metadata(cache_dir) else {
+        return;
+    };
+    if !crate::sandbox::is_real_owned_dir(cache_dir, &cache_meta) {
+        return;
+    }
+    let Ok(blobs_meta) = std::fs::symlink_metadata(blobs_dir) else {
+        return;
+    };
+    if !crate::sandbox::is_real_owned_dir(blobs_dir, &blobs_meta) {
+        return;
+    }
+    let tmp = blobs_dir.join("tmp");
+    let Ok(tmp_meta) = std::fs::symlink_metadata(&tmp) else {
+        return;
+    };
+    if !crate::sandbox::is_real_owned_dir(&tmp, &tmp_meta) {
+        return;
+    }
+    let owners = blobs_dir.join("owners");
+    match std::fs::symlink_metadata(&owners) {
+        Ok(owners_meta) if !crate::sandbox::is_real_owned_dir(&owners, &owners_meta) => return,
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+    let _ = sweep_tmp_and_owners(&tmp, &owners, None, false, false);
 }
 
 /// Creates or validates `dir` (and any missing ancestors) as a private cache directory:
@@ -1055,7 +1341,9 @@ mod tests {
         use std::process::Command;
 
         fn make_junction(link: &Path, target: &Path) {
+            use std::os::windows::process::CommandExt;
             let status = Command::new("cmd")
+                .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
                 .args(["/c", "mklink", "/J"])
                 .arg(link)
                 .arg(target)
@@ -1084,6 +1372,7 @@ mod tests {
             blobs_dir.clone(),
             blobs_dir.join("objects"),
             blobs_dir.join("tmp"),
+            blobs_dir.join("owners"),
             fanout_dir,
         ] {
             let (aces, protected) = read_dacl(&d).unwrap();
@@ -1132,6 +1421,22 @@ mod tests {
         assert!(
             err_fanout.to_string().contains("reparse point"),
             "{err_fanout}"
+        );
+
+        // 3b. A junction at `<base>\cache\blobs\owners` is also refused on open.
+        let junc_owners_base = root_tmp.path().join("base_junc_owners");
+        let owners_blobs = junc_owners_base.join("cache").join("blobs");
+        drop(BlobCache::open(&owners_blobs, 1 << 20).unwrap());
+        let owners_dir = owners_blobs.join("owners");
+        std::fs::remove_dir(&owners_dir).unwrap();
+        make_junction(&owners_dir, &canary_target);
+        let err_owners = match BlobCache::open(&owners_blobs, 1 << 20) {
+            Ok(_) => panic!("junction at owners must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err_owners.to_string().contains("reparse point"),
+            "{err_owners}"
         );
 
         // 4. Existing `<base>\cache` or `<base>\cache\blobs\objects` with a foreign write grant
@@ -1216,5 +1521,289 @@ mod tests {
                     .contains(&foreign_cache.display().to_string()),
             "{err_owner}"
         );
+    }
+
+    #[test]
+    fn killed_writer_part_is_removed_and_live_writer_part_is_kept_across_processes() {
+        if let Some(blobs_dir_os) = std::env::var_os("BUG34_CHILD_BLOBS_DIR") {
+            let part_out = std::env::var_os("BUG34_CHILD_PART_FILE")
+                .expect("BUG34_CHILD_PART_FILE must be set");
+            let ready_out = std::env::var_os("BUG34_CHILD_READY_FILE")
+                .expect("BUG34_CHILD_READY_FILE must be set");
+            let cache = BlobCache::open(Path::new(&blobs_dir_os), 1 << 20).unwrap();
+            let part = cache.temp_path();
+            std::fs::write(&part, b"live partial blob").unwrap();
+            std::fs::write(&part_out, part.to_string_lossy().as_bytes()).unwrap();
+            std::fs::write(&ready_out, b"ready").unwrap();
+            // Hold the BlobCache owner lock until parent kills this process.
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+
+        struct ChildKillGuard(Option<std::process::Child>);
+        impl Drop for ChildKillGuard {
+            fn drop(&mut self) {
+                if let Some(mut c) = self.0.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        let part_file = dir.path().join("child_part_path.txt");
+        let ready_file = dir.path().join("child_ready.txt");
+        let exe = std::env::current_exe().unwrap();
+        let mut guard = ChildKillGuard(Some(
+            std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "blob_cache::tests::killed_writer_part_is_removed_and_live_writer_part_is_kept_across_processes",
+                    "--nocapture",
+                ])
+                .env("BUG34_CHILD_BLOBS_DIR", &blobs_dir)
+                .env("BUG34_CHILD_PART_FILE", &part_file)
+                .env("BUG34_CHILD_READY_FILE", &ready_file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn child writer process"),
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready_file.exists() {
+            if let Some(status) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+                panic!("child writer exited early before signalling ready: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child writer did not signal ready within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let part_path_str = std::fs::read_to_string(&part_file).unwrap();
+        let child_part = PathBuf::from(part_path_str.trim());
+        assert!(
+            child_part.is_file(),
+            "child .part file must exist while child lives"
+        );
+
+        // While the child process lives and holds its owner lock, opening another cache or running
+        // the startup sweep must leave the live writer's .part file untouched.
+        let live_sibling = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+        sweep_dead_owner_tmp(&blobs_dir);
+        assert!(
+            child_part.is_file(),
+            "live child writer's .part file must not be removed by sibling open/sweep"
+        );
+        assert_eq!(
+            std::fs::read(&child_part).unwrap(),
+            b"live partial blob",
+            "live child writer's .part file contents must remain intact"
+        );
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            2,
+            "both live owner locks must be present"
+        );
+        drop(live_sibling);
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            1,
+            "clean Drop must release only the closed owner lock"
+        );
+        assert!(child_part.is_file());
+
+        // Hard-kill the child so Drop does not run, leaving an orphaned .part and unlocked .lock.
+        let mut child = guard.0.take().unwrap();
+        child.kill().unwrap();
+        let _ = child.wait().unwrap();
+        assert!(
+            child_part.is_file(),
+            "killed child's orphaned .part file remains until next open/sweep"
+        );
+
+        let reopened = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+        assert!(
+            !child_part.exists(),
+            "orphaned .part file of killed writer must be removed on next open"
+        );
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("tmp")).unwrap().count(),
+            0,
+            "tmp/ must be empty after dead-owner sweep"
+        );
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            1,
+            "only the reopened cache's own lock may remain in owners/"
+        );
+        drop(reopened);
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            0,
+            "owners/ must be empty once all caches drop cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_removes_killed_owner_part_and_keeps_live_and_legacy_parts() {
+        let root = tempfile::tempdir().unwrap();
+        let base_dir = root.path().join("sandboxes");
+        let config = crate::sandbox::SandboxConfig::new(&base_dir);
+        config.ensure_usable().await.unwrap();
+        assert!(
+            !base_dir.join("cache").exists(),
+            "startup sweep must not create cache directories when none exist"
+        );
+
+        let blobs_dir = base_dir.join("cache").join("blobs");
+        let live_cache = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+        let live_part = live_cache.temp_path();
+        std::fs::write(&live_part, b"live-in-flight").unwrap();
+
+        let dead_owner_id = Uuid::new_v4();
+        let dead_lock = blobs_dir
+            .join("owners")
+            .join(format!("{dead_owner_id}.lock"));
+        std::fs::write(&dead_lock, b"").unwrap();
+        let dead_part = blobs_dir
+            .join("tmp")
+            .join(format!("{dead_owner_id}.{}.part", Uuid::new_v4()));
+        std::fs::write(&dead_part, b"killed-worker").unwrap();
+
+        let legacy_part = blobs_dir
+            .join("tmp")
+            .join(format!("{}.part", Uuid::new_v4()));
+        std::fs::write(&legacy_part, b"legacy-part").unwrap();
+
+        config.ensure_usable().await.unwrap();
+        assert!(
+            !dead_part.exists(),
+            "startup sweep must remove killed owner's .part file"
+        );
+        assert!(
+            !dead_lock.exists(),
+            "startup sweep must remove dead owner's .lock file"
+        );
+        assert!(
+            live_part.is_file(),
+            "startup sweep must keep live owner's .part file"
+        );
+        assert!(
+            legacy_part.is_file(),
+            "startup sweep must keep fresh legacy unowned .part file"
+        );
+        drop(live_cache);
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_unowned_part_keeps_24h_stale_age_and_orphan_dead_owner_lock_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        let cache1 = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+        let cache2 = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+
+        let legacy_part = blobs_dir
+            .join("tmp")
+            .join(format!("{}.part", Uuid::new_v4()));
+        std::fs::write(&legacy_part, b"fresh-legacy").unwrap();
+
+        let orphan_dead_id = Uuid::new_v4();
+        let orphan_dead_lock = blobs_dir
+            .join("owners")
+            .join(format!("{orphan_dead_id}.lock"));
+        std::fs::write(&orphan_dead_lock, b"").unwrap();
+
+        drop(cache1);
+        let cache3 = BlobCache::open(&blobs_dir, 1 << 20).unwrap();
+        assert!(
+            legacy_part.is_file(),
+            "fresh unowned legacy .part file must keep its 24h stale-age protection"
+        );
+        assert!(
+            !orphan_dead_lock.exists(),
+            "orphan unlocked dead owner lock file must be swept on open"
+        );
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            2,
+            "live cache2 and cache3 owner locks must remain"
+        );
+        drop(cache2);
+        drop(cache3);
+        assert_eq!(
+            std::fs::read_dir(blobs_dir.join("owners")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn acquire_owner_lock_retries_when_sibling_claims_or_unlinks_before_lock() {
+        // Case A: sibling acquires, unlinks, and drops the brand-new lock file between open and
+        // try_lock; acquire_owner_lock_with must detect the unlinked file and retry with a new UUID.
+        let dir = tempfile::tempdir().unwrap();
+        let owners = dir.path().join("owners");
+        std::fs::create_dir_all(&owners).unwrap();
+
+        let mut seen_paths: Vec<PathBuf> = Vec::new();
+        let guard_a = acquire_owner_lock_with(&owners, &mut |path| {
+            seen_paths.push(path.to_path_buf());
+            if seen_paths.len() == 1 {
+                let sibling = open_existing_owner_lock(path).unwrap();
+                sibling.try_lock().unwrap();
+                std::fs::remove_file(path).unwrap();
+                let _ = sibling.unlock();
+                drop(sibling);
+            }
+        })
+        .unwrap();
+        assert_eq!(seen_paths.len(), 2, "must retry once with a fresh UUID");
+        let first_id_a =
+            parse_owner_lock_id(seen_paths[0].file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_ne!(guard_a.owner_id, first_id_a);
+        assert!(guard_a.path.is_file());
+        drop(guard_a);
+        assert_eq!(std::fs::read_dir(&owners).unwrap().count(), 0);
+
+        // Case B: sibling holds the exclusive lock on attempt 0; acquire_owner_lock_with sees
+        // WouldBlock, leaves the sibling's lock untouched, and succeeds on attempt 1 with a new UUID.
+        let mut held_by_sibling: Option<File> = None;
+        let mut sibling_path: Option<PathBuf> = None;
+        let mut seen_b = 0usize;
+        let guard_b = acquire_owner_lock_with(&owners, &mut |path| {
+            seen_b += 1;
+            if seen_b == 1 {
+                let sibling = open_existing_owner_lock(path).unwrap();
+                sibling.try_lock().unwrap();
+                sibling_path = Some(path.to_path_buf());
+                held_by_sibling = Some(sibling);
+            }
+        })
+        .unwrap();
+        assert_eq!(seen_b, 2);
+        let sib_p = sibling_path.unwrap();
+        let sib_id = parse_owner_lock_id(sib_p.file_name().unwrap().to_str().unwrap()).unwrap();
+        assert_ne!(guard_b.owner_id, sib_id);
+        assert!(
+            sib_p.is_file(),
+            "sibling's held lock file must not be unlinked"
+        );
+        assert!(guard_b.path.is_file());
+        drop(guard_b);
+        if let Some(sib) = held_by_sibling {
+            let _ = std::fs::remove_file(&sib_p);
+            let _ = sib.unlock();
+            drop(sib);
+        }
+        assert_eq!(std::fs::read_dir(&owners).unwrap().count(), 0);
     }
 }

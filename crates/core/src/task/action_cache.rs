@@ -463,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn key_hex_round_trips() {
         let key = compute_action_cache_key(&sample_cached_task());
         let hex = key.to_hex();
@@ -472,6 +473,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn key_ignores_volatile_fields_and_scheduling_hints() {
         let a = sample_cached_task();
         let mut b = a.clone();
@@ -491,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn key_is_independent_of_input_staged_env_and_output_order() {
         let a = sample_cached_task();
         let mut b = a.clone();
@@ -505,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri: ring detects CPU features in C and assembly")]
     fn key_changes_on_every_deterministic_dimension() {
         let base = sample_cached_task();
         let base_key = compute_action_cache_key(&base);

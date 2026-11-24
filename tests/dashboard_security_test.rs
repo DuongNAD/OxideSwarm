@@ -26,9 +26,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::connect_async;
 
+use rusty_grid_core::noise_auth::{compute_enroll_proof, MemberRole, NodeKeypair};
 use rusty_grid_core::ClusterSecret;
 use rusty_grid_master::auth::{dashboard_admin_token, AuthConfig, AuthScope, DevBypass};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::server::{AuthMode, MasterHandle, MasterServer, MemberStore, ServerConfig};
 
 const NIL_TASK_ID: &str = "00000000-0000-0000-0000-000000000000";
 
@@ -175,6 +176,14 @@ async fn test_every_route_is_denied_without_a_token_and_nothing_runs() {
         (Method::GET, format!("/api/tasks/{NIL_TASK_ID}")),
         (Method::GET, "/api/modes".into()),
         (Method::GET, "/api/modes/status".into()),
+        (Method::GET, "/api/members".into()),
+        (Method::GET, "/api/invites".into()),
+        (Method::POST, "/api/invites".into()),
+        (Method::DELETE, "/api/invites/abc".into()),
+        (Method::POST, "/api/members/abc/approve".into()),
+        (Method::POST, "/api/members/abc/reject".into()),
+        (Method::POST, "/api/members/abc/revoke".into()),
+        (Method::POST, "/api/members/abc/rename".into()),
         (Method::GET, "/api/stream/sse".into()),
         (Method::GET, "/ws".into()),
         (Method::GET, "/api/stream".into()),
@@ -968,6 +977,314 @@ async fn test_anonymous_rendezvous_lease_response_has_no_ticket() {
         parsed_auth.p2p_ticket.as_deref(),
         Some("iroh-ticket-should-be-redacted")
     );
+
+    let _ = master.shutdown();
+}
+
+// ---------------------------------------------------------------------------------------------
+// 7. Member & Invite Administration RBAC, CORS DELETE, Secret Redaction & XSS Safety (ENROLL-1d)
+// ---------------------------------------------------------------------------------------------
+
+async fn spawn_v3_security_dashboard(
+    auth: AuthConfig,
+    secret: Option<ClusterSecret>,
+) -> (tempfile::TempDir, MasterHandle, SocketAddr) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let master_kp = NodeKeypair::generate().unwrap();
+    let members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+    let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_state_dir(dir.path().to_path_buf())
+        .with_auth_mode(AuthMode::Members)
+        .with_ephemeral_key(false)
+        .with_master_noise_key(master_kp)
+        .with_members(members)
+        .with_dashboard_port(0)
+        .with_auth_config(auth);
+    config.enable_discovery = false;
+    #[cfg(feature = "p2p")]
+    {
+        config.enable_p2p = false;
+    }
+    if let Some(secret) = secret {
+        config = config.with_cluster_secret(secret);
+    }
+    let master = MasterServer::spawn(config).await.expect("spawn v3 master");
+    let addr = master.dashboard_addr().expect("dashboard addr");
+    (dir, master, addr)
+}
+
+#[tokio::test]
+async fn test_members_and_invites_require_admin_scope_and_never_leak_secrets() {
+    let secret = ClusterSecret::from_bytes(&[0x71; 32]).unwrap();
+    let admin_token = dashboard_admin_token(&secret);
+    let auth = strict()
+        .with_token("obs-tok", "obs", &[AuthScope::Observer])
+        .with_token("sub-tok", "sub", &[AuthScope::Submitter])
+        .with_token("wrk-tok", "wrk", &[AuthScope::Worker]);
+    let (_dir, master, addr) = spawn_v3_security_dashboard(auth, Some(secret.clone())).await;
+    let base = format!("http://{addr}");
+    let client = http_client();
+
+    let member_routes = [
+        (Method::GET, "/api/members", "{}"),
+        (Method::GET, "/api/invites", "{}"),
+        (Method::POST, "/api/invites", r#"{"roles":["worker"]}"#),
+        (Method::DELETE, "/api/invites/nonexistent", "{}"),
+        (
+            Method::POST,
+            "/api/members/nonexistent/approve",
+            r#"{"pairing_code":"123456"}"#,
+        ),
+        (Method::POST, "/api/members/nonexistent/reject", "{}"),
+        (Method::POST, "/api/members/nonexistent/revoke", "{}"),
+        (
+            Method::POST,
+            "/api/members/nonexistent/rename",
+            r#"{"name":"newname"}"#,
+        ),
+    ];
+
+    // Observer, Submitter, and Worker tokens are all denied with 403 Forbidden (never fall through
+    // GET catch-all to Observer!).
+    for tok in ["obs-tok", "sub-tok", "wrk-tok"] {
+        for (method, path, body) in &member_routes {
+            let resp = client
+                .request(method.clone(), format!("{base}{path}"))
+                .bearer_auth(tok)
+                .header("content-type", "application/json")
+                .body(*body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{tok} {method} {path} must return 403"
+            );
+            assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(resp.headers()["x-frame-options"], "DENY");
+            assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+        }
+    }
+
+    // Raw cluster secret is rejected with 401 Unauthorized.
+    let raw_secret_resp = client
+        .get(format!("{base}/api/members"))
+        .bearer_auth(secret.to_hex())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw_secret_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        raw_secret_resp.headers()["x-content-type-options"],
+        "nosniff"
+    );
+
+    // Derived Admin token succeeds (200) on /api/invites and /api/members, and 404 keeps security
+    // headers.
+    let create_inv = client
+        .post(format!("{base}/api/invites"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({ "roles": ["worker"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create_inv.status(), StatusCode::OK);
+    assert_eq!(create_inv.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(create_inv.headers()["x-frame-options"], "DENY");
+    assert_eq!(create_inv.headers()["referrer-policy"], "no-referrer");
+    let created: serde_json::Value = create_inv.json().await.unwrap();
+    let inv_id = created["invite_id"].as_str().unwrap().to_string();
+    assert!(created["invite"]
+        .as_str()
+        .unwrap()
+        .starts_with("oxs1-invite:"));
+
+    let get_inv = client
+        .get(format!("{base}/api/invites"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_inv.status(), StatusCode::OK);
+    let get_inv_body = get_inv.text().await.unwrap();
+    assert!(!get_inv_body.contains("invite_secret"));
+    assert!(!get_inv_body.contains("oxs1-invite:"));
+
+    let get_mem = client
+        .get(format!("{base}/api/members"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_mem.status(), StatusCode::OK);
+    assert_eq!(get_mem.headers()["x-content-type-options"], "nosniff");
+    let get_mem_body = get_mem.text().await.unwrap();
+    assert!(!get_mem_body.contains("pairing_code"));
+    assert!(!get_mem_body.contains("invite_secret"));
+
+    let del_inv = client
+        .delete(format!("{base}/api/invites/{inv_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_inv.status(), StatusCode::OK);
+
+    let missing_del = client
+        .delete(format!("{base}/api/invites/deadbeef"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_del.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing_del.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(missing_del.headers()["x-frame-options"], "DENY");
+    assert_eq!(missing_del.headers()["referrer-policy"], "no-referrer");
+
+    let _ = master.shutdown();
+}
+
+#[tokio::test]
+async fn test_members_and_invites_cross_origin_dev_bypass_and_cors_delete() {
+    // 1. In dev mode, cross-origin/spoofed-Host/proxy/cross-site requests to member/invite
+    //    endpoints are denied with 401.
+    let (_dir_dev, dev_master, dev_addr) =
+        spawn_v3_security_dashboard(AuthConfig::dev(), None).await;
+    let port = dev_addr.port();
+    let bad_headers: Vec<[(&str, String); 1]> = vec![
+        [("Origin", "https://evil.example".to_string())],
+        [("Host", format!("evil.example:{port}"))],
+        [("X-Forwarded-For", "203.0.113.9".to_string())],
+        [("Sec-Fetch-Site", "cross-site".to_string())],
+    ];
+    for hdrs in &bad_headers {
+        let borrowed: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        for (method, path, body) in [
+            ("GET", "/api/members", None),
+            ("POST", "/api/invites", Some("{}")),
+            ("DELETE", "/api/invites/abc", None),
+            ("POST", "/api/members/abc/revoke", Some("{}")),
+        ] {
+            let resp = raw_http(dev_addr, method, path, &borrowed, body).await;
+            assert_eq!(
+                resp.status, 401,
+                "{method} {path} with {:?} must be denied",
+                hdrs
+            );
+        }
+    }
+    let _ = dev_master.shutdown();
+
+    // 2. Allow-listed CORS origin gets Access-Control-Allow-Methods including DELETE on preflight;
+    //    evil origin gets none.
+    let cors_auth = strict()
+        .with_token("cors-adm", "admin", &[AuthScope::Admin])
+        .with_allowed_origin("https://ops.example.com");
+    let (_dir_cors, cors_master, cors_addr) = spawn_v3_security_dashboard(cors_auth, None).await;
+
+    let ok_preflight = raw_http(
+        cors_addr,
+        "OPTIONS",
+        "/api/invites/abc",
+        &[
+            ("Origin", "https://ops.example.com"),
+            ("Access-Control-Request-Method", "DELETE"),
+            ("Access-Control-Request-Headers", "authorization"),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(ok_preflight.status, 200);
+    assert_eq!(
+        ok_preflight.header("access-control-allow-origin"),
+        Some("https://ops.example.com")
+    );
+    let allow_methods = ok_preflight
+        .header("access-control-allow-methods")
+        .unwrap_or("");
+    assert!(
+        allow_methods.to_ascii_uppercase().contains("DELETE"),
+        "CORS preflight must allow DELETE: {allow_methods:?}"
+    );
+
+    let evil_preflight = raw_http(
+        cors_addr,
+        "OPTIONS",
+        "/api/invites/abc",
+        &[
+            ("Origin", "https://evil.example"),
+            ("Access-Control-Request-Method", "DELETE"),
+        ],
+        None,
+    )
+    .await;
+    assert!(evil_preflight
+        .header("access-control-allow-origin")
+        .is_none());
+
+    let _ = cors_master.shutdown();
+}
+
+#[tokio::test]
+async fn test_member_xss_payload_roundtrip_and_dashboard_html_safety() {
+    let auth = strict().with_token("adm", "admin", &[AuthScope::Admin]);
+    let (_dir, master, addr) = spawn_v3_security_dashboard(auth, None).await;
+    let client = http_client();
+    let base = format!("http://{addr}");
+
+    let kp = NodeKeypair::generate().unwrap();
+    let xss_name = "<img src=x onerror=alert(1)>";
+    let inv = master
+        .members()
+        .create_invite(vec![MemberRole::Worker], 1, 3600, false)
+        .unwrap();
+    let h = [0x33u8; 32];
+    let proof = compute_enroll_proof(&inv.invite_secret.0, &h);
+    master
+        .members()
+        .handle_enroll_request(
+            *kp.public_key(),
+            &h,
+            "1111-2222-3333-4444",
+            "127.0.0.1:44000",
+            &inv.invite_id,
+            &proof,
+            xss_name.to_string(),
+            "linux".to_string(),
+            "x86_64".to_string(),
+        )
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base}/api/members"))
+        .bearer_auth("adm")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["members"][0]["name"], xss_name);
+
+    // Served SPA HTML must use safe escaping + setHtml + delegated data-action/data-id only.
+    let html = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("function setHtml("));
+    assert!(html.contains("function escapeHtml("));
+    assert!(html.contains("data-action=\"revoke-member\""));
+    assert!(html.contains("data-action=\"approve-pending\""));
+    assert_eq!(html.matches(".innerHTML").count(), 1);
 
     let _ = master.shutdown();
 }

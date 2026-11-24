@@ -15,23 +15,38 @@ pub mod sdf;
 pub mod types;
 pub mod uv;
 
-use bake::{bake_texture_atlas, ProceduralPbrSampler};
-use gltf_pack::pack_glb;
-use manifold::repair_manifold_mesh;
+use bake::{bake_texture_atlas_cancellable, ProceduralPbrSampler};
+use gltf_pack::pack_glb_cancellable;
+use manifold::repair_manifold_mesh_cancellable;
 use rusty_grid_core::task::Generative3DSpec;
 use std::time::Instant;
 pub use types::{BakedMaterial, GenerationStats, RawMesh};
-use uv::{MultiChartBoxUnwrapper, UvUnwrapper};
+use uv::MultiChartBoxUnwrapper;
 
 /// Executes the full Tier-0 procedural 3D generation pipeline in pure Rust (< 50ms)
 /// with progressive milestone callback reporting (25%, 50%, 75%, 100%).
 pub fn generate_procedural_3d_with_progress<F>(
     spec: &Generative3DSpec,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<(Vec<u8>, GenerationStats), String>
 where
     F: FnMut(f32, &'static str, &'static str),
 {
+    generate_procedural_3d_cancellable(spec, on_progress, &|| false)
+}
+
+/// Executes the Tier-0 procedural 3D generation pipeline with cooperative cancellation checks.
+pub fn generate_procedural_3d_cancellable<F>(
+    spec: &Generative3DSpec,
+    mut on_progress: F,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<(Vec<u8>, GenerationStats), String>
+where
+    F: FnMut(f32, &'static str, &'static str),
+{
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let start = Instant::now();
 
     // 1. Resolve preset from prompt
@@ -45,41 +60,55 @@ where
     };
 
     // Stage 1: Geometry Extraction (25%)
-    let raw_mesh = marching_cubes::extract_isosurface(&preset, resolution)?;
+    let raw_mesh =
+        marching_cubes::extract_isosurface_cancellable(&preset, resolution, should_stop)?;
     on_progress(
         0.25,
         "sdf_geometry",
         "Isosurface extracted via Marching Cubes",
     );
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
 
     // Stage 2: Manifold Mesh Cleanup & Conformal UV Parameterization (50%)
-    let clean_mesh = repair_manifold_mesh(&raw_mesh);
+    let clean_mesh = repair_manifold_mesh_cancellable(&raw_mesh, should_stop)?;
     let atlas_size = match spec.quality.as_str() {
         "fast" => 512,
         "high" => 2048,
         _ => 1024,
     };
     let unwrapper = MultiChartBoxUnwrapper;
-    let uv_mesh = unwrapper.unwrap(&clean_mesh, 4, atlas_size);
+    let uv_mesh = unwrapper.unwrap_cancellable(&clean_mesh, 4, atlas_size, should_stop)?;
     on_progress(
         0.50,
         "manifold_uv",
         "Manifold topology repaired and conformal UV charts mapped",
     );
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
 
     // Stage 3: Barycentric PBR Texture Atlas Baking (75%)
     let material = if spec.export_texture {
         let sampler = ProceduralPbrSampler;
-        Some(bake_texture_atlas(
-            &uv_mesh, atlas_size, atlas_size, &sampler,
-        ))
+        Some(bake_texture_atlas_cancellable(
+            &uv_mesh,
+            atlas_size,
+            atlas_size,
+            &sampler,
+            should_stop,
+        )?)
     } else {
         None
     };
     on_progress(0.75, "texture_baking", "PBR albedo texture atlas baked");
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
 
     // Stage 4: Binary glTF 2.0 Packaging (100%)
-    let glb_bytes = pack_glb(&uv_mesh, material.as_ref())?;
+    let glb_bytes = pack_glb_cancellable(&uv_mesh, material.as_ref(), should_stop)?;
     on_progress(1.00, "gltf_pack", "Binary glTF 2.0 container assembled");
 
     let elapsed = start.elapsed().as_millis() as u64;

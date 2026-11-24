@@ -1251,6 +1251,7 @@ fn parse_journal(path: &Path, bytes: &[u8], snapshot_generation: u64) -> GridRes
 }
 
 #[cfg(feature = "fuzzing")]
+#[forbid(unsafe_code)]
 pub mod fuzzing;
 
 #[cfg(test)]

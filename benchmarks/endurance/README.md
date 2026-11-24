@@ -1,11 +1,17 @@
-# Endurance benchmarks (`TEST-24`, design 0065)
+# Endurance benchmarks (`TEST-24` & `TEST-25`, design 0065)
 
 `benchmarks/endurance/endurance.py` drives the built `oxideswarm` binary to measure large file
 and many-file transfers, memory flatness across sizes, output-limit enforcement, upload
-deduplication, mid-transfer disconnects, throttled TCP behavior, and blob-store capacity
-refusals. It uses only the Python 3 standard library.
+deduplication, mid-transfer disconnects, throttled TCP behavior, blob-store capacity
+refusals, and multi-worker fault-injection soak runs. It uses only the Python 3 standard library.
 
-The `soak` subcommand comes in `TEST-25`, and the scheduled CI workflow comes in `TEST-26`.
+## Scheduled CI (`TEST-26`, design 0065 D4.2)
+
+`.github/workflows/ci.yml` defines an `endurance` job on `ubuntu-latest` triggered only on
+`schedule` (weekly Monday `03:17 UTC`) and `workflow_dispatch` (never on pull requests, not a
+required check). It builds `target/release/oxideswarm`, runs `transfer` (`T1` `1 GiB`, `T2`
+`20,000` files, `T4`, `T6`, `T7`, `T8`) followed by a `45m` loopback `soak`, and uploads
+`transfer-loopback.json` and `soak-45m-loopback.json` as the `endurance-records` artifact.
 
 ## Usage
 
@@ -13,6 +19,7 @@ The `soak` subcommand comes in `TEST-25`, and the scheduled CI workflow comes in
 cargo build --release --locked --bin oxideswarm
 python3 tests/test_endurance_harness.py
 python3 benchmarks/endurance/endurance.py transfer --bin target/release/oxideswarm
+python3 benchmarks/endurance/endurance.py soak --bin target/release/oxideswarm --duration 45m --fault-scale 0.25
 ```
 
 Windows PowerShell example using a private work directory outside `AppData`:
@@ -26,12 +33,29 @@ python benchmarks\endurance\endurance.py transfer `
   --scenarios T1,T2,T3,T4,T6,T7,T8 `
   --t1-sizes-gib 1,3 `
   --t2-files 20000
+python benchmarks\endurance\endurance.py soak `
+  --bin target\release\oxideswarm.exe `
+  --duration 45m `
+  --fault-scale 0.25 `
+  --load-scale 1.0 `
+  --sample-interval 60s `
+  --workers 3 `
+  --slots 4 `
+  --max-queue-size 64 `
+  --work-dir C:\ox_tmp\soak
 ```
 
-Subcommands in `TEST-24`:
+Subcommands in `TEST-24` and `TEST-25`:
 
 - `transfer`: runs selected transfer scenarios (`T1`–`T9`) and writes one JSON record under
   `benchmarks/endurance/results/<UTC date>-<link>-<os>-<arch>-<cpu>.json`.
+- `soak`: runs one master (`--state-dir`, `--max-queue-size`, `--blob-store-mb`) and 2 or 3 workers
+  (`--workers`, `--slots`, `--workspaces`/`--no-workspaces`, `--blob-cache-mb`) across per-worker
+  `127.0.0.1` `ThrottleProxy` instances under seeded per-minute load (`--load-scale`) and scaled
+  faults (`--duration`, `--fault-scale`, `--sample-interval`: worker kill/restart, master restart
+  on the same state dir, proxy link cuts, and queue-cap bursts), checks every task via `TaskLedger`
+  and computes all five D3 item 6 pass/fail checks into
+  `benchmarks/endurance/results/<UTC date>-soak-<duration>-<link>-<os>-<arch>-<cpu>.json`.
 - `throttle`: runs a standalone user-space TCP proxy bound strictly to `127.0.0.1` (`--listen`,
   `--target`, `--rate-mbps`, `--delay-ms`, `--port-file`). Used in `T6`, `T7`, and `T8`.
 - `sample`: polls resident memory (`rss_bytes`), open handles (`handles`), threads (`threads`),
@@ -76,17 +100,17 @@ disk, while recording `oxideswarm`'s on-disk BLAKE3 store object names:
    and verified again on download by `oxideswarm submit --output-dir` plus independent streaming
    `sha256`.
 
-## Scope and deferred runs (`TEST-24` step 1 vs step 2)
+## Scope and deferred runs (`TEST-24` & `TEST-25` step 1 vs step 2)
 
-Loopback baseline results on a Windows `x86_64` desktop (`T1` at `1` and `3 GiB`, `T2` at
-`20,000` files, `T3`, `T4`, `T6`, `T7`, `T8`) are recorded below.
+Loopback baseline results on a Windows `x86_64` desktop are recorded below (`TEST-24` step 1
+`T1`–`T8`, and `TEST-25` step 1 45-minute soak).
 
-Deferred to the owner-present two-machine session (`TEST-24` step 2):
+Deferred to owner multi-machine sessions (`TEST-24` & `TEST-25` step 2):
 
-- `T1` at `8 GiB` and `T2` at `100,000` files
-- `T5` (half-cut upload over a real/throttled two-machine upload)
-- `T9` (3 sequential tasks with a `3 GiB` input > `2 GiB` worker cache)
-- Two-machine links: `lan-tcp`, `lan-quic`, and `quic-relay`
+- `TEST-24` step 2: `T1` at `8 GiB`, `T2` at `100,000` files, `T5`, `T9`, and two-machine links
+  (`lan-tcp`, `lan-quic`, `quic-relay`)
+- `TEST-25` step 2: full `24h` (`--fault-scale 1.0`) three-machine soak (Mac master + two Windows
+  workers on mains power, Q57)
 
 ## Recorded runs
 
@@ -108,3 +132,22 @@ All 7 requested loopback scenarios passed (`7/7`, total run `2,648.17 s`):
 | `T6` | `64 MiB` input fetch cut mid-transfer via loopback proxy (`12 Mbit/s`, `cut_links(3 s)`) | `PASS` | `4.440 s` | Worker disconnected (`os error 10054`), failed over and completed cleanly; `0` `.part` files left in `cache/blobs/tmp` |
 | `T7` | `256 MiB` input + `256 MiB` output over throttled TCP (`2.0 Mbit/s`, `50 ms` RTT, `2,165 s` vs `0.25 MiB/s` cap) | `PASS` | `2,164.622 s` | `worker_reaped = false` (`0` reap log entries across `406` samples over `36.1 min`); output BLAKE3 `1e9191a6...7af` verified; peak RSS: master `23.6 MiB`, worker `35.9 MiB` |
 | `T8` | `--blob-store-mb 64`: `72 MiB` single blob + two concurrent `40 MiB` uploads | `PASS` | `0.050 s` (`8a`) | Both refused naming `--blob-store-mb` (`0` tmp leftovers after finish) |
+
+### `TEST-25` step 1 (`45m` Windows loopback soak)
+
+Record: [`results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json`](results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json).
+`2026-11-19` (`12:30:08Z`), Windows `10.0.26300` (`AMD64`), `Intel(R) Core(TM) i5-14600KF` (`20` logical
+cores, `47.79 GiB` / `51,318,800,384 B` RAM), Windows Defender real-time protection `enabled = true`,
+release build `rusty-grid 0.4.4` at `4c11a45` (`dirty_tree = false`), loopback (`127.0.0.1`,
+measured TCP connect RTT `0.363 ms`), `--duration 45m --fault-scale 0.25 --load-scale 1.0 --sample-interval 60s --workers 3 --slots 4 --workspaces --max-queue-size 64 --blob-store-mb 4096 --blob-cache-mb 2048`.
+
+All 6 checks passed (`6/6`, 5 D3 item 6 checks plus fault completeness, actual elapsed `2,704.22 s`; faults injected: `8` `worker_kill`, `5` `link_cut`, `2` `queue_burst` [80 submits each into `max_queue_size=64`; spawning 24 CLI subprocesses spread submits over several seconds as the 12 worker slots drained, so `0` `QueueFull` refusals occurred in this run], `1` `master_restart`):
+
+| Check | Result | Key Metrics & Resource Summary |
+|---|---|---|
+| `1_accounting` | `PASS` | `2,185` submitted (`1,350` `noop`, `225` `new_input`, `225` `reused_input`, `90` `output`, `45` `workspace_sync`, `45` `cancel`, `45` `probe`, `160` `queue_burst`), `2,185` terminal (`2,140` `ok`, `45` `cancelled`), `0` submit failures, `0` lost/duplicate/hash mismatch/unexpected, `master_audit`: `2,185` unique task results logged (`0` multi-result tasks, `0` queue errors, `12` failover sweeps), `4` retries / `4` orphan requeues (`GET /api/tasks` + master `INFO` logs; debug-only `stale_results_ignored` / `late_results_ignored` unmeasured at default `INFO`) |
+| `2_resource_plateau` | `PASS` | Early (`423.2–1,208.6 s`) vs late (`1,934.2–2,702.0 s`) means across restarts: master `31.2 -> 38.4 MiB` (`198.4 -> 201.1` handles), `w0 28.6 -> 29.2 MiB`, `w1 28.3 -> 28.2 MiB`, `w2 26.6 -> 30.3 MiB`. Per-process lifetimes: master gen 0 `16.0 -> 35.5 MiB` (`+19.6 MiB`), master gen 1 `29.2 -> 40.3 MiB` (`+11.1 MiB`); worker lifetimes stayed `15.2–31.7 MiB` peak across restarts |
+| `3_disk_and_journal` | `PASS` | Blob store peak `4,293,920,667 B`, idle `4,285,531,715 B` (`<= 4 GiB`); worker cache mid-run peaks `w0 2,146,435,072 B` / `w1 2,228,226,815 B` (`2,125.0 MiB`, 1 sample above `2 GiB` while pinned inputs were active, within `2 GiB + 564 MiB` pinned headroom) / `w2 2,140,143,616 B` and idle `w0 2,128,610,709 B` / `w1 2,107,639,671 B` / `w2 2,090,860,544 B` (`<= 2 GiB`); sandboxes clean (`0` tmp/lock leftovers); `journal.bin` shrank `1,525,821 -> 24 B` (restart) and `801,453 -> 24 B` (final stop) |
+| `4_probe_p99` | `PASS` | `45/45` probes ok; `8` probes overlapping fault windows excluded (`[t_s, end_s + 15 s]`), leaving `14` baseline (`p99 = 130.852 ms`) and `16` late (`p99 = 146.509 ms`) clean probes (`ratio = 1.1197 <= 1.5`) |
+| `5_clean_stop` | `PASS` | `leftover_pids = []`, `leftover_task_trees = []` |
+| `6_fault_injection` | `PASS` | `16/16` planned faults executed cleanly, `0` fault errors |
