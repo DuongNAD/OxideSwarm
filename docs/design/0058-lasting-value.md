@@ -376,7 +376,7 @@ when the owner adds them.
 | LV-1 | Fuzz targets for every parser, in CI | Assurance | M | R12 | `fuzz/` (new), `.github/workflows/ci.yml` | Measure M10 is met, and the LV-1 test of the test plan passes | Planned |
 | LV-2 | Deterministic simulation of master and workers | Assurance | L | R11 | `crates/master/`, `crates/core/src/transport.rs`, `tests/` | The LV-2 test of the test plan passes, and proof run V1 is recorded | Planned |
 | LV-3 | A checked model of the task state machine and failover | Assurance | M | LV-2 | a new directory, `docs/design/` | CI checks the model, and the LV-3 test passes | Planned |
-| LV-4 | Inventory of `unsafe`, with comments, lints and Miri | Assurance | M | | `crates/*/src/`, `.github/workflows/ci.yml` | Measure M11 is met, and the lint is a required check | Partial |
+| LV-4 | Inventory of `unsafe`, with comments, lints and Miri | Assurance | M | | `crates/*/src/`, `.github/workflows/ci.yml` | Measure M11 is met, and the lint is a required check | Implemented |
 | LV-5 | Supply chain: dependency policy, provenance, outside checklist | Assurance | M | | `deny.toml` (new), `.github/workflows/release.yml`, `README.md` | Measure M12 is met, and the LV-5 test passes | Planned |
 | LV-6 | Independent security review | Assurance | Owner | LV-1 | `docs/SECURITY.md` | The findings and the fixes are published with their dates | Planned |
 | LV-7 | Testing page with numbers from a script | Assurance | S | LV-1, LV-2 | `docs/TESTING.md` (new), `scripts/` | The page is built in CI and linked from `README.md` | Planned |
@@ -466,5 +466,5 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q31 to Q35.
     `runner::process_tree_tests`, and `staging::tests` (keeping production `client`, `runner`,
     `staging` code denied); clean denied modules: `autorig`, `backoff`, `blob_client`, `cpu_simd`,
     `gen3d`, `gpu`, `heartbeat`, `identity`, `sim`, `wgpu_engine`.
-  - `fuzz/` (excluded from `[workspace]`): 0 `unsafe` hits. LV-4 remains Partial until the CI Miri
-    job runs on `master`.
+  - `fuzz/` (excluded from `[workspace]`): 0 `unsafe` hits.
+- 2026-11-24: `LV-4` Implemented (`origin/master` `abff2514`): verified all `384` non-comment `unsafe` sites (`352` blocks, `32` `fn`/`impl`/`extern` items) across `crates/` and `tests/` have `SAFETY:` / `# Safety` docs (`0` missing), all `6` workspace member crates inherit `[lints] workspace = true` (`undocumented_unsafe_blocks = "deny"`), `cargo clippy --workspace --all-targets --locked -- -D warnings` passes (`0` warnings), all three `clippy (*)` jobs are required status checks on `master`, and `miri (rusty_grid_core)` passed on `master` push CI (`run 45297098266`, job `138120143503`: `203 passed; 0 failed; 93 ignored` in `491.91 s`).

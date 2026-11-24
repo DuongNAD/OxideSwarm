@@ -1006,6 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_master_reports_unreachable_master() {
+        let _env_guard = crate::test_env_lock::lock_async().await;
         // Port 1 is never listening.
         let err = connect_master("127.0.0.1:1", None)
             .await
@@ -1065,6 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_master_authenticates_with_the_shared_secret() {
+        let _env_guard = crate::test_env_lock::lock_async().await;
         let addr = serve_one_client(secret(2)).await;
         let mut transport = connect_master(&addr.to_string(), Some(&secret(2)))
             .await
@@ -1079,6 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_master_rejects_a_master_with_another_secret() {
+        let _env_guard = crate::test_env_lock::lock_async().await;
         let addr = serve_one_client(secret(3)).await;
         let err = connect_master(&addr.to_string(), Some(&secret(4)))
             .await
@@ -1089,6 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_master_without_secret_learns_about_auth_on_first_reply() {
+        let _env_guard = crate::test_env_lock::lock_async().await;
         let addr = serve_one_client(secret(5)).await;
         let err = connect_master(&addr.to_string(), None)
             .await
@@ -1150,6 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_master_refuses_invalid_relay_url_and_minimal_conflict_before_network() {
+        let _env_guard = crate::test_env_lock::lock_async().await;
         for bad_url in [
             "http://relay.example.com",
             "https://alice:secret@relay.example.com",

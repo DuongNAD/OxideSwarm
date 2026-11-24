@@ -444,7 +444,9 @@ async fn test_assign_refuses_a_task_before_touching_a_replaced_sandbox_base_on_w
     let elsewhere = temp.path().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
     let base_junction = temp.path().join("sandboxes_junction");
+    use std::os::windows::process::CommandExt;
     let mk = std::process::Command::new("cmd")
+        .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
         .args(["/C", "mklink", "/J"])
         .arg(&base_junction)
         .arg(&elsewhere)
@@ -4151,13 +4153,171 @@ async fn test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces
 
     let lan_ip = rusty_grid_core::discovery::get_local_ip_or_loopback();
     if !lan_ip.is_loopback() {
-        let lan_bind = std::net::TcpListener::bind((lan_ip, portal_port));
-        assert!(
-                lan_bind.is_ok(),
-                "loopback-targeting worker portal must not bind 0.0.0.0:{portal_port} (binding {lan_ip}:{portal_port} failed: {:?})",
-                lan_bind.err()
-            );
+        assert_portal_not_listening_on_lan(lan_ip, portal_port)
+            .await
+            .expect("loopback-targeting worker portal must not listen on LAN");
     }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, portal_handle).await;
+}
+
+fn is_worker_portal_status_response(resp: &str) -> bool {
+    let Some((head, body)) = resp
+        .split_once("\r\n\r\n")
+        .or_else(|| resp.split_once("\n\n"))
+    else {
+        return false;
+    };
+    if !head
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains("200 OK"))
+    {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body.trim()).is_ok_and(|val| {
+        val.get("role").and_then(|v| v.as_str()) == Some("WORKER_PORTAL")
+            && val.get("master_cluster_addr").is_some()
+    })
+}
+
+async fn assert_portal_not_listening_on_lan(
+    lan_ip: std::net::IpAddr,
+    portal_port: u16,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    match std::net::TcpListener::bind((lan_ip, portal_port)) {
+        Ok(_listener) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            let Ok(Ok(mut stream)) = tokio::time::timeout(
+                TEST_WAIT_TIMEOUT,
+                tokio::net::TcpStream::connect((lan_ip, portal_port)),
+            )
+            .await
+            else {
+                return Ok(());
+            };
+            if stream
+                .write_all(b"GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            let mut resp = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let read_res = tokio::time::timeout(TEST_WAIT_TIMEOUT, async {
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let remaining = 4096usize.saturating_sub(resp.len());
+                            let take = n.min(remaining);
+                            resp.extend_from_slice(&chunk[..take]);
+                            if resp.len() >= 4096 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .await;
+            if read_res.is_err() {
+                return Ok(());
+            }
+            let resp_text = String::from_utf8_lossy(&resp);
+            if is_worker_portal_status_response(&resp_text) {
+                Err(format!(
+                    "loopback-targeting worker portal answered /api/status on {lan_ip}:{portal_port}: {resp_text}"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(err) => Err(format!(
+            "loopback-targeting worker portal must not bind 0.0.0.0:{portal_port} (binding {lan_ip}:{portal_port} failed: {err:?})"
+        )),
+    }
+}
+
+#[tokio::test]
+async fn test_portal_lan_bind_check_tolerates_non_portal_socket_on_addr_in_use() {
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let probe_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    // Case 1: unrelated HTTP listener answering a non-portal body on the port.
+    let unrelated_listener = tokio::net::TcpListener::bind((probe_ip, 0))
+        .await
+        .expect("bind unrelated listener");
+    let occupied_port = unrelated_listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = unrelated_listener.accept().await {
+            let mut req = [0u8; 256];
+            let _ = stream.read(&mut req).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nother",
+                )
+                .await;
+        }
+    });
+    assert_portal_not_listening_on_lan(probe_ip, occupied_port)
+        .await
+        .expect("unrelated HTTP socket holding the port must not fail the portal bind check");
+    let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, server).await;
+
+    // Case 2: unrelated listener closing immediately with an empty response.
+    let silent_listener = tokio::net::TcpListener::bind((probe_ip, 0))
+        .await
+        .expect("bind silent listener");
+    let silent_port = silent_listener.local_addr().unwrap().port();
+    let silent_server = tokio::spawn(async move {
+        let _ = silent_listener.accept().await;
+    });
+    assert_portal_not_listening_on_lan(probe_ip, silent_port)
+        .await
+        .expect("listener closing without portal body must not fail the portal bind check");
+    let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, silent_server).await;
+
+    // Case 3: bound non-listening socket (connection refused if AddrInUse triggers).
+    let unbound_sock = tokio::net::TcpSocket::new_v4().expect("create v4 socket");
+    unbound_sock
+        .bind(std::net::SocketAddr::new(probe_ip, 0))
+        .expect("bind non-listening socket");
+    let bound_port = unbound_sock.local_addr().unwrap().port();
+    assert_portal_not_listening_on_lan(probe_ip, bound_port)
+        .await
+        .expect("non-listening socket occupying the port must not fail the portal bind check");
+    drop(unbound_sock);
+}
+
+#[tokio::test]
+async fn test_portal_lan_bind_check_rejects_real_portal_on_addr_in_use() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let probe_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let listener = tokio::net::TcpListener::bind((probe_ip, 0))
+        .await
+        .expect("bind portal");
+    let portal_port = listener.local_addr().unwrap().port();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let portal_handle = tokio::spawn(run_portal(
+        listener,
+        PortalTarget::from("127.0.0.1:18088"),
+        None,
+        shutdown_rx,
+        PORTAL_MAX_CONNECTIONS,
+    ));
+
+    let err = assert_portal_not_listening_on_lan(probe_ip, portal_port)
+        .await
+        .expect_err("a live worker portal on the probed address must still fail the check");
+    assert!(err.contains("answered /api/status"), "{err}");
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(TEST_WAIT_TIMEOUT, portal_handle).await;

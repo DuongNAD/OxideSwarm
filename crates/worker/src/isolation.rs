@@ -1653,7 +1653,9 @@ mod tests {
         if let Some(parent) = link.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
         }
+        use std::os::windows::process::CommandExt;
         let out = std::process::Command::new("cmd")
+            .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
             .args([
                 "/C",
                 "mklink",
@@ -3181,12 +3183,14 @@ mod tests {
         }
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
             for (link, dest) in [
                 (&direct_link, &target),
                 (&parent_link, &target),
                 (&home_link, &fake_home),
             ] {
                 let status = std::process::Command::new("cmd")
+                    .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
                     .args([
                         "/C",
                         "mklink",

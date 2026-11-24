@@ -66,7 +66,8 @@ stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.
 - A first application for the model track (Draft, 2026-11-11): LIVA, the owner's desktop
   assistant. A trial comes first (Q40, decided), then a client tunnel to a model server, usage
   records and a balance per member, all proposals. The plan is in
-  [design 0061](design/0061-first-application-model-tunnel.md). Q41 to Q43 are open.
+  [design 0061](design/0061-first-application-model-tunnel.md). Q41 was decided on 2026-11-24, Q43 on
+  2026-11-19 (Q96); Q42 is open.
 - Model weights into the memory of another machine (Draft, 2026-11-11): a worker that holds no
   model file runs a model whose file is on another machine, with no copy written to its disk
   first (Q44, decided). Four spikes come first (R15 to R18). A model server that takes its
@@ -156,7 +157,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | Compatibility spans one protocol version | A peer more than one protocol version behind the master is refused until it is upgraded, and a rollback of the master needs the copy of `--state-dir` taken before the upgrade | By design ([design 0083](design/0083-one-version-window.md)). PROTO-5 keeps a test against the release one protocol back |
 | The Android app does not compile | There is no Android worker app to install; phones join through Termux. The bridge library compiles in CI (AND-5, pull request 240) | AND-1 |
 | GPU work is command tasks, with no user kernel | PyTorch, Blender and CUDA programs run as command tasks, with a guide ([guides/gpu-workloads.md](guides/gpu-workloads.md)), VRAM accounting (FEAT-9a) and a runtime allowlist under isolation (FEAT-3e). The built-in `GpuCompute` task is a benchmark (decision D6). No rule for a GPU inside the Linux sandbox is recorded, and the two-machine GPU run under `--isolation fs` is not recorded | FEAT-9, R20 (Linux) |
-| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only, Q60 to Q63) |
+| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only; Q60 to Q63 decided on 2026-11-24) |
 
 ## Releases
 
@@ -236,11 +237,13 @@ report that design 0067 names.
 
 In order:
 
-1. The owner answers Q60 to Q63 (design 0067), Q54
-   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q41 (design 0061).
-2. Spike R21, a reading of what Mesh-LLM already does, has no record. Q54 recommends that no model
-   item is built before it has one.
-3. Trial APP-1 (Q40, decided): LIVA on a Mac with the model on another machine. No trial has run.
+1. Done on 2026-11-24: the owner decided Q41 (design 0061), Q54
+   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q60 to Q63 (design 0067) at the
+   recommended defaults.
+2. Spike R21, a reading of what Mesh-LLM already does, has no record. By Q54 no model item is built
+   before it has one.
+3. Trial APP-1 (Q40, decided): a coding agent on a Mac with the model on another machine (Q98; LIVA
+   follows later). No trial has run.
 4. The items that the answers keep enter [BACKLOG.md](BACKLOG.md) as a phase of their own, each
    with files and a check.
 
@@ -630,10 +633,11 @@ AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for
 [BACKLOG.md](BACKLOG.md) since 2026-11-17 (Phase 13).
 
 [Design 0061](design/0061-first-application-model-tunnel.md) (Draft, 2026-11-11) takes the third
-row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
-with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
+row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): an application
+on a Mac with the model on another machine, over SSH, with nothing built here. Since 2026-11-24 (Q98)
+that application is a coding agent, and LIVA, on hold, follows as the second one. A client tunnel to a model
 server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
-for the trial records. Q41 to Q43 are open.
+for the trial records. Q41 (decided on 2026-11-24) and Q43 are decided; Q42 is open.
 
 [Design 0062](design/0062-model-weights-into-remote-memory.md) (Draft, 2026-11-11) plans how a
 worker gets a model whose file is on another machine, with no copy on its disk first (Q44,
@@ -679,8 +683,8 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q1
 right column is a recommended default, not a decision, and no work depends on it until the owner
 answers.
 
-Q60 to Q63 are open in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and join
-this table once the owner answers them. Q64 to Q79 are decided and recorded where they were asked:
+Q60 to Q63 were asked in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and
+decided on 2026-11-24; they are in this table. Q64 to Q79 are decided and recorded where they were asked:
 Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train.md), Q68 to Q72 in
 [design 0082](design/0082-task-extension-slot.md) and Q73 to Q79 in
 [design 0083](design/0083-one-version-window.md).
@@ -726,7 +730,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
 | Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
 | Q40 | Does a trial of LIVA on the owner's Mac, with the language model on another machine, come before any build item of design 0061? | Yes, decided by the owner on 2026-11-11. No trial has run yet |
-| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
+| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Yes, decided by the owner on 2026-11-24, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
 | Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Display only; it refuses nobody. Decided by the owner on 2026-11-19 through Q96 (design 0094) |
 | Q44 | Is the path to develop the one where model weights go from the file on one machine into the memory of another, with no file written there first (design 0062)? | Yes, decided by the owner on 2026-11-11. Nothing is measured or built yet |
@@ -739,12 +743,16 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q51 | For the workload of design 0045 D6, which grades edits to the weights of a small model: does the first step use only edits that others have published, with no paid model that writes them? | Open. Recommended: yes; spike R19 needs no paid model |
 | Q52 | Does Anima Engine, the owner's simulation project, become the public showcase of the grid: a world that the machines of several people evolve together (design 0063, D5)? | Open. Recommended: not yet; after trial APP-4 and after Anima Engine has a release of its own |
 | Q53 | Which of the owner's workloads is FEAT-9 (GPU workloads beyond the benchmark) designed for first: 3D assets through Blender, or the grading and training of models (design 0063, D6)? | Open. Recommended: 3D assets through Blender, after trial APP-4; workers already report Blender |
-| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
+| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Yes, decided by the owner on 2026-11-24: no model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
 | Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Yes, approved by the owner and implemented in `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md)) |
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Yes, decided by the owner on 2026-11-19: the 24-hour soak runs on the owner's three machines, now (apart from the trial cluster) |
 | Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Decided by the owner on 2026-11-19: decide from the T5 and T9 records over a relay; nothing changes before them |
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Decided by the owner on 2026-11-19: 8 GiB first; add a model's size when design 0062 names one |
+| Q60 | Does trial APP-1 grow with spike R22, which measures throughput against the number of concurrent requests (1 to 32), before the concurrency limits of LLM-9 or EDU-1 are fixed (design 0067)? | Yes, decided by the owner on 2026-11-24. The R22 record of 2026-11-16 is the first; each GPU machine that serves a model gets one |
+| Q61 | Do LLM-6 and LLM-9 place requests by the requests in flight and the measured knee point instead of the fewest open tunnels, with an `interactive` band (LIVA) ahead of a `batch` band (agents, a class) (LLM-14, design 0067)? | Yes, decided by the owner on 2026-11-24. The cap also counts prompt plus answer tokens against the server's pool, because the R22 record shows answers cut short with no deferred request |
+| Q62 | When FEAT-9b reports live GPU memory, does a worker report the memory the OS lets it use (DXGI budget minus usage on Windows, `recommendedMaxWorkingSetSize` on Metal, NVML free with a safety margin on Linux) rather than the physical VRAM (design 0067)? | Yes, decided by the owner on 2026-11-24 |
+| Q63 | Do direct fast links between machines (Thunderbolt bridge, direct 2.5G/10G Ethernet) carry worker-to-worker and client-to-worker data with session tickets minted by the master and a fallback to LAN, QUIC or the master (Q47, SCALE-3, design 0067)? | Yes, decided by the owner on 2026-11-24, after single-hop LLM-9 works; not part of the first 0.5.0 |
 | Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
 | Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are Phase 13 of [BACKLOG.md](BACKLOG.md) |
@@ -761,6 +769,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q95 | Who takes part in the Stage 1 pilot (design 0094)? | Decided by the owner on 2026-11-19 at the recommended answer: the owner and three to five people the owner already knows, with about ten machines on at least two home networks and at least two machines of each system in use, each agreeing to the campaign sheet before joining |
 | Q96 | Are credits display only: not transferable, never spent or sold, with no cash value, in every stage of design 0094? | Yes, decided by the owner on 2026-11-19 at the recommended answer. It closes Q14 for the research grid and Q43 |
 | Q97 | Does Stage 1 of design 0094 run in parallel with release `0.5.0`? | Yes, decided by the owner on 2026-11-19 at the recommended answer: one lane at most beside `0.5.0` and bet A, with implementation merged after the stability release (Q80) and docs-only or test-only work before it |
+| Q98 | Does trial APP-1 run with another application while LIVA is on hold (design 0061)? | Yes, decided by the owner on 2026-11-24: a coding agent that uses an OpenAI-compatible endpoint (for example aider or opencode); LIVA follows as the second application once it starts on macOS and has its Cloud provider |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
