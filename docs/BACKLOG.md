@@ -196,6 +196,12 @@ Recounted on 2026-11-24 from the rows with pull request 409: 259 items, 195 Impl
 Recounted on 2026-11-24 from the rows with pull request 368: 283 items, 195 Implemented, 18 Partial and 70 Planned; 19 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 444: 284 items, 195 Implemented, 18 Partial and 71 Planned; 20 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with TEST-96: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 446: 285 items, 195 Implemented, 19 Partial and 71 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 449: 285 items, 195 Implemented, 20 Partial and 70 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 451: 286 items, 196 Implemented, 20 Partial and 70 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 450: 287 items, 197 Implemented, 20 Partial and 70 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 447: 287 items, 197 Implemented, 21 Partial and 69 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 448: 287 items, 197 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -308,13 +314,15 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Implemented |  | 429 |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
-| TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Planned | In | (unlanded claim `TEST-70`) |
+| TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Partial | In | (unlanded claim `TEST-70`) |
 | TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Partial | In |  |
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
-| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Planned | In |  |
-| TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Planned | In |  |
+| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Partial | In |  |
+| TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Partial | In |  |
+| TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
+| TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -806,6 +814,7 @@ The full suite must pass on a clean machine before CI can require it.
   2. Replace `avg_latency < Duration::from_millis(50)` with a structural QUIC multiplexing / control-lane anti-HOL proof (matching `TEST-83`'s `zero_copy_quic_test` `test_quic_stream_multiplexing_isolation_and_anti_hol_blocking`, printing `avg_latency` / `max_latency` as `[timing]` lines instead of failing on debug CPU jitter).
   3. Verify `cargo test --locked -p rusty_grid_master --test m2_challenger_1_stress` passes `20/20` runs under 6 Python CPU busy loops on macOS.
 - **Done when:** `tests/m2_challenger_1_stress.rs` uses structural multiplexing proofs instead of `< 50 ms` and passes `20/20` loaded runs.
+- **Update (2026-11-24):** Audited `tests/m2_challenger_1_stress.rs` (line 472 was the sole Category 1 wall-clock bound across 1,098 lines), replaced `avg_latency < 50 ms` with the structural QUIC `STREAM_DATA` flow-control backpressure + in-order `HeartbeatAck` proof (`60 s` hang guard) and `[timing]` printout, and verified `10/10` sequential Windows passes (`-j 4`, no busy loops during Stage C `S7`, `12 passed; 0 failed` per run). Stays `Partial` pending post-S7 `20/20` loaded runs (`loop after S7`).
 
 ### TEST-90: Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700`
 
@@ -843,12 +852,14 @@ The full suite must pass on a clean machine before CI can require it.
   line `1430`). When `--fail-fast` tears down remaining shards while a sibling child is creating/truncating
   or writing `shard_<N>.pid`, the test's reader (`line 4784`, and `line 3777` in `test_t2_ax2_03`) can observe
   a zero-byte `.pid` file and raise `ValueError`.
-- **Do:** (Code fix and 20-run busy-loop verification wait until after the Stage C `S7` 24-hour soak finishes.)
-  1. Failing check first: demonstrate the empty `shard_*.pid` `ValueError` in `test_t3_03` / `test_t2_ax2_03`.
+- **Do:** (Code fix landed on `mac/test-95-atomic-pid-writes`; 20-run loaded loop under busy loops waits until after the Stage C `S7` 24-hour soak finishes — `loop after S7`.)
+  1. Failing check first: `HarnessAtomicWriteTests` reproduced empty `shard_2.pid` `ValueError: invalid literal for int() with base 10: ''` and failed before the fix (`AssertionError: 'os.replace(' not found`).
   2. Write all `.pid` and marker files via a temporary file in the same directory followed by atomic
-     rename (`os.replace` in `install_fake_cargo_nextest` line `1100` and `install_fake_blender` lines
-     `1353`, `1421`, `1430`; temp file + `mv -f` in `test_t2_ax2_03` line `3757`), so readers (`lines 3774`,
-     `4783`) only see complete `*.pid` files.
+     rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_<N>.pid` and
+     `install_fake_blender` `PROBE_PID_FILE` / `HANG_PID_FILE` / `HANG_MARKER_FILE`; temp file + `mv -f`
+     in `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards`), so readers only see complete `*.pid`
+     and marker files.
+  3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`. Remaining: `20/20` runs under busy loops (`loop after S7`).
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
@@ -868,15 +879,16 @@ The full suite must pass on a clean machine before CI can require it.
   dropped or a pending entry evicted on the hub's routing path (`Outbox::push` in `crates/agent_mesh/src/hub.rs`
   kicks a peer whose queue is full; the in-flight data table of design 0107 evicts a sender's oldest entries)
   or the consumer's out-of-order reassembly not completing. Under (b) a longer wait only hides a bug.
-- **Do:** (Code fix and loop verification wait until after the Stage C `S7` 24-hour soak finishes.)
-  1. Read the chunk path end to end (sender `send_envelope`, hub routing and in-flight table, consumer
-     reassembly and inbox write) and decide between (a) and (b); run the test in a 200-iteration loop under a
-     CPU load generator on Linux and record the result.
-  2. Under (b), fix the lost ACK with a failing check first. Under (a), wait on state instead of a short window:
-     keep a generous cap (60 s) only as a hang guard, and print the elapsed time on success.
-- **Done when:** the root cause is written here, the test has no short wall-clock window, and
+- **Root cause `(a)` (starved runner + blocking `fsync`, NOT a lost ACK `(b)`):** End-to-end audit of `crates/agent_mesh/src/{client,hub,delivery}.rs` rules out `(b)`:
+  - *Sender (`client.rs`):* `send_envelope` pushes all 5 chunks (~7.5 KB total) into an unbounded mpsc channel drained in FIFO order; any WebSocket close clears `pending_map` and wakes `rx3` immediately with `RecvError`, never `Elapsed(())`. The inbound loop ignores intermediate `DeliveryAck(chunk_received)` frames (`L839-851`), so `rx3` waits strictly for `DeliveryAck(data_received_verified)`.
+  - *Hub (`hub.rs`):* `Outbox::push` (`L213`) allows `1,024` messages and `32 MiB` queued bytes (`DEFAULT_MAX_QUEUED_*`); `PushError::Full` or `Closed` immediately emits `DeliveryNack(ERR_NODE_UNAVAILABLE)` back to the sender (which panics at the `DeliveryAck` match, not `Elapsed(())`). `InflightDataTracker` (`L248`, `256`/sender, `16,384` total) deduplicates `(consumer, multi_corr, sender)` across all 5 chunks and is only consulted on target disconnect; `DeliveryAck` forwarding (`L1328-1352`) does not require a tracker hit.
+  - *Consumer (`delivery.rs` + `client.rs`):* `DataConsumer::accept` + `ChunkReassembler` (`64` concurrent assemblies / `60 s` TTL) accept out-of-order chunks `[4,3,2,1,0]`, reassemble on the last chunk, and verify `total_sha256`. Unlike parts 1–2 (in-memory NACKs), part 3 is the first sub-test to run `tokio::task::spawn_blocking(|| persist_payload_atomic(...))` (`client.rs:790`), which calls `file.sync_all()` (`fsync`, `delivery.rs:768`) before emitting the final `DeliveryAck`. On a shared CI runner executing 72 `agent_mesh` tests concurrently while `test_corrupt_and_multi_chunk_data_delivery` runs on a single-threaded `#[tokio::test]` runtime, `spawn_blocking` scheduling + `fsync` stalled past the `5 s` wall-clock cap.
+- **Do:** (Code fix landed on `mac/test-96-mesh-multichunk-ack-guard`; 200-iteration loaded Linux loop waits until after Stage C `S7` finishes — `loop after S7`.)
+  1. Read the chunk path end to end (completed: cause `(a)` confirmed) and run the 200-iteration loop under a CPU load generator on Linux after `S7` (`loop after S7`).
+  2. Replaced the short 3 s / 5 s timeouts in `test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and added `[timing]` prints on success.
+- **Done when:** the root cause is written here (done), the test has no short wall-clock window (done), and
   `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
-  loop runs under load on Linux.
+  loop runs under load on Linux (`loop after S7`).
 
 ## Phase 3: make the documents true
 
@@ -3122,3 +3134,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
 - 2026-11-24: TEST-96 added (Planned, In; claim `claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`): `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` timed out waiting 5 s for the multi-chunk `DeliveryAck` on master push `016f39c4` (CI run `45349647014`, job `138292591350`, `unit tests (ubuntu-latest)`); root cause (starved runner or lost ACK) and fix wait until after Stage C `S7` (Index header recounted: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out).
 - 2026-11-24: TEST-90 Partial (`mac/test-90-soak-dir-0700`, `loop after S7`): added `_ensure_private_dir` (`os.makedirs(..., mode=0o700, exist_ok=True)` plus `os.chmod(..., 0o700)` on POSIX) in `benchmarks/endurance/endurance.py` across `SoakCluster._start_worker_locked` (`sandbox_dirs`, `workspace_dirs`), `SoakCluster._start_master_locked` (`state_dir`, `blob_dir`), `EnduranceCluster` / `RemoteEnduranceCluster` `workdir` & `sandbox_dirs`, and `_isolated_process_env` (`home`, `tmp`, `ox_home`), plus failing-first `test_soak_cluster_creates_0700_dirs_under_0022_umask` in `tests/test_endurance_harness.py` (failed `0o755 != 0o700` under `umask 0o022` before the fix); verified `5/5` sequential passes of `tests/test_endurance_harness.py` (`23` tests/run) and `tests/test_m1_challenger_hygiene.py` (`5/5 OK`); stays `Partial | In` until a Linux `endurance.py soak` smoke run runs after `S7` / in Linux CI.
+- 2026-11-24: TEST-95 Partial (`mac/test-95-atomic-pid-writes`, `loop after S7`): added `HarnessAtomicWriteTests` (failing-first check reproduced `ValueError: invalid literal for int() with base 10: ''` on empty `shard_2.pid` and failed on unpatched shims/scripts before fix) and converted all five `.pid`/marker writers in `tests/test_wave3_e2e.py` to same-directory temp-file + atomic rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_*.pid` and `install_fake_blender` `PROBE_PID_FILE`/`HANG_PID_FILE`/`HANG_MARKER_FILE`; temp file + `mv -f` in `test_t2_ax2_03`); verified `test_m1_challenger_hygiene.py` (`5/5 OK`) and `20/20` sequential runs of `tests/test_wave3_e2e.py` (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures, no busy loops during Stage C `S7`); stays `Partial | In` until the `20`-run loaded loop runs after `S7`.
+- 2026-11-24: TEST-97 Implemented (`win2/test-97-bridge-drive-scan`, claim `claims/item/TEST-97__win-2__20261124T160534948637Z__7d8bb16c.json`, text moved to `docs/BACKLOG-ARCHIVE.md`): isolated `tests/test_agent_bridge.py` (`use_hub=False`) from scanning real Windows `G:\`/`H:\`/`D:\` Google Drive mounts via `OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN`, removed the `G:\` skip guard on `WithoutHub`, added `WithoutHub.test_drive_scan_opt_out_isolates_hub_discovery`, and verified `20/20` sequential runs (`73/73 OK` per run, `0` skipped, `0` Drive claim diffs, `total 2,480.673 s`, median `121.884 s`, `minRAM 4.716 GiB`).
+- 2026-11-24: TEST-98 Implemented (`win2/test-98-revoke-worker-scope`, claim `claims/item/TEST-98__win-2__20261124T172506156991Z__f7dbab9d.json`, text moved to `docs/BACKLOG-ARCHIVE.md`): added `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT` filtering in `windows/revoke-isolation-acls.ps1`, scoped `ps_env` plus added a positive scoped-worker detection test in `tests/test_launcher_scripts.py`, and verified `20/20` sequential runs on Windows alongside live Stage C `S7` (`96` tests / `62` skipped / `0` failures per run; `total 3,452.253 s`, median `168.249 s`, `minRAM 4.523 GiB`).
+- 2026-11-24: TEST-96 Partial (`mac/test-96-mesh-multichunk-ack-guard`, `loop after S7`): audited sender `send_envelope`, hub `Outbox::push` / `InflightDataTracker`, and consumer `DataConsumer` / `ChunkReassembler` / `persist_payload_atomic` end to end and confirmed root cause `(a)` (starved CI runner + `spawn_blocking` `file.sync_all()` `fsync` in part 3 delaying `DeliveryAck(data_received_verified)` past `5 s`, not lost/evicted ACKs `(b)` which fail immediately with `RecvError` or `DeliveryNack`); replaced all `3 s` / `5 s` wall-clock windows in `crates/agent_mesh/src/client.rs::test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and `[timing]` prints; stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
+- 2026-11-24: TEST-93 Partial (`win/test-93-quic-heartbeat-structural`): audited all 1,098 lines of `tests/m2_challenger_1_stress.rs` (line 472 `avg_latency < 50 ms` was the sole Category 1 wall-clock upper bound), replaced it in `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` with a structural QUIC `STREAM_DATA` flow-control backpressure (`64 KiB` stream receive window, `16 KiB` chunks, paused server sink) + in-order `HeartbeatAck` verification under a `60 s` hang guard and `[timing]` printout, and verified `10/10` sequential Windows passes (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress`, no busy loops during Stage C `S7`, `12` passed/`0` failed per run; wall `2.250–3.469 s`, median `2.821 s`, total `27.453 s`; `avg_latency` `677.343–787.493 µs`, `max_latency` `6.8813–8.1431 ms`); `fmt` and `-j 4` `clippy` clean (`0` warnings); stays Partial pending `20/20` loaded runs (`loop after S7`).
