@@ -447,6 +447,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
+| BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -1676,6 +1677,39 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   fails without the change: more shards than slots, each well inside `--timeout-secs`, the run longer than it.
 - **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
   queue time, and that test passes.
+
+### BUG-38: Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt
+
+- **Evidence:** Live Windows 11 Pro x86_64 check of the released `v0.4.4` USB kit (`packaging/usb/install.ps1:931-955`,
+  `packaging/usb/uninstall.ps1:140`; both byte-identical on `origin/master` `77553214`) against a throwaway loopback
+  `v0.4.4` master (`127.0.0.1:19500`, `OXIDESWARM_USB_POINTER_KEY` isolated; recorded in Hub
+  `test_runs/win_usb_kit_044_2026-11-25.md`).
+  - Fresh `Install OxideSwarm.cmd -Slots 1`, `doctor` (`8 passed, 0 warnings, 0 failed, 1 skipped` on `C5`),
+    `submit --wait --command cmd -- /c ver` (`Exit Code: 0`, `13 ms`), and `Uninstall OxideSwarm.cmd` all pass.
+  - `Update OxideSwarm.cmd` (`install.ps1 -Update`) failed 2/2 times with `rc=1`:
+    1. `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The requested operation cannot be performed on a file with a user-mapped section open.`
+    2. `stopping the worker started earlier (PID 29324)` -> `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The process cannot access the file 'C:\Users\Admin\AppData\Local\OxideSwarm-USB\bin\oxideswarm.exe' because it is being used by another process.`
+  - `Uninstall OxideSwarm.cmd` (`packaging/usb/uninstall.ps1:140`) printed `"Remove the OxideSwarm install in  [y/N]:"`
+    with the install path omitted.
+- **Problem:**
+  1. `packaging/usb/install.ps1:931-955` calls `Stop-Process -Id ([int]$old) -Force` + a fixed `Start-Sleep -Seconds 2`,
+     deletes `run\worker.pid`, and immediately runs a single-shot `Copy-Item $f (Join-Path $Bin $b) -Force`. On Windows
+     before the exited worker's memory-mapped executable section closes (or transient lock clears), `Copy-Item` throws
+     and aborts `-Update` without restarting the worker (`doctor` fails with `0 connected`).
+  2. `packaging/usb/uninstall.ps1:140` writes `"Remove the OxideSwarm install in $InstallRoot? [y/N]"`. Because `?` is
+     a valid identifier character in PowerShell, `"$InstallRoot?"` resolves to unset `$InstallRoot?` (`$null`), hiding the
+     target folder path from the confirmation prompt.
+- **Do:**
+  1. Wait for stopped worker PIDs to exit (polling `Get-Process` up to ~10 s, matching `uninstall.ps1:174-179`) and
+     retry/stage binary replacement in `packaging/usb/install.ps1` with a short backoff when Windows reports a transient
+     sharing/user-mapped section lock on `oxideswarm.exe` / `rusty-grid.exe` / `ox-mode.exe` (and on failure avoid
+     leaving a silently dead worker or document the retry cleanly).
+  2. Fix `packaging/usb/uninstall.ps1:140` to `${InstallRoot}?`.
+  3. Add unit/regression coverage in `tests/test_launcher_scripts.py` verifying `$InstallRoot` renders before `?` in
+     the uninstall prompt and verifying update wait/retry behavior on Windows.
+- **Done when:** `Update OxideSwarm.cmd` succeeds repeatedly against an active Windows worker, `Uninstall OxideSwarm.cmd`
+  prints the full install folder before `? [y/N]`, and the launcher test suite passes on Windows (`install.ps1` /
+  `uninstall.ps1`).
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
