@@ -62,10 +62,11 @@ pub fn run_doc_build(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Doc, "build");
 
-    let cmd_res = Command::new("cargo")
-        .args(["doc", "--workspace", "--no-deps"])
-        .current_dir(workspace_root)
-        .output();
+    let cmd_res = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["doc", "--workspace", "--no-deps"])
+            .current_dir(workspace_root),
+    );
 
     res.duration_ms = start.elapsed().as_millis() as u64;
 

@@ -13,6 +13,7 @@ use tempfile::TempDir;
 use tokio::sync::watch;
 
 use rusty_grid_core::capabilities::MobileCapabilities;
+use rusty_grid_core::process_spawn;
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{
@@ -339,6 +340,11 @@ fn isolated(mut cmd: Command, home: &Path, fake_bin: &Path) -> Command {
     cmd
 }
 
+/// Runs a CLI command under the macOS spawn lock (`BUG-35`), capturing stdout and stderr.
+fn cli_output(cmd: &mut Command) -> Output {
+    process_spawn::output_std(cmd).expect("cli_output")
+}
+
 fn json_of(out: &Output) -> Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         panic!(
@@ -441,25 +447,21 @@ impl Drop for Mcp {
 async fn test_shard_env_injection_and_slot_spreading_across_workers() {
     let cluster = Cluster::start_with_workers(&[("w-heavy", 6, &[]), ("w-light", 2, &[])]).await;
 
-    let out = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "8",
-            "--json",
-            "--env",
-            "OX_SHARD_INDEX=999",
-            "--env",
-            "OX_SHARD_TOTAL=999",
-            "--shell",
-            "--",
-            "printf '%s/%s' \"$OX_SHARD_INDEX\" \"$OX_SHARD_TOTAL\"",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "8",
+        "--json",
+        "--env",
+        "OX_SHARD_INDEX=999",
+        "--env",
+        "OX_SHARD_TOTAL=999",
+        "--shell",
+        "--",
+        "printf '%s/%s' \"$OX_SHARD_INDEX\" \"$OX_SHARD_TOTAL\"",
+    ]));
     assert!(out.status.success(), "{}", describe(&out));
 
     let body = json_of(&out);
@@ -499,23 +501,19 @@ async fn test_shard_env_injection_and_slot_spreading_across_workers() {
 async fn test_shard_list_workers_preflight_zero_workers_fails_fast() {
     let cluster = Cluster::start_with_workers(&[]).await;
     let t0 = Instant::now();
-    let out = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "3",
-            "--timeout-secs",
-            "600",
-            "--json",
-            "--",
-            "echo",
-            "ok",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "3",
+        "--timeout-secs",
+        "600",
+        "--json",
+        "--",
+        "echo",
+        "ok",
+    ]));
     assert!(!out.status.success(), "{}", describe(&out));
     // The "no connected workers" error below proves the pre-flight refused the run before any
     // shard was submitted; the time is printed, not asserted (TEST-86).
@@ -532,25 +530,21 @@ async fn test_shard_list_workers_preflight_zero_workers_fails_fast() {
     // Also test 1 connected worker with non-matching placement constraint.
     let cluster2 = Cluster::start_with_workers(&[("w1", 2, &["role-cpu"])]).await;
     let t1 = Instant::now();
-    let out2 = cluster2
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster2.addr,
-            "--count",
-            "2",
-            "--timeout-secs",
-            "600",
-            "--require-tag",
-            "role-missing",
-            "--json",
-            "--",
-            "echo",
-            "ok",
-        ])
-        .output()
-        .unwrap();
+    let out2 = cli_output(cluster2.cli().args([
+        "shard",
+        "--master",
+        &cluster2.addr,
+        "--count",
+        "2",
+        "--timeout-secs",
+        "600",
+        "--require-tag",
+        "role-missing",
+        "--json",
+        "--",
+        "echo",
+        "ok",
+    ]));
     assert!(!out2.status.success(), "{}", describe(&out2));
     eprintln!("[timing] non-matching preflight: {:?}", t1.elapsed());
     let body2 = json_of(&out2);
@@ -569,24 +563,20 @@ async fn test_shard_partial_failure_and_fail_fast_cancels_siblings() {
 
     // 1) --fail-fast cancels slow siblings long before their 600 s sleep ends.
     let t0 = Instant::now();
-    let out_ff = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "3",
-            "--fail-fast",
-            "--timeout-secs",
-            "900",
-            "--json",
-            "--shell",
-            "--",
-            "if [ \"$OX_SHARD_INDEX\" = \"1\" ]; then exit 7; else sleep 600; fi",
-        ])
-        .output()
-        .unwrap();
+    let out_ff = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "3",
+        "--fail-fast",
+        "--timeout-secs",
+        "900",
+        "--json",
+        "--shell",
+        "--",
+        "if [ \"$OX_SHARD_INDEX\" = \"1\" ]; then exit 7; else sleep 600; fi",
+    ]));
     assert!(!out_ff.status.success(), "{}", describe(&out_ff));
     assert_eq!(out_ff.status.code(), Some(7));
     // `cancelled_shards == 2` below proves the two `sleep 600` siblings were cancelled rather than
@@ -598,21 +588,17 @@ async fn test_shard_partial_failure_and_fail_fast_cancels_siblings() {
     assert_eq!(body_ff["cancelled_shards"], 2);
 
     // 2) Without --fail-fast, all shards finish and partial failure exits non-zero.
-    let out_all = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "3",
-            "--json",
-            "--shell",
-            "--",
-            "if [ \"$OX_SHARD_INDEX\" = \"2\" ]; then exit 5; fi; echo ok-$OX_SHARD_INDEX",
-        ])
-        .output()
-        .unwrap();
+    let out_all = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "3",
+        "--json",
+        "--shell",
+        "--",
+        "if [ \"$OX_SHARD_INDEX\" = \"2\" ]; then exit 5; fi; echo ok-$OX_SHARD_INDEX",
+    ]));
     assert!(!out_all.status.success(), "{}", describe(&out_all));
     assert_eq!(out_all.status.code(), Some(5));
     let body_all = json_of(&out_all);
@@ -625,24 +611,20 @@ async fn test_shard_output_dir_isolation_and_symlink_refusal() {
     let cluster = Cluster::start_with_workers(&[("w1", 2, &[]), ("w2", 2, &[])]).await;
     let out_dir = cluster.home.path().join("shard-outputs");
 
-    let out = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "3",
-            "--output",
-            "out.txt",
-            "--output-dir",
-            out_dir.to_str().unwrap(),
-            "--shell",
-            "--",
-            "printf 'shard-%s' \"$OX_SHARD_INDEX\" > out.txt",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "3",
+        "--output",
+        "out.txt",
+        "--output-dir",
+        out_dir.to_str().unwrap(),
+        "--shell",
+        "--",
+        "printf 'shard-%s' \"$OX_SHARD_INDEX\" > out.txt",
+    ]));
     assert!(out.status.success(), "{}", describe(&out));
     for i in 1..=3 {
         let p = out_dir.join(format!("shard-{i:02}")).join("out.txt");
@@ -656,25 +638,21 @@ async fn test_shard_output_dir_isolation_and_symlink_refusal() {
     std::fs::create_dir_all(&bad_out).unwrap();
     std::os::unix::fs::symlink(&outside, bad_out.join("shard-01")).unwrap();
 
-    let out_sym = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "2",
-            "--output",
-            "out.txt",
-            "--output-dir",
-            bad_out.to_str().unwrap(),
-            "--json",
-            "--shell",
-            "--",
-            "printf 'bad' > out.txt",
-        ])
-        .output()
-        .unwrap();
+    let out_sym = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "2",
+        "--output",
+        "out.txt",
+        "--output-dir",
+        bad_out.to_str().unwrap(),
+        "--json",
+        "--shell",
+        "--",
+        "printf 'bad' > out.txt",
+    ]));
     assert!(!out_sym.status.success(), "{}", describe(&out_sym));
     assert!(
         std::fs::read_dir(&outside).unwrap().next().is_none(),
@@ -688,25 +666,21 @@ async fn test_shard_output_dir_isolation_and_symlink_refusal() {
     std::os::unix::fs::symlink(&outside_nested, &sym_parent).unwrap();
     let nested_out_dir = sym_parent.join("nested");
 
-    let out_sym_ancestor = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "2",
-            "--output",
-            "leak.txt",
-            "--output-dir",
-            nested_out_dir.to_str().unwrap(),
-            "--json",
-            "--shell",
-            "--",
-            "echo LEAKED > leak.txt",
-        ])
-        .output()
-        .unwrap();
+    let out_sym_ancestor = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "2",
+        "--output",
+        "leak.txt",
+        "--output-dir",
+        nested_out_dir.to_str().unwrap(),
+        "--json",
+        "--shell",
+        "--",
+        "echo LEAKED > leak.txt",
+    ]));
     assert!(
         !out_sym_ancestor.status.success(),
         "symlinked --output-dir ancestor must be refused: {}",
@@ -731,25 +705,21 @@ async fn test_shard_output_dir_isolation_and_symlink_refusal() {
     std::fs::create_dir_all(&outside_dotdot).unwrap();
     std::os::unix::fs::symlink(&outside_dotdot, cluster.home.path().join("sym-dir")).unwrap();
 
-    let out_dotdot = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "1",
-            "--output",
-            "leak.txt",
-            "--output-dir",
-            "nonexistent/../sym-dir",
-            "--json",
-            "--shell",
-            "--",
-            "echo LEAK > leak.txt",
-        ])
-        .output()
-        .unwrap();
+    let out_dotdot = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "1",
+        "--output",
+        "leak.txt",
+        "--output-dir",
+        "nonexistent/../sym-dir",
+        "--json",
+        "--shell",
+        "--",
+        "echo LEAK > leak.txt",
+    ]));
     assert!(
         !out_dotdot.status.success(),
         "nonexistent/../sym-dir --output-dir must be refused: {}",
@@ -770,24 +740,20 @@ async fn test_shard_output_dir_isolation_and_symlink_refusal() {
     );
 
     // Relative multi-level non-existent `--output-dir ./rel/nested/out` works cleanly.
-    let out_rel = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "1",
-            "--output",
-            "ok.txt",
-            "--output-dir",
-            "./rel/nested/out",
-            "--shell",
-            "--",
-            "printf 'ok' > ok.txt",
-        ])
-        .output()
-        .unwrap();
+    let out_rel = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "1",
+        "--output",
+        "ok.txt",
+        "--output-dir",
+        "./rel/nested/out",
+        "--shell",
+        "--",
+        "printf 'ok' > ok.txt",
+    ]));
     assert!(out_rel.status.success(), "{}", describe(&out_rel));
     assert_eq!(
         std::fs::read_to_string(cluster.home.path().join("rel/nested/out/shard-01/ok.txt"))
@@ -802,7 +768,7 @@ async fn test_shard_junit_out_merges_per_shard_reports_without_cluttering_cwd() 
     let junit_path = cluster.home.path().join("reports/merged-junit.xml");
 
     // Failing shard 2 + passing shards 1 & 3, NO --output-dir -> must NOT create ./shard-01/.
-    let out = cluster
+    let out = cli_output(cluster
         .cli()
         .args([
             "shard",
@@ -832,8 +798,7 @@ else
 EOF
 fi"#,
         ])
-        .output()
-        .unwrap();
+        );
     assert!(!out.status.success(), "{}", describe(&out));
     assert!(
         !cluster.home.path().join("shard-01").exists(),
@@ -853,27 +818,23 @@ fi"#,
 
     // All-passing shards -> exit 0.
     let junit_pass = cluster.home.path().join("reports/pass-junit.xml");
-    let out_pass = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "2",
-            "--junit-out",
-            junit_pass.to_str().unwrap(),
-            "--shell",
-            "--",
-            r#"cat > junit.xml <<EOF
+    let out_pass = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "2",
+        "--junit-out",
+        junit_pass.to_str().unwrap(),
+        "--shell",
+        "--",
+        r#"cat > junit.xml <<EOF
 <testsuite name="s-$OX_SHARD_INDEX" tests="2" failures="0" errors="0" skipped="0" time="0.050">
   <testcase name="t1" classname="c" time="0.025"/>
   <testcase name="t2" classname="c" time="0.025"/>
 </testsuite>
 EOF"#,
-        ])
-        .output()
-        .unwrap();
+    ]));
     assert!(out_pass.status.success(), "{}", describe(&out_pass));
     let pass_xml = std::fs::read_to_string(&junit_pass).unwrap();
     assert!(pass_xml.contains("tests=\"4\""));
@@ -881,7 +842,7 @@ EOF"#,
 
     // Nested <testsuite> inside <testsuite> where outer omits summary attributes.
     let junit_nested = cluster.home.path().join("reports/nested-junit.xml");
-    let out_nested = cluster
+    let out_nested = cli_output(cluster
         .cli()
         .args([
             "shard",
@@ -898,8 +859,7 @@ EOF"#,
 <testsuites><testsuite name="outer"><testsuite name="inner" tests="2" failures="1" errors="0" skipped="0" time="0.3"><testcase name="x"/><testcase name="y"><failure/></testcase></testsuite></testsuite></testsuites>
 EOF"#,
         ])
-        .output()
-        .unwrap();
+        );
     assert!(out_nested.status.success(), "{}", describe(&out_nested));
     let nested_body = json_of(&out_nested);
     assert_eq!(nested_body["junit"]["tests"], 2, "{nested_body}");
@@ -935,23 +895,19 @@ async fn test_shard_build_once_archive_blob_inputs_pipeline() {
     std::fs::write(project.join("target/stale.bin"), b"stale").unwrap();
 
     let junit_out = cluster.home.path().join("build-once-junit.xml");
-    let out = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "4",
-            "--build-once",
-            "--build-source",
-            project.to_str().unwrap(),
-            "--junit-out",
-            junit_out.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "4",
+        "--build-once",
+        "--build-source",
+        project.to_str().unwrap(),
+        "--junit-out",
+        junit_out.to_str().unwrap(),
+        "--json",
+    ]));
     assert!(out.status.success(), "{}", describe(&out));
 
     let body = json_of(&out);
@@ -987,21 +943,17 @@ async fn test_shard_build_once_archive_blob_inputs_pipeline() {
 
     // Now verify builder failure aborts BEFORE dispatching any shards.
     let fail_cluster = SubprocessCluster::start_with_stub_cargo(&["sub-fail"], true).await;
-    let out_fail = fail_cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &fail_cluster.addr,
-            "--count",
-            "3",
-            "--build-once",
-            "--build-source",
-            project.to_str().unwrap(),
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    let out_fail = cli_output(fail_cluster.cli().args([
+        "shard",
+        "--master",
+        &fail_cluster.addr,
+        "--count",
+        "3",
+        "--build-once",
+        "--build-source",
+        project.to_str().unwrap(),
+        "--json",
+    ]));
     assert!(!out_fail.status.success(), "{}", describe(&out_fail));
     let body_fail = json_of(&out_fail);
     assert!(
@@ -1118,10 +1070,7 @@ fn test_shard_offline_validation_refusals() {
         ],
     ];
     for args in cases {
-        let out = isolated(Command::new(BIN), home.path(), fake_bin.path())
-            .args(*args)
-            .output()
-            .unwrap();
+        let out = cli_output(isolated(Command::new(BIN), home.path(), fake_bin.path()).args(*args));
         assert!(
             !out.status.success(),
             "expected offline refusal for {args:?}: {}",
@@ -1144,23 +1093,19 @@ async fn test_shard_slot_spreading_with_max_retries_failover_and_worker_pin() {
     //    and explicit `--worker` pins strictly to that worker.
     let spread_cluster =
         Cluster::start_with_workers(&[("w-heavy", 6, &[]), ("w-light", 2, &[])]).await;
-    let spread_out = spread_cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &spread_cluster.addr,
-            "--count",
-            "8",
-            "--max-retries",
-            "2",
-            "--json",
-            "--shell",
-            "--",
-            "printf '%s/%s' \"$OX_SHARD_INDEX\" \"$OX_SHARD_TOTAL\"",
-        ])
-        .output()
-        .unwrap();
+    let spread_out = cli_output(spread_cluster.cli().args([
+        "shard",
+        "--master",
+        &spread_cluster.addr,
+        "--count",
+        "8",
+        "--max-retries",
+        "2",
+        "--json",
+        "--shell",
+        "--",
+        "printf '%s/%s' \"$OX_SHARD_INDEX\" \"$OX_SHARD_TOTAL\"",
+    ]));
     assert!(spread_out.status.success(), "{}", describe(&spread_out));
     let spread_body = json_of(&spread_out);
     assert_eq!(spread_body["completed_shards"], 8);
@@ -1180,25 +1125,21 @@ async fn test_shard_slot_spreading_with_max_retries_failover_and_worker_pin() {
         "both workers must take shards (soft SWRR, design 0103 D7)"
     );
 
-    let pin_out = spread_cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &spread_cluster.addr,
-            "--count",
-            "4",
-            "--max-retries",
-            "2",
-            "--worker",
-            "w-light",
-            "--json",
-            "--",
-            "echo",
-            "pinned",
-        ])
-        .output()
-        .unwrap();
+    let pin_out = cli_output(spread_cluster.cli().args([
+        "shard",
+        "--master",
+        &spread_cluster.addr,
+        "--count",
+        "4",
+        "--max-retries",
+        "2",
+        "--worker",
+        "w-light",
+        "--json",
+        "--",
+        "echo",
+        "pinned",
+    ]));
     assert!(pin_out.status.success(), "{}", describe(&pin_out));
     let pin_body = json_of(&pin_out);
     assert!(pin_body["shards"]
@@ -1380,25 +1321,21 @@ async fn test_shard_count_1_and_256_boundaries() {
 
     // 1. --count 1 boundary with --output-dir
     let out_dir_1 = cluster.home.path().join("out-1");
-    let out_1 = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "1",
-            "--output-dir",
-            out_dir_1.to_str().unwrap(),
-            "--output",
-            "res.txt",
-            "--json",
-            "--shell",
-            "--",
-            "printf '%s/%s' \"$OX_SHARD_INDEX\" \"$OX_SHARD_TOTAL\" > res.txt",
-        ])
-        .output()
-        .unwrap();
+    let out_1 = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "1",
+        "--output-dir",
+        out_dir_1.to_str().unwrap(),
+        "--output",
+        "res.txt",
+        "--json",
+        "--shell",
+        "--",
+        "printf '%s/%s' \"$OX_SHARD_INDEX\" \"$OX_SHARD_TOTAL\" > res.txt",
+    ]));
     assert!(out_1.status.success(), "{}", describe(&out_1));
     let body_1 = json_of(&out_1);
     assert_eq!(body_1["completed_shards"], 1);
@@ -1408,22 +1345,18 @@ async fn test_shard_count_1_and_256_boundaries() {
     );
 
     // 2. --count 256 boundary (exercises MAX_CONCURRENT_HANDSHAKES semaphore + 3-digit slugs)
-    let out_256 = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "256",
-            "--timeout-secs",
-            "60",
-            "--json",
-            "--",
-            "true",
-        ])
-        .output()
-        .unwrap();
+    let out_256 = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "256",
+        "--timeout-secs",
+        "60",
+        "--json",
+        "--",
+        "true",
+    ]));
     assert!(out_256.status.success(), "{}", describe(&out_256));
     let body_256 = json_of(&out_256);
     assert_eq!(body_256["status"], "completed");
@@ -1441,23 +1374,19 @@ async fn test_shard_output_without_output_dir_refuses_symlink_shard01() {
     std::fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, cluster.home.path().join("shard-01")).unwrap();
 
-    let out = cluster
-        .cli()
-        .args([
-            "shard",
-            "--master",
-            &cluster.addr,
-            "--count",
-            "1",
-            "--output",
-            "leak.txt",
-            "--json",
-            "--shell",
-            "--",
-            "printf 'secret' > leak.txt",
-        ])
-        .output()
-        .unwrap();
+    let out = cli_output(cluster.cli().args([
+        "shard",
+        "--master",
+        &cluster.addr,
+        "--count",
+        "1",
+        "--output",
+        "leak.txt",
+        "--json",
+        "--shell",
+        "--",
+        "printf 'secret' > leak.txt",
+    ]));
     assert!(!out.status.success(), "{}", describe(&out));
     let body = json_of(&out);
     assert_eq!(body["shards"][0]["status"], "error", "{body}");
@@ -1572,8 +1501,8 @@ exit 9
         .unwrap();
         std::fs::write(project.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
 
-        let out = isolated(Command::new(BIN), cli_home.path(), fake_bin.path())
-            .args([
+        let out = cli_output(
+            isolated(Command::new(BIN), cli_home.path(), fake_bin.path()).args([
                 "shard",
                 "--master",
                 &addr,
@@ -1583,9 +1512,8 @@ exit 9
                 "--build-source",
                 project.to_str().unwrap(),
                 "--json",
-            ])
-            .output()
-            .unwrap();
+            ]),
+        );
         let _ = w_child.kill();
         let _ = w_child.wait();
 
