@@ -503,6 +503,32 @@ The full suite must pass on a clean machine before CI can require it.
   and concurrent `40 + 40 MiB` uploads naming `--blob-store-mb`, `0` tmp leftovers). `T1 (8 GiB)`,
   `T2 (100,000 files)`, `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` links
   remain for step 2.
+- **Progress (2026-11-24, step 2 loopback missing + two-machine `lan-tcp` at `cb25d6f4`):** Added two-machine
+  remote master support (`--master`, `--secret-file`, `--target-worker`, `--master-pid`,
+  `--master-blob-dir`, `--master-log`, `throttle`, `@ticket_file`) and `state:busy` eligibility fix
+  in `benchmarks/endurance/endurance.py` (`tests/test_endurance_harness.py` `22/22`), and recorded:
+  1. **macOS `aarch64` loopback missing scenarios (`benchmarks/endurance/results/2026-11-23-loopback-macos-arm64-apple-m5.json`, Apple M5, `rusty-grid 0.4.4`):** `4/4` PASS:
+     `T1` (`1 GiB` `4.743 s`, `3 GiB` `15.683 s`, `8 GiB` `43.513 s`), `T2` (`100,000` files, `869,791,259 B`,
+     `100,001` blobs, `598.149 s`), `T5` (`64 MiB` TCP proxy cut at `33,587,867 B`, resubmit `64 MiB` in `0.351 s`),
+     and `T9` (`3 GiB` x `3` sequential tasks verified).
+  2. **Two-machine `lan-tcp` (`benchmarks/endurance/results/2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, Mac master -> Windows case PC `--isolation off`, Windows Defender real-time protection on, measured ping RTT `9.028 ms`, `rusty-grid 0.4.4`):** `9/9` PASS (`T1`–`T9`):
+     `T1` (`1 GiB` `19.714 s` / `51.943 MiB/s`, `3 GiB` `60.255 s` / `50.983 MiB/s`, `8 GiB` `201.483 s` /
+     `40.659 MiB/s`; master peak RSS delta `+0.20 MiB`, client `-0.34 MiB` vs `128 MiB` bound),
+     `T2` (`100,000` files, `869,019,579 B`, `581.938 s`, `100,001` blobs, master peak RSS `92.0 MiB`),
+     `T3` (`1,000 MiB` `19.663 s` ok; `1,100 MiB` refused naming `--output-limit-mb` in `3.072 s`),
+     `T4` (second `3 GiB` submit uploaded `0` blobs / `0 B` in `52.104 s`),
+     `T5` (`64 MiB` TCP proxy cut at `33,555,566 B`, resubmit uploaded `67,108,864 B` in `1.312 s`),
+     `T6` (`64 MiB` via Windows `12 Mbit/s` `ThrottleProxy` cut at `236,193 B` on `.part` creation, requeued &
+     completed in `5.353 s`, `2` master failover/disconnect log hits, `0` `.part` leftovers in `cache/blobs/tmp`),
+     `T7` (`256 MiB` in + `256 MiB` out via Windows `2.0 Mbit/s` / `50 ms` RTT `ThrottleProxy` finished in
+     `2,160.519 s` with `worker_reaped = false`, `0` reap log hits, output BLAKE3 `ae3cf061...` verified),
+     `T8` (secondary `:18189` master `--blob-store-mb 64` + `win-t8-lab` refused `72 MiB` in `0.046 s` and second
+     concurrent `40 MiB` upload naming `--blob-store-mb` while completing the first, `0` tmp leftovers), and
+     `T9` (`3 GiB` x `3` sequential tasks `61.953 s` / `52.873 s` / `53.029 s`, all verified).
+  Remains `Partial | In` pending `lan-quic` and `quic-relay` two-machine runs and `Q58` answer (per `AGENT_RULES.md`
+  Rule 2, active P2P tickets are never placed on Google Drive and await owner ticket carry; `quic-relay` also
+  needs separate-network routing because `iroh` on the same LAN upgrades direct QUIC connections and exposes
+  no CLI relay-only switch).
 
 ### TEST-25: Run a cluster for 24 hours under load and faults
 
@@ -2496,3 +2522,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
+- 2026-11-24: TEST-24 Partial updated (`mac/test-24-two-machines`): added Mac loopback missing scenarios (`2026-11-23-loopback-macos-arm64-apple-m5.json`, `T1 8 GiB`/`T2 100k`/`T5`/`T9`, `4/4` PASS) and two-machine `lan-tcp` record (`2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, `T1`–`T9`, `9/9` PASS, `worker_reaped = false` on `T7`); `lan-quic`/`quic-relay` and `Q58` await owner P2P ticket carry (`AGENT_RULES.md` Rule 2) and separate-network routing. Index recount deferred to stage D (`M9`).
