@@ -242,7 +242,8 @@ In order:
    recommended defaults.
 2. Spike R21, a reading of what Mesh-LLM already does, has no record. By Q54 no model item is built
    before it has one.
-3. Trial APP-1 (Q40, decided): LIVA on a Mac with the model on another machine. No trial has run.
+3. Trial APP-1 (Q40, decided): a coding agent on a Mac with the model on another machine (Q98; LIVA
+   follows later). No trial has run.
 4. The items that the answers keep enter [BACKLOG.md](BACKLOG.md) as a phase of their own, each
    with files and a check.
 
@@ -632,8 +633,9 @@ AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for
 [BACKLOG.md](BACKLOG.md) since 2026-11-17 (Phase 13).
 
 [Design 0061](design/0061-first-application-model-tunnel.md) (Draft, 2026-11-11) takes the third
-row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
-with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
+row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): an application
+on a Mac with the model on another machine, over SSH, with nothing built here. Since 2026-11-24 (Q98)
+that application is a coding agent, and LIVA, on hold, follows as the second one. A client tunnel to a model
 server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
 for the trial records. Q41 (decided on 2026-11-24) and Q43 are decided; Q42 is open.
 
@@ -767,6 +769,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q95 | Who takes part in the Stage 1 pilot (design 0094)? | Decided by the owner on 2026-11-19 at the recommended answer: the owner and three to five people the owner already knows, with about ten machines on at least two home networks and at least two machines of each system in use, each agreeing to the campaign sheet before joining |
 | Q96 | Are credits display only: not transferable, never spent or sold, with no cash value, in every stage of design 0094? | Yes, decided by the owner on 2026-11-19 at the recommended answer. It closes Q14 for the research grid and Q43 |
 | Q97 | Does Stage 1 of design 0094 run in parallel with release `0.5.0`? | Yes, decided by the owner on 2026-11-19 at the recommended answer: one lane at most beside `0.5.0` and bet A, with implementation merged after the stability release (Q80) and docs-only or test-only work before it |
+| Q98 | Does trial APP-1 run with another application while LIVA is on hold (design 0061)? | Yes, decided by the owner on 2026-11-24: a coding agent that uses an OpenAI-compatible endpoint (for example aider or opencode); LIVA follows as the second application once it starts on macOS and has its Cloud provider |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
