@@ -1690,7 +1690,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
     `submit --wait --command cmd -- /c ver` (`Exit Code: 0`, `13 ms`), and `Uninstall OxideSwarm.cmd` all pass.
   - `Update OxideSwarm.cmd` (`install.ps1 -Update`) failed 2/2 times with `rc=1`:
     1. `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The requested operation cannot be performed on a file with a user-mapped section open.`
-    2. `stopping the worker started earlier (PID 29324)` -> `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The process cannot access the file 'C:\Users\Admin\AppData\Local\OxideSwarm-USB\bin\oxideswarm.exe' because it is being used by another process.`
+    2. `stopping the worker started earlier (PID 29324)` -> `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The process cannot access the file '%LOCALAPPDATA%\OxideSwarm-USB\bin\oxideswarm.exe' because it is being used by another process.`
   - `Uninstall OxideSwarm.cmd` (`packaging/usb/uninstall.ps1:140`) printed `"Remove the OxideSwarm install in  [y/N]:"`
     with the install path omitted.
 - **Problem:**
