@@ -194,6 +194,7 @@ Recounted on 2026-11-24 from the rows with pull request 433: 254 items, 188 Impl
 Recounted on 2026-11-24 from the rows after the batch merge of pull requests 423, 427 to 430, 432 to 435, 437, 438 and 441: 258 items, 194 Implemented, 16 Partial and 48 Planned; 19 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 409: 259 items, 195 Implemented, 17 Partial and 47 Planned; 19 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 368: 283 items, 195 Implemented, 18 Partial and 70 Planned; 19 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 444: 284 items, 195 Implemented, 18 Partial and 71 Planned; 20 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -311,6 +312,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
+| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -820,6 +822,31 @@ The full suite must pass on a clean machine before CI can require it.
   fails under `umask 0o022` without the fix.
 - **Done when:** `tests/test_endurance_harness.py` verifies `0o700` permissions on created soak directories under
   a `0o022` umask, and a Linux `endurance.py soak` smoke run starts and connects workers cleanly.
+
+### TEST-95: CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast`
+
+- **Evidence:** CI run `45272824360` (pull request 432, head `c42bffba`, docs only for `TEST-93`, 2026-11-23
+  22:51 UTC), job `unit tests (ubuntu-latest)` (`138036810990`), step
+  `python3 -B -m unittest tests/test_wave3_e2e.py -v`: `62` of `63` tests passed (`130.746 s`), and
+  `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed at `tests/test_wave3_e2e.py:4756`
+  (now line `4784` on `ee3590ea`) with `ValueError: invalid literal for int() with base 10: ''` on
+  `pid = int(pf.read_text(encoding="utf-8").strip())`. Claimed via `agent_bridge.py claim`
+  (`claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`).
+- **Problem:** Helper PID and marker files in `tests/test_wave3_e2e.py` are written non-atomically in place:
+  `install_fake_cargo_nextest` (line `1100`, `(pd / f"shard_{shard_idx}.pid").write_text(...)`),
+  `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` (line `3757`, `echo $$ > ...`), and
+  `install_fake_blender` (`PROBE_PID_FILE` line `1353`, `HANG_PID_FILE` line `1421`, `HANG_MARKER_FILE`
+  line `1430`). When `--fail-fast` tears down remaining shards while a sibling child is creating/truncating
+  or writing `shard_<N>.pid`, the test's reader (`line 4784`, and `line 3777` in `test_t2_ax2_03`) can observe
+  a zero-byte `.pid` file and raise `ValueError`.
+- **Do:** (Code fix and 20-run busy-loop verification wait until after the Stage C `S7` 24-hour soak finishes.)
+  1. Failing check first: demonstrate the empty `shard_*.pid` `ValueError` in `test_t3_03` / `test_t2_ax2_03`.
+  2. Write all `.pid` and marker files via a temporary file in the same directory followed by atomic
+     rename (`os.replace` in `install_fake_cargo_nextest` line `1100` and `install_fake_blender` lines
+     `1353`, `1421`, `1430`; temp file + `mv -f` in `test_t2_ax2_03` line `3757`), so readers (`lines 3774`,
+     `4783`) only see complete `*.pid` files.
+- **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
+  and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
 ## Phase 3: make the documents true
 
@@ -3061,4 +3088,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-87 Implemented (pull request 429, branch `win/test-87-portal-lan-bind`, text moved to the archive): reproduced the `AddrInUse` false failure first, updated `crates/worker/src/client/tests.rs` (`assert_portal_not_listening_on_lan`, keeping the `127.0.0.1` check) to probe `GET /api/status` on `AddrInUse` and fail only on the worker portal JSON body (plus negative control rejecting a live portal); passed `50/50` runs of `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops on Windows (`ff832b0e`, `14` physical / `20` logical cores, `83` tests/run, `6.72–7.91 s`, median `6.81 s`, total `342.20 s`) and `50/50` runs under `4` Python CPU busy loops on Apple Silicon M5 macOS (`d3103d30`, `agent-mac-ag`, `10` logical cores, `84` tests/run, `9.52–11.65 s`, median `9.75 s`, total `490.43 s`).
 - 2026-11-24: AX-1 Implemented (`mac/ax1-ax2-live-records`, text moved to `docs/BACKLOG-ARCHIVE.md`) via live 3-OS MCP `submit` matrix call (`os=macos,windows,linux` over `--workspace ax1-live-2026-11-24`, `3/3` cells passed in `102.221 s`, `machines = 3`, `0` failed cells); AX-2 updated (`Partial | In`) with the 3-worker LAN TCP + Docker Linux live record `benchmarks/grid/results/2026-11-24-r2-m1-3workers-macos-windows-linux.json` (Spike R2 `27.18 %` savings triggering the `< 30 %` stop rule; Measure M1 `0.6499x` at `--count 3` and `0.5928x` at `--count 6`). Index recount deferred to stage D (`M9`).
 - 2026-11-24: TEST-24 Partial updated (`mac/test-24-two-machines`): added Mac loopback missing scenarios (`2026-11-23-loopback-macos-arm64-apple-m5.json`, `T1 8 GiB`/`T2 100k`/`T5`/`T9`, `4/4` PASS) and two-machine `lan-tcp` record (`2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, `T1`–`T9`, `9/9` PASS, `worker_reaped = false` on `T7`); `lan-quic`/`quic-relay` and `Q58` await owner P2P ticket carry (`AGENT_RULES.md` Rule 2) and separate-network routing. Index recount deferred to stage D (`M9`).
+- 2026-11-24: TEST-95 added (Planned, In; claim `claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`): in `tests/test_wave3_e2e.py`, `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed in pull request 432 CI (run `45272824360`, job `138036810990`) with `ValueError: invalid literal for int() with base 10: ''` reading an empty `shard_*.pid` written non-atomically under `--fail-fast`; code fix and 20-run loop wait until after Stage C `S7` (Index header recounted: 259 items, 194 Implemented, 16 Partial and 49 Planned; 20 open items are In and 45 are Out).
 - 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
