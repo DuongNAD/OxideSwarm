@@ -2,12 +2,12 @@
 """
 benchmarks/grid/bench_shard_r2_m1.py - Spike R2 & Measure M1 for AX-2 sharded runs.
 
-Measures on single-host loopback (127.0.0.1; NOT 3 physical machines):
-  - Spike R2: wall-clock speedup across 1, 2, 3 workers using parallel `oxideswarm submit --wait`
-    calls (`OX_SHARD_INDEX` / `OX_SHARD_TOTAL`) and evaluates the design 0056 `< 30%` stop rule.
-  - Measure M1: wall-clock speedup and RunSummary metrics across 1, 2, 3 workers using
-    `oxideswarm shard --count <K> --json` and evaluates the `<= 0.50x` (<= half of 1-worker time)
-    target from design 0056.
+Supports both:
+  - Single-host loopback mode (default when `--master` is omitted): spins up a local
+    master and 1..3 loopback workers on 127.0.0.1.
+  - Remote multi-worker cluster mode (`--master <ADDR>`): runs baseline (`--baseline-worker`)
+    vs multi-worker (`--workers ...` and `oxideswarm shard --count ...`) against an
+    existing multi-OS lab cluster (e.g. macOS + Windows + Linux Docker).
 
 Standard library only. Uses isolated private HOME/USERPROFILE directories, fake AC pmset on
 macOS when needed, strict PID-handle cleanup, and removes its temporary workspace on exit.
@@ -21,6 +21,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -100,6 +101,286 @@ def parse_shard_json(stdout_text):
         "waited_ms": data.get("waited_ms", 0),
         "task_time_sum_ms": data.get("task_time_sum_ms", 0),
     }
+
+
+def parse_shard_report_full(stdout_text):
+    """Parses full `oxideswarm shard --json` output including per-worker shard distribution."""
+    summary = parse_shard_json(stdout_text)
+    data = json.loads(stdout_text)
+    per_worker_shards = {}
+    shard_cargo_summaries = []
+    for rec in data.get("shards") or []:
+        wname = rec.get("worker_name") or rec.get("worker") or rec.get("assigned_worker") or "unknown"
+        per_worker_shards[wname] = per_worker_shards.get(wname, 0) + 1
+        cs = parse_ax2_cargo_summary(rec.get("stdout") or "")
+        if cs is not None:
+            shard_cargo_summaries.append(cs)
+    summary["per_worker_shards"] = dict(sorted(per_worker_shards.items()))
+    summary["cargo_summaries"] = shard_cargo_summaries
+    return summary
+
+
+def parse_ax2_cargo_summary(stdout_text):
+    """Extracts the `AX2_SHARD_SUMMARY <json>` line emitted by CARGO_SHARD_RUNNER_PY."""
+    for line in reversed((stdout_text or "").splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("AX2_SHARD_SUMMARY "):
+            return json.loads(stripped[len("AX2_SHARD_SUMMARY "):])
+    return None
+
+
+CARGO_SHARD_RUNNER_PY = """#!/usr/bin/env python3
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import platform
+
+
+def _pick_target_dir(tag):
+    shared = os.path.join(tempfile.gettempdir(), f"oxs-ax2-{tag}")
+    try:
+        os.makedirs(shared, exist_ok=True)
+        probe = os.path.join(shared, f".probe-{os.getpid()}")
+        with open(probe, "w") as pf:
+            pf.write("ok")
+        os.remove(probe)
+        return shared, "shared_temp"
+    except OSError:
+        local = os.path.join(os.getcwd(), "target")
+        os.makedirs(local, exist_ok=True)
+        return local, "sandbox_local"
+
+
+def _sanitized_env():
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("RUSTY_GRID_")
+        and not k.startswith("OXIDESWARM_")
+        and not k.startswith("OXIDE_")
+        and not k.startswith("OX_SHARD_")
+    }
+
+
+def main():
+    src_dir = os.path.abspath(sys.argv[1])
+    threads = int(sys.argv[2])
+    build_mode = sys.argv[3]
+    packages_csv = sys.argv[4]
+    target_tag = sys.argv[5]
+    idx = int(os.environ.get("OX_SHARD_INDEX", "1"))
+    total = int(os.environ.get("OX_SHARD_TOTAL", "1"))
+    if idx < 1 or idx > total:
+        raise SystemExit(f"invalid OX_SHARD_INDEX={idx} for OX_SHARD_TOTAL={total}")
+
+    target_dir, target_mode = _pick_target_dir(target_tag)
+    cargo_env = _sanitized_env()
+    cargo_env["CARGO_TARGET_DIR"] = target_dir
+    cargo_env["NO_COLOR"] = "1"
+    test_env = _sanitized_env()
+    test_env["NO_COLOR"] = "1"
+
+    cmd = ["cargo", "test", "--locked", "--lib", "--no-run", "--message-format=json"]
+    if build_mode == "release":
+        cmd.append("--release")
+    if packages_csv == "workspace":
+        cmd.append("--workspace")
+    else:
+        for pkg in packages_csv.split(","):
+            if pkg:
+                cmd.extend(["-p", pkg])
+
+    t_prep0 = time.perf_counter()
+    prep = subprocess.run(cmd, cwd=src_dir, env=cargo_env, capture_output=True, text=True)
+    if prep.returncode != 0:
+        sys.stderr.write(prep.stdout[-4000:])
+        sys.stderr.write(prep.stderr[-4000:])
+        sys.exit(prep.returncode)
+
+    executables = {}
+    for line in prep.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("reason") == "compiler-artifact" and msg.get("profile", {}).get("test"):
+            exe = msg.get("executable")
+            if exe and os.path.isfile(exe):
+                stem = re.sub(r"-[0-9a-f]{16}(\\.exe)?$", "", os.path.basename(exe))
+                executables[exe] = stem
+    if not executables:
+        raise SystemExit("no test binaries compiled")
+
+    entries = []
+    for exe, stem in sorted(executables.items(), key=lambda kv: (kv[1], kv[0])):
+        listed = subprocess.run([exe, "--list", "--format", "terse"], env=test_env, capture_output=True, text=True)
+        if listed.returncode != 0:
+            sys.stderr.write(listed.stderr[-2000:])
+            sys.exit(listed.returncode)
+        for raw in listed.stdout.splitlines():
+            if raw.endswith(": test"):
+                name = raw[: -len(": test")].strip()
+                if name:
+                    entries.append((stem, exe, name))
+    entries.sort(key=lambda item: (item[0], item[2]))
+    cargo_prepare_s = time.perf_counter() - t_prep0
+
+    mine = [item for i, item in enumerate(entries) if (i % total) == (idx - 1)]
+    by_bin = {}
+    for _stem, exe, tname in mine:
+        by_bin.setdefault(exe, []).append(tname)
+
+    t_exec0 = time.perf_counter()
+    for exe, tests in by_bin.items():
+        for start in range(0, len(tests), 400):
+            chunk = tests[start : start + 400]
+            res = subprocess.run(
+                [exe, "--exact", f"--test-threads={threads}"] + chunk,
+                cwd=src_dir,
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if res.returncode != 0:
+                sys.stdout.write(res.stdout[-4000:])
+                sys.stderr.write(res.stderr[-4000:])
+                sys.exit(res.returncode)
+    exec_s = time.perf_counter() - t_exec0
+
+    summary = {
+        "idx": idx,
+        "total": total,
+        "listed_tests": len(entries),
+        "executed_tests": len(mine),
+        "cargo_prepare_s": round(cargo_prepare_s, 4),
+        "exec_s": round(exec_s, 4),
+        "target_mode": target_mode,
+        "os": platform.system().lower(),
+        "arch": platform.machine().lower(),
+    }
+    print("AX2_SHARD_SUMMARY " + json.dumps(summary, sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+class RemoteCluster:
+    """Wrapper around an already-running multi-machine OxideSwarm master."""
+
+    def __init__(self, binary, workdir, master_addr, secret_file=None, insecure=False):
+        self.binary = binary
+        self.workdir = workdir
+        self.master_addr = master_addr
+        self.secret_file = os.path.abspath(secret_file) if secret_file else None
+        self.insecure = insecure
+        self.empty_config = os.path.join(workdir, "empty.toml")
+        with open(self.empty_config, "w") as f:
+            f.write("")
+        home = os.path.join(workdir, "home-client")
+        ox_home = os.path.join(home, ".oxideswarm")
+        os.makedirs(ox_home, exist_ok=True)
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("RUSTY_GRID_")
+            and not k.startswith("OXIDESWARM_")
+            and not k.startswith("OXIDE_")
+            and not k.startswith("OX_SHARD_")
+        }
+        env.update(
+            HOME=home,
+            USERPROFILE=home,
+            OXIDESWARM_HOME=ox_home,
+            RUSTY_GRID_CONFIG=self.empty_config,
+            RUSTY_GRID_NO_BATTERY="1",
+            RUSTY_GRID_DISABLE_DISCOVERY="1",
+            NO_COLOR="1",
+        )
+        self.env = env
+
+    def run(self, args, cwd=None, timeout=1800):
+        cmd = [self.binary, args[0], "--master", self.master_addr]
+        if self.secret_file:
+            cmd.extend(["--secret-file", self.secret_file])
+        elif self.insecure:
+            cmd.append("--insecure")
+        cmd.extend(args[1:])
+        return subprocess.run(
+            cmd,
+            cwd=cwd or self.workdir,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def connected_workers(self):
+        res = self.run(["workers", "--json"], timeout=60)
+        if res.returncode != 0:
+            raise RuntimeError(f"workers --json failed: {res.stderr}\n{res.stdout}")
+        raw = json.loads(res.stdout)
+        out = []
+        for w in raw:
+            tags = list(w.get("tags") or [])
+            if "state:disconnected" in tags:
+                continue
+            tag_map = {}
+            for t in tags:
+                if ":" in t:
+                    k, v = t.split(":", 1)
+                    tag_map[k] = v
+            out.append({
+                "name": w.get("name"),
+                "os": tag_map.get("os", "unknown"),
+                "arch": tag_map.get("arch", "unknown"),
+                "cpu_cores": w.get("cpu_cores"),
+                "ram_mb": w.get("ram_mb"),
+                "slots": int(tag_map["slots"]) if tag_map.get("slots", "").isdigit() else w.get("cpu_cores"),
+                "iso": tag_map.get("iso", "unknown"),
+                "has_workspaces": "feat:workspaces" in tags,
+                "link": w.get("link"),
+            })
+        return sorted(out, key=lambda item: (item["os"], item["arch"], item["name"] or ""))
+
+
+def export_clean_repo(repo_path, dest_dir):
+    """Exports HEAD of repo_path without .git or target/ into dest_dir."""
+    os.makedirs(dest_dir, exist_ok=True)
+    archive = subprocess.run(
+        ["git", "-C", repo_path, "archive", "--format=tar", "HEAD"],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(["tar", "-xf", "-", "-C", dest_dir], input=archive.stdout, check=True)
+
+
+PRIVATE_IPV4_RE = re.compile(
+    r"\b(?:192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"
+)
+BRACKETED_IPV6_RE = re.compile(r"\[(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\]")
+INVITE_OR_TICKET_RE = re.compile(r"\boxs1-[A-Za-z0-9_-]{8,}\b")
+
+
+def assert_no_private_identifiers(obj, extra_forbidden=()):
+    """Raises ValueError if serialized record contains private IPs, tickets, or hostnames."""
+    text = obj if isinstance(obj, str) else json.dumps(obj, sort_keys=True)
+    if PRIVATE_IPV4_RE.search(text):
+        raise ValueError("record contains private RFC1918 IPv4 address")
+    if BRACKETED_IPV6_RE.search(text):
+        raise ValueError("record contains bracketed IPv6 address")
+    if INVITE_OR_TICKET_RE.search(text):
+        raise ValueError("record contains oxs1-* invite/ticket token")
+    candidates = [socket.gethostname(), platform.node()] + list(extra_forbidden)
+    for token in candidates:
+        if token and len(token) >= 4 and token in text:
+            raise ValueError(f"record contains forbidden identifier ({len(token)} chars)")
 
 
 def sh(cmd):
@@ -506,16 +787,286 @@ def run_m1_shard(cluster, n_shards, runner_path, manifest_path, worker_threads):
     return wall, parsed
 
 
+def run_remote_r2_submit(cluster, workers, src_dir, runner_path, worker_threads, build_mode, packages_csv, remote_python, target_tag, timeout_secs=1800):
+    n_shards = len(workers)
+    t0 = time.perf_counter()
+
+    def one(pair):
+        idx, wname = pair
+        return cluster.run(
+            [
+                "submit",
+                "--wait",
+                "--json",
+                "--worker",
+                wname,
+                "--timeout-secs",
+                str(timeout_secs),
+                "--env",
+                f"OX_SHARD_INDEX={idx}",
+                "--env",
+                f"OX_SHARD_TOTAL={n_shards}",
+                "--input",
+                f"{src_dir}:src",
+                "--input",
+                f"{runner_path}:shard_cargo_runner.py",
+                "--",
+                remote_python,
+                "shard_cargo_runner.py",
+                "src",
+                str(worker_threads),
+                build_mode,
+                packages_csv,
+                target_tag,
+            ],
+            timeout=timeout_secs + 120,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_shards) as pool:
+        results = list(pool.map(one, enumerate(workers, start=1)))
+    wall = time.perf_counter() - t0
+    shard_summaries = []
+    for idx, (wname, res) in enumerate(zip(workers, results), start=1):
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"Remote R2 submit shard {idx}/{n_shards} ({wname}) failed rc={res.returncode}:\n{res.stderr}\n{res.stdout}"
+            )
+        stdout_text = res.stdout
+        try:
+            payload = json.loads(res.stdout)
+            stdout_text = payload.get("stdout") or res.stdout
+        except ValueError:
+            pass
+        cs = parse_ax2_cargo_summary(stdout_text)
+        if cs is not None:
+            cs["worker_name"] = wname
+            shard_cargo = cs
+            shard_summaries.append(shard_cargo)
+    return wall, shard_summaries
+
+
+def run_remote_m1_shard(cluster, n_shards, src_dir, runner_path, worker_threads, build_mode, packages_csv, remote_python, target_tag, worker_pin=None, timeout_secs=1800):
+    args = [
+        "shard",
+        "--count",
+        str(n_shards),
+        "--timeout-secs",
+        str(timeout_secs),
+        "--json",
+        "--input",
+        f"{src_dir}:src",
+        "--input",
+        f"{runner_path}:shard_cargo_runner.py",
+    ]
+    if worker_pin:
+        args.extend(["--worker", worker_pin])
+    args.extend([
+        "--",
+        remote_python,
+        "shard_cargo_runner.py",
+        "src",
+        str(worker_threads),
+        build_mode,
+        packages_csv,
+        target_tag,
+    ])
+    t0 = time.perf_counter()
+    res = cluster.run(args, timeout=timeout_secs + 120)
+    wall = time.perf_counter() - t0
+    if res.returncode != 0:
+        raise RuntimeError(f"Remote M1 shard ({n_shards}) failed rc={res.returncode}:\n{res.stderr}\n{res.stdout}")
+    parsed = parse_shard_report_full(res.stdout)
+    if parsed["failed_shards"] != 0 or parsed["completed_shards"] != n_shards:
+        raise RuntimeError(f"Remote M1 shard ({n_shards}) incomplete: {parsed}")
+    return wall, parsed
+
+
+def run_remote_mode(args, binary, tmp, started, load_before):
+    if not args.baseline_worker:
+        raise SystemExit("--baseline-worker is required in --master remote mode")
+    workers = args.workers or [args.baseline_worker]
+    shard_counts = args.shard_counts or [3, 6]
+    if 3 not in shard_counts and len(workers) == 3:
+        shard_counts = [3] + shard_counts
+    packages = args.packages if args.packages else ["workspace"]
+    packages_csv = ",".join(packages)
+    build_mode = args.build_mode or "debug"
+    target_tag = f"v1-{build_mode}"
+
+    src_dir = os.path.join(tmp, "repo_src")
+    runner_path = os.path.join(tmp, "shard_cargo_runner.py")
+    export_clean_repo(REPO, src_dir)
+    with open(runner_path, "w") as f:
+        f.write(CARGO_SHARD_RUNNER_PY)
+    os.chmod(runner_path, 0o755)
+
+    cluster = RemoteCluster(
+        binary,
+        tmp,
+        args.master,
+        secret_file=args.secret_file,
+        insecure=args.insecure,
+    )
+    connected = cluster.connected_workers()
+    by_name = {w["name"]: w for w in connected}
+    required_names = [args.baseline_worker] + [w for w in workers if w != args.baseline_worker]
+    missing = [w for w in required_names if w not in by_name]
+    if missing:
+        raise SystemExit(f"Required workers not connected on remote master: {missing}; connected={list(by_name)}")
+
+    selected_workers = [by_name[w] for w in required_names]
+    print(f"Remote workers ready: {[ (w['name'], w['os'], w['arch'], w['slots']) for w in selected_workers ]}", flush=True)
+
+    # Warmup compile on every worker (1 uncounted pass each)
+    warmup = {}
+    for w in required_names:
+        print(f"[warmup] compiling/running {packages_csv} ({build_mode}) on {w}...", flush=True)
+        w_wall, w_sums = run_remote_r2_submit(
+            cluster, [w], src_dir, runner_path, args.worker_threads, build_mode, packages_csv, args.remote_python, target_tag
+        )
+        warmup[w] = {
+            "wall_s": round(w_wall, 4),
+            **(w_sums[0] if w_sums else {}),
+        }
+        print(f"[warmup] {w}: {w_wall:.2f}s summary={warmup[w]}", flush=True)
+
+    r2_1w_raw = []
+    r2_mw_raw = []
+    m1_1w_raw = []
+    m1_counts_raw = {sc: [] for sc in shard_counts}
+
+    for r in range(args.runs):
+        print(f"[remote run {r + 1}/{args.runs}] 1w baseline ({args.baseline_worker}) vs {len(workers)}w parallel submit & shard {shard_counts}", flush=True)
+        w_1w, s_1w = run_remote_r2_submit(
+            cluster, [args.baseline_worker], src_dir, runner_path, args.worker_threads, build_mode, packages_csv, args.remote_python, target_tag
+        )
+        r2_1w_raw.append({"wall_s": round(w_1w, 4), "shards": s_1w})
+
+        w_mw, s_mw = run_remote_r2_submit(
+            cluster, workers, src_dir, runner_path, args.worker_threads, build_mode, packages_csv, args.remote_python, target_tag
+        )
+        r2_mw_raw.append({"wall_s": round(w_mw, 4), "shards": s_mw})
+
+        m_1w_wall, m_1w_info = run_remote_m1_shard(
+            cluster, 1, src_dir, runner_path, args.worker_threads, build_mode, packages_csv, args.remote_python, target_tag, worker_pin=args.baseline_worker
+        )
+        m1_1w_raw.append({"wall_s": round(m_1w_wall, 4), **m_1w_info})
+
+        for sc in shard_counts:
+            m_sc_wall, m_sc_info = run_remote_m1_shard(
+                cluster, sc, src_dir, runner_path, args.worker_threads, build_mode, packages_csv, args.remote_python, target_tag
+            )
+            m1_counts_raw[sc].append({"wall_s": round(m_sc_wall, 4), **m_sc_info})
+
+    r2_1w_summary = summarize([row["wall_s"] for row in r2_1w_raw])
+    r2_mw_summary = summarize([row["wall_s"] for row in r2_mw_raw])
+    r2_eval = compute_r2_metrics(r2_1w_summary["median"], r2_mw_summary["median"])
+
+    m1_1w_summary = {
+        "wall_s": summarize([row["wall_s"] for row in m1_1w_raw]),
+        "waited_ms": summarize([row["waited_ms"] for row in m1_1w_raw]),
+        "task_time_sum_ms": summarize([row["task_time_sum_ms"] for row in m1_1w_raw]),
+        "machines_median": statistics.median([row["machines"] for row in m1_1w_raw]),
+    }
+    m1_by_count = {"1": m1_1w_summary}
+    m1_evals = {}
+    for sc in shard_counts:
+        rows = m1_counts_raw[sc]
+        sc_sum = {
+            "wall_s": summarize([row["wall_s"] for row in rows]),
+            "waited_ms": summarize([row["waited_ms"] for row in rows]),
+            "task_time_sum_ms": summarize([row["task_time_sum_ms"] for row in rows]),
+            "machines_median": statistics.median([row["machines"] for row in rows]),
+            "per_worker_shards_sample": rows[-1].get("per_worker_shards") if rows else {},
+        }
+        m1_by_count[str(sc)] = sc_sum
+        m1_evals[str(sc)] = compute_m1_metrics(m1_1w_summary["wall_s"]["median"], sc_sum["wall_s"]["median"])
+
+    primary_eval_key = "3" if "3" in m1_evals else str(shard_counts[0])
+    primary_m1_eval = m1_evals[primary_eval_key]
+
+    hw = hardware()
+    os_facts = os_info()
+    record = {
+        "benchmark": "ax2-shard-r2-m1",
+        "date_utc": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "plan": {
+            "question_r2": "How much wall time does sharding this repository's workspace --lib unit tests over 3 workers save via today's `submit`?",
+            "question_m1": "Does `oxideswarm shard` finish in <= 0.50x of 1-worker time?",
+            "stop_rule": "R2 savings < 30% triggers guide-only stop rule",
+            "scope": "multi-machine 3-worker lab cluster (macOS arm64 + Windows x86_64 + Linux arm64 Docker on Mac)",
+        },
+        "git": git_info(),
+        "binary": {"profile": build_profile(binary), "version": sh([binary, "--version"])},
+        "coordinator_hardware": hw,
+        "coordinator_os": os_facts,
+        "workers": selected_workers,
+        "network": "LAN TCP (Mac master + Windows case PC + Linux arm64 Docker container on Mac)",
+        "power": power_state(),
+        "load_average_before": load_before,
+        "load_average_after": load_avg(),
+        "python": platform.python_version(),
+        "note": args.label or "Multi-machine AX-2 R2/M1 evaluation across Mac, Windows case PC, and Linux arm64 Docker worker on Mac",
+        "parameters": {
+            "packages": packages,
+            "build_mode": build_mode,
+            "baseline_worker": args.baseline_worker,
+            "r2_workers": workers,
+            "shard_counts": shard_counts,
+            "runs_per_config": args.runs,
+            "warmup_runs": 1,
+            "worker_threads": args.worker_threads,
+            "remote_python": args.remote_python,
+        },
+        "warmup": warmup,
+        "r2_submit": {
+            "by_workers": {"1": r2_1w_summary, str(len(workers)): r2_mw_summary},
+            "evaluation": r2_eval,
+        },
+        "m1_shard": {
+            "by_shards": m1_by_count,
+            "evaluation": primary_m1_eval,
+            "evaluations_by_count": m1_evals,
+        },
+        "raw": {
+            "r2_submit": {"1": r2_1w_raw, str(len(workers)): r2_mw_raw},
+            "m1_shard": {"1": m1_1w_raw, **{str(sc): m1_counts_raw[sc] for sc in shard_counts}},
+        },
+    }
+    assert_no_private_identifiers(record)
+    if args.no_write:
+        print(json.dumps(record, indent=2))
+    else:
+        out_dir = os.path.join(HERE, "results")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = args.out or result_path(out_dir, started, os_facts, hw)
+        with open(out_path, "w") as f:
+            json.dump(record, f, indent=2)
+            f.write("\n")
+        print(f"Wrote record to {out_path}")
+        print(f"R2 savings ({len(workers)}w vs 1w): {r2_eval['savings_pct']}% (stop rule triggered: {r2_eval['stop_rule_triggered']})")
+        for sc_key, ev in m1_evals.items():
+            print(f"M1 ratio (shard --count {sc_key} / 1w): {ev['ratio_3w_to_1w']}x (target <= 0.50 met: {ev['target_met']}, machines_median={m1_by_count[sc_key]['machines_median']})")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     default_bin = os.path.join(REPO, "target", "release", "oxideswarm" + (".exe" if IS_WINDOWS else ""))
     ap.add_argument("--bin", default=default_bin, help="oxideswarm binary path")
-    ap.add_argument("--packages", nargs="+", default=["rusty_grid_core", "rusty_grid_master"],
+    ap.add_argument("--packages", nargs="+", default=None,
                     help="Cargo packages whose --lib unit tests form the sharded suite")
     ap.add_argument("--runs", type=int, default=3, help="measured runs per worker count (default 3)")
     ap.add_argument("--worker-threads", type=int, default=2,
                     help="libtest --test-threads per worker (default 2)")
     ap.add_argument("--quick", action="store_true", help="1 run on 1 and 3 workers with 60 tests")
+    ap.add_argument("--master", help="Existing master address to benchmark remotely instead of loopback")
+    ap.add_argument("--secret-file", help="Cluster secret file for --master")
+    ap.add_argument("--insecure", action="store_true", help="Pass --insecure with --master")
+    ap.add_argument("--baseline-worker", help="Baseline 1-worker name in --master mode")
+    ap.add_argument("--workers", nargs="+", help="Worker names for R2 parallel submit in --master mode")
+    ap.add_argument("--shard-counts", nargs="+", type=int, help="Shard counts to test in --master mode (default: 3 6)")
+    ap.add_argument("--build-mode", choices=["debug", "release"], help="Cargo test profile (default: release in loopback, debug in remote)")
+    ap.add_argument("--remote-python", default="python3", help="Python executable on remote workers")
     ap.add_argument("--no-write", action="store_true", help="print JSON record instead of saving")
     ap.add_argument("--out", help="override output JSON path")
     ap.add_argument("--label", default="", help="optional free-text note")
@@ -525,20 +1076,25 @@ def main():
     if not os.path.isfile(binary):
         raise SystemExit(f"binary not found: {binary} (build with: cargo build --release --locked --bin oxideswarm)")
 
-    worker_counts = [1, 3] if args.quick else [1, 2, 3]
-    runs = 1 if args.quick else args.runs
-
-    tmp = tempfile.mkdtemp(prefix="oxshard-bench-")
-    fake_bin = os.path.join(tmp, "fake_bin")
-    install_fake_pmset(fake_bin)
     started = datetime.datetime.now(datetime.timezone.utc)
     load_before = load_avg()
+    tmp = tempfile.mkdtemp(prefix="oxshard-bench-")
 
     try:
+        if args.master:
+            run_remote_mode(args, binary, tmp, started, load_before)
+            return
+
+        packages = args.packages or ["rusty_grid_core", "rusty_grid_master"]
+        worker_counts = [1, 3] if args.quick else [1, 2, 3]
+        runs = 1 if args.quick else args.runs
+        fake_bin = os.path.join(tmp, "fake_bin")
+        install_fake_pmset(fake_bin)
+
         runner_path, manifest_path, test_count = compile_rust_libtest_manifest(
-            args.packages, tmp, quick=args.quick
+            packages, tmp, quick=args.quick, release=(args.build_mode or "release") == "release"
         )
-        print(f"Prepared {test_count} tests across {args.packages}", flush=True)
+        print(f"Prepared {test_count} tests across {packages}", flush=True)
 
         r2_raw = {k: [] for k in worker_counts}
         m1_raw = {k: [] for k in worker_counts}
@@ -598,7 +1154,7 @@ def main():
             "python": platform.python_version(),
             "note": args.label or "Single-host loopback R2/M1 evaluation across 1..3 local workers sharing host CPU cores",
             "parameters": {
-                "packages": args.packages,
+                "packages": packages,
                 "test_count": test_count,
                 "worker_counts": worker_counts,
                 "runs_per_worker_count": runs,
