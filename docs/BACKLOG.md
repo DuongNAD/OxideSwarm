@@ -297,7 +297,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-82 | `rusty_grid_worker`: replace wall-clock upper bounds and bound `scale1` status queries | P2 | M |  |  | Implemented |  | 405 (open) |
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
-| TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
+| TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Implemented |  | 417, 430 |
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
@@ -596,35 +596,6 @@ The full suite must pass on a clean machine before CI can require it.
   `endurance-records` (`transfer-loopback.json` and `soak-45m-loopback.json`, `if: always()`).
   Static checks in `tests/test_endurance_harness.py` (`EnduranceCiWorkflowTests`) verify trigger,
   pins, commands, and upload step. Stays Partial until green on two scheduled runs.
-
-### TEST-85: Windows: the `submit --type compile` runtime test times out after 60 s
-
-- **Evidence:** CI run `44747726996` (push of pull request 407 to `master`, 2026-11-20 13:49 UTC), job
-  `gpu-wgpu (windows-latest)` (`136327278116`), step `cargo test -p rusty_grid_cli --lib --features gpu-wgpu`:
-  `cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo`
-  (`crates/cli/src/cli_app/runtime_tests.rs`) printed "Timed out after 60s waiting for task ... to complete" and
-  panicked at the assertion "submit --type compile must succeed" (`ExitCode(1)`). 200 other tests of the step passed.
-  It is the last failing test on `master` before the Q80 streak counted from 2026-11-20.
-- **Problem:** The test builds a real crate with a local path dependency through `cargo` on a worker. A cold
-  `cargo build` on a hosted Windows runner can take longer than the 60 s wait of `submit`. The cause (a wait that is
-  too short, or a task that hangs) is not known.
-- **Do:**
-  1. Read the test and the wait it uses (`submit_args`, `run_submit_with_secret`, the `--wait` budget of `submit`).
-  2. On Windows, run the test alone and in the whole `rusty_grid_cli --lib --features gpu-wgpu` binary 20 times each,
-     the second set under 4 busy loops; record each task's `execution_time_ms` and whether `cargo` was still running
-     at the timeout.
-  3. If the task finishes but late, give the test a budget that cannot be the cause (at least 600 s), keep every
-     assertion, and print the time. If the task hangs, follow rule 4: a test that fails without the fix, then the fix.
-- **Done when:** The cause is found, or the test passes 50 runs in a row on Windows under 4 busy loops and stays green in CI on `windows-latest` through the Q80 streak window.
-- **Partial (2026-11-23, pull request 417, commit `b0d4058f`):**
-  - **Cause (not found):** The CI failure was a `60` s timeout (`crates/cli/src/cli_app/submit.rs` `:1049`, `:1220`, `:1232`: `submit --type compile` forces `wait = true` and defaults `timeout_secs` to `60` s when `--timeout-secs` is omitted, unless `--workspace` is set) on a task whose local path-dependency build normally completes in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on the case PC). A task that short reaching a `60` s deadline looks like a stall rather than a slow build; the underlying cause did not reproduce locally on the case PC and remains unfound.
-  - **Fix (`crates/cli/src/cli_app/runtime_tests.rs`):** kept the product default `60` s untouched, passed `--timeout-secs 600` in the test's `submit_args` as a hang guard, widened the worker-registration `deadline` from `10` s to `60` s, and printed `TEST-85 compile_wall_ms=... exec_ms=...` with every assertion preserved so any repeat shows whether the task was slow or stuck. Stays `Partial` until the cause is found or `windows-latest` stays green through the Q80 streak window.
-  - **Baseline (`origin/master` `6a9060ba`, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.98.1`, isolated NTFS `USERPROFILE`/`HOME`/`TEMP` under `C:\ox_tmp\s1`):**
-    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (solo, `0` busy loops): `20/20` passed (wall `3.48–6.66` s, median `3.55` s; `exec_ms` `458–505`, median `470`).
-    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu` (full binary, `4` Python CPU busy loops): `20/20` passed (`228` tests/run; wall `13.00–13.12` s, median `13.06` s).
-  - **Post-fix (`b0d4058f`, same machine and isolated NTFS `USERPROFILE`/`HOME`/`TEMP`):**
-    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (`4` Python CPU busy loops): `50/50` passed (wall `3.91–4.52` s, median `4.06` s; `compile_wall_ms` `523–619`, median `551`; `exec_ms` `341–431`, median `360`).
-    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu`: `228/228` passed (`10.04` s); `cargo fmt --all -- --check`, `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings`, `cargo +1.96.0 clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
 
 ### TEST-86: macOS: `shard` tests stall for 60 s when run beside other shard tests
 
@@ -2574,3 +2545,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-93 added (`Planned | In`, claimed via `claims/item/TEST-93`): `master` push CI run `45261621774` (`720106d8`, pull request 426) failed in `workspace tests (macos-latest)` (`137997584352`) at `tests/m2_challenger_1_stress.rs:472` (`test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation`: `avg_latency=73.508552ms` vs `< 50 ms` wall-clock bound skipped in `TEST-83` under unlanded claim `TEST-70`), resetting the Q80 clean streak from `2026-11-23 21:35 UTC`.
 - 2026-11-24: TEST-90 added (`Planned | In`, claimed via `claims/item/TEST-90`): scheduled CI run `45180525786` (`2026-11-23T13:05:51Z`, `edd82f64`), job `endurance (loopback)` (`137725714467`) failed in step 9 (`soak`) because `benchmarks/endurance/endurance.py:2950` creates `workspaces-w0` with `os.makedirs(..., exist_ok=True)` (mode `0755` under default `ubuntu-latest` umask instead of `0700`); `schedule` event does not reset the Q80 push streak, and `TEST-26` remains `0/2` green scheduled runs.
 - 2026-11-24: TEST-91 Implemented (pull request 434, branch `win/s9-gpu-stability-record`, claimed via `claims/item/TEST-91`, text moved to the archive): Local S9.1–S9.5 passed on PR #424 head `055ca0c7` [open] on Windows case PC (`NVIDIA GeForce RTX 5060 Ti`, `16311 MiB`, driver `621.24`, `14` physical / `20` logical cores, `rustc 1.96.0`): `443/443` warm-up + `50/50` `RUSTY_GRID_REQUIRE_GPU=1` `rusty_grid_worker --features gpu-wgpu` runs (`96.203–106.968 s`, median `96.757 s`, total `4,891.748 s`), `3 + 3` `gemm_bench` runs (`1024` GPU median `3–4 ms` / CPU `397–401 ms`; `2048` GPU median `19–21 ms` / CPU `3419–3733 ms`), `20/20` loopback `--type gpu --gpu` GEMM (`VERIFIED_OK`), `triposr` `high` placed on `win-gpu` only vs `auto`/`sdf` running on `win-cpu`, and killing `win-gpu` mid-`8192x8192` GEMM requeued without CPU fallback and finished on restarted `win-gpu` (`1143 ms`, `VERIFIED_OK`). Stage B W6 cross-machine verification passed on `720106d8` across Mac lab master + `win-case-lab` (`--isolation fs --gpu --vram-mb 16311 --workspaces --no-portal`) + `mac-lab-worker` + `linux-docker-lab` (`3-worker doctor`: `15/0/0/0`, `C5 GPU probe`: `512x512` in `4 ms`, `67.1 GFLOP/s`; `20/20` `--type gpu --gpu --require-isolation fs` on `win-case-lab` with `VERIFIED_OK`; unpinned `triposr` `high` routed strictly to `win-case-lab`; `sdf` exited `0` in `78 ms`).
+- 2026-11-24: TEST-85 Implemented (pull request 417 + pull request 430, branch `win/test-85-windows-50-runs`, text moved to the archive): confirmed `50/50` consecutive passes on clean `origin/master` `720106d8` under `4` Python CPU busy loops on Windows (`14` physical / `20` logical cores, isolated NTFS temp/home, `rustc 1.96.0`; wall `2.34–2.88 s`, median `2.55 s`, total `127.69 s`; `compile_wall_ms` `1078–1532`, median `1247.0`; `exec_ms` `555–667`, median `581.5`), and verified all `14` subsequent `master` push CI runs after `44747726996` (`44755048283` through `45261621774`, including all `8` runs from pull request 417 onward) passed `100%` of `windows-latest` jobs through the Q80 window so far.

@@ -3805,6 +3805,39 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
      - Unpinned `--type 3d --engine triposr --quality high --prompt "w6 test cube"`: routed strictly to `win-case-lab` (`0` runs on CPU workers `mac-lab-worker` / `linux-docker-lab`), exited `1` in `22 ms` with expected `"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"`.
      - `--type 3d --engine sdf --prompt "w6 test cube" --worker win-case-lab`: exited `0` in `78 ms`, `"Tier 0 procedural SDF mesh generated: 9992 vertices, 15224 triangles in 78 ms"` (`4,608,376`-byte GLB).
 - **Status:** Implemented (2026-11-24, pull request 434).
+### TEST-85: Windows: the `submit --type compile` runtime test times out after 60 s
+- **Evidence:** CI run `44747726996` (push of pull request 407 to `master`, 2026-11-20 13:49 UTC), job
+  `gpu-wgpu (windows-latest)` (`136327278116`), step `cargo test -p rusty_grid_cli --lib --features gpu-wgpu`:
+  `cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo`
+  (`crates/cli/src/cli_app/runtime_tests.rs`) printed "Timed out after 60s waiting for task ... to complete" and
+  panicked at the assertion "submit --type compile must succeed" (`ExitCode(1)`). 200 other tests of the step passed.
+  It is the last failing test on `master` before the Q80 streak counted from 2026-11-20.
+- **Problem:** The test builds a real crate with a local path dependency through `cargo` on a worker. A cold
+  `cargo build` on a hosted Windows runner can take longer than the 60 s wait of `submit`. The cause (a wait that is
+  too short, or a task that hangs) is not known.
+- **Do:**
+  1. Read the test and the wait it uses (`submit_args`, `run_submit_with_secret`, the `--wait` budget of `submit`).
+  2. On Windows, run the test alone and in the whole `rusty_grid_cli --lib --features gpu-wgpu` binary 20 times each,
+     the second set under 4 busy loops; record each task's `execution_time_ms` and whether `cargo` was still running
+     at the timeout.
+  3. If the task finishes but late, give the test a budget that cannot be the cause (at least 600 s), keep every
+     assertion, and print the time. If the task hangs, follow rule 4: a test that fails without the fix, then the fix.
+- **Done when:** The cause is found, or the test passes 50 runs in a row on Windows under 4 busy loops and stays green in CI on `windows-latest` through the Q80 streak window.
+- **Partial (2026-11-23, pull request 417, commit `b0d4058f`):**
+  - **Cause (not found):** The CI failure was a `60` s timeout (`crates/cli/src/cli_app/submit.rs` `:1049`, `:1220`, `:1232`: `submit --type compile` forces `wait = true` and defaults `timeout_secs` to `60` s when `--timeout-secs` is omitted, unless `--workspace` is set) on a task whose local path-dependency build normally completes in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on the case PC). A task that short reaching a `60` s deadline looks like a stall rather than a slow build; the underlying cause did not reproduce locally on the case PC and remains unfound.
+  - **Fix (`crates/cli/src/cli_app/runtime_tests.rs`):** kept the product default `60` s untouched, passed `--timeout-secs 600` in the test's `submit_args` as a hang guard, widened the worker-registration `deadline` from `10` s to `60` s, and printed `TEST-85 compile_wall_ms=... exec_ms=...` with every assertion preserved so any repeat shows whether the task was slow or stuck. Stays `Partial` until the cause is found or `windows-latest` stays green through the Q80 streak window.
+  - **Baseline (`origin/master` `6a9060ba`, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.98.1`, isolated NTFS `USERPROFILE`/`HOME`/`TEMP` under `C:\ox_tmp\s1`):**
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (solo, `0` busy loops): `20/20` passed (wall `3.48–6.66` s, median `3.55` s; `exec_ms` `458–505`, median `470`).
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu` (full binary, `4` Python CPU busy loops): `20/20` passed (`228` tests/run; wall `13.00–13.12` s, median `13.06` s).
+  - **Post-fix (`b0d4058f`, same machine and isolated NTFS `USERPROFILE`/`HOME`/`TEMP`):**
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (`4` Python CPU busy loops): `50/50` passed (wall `3.91–4.52` s, median `4.06` s; `compile_wall_ms` `523–619`, median `551`; `exec_ms` `341–431`, median `360`).
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu`: `228/228` passed (`10.04` s); `cargo fmt --all -- --check`, `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings`, `cargo +1.96.0 clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+- **Implemented (2026-11-24, pull requests 417 and 430, branch `win/test-85-windows-50-runs`, commit `720106d8`):**
+  - **50-run loaded loop (`720106d8`, `git status --porcelain` empty, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`OXIDESWARM_HOME`/`TEMP`/`TMP` under `C:\ox_tmp\w4_test85`):**
+    - `cargo +1.96.0 test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` under `4` Python CPU busy loops: `50/50` passed (`0` failures; wall `2.34–2.88 s`, median `2.55 s`, total `127.69 s`; `compile_wall_ms` `1078–1532`, median `1247.0`; `exec_ms` `555–667`, median `581.5`).
+  - **`master` `windows-latest` CI history since 2026-11-20 (`gh run list --branch master --event push --workflow ci.yml`):**
+    - `44747726996` (`2026-11-20T13:49:38Z`, `a5da4a97`): `gpu-wgpu (windows-latest)` failed on TEST-85.
+    - All `14` subsequent `master` push CI runs (`44755048283` at `2026-11-20T14:36:15Z` through `45261621774` at `2026-11-23T20:39:25Z`, including all `8` runs from pull request 417 `8e55dac9` on `2026-11-23T07:54:04Z` onward; note `45261621774` still had non-Windows jobs queued/in progress at capture time) passed `100%` of `windows-latest` jobs (`gpu-wgpu`, `unit tests`, `workspace tests`, `clippy`, `agent bridge`). (Overall non-Windows `master` failures in that span were `44755048283` and `45250047708` cancelled `launcher scripts (macos-latest)`, and `45054272288` `workspace tests (macos-latest)` TEST-86.)
 
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
