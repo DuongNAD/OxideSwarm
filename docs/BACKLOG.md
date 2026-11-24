@@ -513,6 +513,32 @@ The full suite must pass on a clean machine before CI can require it.
   and concurrent `40 + 40 MiB` uploads naming `--blob-store-mb`, `0` tmp leftovers). `T1 (8 GiB)`,
   `T2 (100,000 files)`, `T5`, `T9`, and two-machine `lan-tcp` / `lan-quic` / `quic-relay` links
   remain for step 2.
+- **Progress (2026-11-24, step 2 loopback missing + two-machine `lan-tcp` at `cb25d6f4`):** Added two-machine
+  remote master support (`--master`, `--secret-file`, `--target-worker`, `--master-pid`,
+  `--master-blob-dir`, `--master-log`, `throttle`, `@ticket_file`) and `state:busy` eligibility fix
+  in `benchmarks/endurance/endurance.py` (`tests/test_endurance_harness.py` `22/22`), and recorded:
+  1. **macOS `aarch64` loopback missing scenarios (`benchmarks/endurance/results/2026-11-23-loopback-macos-arm64-apple-m5.json`, Apple M5, `rusty-grid 0.4.4`):** `4/4` PASS:
+     `T1` (`1 GiB` `4.743 s`, `3 GiB` `15.683 s`, `8 GiB` `43.513 s`), `T2` (`100,000` files, `869,791,259 B`,
+     `100,001` blobs, `598.149 s`), `T5` (`64 MiB` TCP proxy cut at `33,587,867 B`, resubmit `64 MiB` in `0.351 s`),
+     and `T9` (`3 GiB` x `3` sequential tasks verified).
+  2. **Two-machine `lan-tcp` (`benchmarks/endurance/results/2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, Mac master -> Windows case PC `--isolation off`, Windows Defender real-time protection on, measured ping RTT `9.028 ms`, `rusty-grid 0.4.4`):** `9/9` PASS (`T1`–`T9`):
+     `T1` (`1 GiB` `19.714 s` / `51.943 MiB/s`, `3 GiB` `60.255 s` / `50.983 MiB/s`, `8 GiB` `201.483 s` /
+     `40.659 MiB/s`; master peak RSS delta `+0.20 MiB`, client `-0.34 MiB` vs `128 MiB` bound),
+     `T2` (`100,000` files, `869,019,579 B`, `581.938 s`, `100,001` blobs, master peak RSS `92.0 MiB`),
+     `T3` (`1,000 MiB` `19.663 s` ok; `1,100 MiB` refused naming `--output-limit-mb` in `3.072 s`),
+     `T4` (second `3 GiB` submit uploaded `0` blobs / `0 B` in `52.104 s`),
+     `T5` (`64 MiB` TCP proxy cut at `33,555,566 B`, resubmit uploaded `67,108,864 B` in `1.312 s`),
+     `T6` (`64 MiB` via Windows `12 Mbit/s` `ThrottleProxy` cut at `236,193 B` on `.part` creation, requeued &
+     completed in `5.353 s`, `2` master failover/disconnect log hits, `0` `.part` leftovers in `cache/blobs/tmp`),
+     `T7` (`256 MiB` in + `256 MiB` out via Windows `2.0 Mbit/s` / `50 ms` RTT `ThrottleProxy` finished in
+     `2,160.519 s` with `worker_reaped = false`, `0` reap log hits, output BLAKE3 `ae3cf061...` verified),
+     `T8` (secondary `:18189` master `--blob-store-mb 64` + `win-t8-lab` refused `72 MiB` in `0.046 s` and second
+     concurrent `40 MiB` upload naming `--blob-store-mb` while completing the first, `0` tmp leftovers), and
+     `T9` (`3 GiB` x `3` sequential tasks `61.953 s` / `52.873 s` / `53.029 s`, all verified).
+  Remains `Partial | In` pending `lan-quic` and `quic-relay` two-machine runs and `Q58` answer (per `AGENT_RULES.md`
+  Rule 2, active P2P tickets are never placed on Google Drive and await owner ticket carry; `quic-relay` also
+  needs separate-network routing because `iroh` on the same LAN upgrades direct QUIC connections and exposes
+  no CLI relay-only switch).
 
 ### TEST-25: Run a cluster for 24 hours under load and faults
 
@@ -2488,3 +2514,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-94 claimed (`claims/item/TEST-94__win__20261124T050706936668Z__0c244bab.json`) and Implemented (`win/test-94-cli-env-lock`): Stage E `E-W3` on Windows (`abff2514`) failed `2/30` runs (`06` and `23`) of `cargo +1.96.0 test --locked -p rusty_grid_cli --lib --features gpu-wgpu` in `test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config_or_aliases` from a parallel env-var race with `cli_app::runtime_tests::test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` setting `RUSTY_GRID_WIRE_CODEC=xml`. Added shared `crate::test_env_lock` (`lock_async`, `lock_blocking`, `ScopedEnvVar`) in `crates/cli/src/lib.rs`, serialized all env-mutating and env-reading CLI runtime tests across `cli_app::runtime_tests`, `cli_app::tests`, and `connect.rs`, and verified `50/50` consecutive loaded runs on Windows under `4` CPU busy loops (`229 passed; 0 failed` per run; min `14.547s`, median `14.734s`, max `16.078s`, total `741.984s`); text moved to `docs/BACKLOG-ARCHIVE.md` (index recount deferred to Stage D `M9`).
 - 2026-11-24: TEST-87 Implemented (pull request 429, branch `win/test-87-portal-lan-bind`, text moved to the archive): reproduced the `AddrInUse` false failure first, updated `crates/worker/src/client/tests.rs` (`assert_portal_not_listening_on_lan`, keeping the `127.0.0.1` check) to probe `GET /api/status` on `AddrInUse` and fail only on the worker portal JSON body (plus negative control rejecting a live portal); passed `50/50` runs of `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops on Windows (`ff832b0e`, `14` physical / `20` logical cores, `83` tests/run, `6.72–7.91 s`, median `6.81 s`, total `342.20 s`) and `50/50` runs under `4` Python CPU busy loops on Apple Silicon M5 macOS (`d3103d30`, `agent-mac-ag`, `10` logical cores, `84` tests/run, `9.52–11.65 s`, median `9.75 s`, total `490.43 s`).
 - 2026-11-24: AX-1 Implemented (`mac/ax1-ax2-live-records`, text moved to `docs/BACKLOG-ARCHIVE.md`) via live 3-OS MCP `submit` matrix call (`os=macos,windows,linux` over `--workspace ax1-live-2026-11-24`, `3/3` cells passed in `102.221 s`, `machines = 3`, `0` failed cells); AX-2 updated (`Partial | In`) with the 3-worker LAN TCP + Docker Linux live record `benchmarks/grid/results/2026-11-24-r2-m1-3workers-macos-windows-linux.json` (Spike R2 `27.18 %` savings triggering the `< 30 %` stop rule; Measure M1 `0.6499x` at `--count 3` and `0.5928x` at `--count 6`). Index recount deferred to stage D (`M9`).
+- 2026-11-24: TEST-24 Partial updated (`mac/test-24-two-machines`): added Mac loopback missing scenarios (`2026-11-23-loopback-macos-arm64-apple-m5.json`, `T1 8 GiB`/`T2 100k`/`T5`/`T9`, `4/4` PASS) and two-machine `lan-tcp` record (`2026-11-24-lan-tcp-macos-arm64-to-windows-amd64.json`, `T1`–`T9`, `9/9` PASS, `worker_reaped = false` on `T7`); `lan-quic`/`quic-relay` and `Q58` await owner P2P ticket carry (`AGENT_RULES.md` Rule 2) and separate-network routing. Index recount deferred to stage D (`M9`).
