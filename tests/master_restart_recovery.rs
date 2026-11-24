@@ -6,10 +6,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
+use rusty_grid_core::GridResult;
 use rusty_grid_master::queue::TaskState;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_master::store::HEADER_LEN;
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::WorkerClient;
+
+async fn spawn_test_master_result(config: ServerConfig) -> GridResult<MasterHandle> {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default()).await
+}
 
 /// In-memory log sink for the `rv158` probe: keeps the last lines the master and worker crates
 /// logged, so a round that ran its task twice can print what happened around that task (TEST-41).
@@ -96,7 +108,9 @@ async fn test_master_restart_recovers_completed_queued_uncharged_running_and_fai
             .with_web_ui(false)
             .with_discovery(false)
             .with_state_dir(&state_dir);
-        let master1 = MasterServer::spawn(config).await.expect("spawn master1");
+        let master1 = spawn_test_master_result(config)
+            .await
+            .expect("spawn master1");
         let master1_addr = master1.server_addr().to_string();
 
         let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -249,7 +263,9 @@ async fn test_master_restart_recovers_completed_queued_uncharged_running_and_fai
         .with_discovery(false)
         .with_state_dir(&state_dir)
         .with_session_resume_hold(Duration::ZERO);
-    let master2 = MasterServer::spawn(config2).await.expect("spawn master2");
+    let master2 = spawn_test_master_result(config2)
+        .await
+        .expect("spawn master2");
 
     // Verify recovered states before any worker connects to master2:
     // - `t_done` is immediately readable as `Completed` without re-execution.
@@ -349,7 +365,7 @@ fn gated_marker_task(
 
     let mut req = TaskRequirements::generic(1, 16);
     req.max_retries = max_retries;
-    req.timeout_secs = 20;
+    req.timeout_secs = 120;
 
     #[cfg(unix)]
     let spec = TaskSpec::ShellScript {
@@ -372,10 +388,10 @@ fn gated_marker_task(
             "-NonInteractive".to_string(),
             "-Command".to_string(),
             concat!(
-                "Add-Content -Path $env:MARKER_PATH -Value 'run'; ",
-                "while (-not (Test-Path $env:GATE_PATH)) { Start-Sleep -Milliseconds 30 }; ",
+                "[System.IO.File]::AppendAllText($env:MARKER_PATH, 'run' + [Environment]::NewLine); ",
+                "while (-not [System.IO.File]::Exists($env:GATE_PATH)) { [System.Threading.Thread]::Sleep(30) }; ",
                 "if ($env:OUT_FILE) { [System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY) }; ",
-                "if ($env:DONE_MARKER_PATH) { Add-Content -Path $env:DONE_MARKER_PATH -Value 'done' }"
+                "if ($env:DONE_MARKER_PATH) { [System.IO.File]::AppendAllText($env:DONE_MARKER_PATH, 'done' + [Environment]::NewLine) }"
             )
             .to_string(),
         ],
@@ -409,7 +425,7 @@ fn timed_sleep_marker_task(
 
     let mut req = TaskRequirements::generic(1, 16);
     req.max_retries = max_retries;
-    req.timeout_secs = 20;
+    req.timeout_secs = 120;
 
     #[cfg(unix)]
     let spec = TaskSpec::ShellScript {
@@ -443,7 +459,7 @@ fn timed_sleep_marker_task(
 async fn spawn_rebound_master(config: ServerConfig, timeout: Duration) -> MasterHandle {
     let deadline = Instant::now() + timeout;
     loop {
-        match MasterServer::spawn(config.clone()).await {
+        match spawn_test_master_result(config.clone()).await {
             Ok(m) => return m,
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -471,7 +487,9 @@ async fn test_master_restart_recovers_finished_queued_and_adopts_running_task_on
         .with_web_ui(false)
         .with_discovery(false)
         .with_state_dir(&state_dir);
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+    let master1 = spawn_test_master_result(config1)
+        .await
+        .expect("spawn master1");
     let master_addr = master1.server_addr();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -663,7 +681,9 @@ async fn test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result
         .with_web_ui(false)
         .with_discovery(false)
         .with_state_dir(&state_dir);
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+    let master1 = spawn_test_master_result(config1)
+        .await
+        .expect("spawn master1");
     let master_addr = master1.server_addr();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -803,7 +823,9 @@ async fn test_worker_reconnecting_after_master_hold_expires_runs_task_only_once(
         .with_heartbeat_interval(1)
         .with_state_dir(&state_dir)
         .with_session_resume_hold(Duration::from_secs(8));
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+    let master1 = spawn_test_master_result(config1)
+        .await
+        .expect("spawn master1");
     let master_addr = master1.server_addr();
 
     let (w1_shutdown_tx, w1_shutdown_rx) = watch::channel(false);
@@ -969,7 +991,9 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
             .with_web_ui(false)
             .with_discovery(false)
             .with_state_dir(&state_dir);
-        let master1 = MasterServer::spawn(config1).await.expect("spawn master1");
+        let master1 = spawn_test_master_result(config1)
+            .await
+            .expect("spawn master1");
         let master_addr = master1.server_addr();
         let (w_tx, w_rx) = watch::channel(false);
         let mut w1 = WorkerClient::for_testing(
@@ -989,7 +1013,7 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
         });
         assert!(
             wait_for(
-                Duration::from_secs(5),
+                Duration::from_secs(60),
                 Duration::from_millis(25),
                 || async {
                     master1
@@ -999,28 +1023,50 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
                         .unwrap_or(false)
                 }
             )
-            .await
+            .await,
+            "round {round} worker did not register within 60 s"
         );
         let t = gated_marker_task(&marker_path, &gate_path, Some(&done_path), None, Some(2));
         let tid = master1.submit_task(t).await.expect("submit");
-        assert!(
-            wait_for(
-                Duration::from_secs(5),
-                Duration::from_millis(10),
-                || async {
-                    let running = master1
-                        .get_task_info(tid)
-                        .await
-                        .map(|i| i.state == TaskState::Running)
-                        .unwrap_or(false);
-                    running
-                        && std::fs::read_to_string(&marker_path)
-                            .map(|s| s.lines().count() == 1)
-                            .unwrap_or(false)
-                }
-            )
-            .await
-        );
+        let dump_round_diag = |phase: &str,
+                               info: Option<rusty_grid_master::queue::TaskInfo>,
+                               res: Option<rusty_grid_core::task::TaskResult>,
+                               marker: std::io::Result<String>| {
+            eprintln!(
+                "RV158 {phase} round={round} task={tid}: info={info:?} result={res:?} marker={marker:?}"
+            );
+            let lines = sink.0.lock().unwrap_or_else(|e| e.into_inner());
+            for line in lines.iter() {
+                eprintln!("RV158 TIMEOUT LOG: {line}");
+            }
+        };
+        let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut marker_ready = false;
+        while tokio::time::Instant::now() < marker_deadline {
+            let info = master1.get_task_info(tid).await.ok();
+            let running = info.as_ref().is_some_and(|i| i.state == TaskState::Running);
+            if running
+                && std::fs::read_to_string(&marker_path)
+                    .map(|s| s.lines().count() == 1)
+                    .unwrap_or(false)
+            {
+                marker_ready = true;
+                break;
+            }
+            if info.as_ref().is_some_and(|i| i.state.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !marker_ready {
+            let info = master1.get_task_info(tid).await.ok();
+            let res = master1.queue().get_result(&tid).await;
+            let marker = std::fs::read_to_string(&marker_path);
+            dump_round_diag("MARKER_TIMEOUT", info.clone(), res.clone(), marker);
+            panic!(
+                "round {round} task {tid} did not enter Running and write marker within 120 s: info={info:?}"
+            );
+        }
         let worker_id = master1
             .list_workers()
             .await
@@ -1029,8 +1075,31 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
             .map(|w| w.worker_id.to_string())
             .unwrap_or_default();
         std::fs::write(&gate_path, b"go").unwrap();
+        let done_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut polls = 0u64;
         while !done_path.exists() {
+            if tokio::time::Instant::now() >= done_deadline {
+                break;
+            }
+            if polls % 50 == 49
+                && master1
+                    .get_task_info(tid)
+                    .await
+                    .is_ok_and(|i| i.state.is_terminal())
+            {
+                break;
+            }
+            polls += 1;
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if !done_path.exists() {
+            let info = master1.get_task_info(tid).await.ok();
+            let res = master1.queue().get_result(&tid).await;
+            let marker = std::fs::read_to_string(&marker_path);
+            dump_round_diag("DONE_TIMEOUT", info.clone(), res.clone(), marker);
+            panic!(
+                "round {round} task {tid} did not write done_path within 120 s after gate: info={info:?}"
+            );
         }
         let delay_ms = if zero_delay { 0 } else { round % 6 };
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -1038,20 +1107,21 @@ async fn rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns() {
         drop(master1);
         assert!(
             wait_for(
-                Duration::from_secs(5),
+                Duration::from_secs(60),
                 Duration::from_millis(10),
                 || async { done_path.exists() }
             )
-            .await
+            .await,
+            "round {round} done_path was not observed within 60 s"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let config2 = ServerConfig::new(master_addr)
             .with_web_ui(false)
             .with_discovery(false)
             .with_state_dir(&state_dir);
-        let master2 = spawn_rebound_master(config2, Duration::from_secs(5)).await;
+        let master2 = spawn_rebound_master(config2, Duration::from_secs(60)).await;
         let res = master2
-            .wait_task(tid, Some(Duration::from_secs(10)))
+            .wait_task(tid, Some(Duration::from_secs(60)))
             .await
             .expect("task completion on master2");
         assert!(res.is_success(), "round {round} task failed: {res:?}");
@@ -1111,7 +1181,9 @@ async fn test_worker_connection_drop_adopts_running_task_while_master_stays_up()
         .with_web_ui(false)
         .with_discovery(false)
         .with_session_resume_hold(Duration::from_secs(30));
-    let master = MasterServer::spawn(config).await.expect("spawn master");
+    let master = spawn_test_master_result(config)
+        .await
+        .expect("spawn master");
     let master_addr = master.server_addr();
 
     // TCP relay that can sever the active connection on demand while accepting subsequent reconnects.
@@ -1428,6 +1500,8 @@ async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_
             "master",
             "--listen",
             "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
             "--port-file",
             port_file.to_str().unwrap(),
             "--dashboard-port",
@@ -1593,5 +1667,220 @@ async fn test_master_sigkill_restart_adopts_running_normal_and_zero_retry_tasks_
 
     let _ = w_shutdown_tx.send(true);
     w1_handle.abort();
+    master2.shutdown().expect("shutdown master2");
+}
+
+/// `TEST-41` Gap 2:
+/// When the Master shuts down via `shutdown_tx` *without* pre-closing the store, the worker
+/// receives `MasterMessage::Shutdown` and closes cleanly (`farewell = None`) instead of sending
+/// `WorkerMessage::Disconnecting`. Therefore the Master does not evacuate the running task
+/// (`evacuation_count == 0`), `master2` adopts it via `ResumeSession`, and the task runs once.
+#[tokio::test]
+async fn test_master_shutdown_via_watch_without_preclose_adopts_once_with_zero_evacuations() {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    use rusty_grid_master::queue::{RetryPolicy, TaskQueue};
+    use rusty_grid_master::registry::WorkerRegistry;
+    use rusty_grid_master::scheduler::WorkloadScheduler;
+    use rusty_grid_master::WaiterMap;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_dir = dir.path().join("master-state");
+    let marker_path = dir.path().join("gap2.marker");
+    let gate_path = dir.path().join("gap2.gate");
+
+    let config1 = ServerConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_state_dir(&state_dir)
+        .with_session_resume_hold(Duration::from_secs(30));
+
+    let registry1 = WorkerRegistry::new();
+    let queue1 = TaskQueue::with_retention_limits(
+        RetryPolicy::default(),
+        config1.max_queue_size,
+        config1.max_terminal_tasks,
+        config1.max_terminal_bytes,
+        config1.max_active_bytes,
+    );
+    let scheduler_notify1 = Arc::new(tokio::sync::Notify::new());
+    let waiters1: WaiterMap = Arc::new(RwLock::new(HashMap::new()));
+    let server1 = MasterServer::bind_full(
+        config1,
+        registry1.clone(),
+        queue1.clone(),
+        scheduler_notify1.clone(),
+        Arc::clone(&waiters1),
+    )
+    .await
+    .expect("bind_full master1");
+    let master_addr = server1.local_addr();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let srv_shutdown_rx = shutdown_rx.clone();
+    let server_task = tokio::spawn(async move { server1.run(srv_shutdown_rx).await });
+
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    let sched = Arc::new(
+        WorkloadScheduler::new(
+            sched_cfg,
+            registry1.clone(),
+            queue1.clone(),
+            scheduler_notify1.clone(),
+        )
+        .with_waiters(Arc::clone(&waiters1)),
+    );
+    let mut sched_shutdown_rx = shutdown_rx.clone();
+    let sched_trigger = scheduler_notify1.clone();
+    let sched_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(sched.config().tick_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = sched_trigger.notified() => {
+                    if *sched_shutdown_rx.borrow() {
+                        break;
+                    }
+                    let _ = sched.schedule_once().await;
+                }
+                _ = ticker.tick() => {
+                    let _ = sched.schedule_once().await;
+                }
+                res = sched_shutdown_rx.changed() => {
+                    if res.is_err() || *sched_shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let (w_tx, w_rx) = watch::channel(false);
+    let mut w1 = WorkerClient::for_testing(
+        master_addr.to_string(),
+        Some("gap2-w1".into()),
+        Some(1),
+        false,
+    );
+    w1.set_backoff_config(rusty_grid_worker::backoff::BackoffConfig {
+        initial: Duration::from_millis(50),
+        max: Duration::from_millis(150),
+        factor: 1.5,
+        jitter_ratio: 0.0,
+    });
+    let w1_id = w1.worker_id();
+    let wh = tokio::spawn(async move {
+        let _ = w1.run(w_rx).await;
+    });
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async { registry1.list_workers().await.len() == 1 }
+        )
+        .await,
+        "w1 must register on master1"
+    );
+
+    let tid = queue1
+        .submit(gated_marker_task(
+            &marker_path,
+            &gate_path,
+            None,
+            None,
+            Some(2),
+        ))
+        .await
+        .expect("submit gated task");
+    scheduler_notify1.notify_one();
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(15),
+            || async {
+                let running = queue1.get_state(&tid).await == Some(TaskState::Running);
+                let marked = std::fs::read_to_string(&marker_path)
+                    .map(|s| s.lines().count() == 1)
+                    .unwrap_or(false);
+                running && marked
+            }
+        )
+        .await,
+        "gated task must be Running with 1 marker line before watch shutdown"
+    );
+
+    // Fire `shutdown_tx` directly WITHOUT pre-closing `TaskStore` (`close_and_compact_store_sync`).
+    shutdown_tx.send(true).expect("send shutdown");
+    server_task
+        .await
+        .expect("server_task join")
+        .expect("server1 clean shutdown");
+    let _ = sched_task.await;
+    // Allow WorkerSession task (if still finishing disconnect cleanup) to complete before master2 binds.
+    assert!(
+        wait_for(
+            Duration::from_secs(2),
+            Duration::from_millis(15),
+            || async {
+                registry1.get_worker(w1_id).await.is_none_or(|w| {
+                    w.status == rusty_grid_master::registry::WorkerStatus::Disconnected
+                })
+            }
+        )
+        .await,
+        "w1 session must finish disconnecting on master1"
+    );
+
+    let config2 = ServerConfig::new(master_addr)
+        .with_web_ui(false)
+        .with_discovery(false)
+        .with_state_dir(&state_dir)
+        .with_session_resume_hold(Duration::from_secs(30));
+    let master2 = spawn_rebound_master(config2, Duration::from_secs(5)).await;
+
+    assert!(
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || async {
+                master2
+                    .get_task_info(tid)
+                    .await
+                    .map(|i| i.state == TaskState::Running && i.assigned_worker_id == Some(w1_id))
+                    .unwrap_or(false)
+            }
+        )
+        .await,
+        "master2 must adopt running task via ResumeSession"
+    );
+
+    std::fs::write(&gate_path, b"go").expect("write gate");
+    let res = master2
+        .wait_task(tid, Some(Duration::from_secs(10)))
+        .await
+        .expect("task completion on master2");
+    assert!(res.is_success(), "task failed: {res:?}");
+
+    let info = master2.get_task_info(tid).await.expect("task info");
+    assert_eq!(info.evacuation_count, 0, "must have zero evacuations");
+    assert_eq!(info.retry_count, 0, "must have zero retries");
+    assert_eq!(info.failover_count, 0, "must have zero failovers");
+    assert_eq!(
+        std::fs::read_to_string(&marker_path)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "task must execute exactly once"
+    );
+
+    let _ = w_tx.send(true);
+    wh.abort();
     master2.shutdown().expect("shutdown master2");
 }

@@ -347,7 +347,14 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     let port_file = master_home.path().join("master.port");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file);
     let master = Service::spawn(master_cmd, master_home.path().join("master.log"));
 
@@ -1145,6 +1152,8 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
             "127.0.0.1:0",
             "--auth",
             "members",
+            "--max-host-cpu-pct",
+            "100",
             "--port-file",
         ])
         .arg(&port_file_m);
@@ -1215,7 +1224,15 @@ fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
     let ticket_file = master_home.path().join("master.ticket");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--p2p", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--p2p",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .arg("--p2p-ticket-file")
         .arg(&ticket_file);
@@ -1378,7 +1395,14 @@ fn start_master(home: &Path, extra_args: &[&str]) -> (Service, String) {
     let log_file = home.join(format!("master-{id}.log"));
     let mut master_cmd = cli(home);
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .args(extra_args);
     let master = Service::spawn(master_cmd, log_file);
@@ -1895,6 +1919,8 @@ fn test_n1_readonly_home_secret_only_master_and_n2_d6_named_worker_v2_to_v3_and_
             "127.0.0.1:0",
             "--auth",
             "secret",
+            "--max-host-cpu-pct",
+            "100",
             "--port-file",
         ])
         .arg(&port_file_ro);
@@ -2001,7 +2027,15 @@ fn test_n1_readonly_home_secret_only_master_and_n2_d6_named_worker_v2_to_v3_and_
     let ticket_file = master_home.path().join("master.ticket");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--p2p", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--p2p",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .arg("--p2p-ticket-file")
         .arg(&ticket_file);

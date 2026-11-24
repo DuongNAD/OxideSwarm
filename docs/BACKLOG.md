@@ -173,6 +173,21 @@ and SEC-17 added, the table holds 215 items: 143 Implemented, 18 Partial and 54 
 Then TEST-56 (pull request 361, open; its `Line` value `In` stays until merged): 216 distinct items, 144 Implemented, 18 Partial and 54 Planned; 26 remaining open items are In and 46 are Out.
 Then BENCH-9 Partial (pull request 354) and SEC-18 added: 216 items, 143 Implemented, 19 Partial and 54 Planned;
 27 open items are In and 46 are Out.
+Recounted on 2026-11-21 from the rows after items through TEST-84, APP-6, and FEAT-9 Implemented: 247 items, 172 Implemented, 21 Partial and 54 Planned; 25 open items are In and 50 are Out (TEST-56 keeps `Line` `In` while pull request 361 is marked open).
+Recounted on 2026-11-21 after LV-10 (steps 1–3) and PROTO-5 Partial: 247 items, 172 Implemented, 23 Partial and 52 Planned; 25 open items are In and 50 are Out.
+Recounted on 2026-11-21 after SCHED-5 Implemented (plus SCHED-4c and SCHED-4d implemented while SCHED-4 stays Partial pending live 2-machine hardware batch): 247 items, 173 Implemented, 23 Partial and 51 Planned; 25 open items are In and 49 are Out.
+Recounted on 2026-11-22 after Wave 2 (`FEAT-5` and `MESH-2` Implemented and archived, `AX-1` Partial, `TEST-41` and `TEST-61` updated): 247 items, 175 Implemented, 24 Partial and 48 Planned; 25 open items are In and 47 are Out.
+Recounted on 2026-11-22 after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented and archived; `AX-2` Partial): 247 items, 178 Implemented, 24 Partial and 45 Planned; 25 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-85 was added (TEST-56 loses its `Line` value now that pull request 361 is merged): 248 items, 178 Implemented, 24 Partial and 46 Planned; 26 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-23, TEST-61, SEC-16 and CI-1 were closed on the owner's delegation: 248 items, 182 Implemented, 20 Partial and 46 Planned; 22 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-85 Partial (pull request 417): 248 items, 182 Implemented, 21 Partial and 45 Planned; 22 open items are In and 44 are Out.
+Recounted on 2026-11-23 after TEST-86 (In) and BUG-36 (Out) were added: 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-41 Partial (pull request 419): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-41 Partial (pull request 420): 250 items, 182 Implemented, 21 Partial and 47 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-69 Implemented (pull request 421): 250 items, 183 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-89 was added (Planned, In): 251 items, 183 Implemented, 20 Partial and 48 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 from the rows after TEST-41 Implemented (pull request 426) and TEST-87 Planned (In): 252 items, 184 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-88 was added as Implemented (pull request 424): 253 items, 185 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -223,10 +238,10 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-20 | Fix Windows disconnect stress timeouts | P1 | S | TEST-19 |  | Implemented |  | 181 |
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
-| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Partial | In | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374 (open), (design 0065) |
+| TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Implemented |  | 305, 357 |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374, (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | In | (design 0065) |
-| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Planned | In | (design 0065) |
+| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Partial | In | 382, (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Implemented |  | 283, 358 (open) |
@@ -241,7 +256,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-38 | Remove the 800 ms window from the re-dispatched task id test | P2 | S |  |  | Implemented |  | 276 |
 | TEST-39 | Wait for the `--no-shell` mesh node to register before calling it | P2 | S |  |  | Implemented |  | 278 |
 | TEST-40 | Wait for each payload in the Agent Mesh large-payload test | P2 | S |  |  | Implemented |  | 278 |
-| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Partial | In | 288, 359, 363 (open) |
+| TEST-41 | Find why a task finished during master shutdown can run twice | P1 | M |  |  | Implemented |  | 288, 359, 363, 09c3accd, 419, 420, 426 |
 | TEST-42 | Make the reaper boundary test independent of scheduler delay | P2 | S |  |  | Implemented |  | 302 |
 | TEST-43 | Show and fix the late dashboard port file of the in-process dev cluster test | P2 | S |  |  | Implemented |  | 307 |
 | TEST-44 | Remove the 1.5x wall-clock cap from the speed-aware batch test | P2 | S |  |  | Implemented |  | 304 |
@@ -256,13 +271,35 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-53 | Wait by condition in the oversized task result worker test | P2 | S |  |  | Implemented |  | 327 |
 | TEST-54 | Wait by condition in the mapreduce parallelism test | P2 | S |  |  | Implemented |  | 333 |
 | TEST-55 | Windows Home: sandbox s1 grant test without the Remote Desktop Users group | P2 | S |  |  | Implemented |  | 356 |
-| TEST-56 | Cut the time of `workspace tests (windows-latest)` without losing coverage | P1 | S | TEST-29 |  | Implemented | In | 361 (open) |
+| TEST-56 | Cut the time of `workspace tests (windows-latest)` without losing coverage | P1 | S | TEST-29 |  | Implemented |  | 361 |
 | TEST-58 | Find why the keep_sandboxes sweep test fails on macOS | P2 | S |  |  | Implemented |  | 366 (open) |
 | TEST-57 | m2 capability stress test: wait for reconnects by condition, not a fixed 1.8 s window | P2 | S |  |  | Implemented |  | 365 (open) |
 | TEST-59 | Zero-duration task test: drop the 100 ms wall-clock window | P2 | S |  |  | Implemented |  | 365 (open) |
 | TEST-60 | Windows: worker client::tests time out at 5 s under parallel load | P2 | S |  |  | Implemented |  | 378 (open) |
-| TEST-61 | macOS: hard-link isolation test control printed empty stdout | P2 | S |  |  | Partial | In | 392 (open) |
+| TEST-63 | master_limits_and_scheduling: prove MapReduce concurrency with a barrier instead of a 7 s window | P2 | S |  |  | Implemented |  | 389 (open) |
+| TEST-62 | blob_transfer_e2e: print CLI submit output on failure and harden loaded timeouts | P2 | S |  |  | Implemented |  | 390 (open) |
+| TEST-64 | worker lib process_tree_tests: wait for partial stdout by condition before cancelling | P2 | S |  |  | Implemented |  | 388 (open) |
+| TEST-65 | test_sec5_hardened_runner: condition waits for short-task pipe EOF and setsid survivor kill | P2 | S |  |  | Implemented |  | 388 (open) |
+| TEST-66 | worker_cluster_auth: drop wall-clock upper bounds on handshake timeout and shutdown tests | P2 | S |  |  | Implemented |  | 387 (open) |
+| TEST-61 | macOS: hard-link isolation test control printed empty stdout | P2 | S |  |  | Implemented |  | 392 |
 | TEST-67 | Campaign driver tests flake on Windows log appends and macOS 0.2 s submit timeout | P1 | S |  |  | Implemented |  | 394 (open) |
+| TEST-79 | scale1_simulated_worker: widen 5-20 s burst, reconnect, and drain deadlines to 60 s | P2 | S |  |  | Implemented |  | 401 (open) |
+| TEST-78 | rendezvous_discovery_e2e: widen 10-30 s command and registration deadlines to 60 s | P2 | S |  |  | Implemented |  | 400 (open) |
+| TEST-74 | m5_challenger_2_stress: wait 60 s for reduce Running on w1 and use TEST-54 MapReduce timeouts | P2 | S |  |  | Implemented |  | 398 (open) |
+| TEST-77 | e2e_cluster: widen 3-5 s worker and wait_task deadlines to 60 s | P2 | S |  |  | Implemented |  | 399 (open) |
+| TEST-73 | m4_scheduling: prove batch concurrency with a barrier and drop 1.2 s / 1.5 s wall-clock windows | P2 | S |  |  | Implemented |  | 397 (open) |
+| TEST-68 | gpu_wgpu_compute_test: replace short 3-8 s waits with 60 s condition deadlines | P2 | S |  |  | Implemented |  | 396 (open) |
+| TEST-69 | Windows AppContainer isolation tests wait too briefly under load | P1 | S |  |  | Implemented |  | 403, 421 |
+| TEST-80 | test_sec5_hardened_runner: drop 5 s wall-clock upper bounds in oversized sparse output test | P2 | S |  |  | Implemented |  | 402 (open) |
+| TEST-81 | Test masters keep 85 % host-CPU backpressure, stalling queued tasks under load | P1 | M |  |  | Implemented |  | 404 (open) |
+| TEST-82 | `rusty_grid_worker`: replace wall-clock upper bounds and bound `scale1` status queries | P2 | M |  |  | Implemented |  | 405 (open) |
+| TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
+| TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
+| TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
+| TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
+| TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
+| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
+| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -287,12 +324,12 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | MOB-1 | Fix the adaptive keepalive | P1 | S | INT-4 |  | Implemented |  | 98 |
 | MOB-2 | Keep thermal state on the master | P1 | M | INT-4 |  | Implemented |  | 99 |
 | MOB-3 | Do not charge evacuation to retry budgets | P2 | S | INT-4 |  | Implemented |  | 108 |
-| 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Planned | Out |  |
-| 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Planned | Out |  |
+| 3D-2 | Wire VRAM and Blender routing | P2 | M | BUG-3 |  | Implemented |  | (design 0105) |
+| 3D-3 | Make AutoRig options real or refuse them | P2 | M | SEC-5 |  | Implemented |  | (design 0106) |
 | MR-1 | Let a CLI user ship a mapper and reducer | P2 | S | INT-4 |  | Implemented |  | 33 |
 | MESH-1 | Make `wss://` work in the Rust mesh client | P2 | S | INT-4 |  | Implemented |  | 94 |
-| MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 |  | Planned | Out |  |
-| MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Partial | Out | 114, 132 |
+| MESH-2 | Deliver mesh data to a consumer | P2 | M | INT-4 |  | Implemented |  | ea3b5e0c, 85a53f71, 36a2d647 |
+| MESH-3 | Attach the bridge to a running master | P2 | M | INT-4 |  | Implemented |  | 114, 132, (design 0104) |
 | MODE-1 | Make `ox-mode` report only what happened | P2 | M | INT-4 |  | Implemented |  | 92 |
 | BRIDGE-1 | Repair `agent_bridge.py diagnose` | P2 | S | SEC-4 |  | Implemented |  | 77 |
 | AND-1 | Make the Android app build | P1 | M | SEC-3 | Yes | Planned | Out |  |
@@ -305,11 +342,11 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | FEAT-3 | OS-level task isolation | P2 | L | SEC-5 |  | Implemented |  | 117 (design), 133, 150, 152 |
 | FEAT-3d | cargo under Windows isolation | P2 | M | FEAT-3 |  | Implemented |  | 183 |
 | FEAT-4 | Remote workspaces for coding agents | P1 | L | MCP-2 |  | Implemented |  | 105 (design), 157, 156, 164, 166, 160, 165, 168, 170, 176, 174, 177, 186 |
-| FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Planned | Out |  |
+| FEAT-5 | Checkpoints for process tasks | P3 | L | FEAT-1 |  | Implemented |  | (design 0102), a8a51357, 06302c06, 27cf8453 |
 | FEAT-6 | Refuse the master-role claim (failover itself is SCALE-4) | P3 | L | FEAT-1 | D1 | Implemented |  | 81 |
 | FEAT-7 | Usable rendezvous discovery | P3 | M | INT-4 |  | Implemented |  | (design 0066), 224 |
 | FEAT-8 | Real protocol versioning | P2 | M | INT-4 |  | Implemented |  | 40, 110, 120 |
-| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Partial | Out | 232 (`FEAT-9a`, design 0068) |
+| FEAT-9 | GPU workloads beyond the benchmark | P3 | L | INT-4 | D6 | Implemented |  | 232 (`FEAT-9a`, design 0068) |
 | FEAT-10 | Compile crates with cargo | P3 | M | INT-4 |  | Implemented |  | 165 |
 | FEAT-11 | Remove dead code and split large modules | P3 | L | TEST-6 |  | Implemented |  | 118 (design), 125, 126, 127, 131 |
 | MAINT-1 | Split the six largest source files and cap file size in CI | P2 | L | FEAT-11 |  | Implemented |  | 211, 212, 230, 231, 242, 249, 250, 253, 259 |
@@ -329,6 +366,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | SCALE-1 | Load harness with simulated workers | P2 | L | BENCH-1 |  | Implemented |  | 222, (design 0050) |
 | SCALE-2 | Scheduler and queue at scale | P2 | L | SCALE-1 |  | Implemented |  | 227, (design 0050) |
 | SCHED-4 | Place tasks by measured worker speed and re-run stragglers | P2 | L | SCHED-1 |  | Partial | Out | 214, (design 0060) |
+| SCHED-5 | Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct | P2 | M |  |  | Implemented |  | (design 0099) |
 | SCALE-3 | Worker-to-worker blob distribution | P2 | L | SCALE-1 |  | Planned | Out |  |
 | SCALE-4 | Master high availability | P2 | L | SCALE-1, FEAT-1 |  | Planned | Out |  |
 | SCALE-5 | Autoscaling providers | P3 | L | SCALE-1, JOIN-1 |  | Planned | Out |  |
@@ -351,14 +389,14 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | NET-8 | Trusted execution environments for confidential tasks | P3 | L | NET-5 |  | Planned | Out | (design 0054) |
 | LV-1 | Fuzz targets for the parsers of untrusted bytes (first targets) | P1 | M |  |  | Implemented |  | 270, (design 0058) |
 | LV-5 | Supply chain: dependency policy, release provenance, outside checklist | P2 | M | REL-4 | Yes | Partial | In | 342, (design 0058) |
-| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Planned | Out | (design 0058) |
+| LV-10 | Citation file and a DOI per release | P2 | S | REL-4 | Yes | Partial | Out | (design 0058) |
 | LV-14 | Governance files and a licence that GitHub detects | P2 | S | REL-5 | Yes | Planned | In | (design 0058) |
 | PROTO-1 | The release-train rule for wire changes | P1 | S |  |  | Implemented |  | 262, (design 0076) |
 | PROTO-2 | A CI job that runs the newest release against the pull request's build | P1 | M | PROTO-1, REL-6 |  | Implemented |  | (design 0076) |
 | PROTO-3 | An extension slot for optional wire fields | P1 | L | PROTO-1 |  | Implemented |  | (pull request 272), (design 0082) |
 | PROTO-4 | A one-version compatibility window | P1 | L | PROTO-3 |  | Implemented |  | (pull request 274), (design 0083) |
-| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Planned | Out | (design 0083) |
-| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Partial | In | 358 (open) |
+| PROTO-5 | Keep a skew job against the release one protocol back (pinned) | P2 | M | PROTO-4 |  | Partial | Out | (design 0083) |
+| SEC-16 | Find what put a full-control entry for an unknown capability on `AppData` | P2 | S |  | Yes | Implemented |  | 358 |
 | SEC-17 | Windows workspace root: refuse a reparse point in any folder between home and the root, and hard-linked marker or lock files | P2 | S | BUG-32 |  | Implemented |  | 360 (open) |
 | SEC-18 | Windows workspace root: check every entry the DACL rewrite reaches, write the DACL through a handle, and tests that prove each walk | P2 | S | SEC-17 |  | Implemented |  | 372 (open) |
 | BUG-22 | Count cancelled tasks apart from failed tasks in `status --json` | P3 | S |  |  | Planned | In |  |
@@ -373,17 +411,19 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-31 | Report a USB-kit worker that stops after its start, with its log, and keep that log | P2 | S |  |  | Implemented |  | 341 |
 | BUG-32 | Allow the USB kit's workspace root under `-Isolation fs` | P2 | S |  |  | Implemented |  | 352 |
 | BUG-33 | macOS: the lifeline supervisor closes descriptors one by one up to the soft limit for every task | P2 | S |  |  | Implemented |  | 367 (open) |
+| BUG-34 | Clean up leftover blob-cache `.part` files of a killed worker without breaking shared sandbox bases | P2 | S |  |  | Implemented |  | 391 (open) |
 | CLI-2 | Add a flag to move or disable the UDP discovery beacon | P3 | S |  |  | Implemented |  | 275 |
-| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Partial | In | (design 0088; PR 306) |
+| CI-1 | Keep runs for pushes on `master` from ending red or cancelled without a failing test | P1 | S |  |  | Implemented |  | (design 0088; PR 306) |
 | MAINT-2 | Bring the last three files under the size cap | P2 | M | MAINT-1 |  | Implemented |  | 323, 325, 331, (design 0088) |
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
-| ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | (design 0059) |
+| ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | study kit ready (PR 393), (design 0059) |
 | ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350, (design 0059) |
 | ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
-| AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Planned | In | (design 0056) |
-| AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Planned | In | (design 0056) |
+| AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
+| AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
+| BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -423,66 +463,6 @@ These items remove ways to lose data or to run code without authorisation.
 ## Phase 2: make the tests trustworthy
 
 The full suite must pass on a clean machine before CI can require it.
-
-### TEST-23: Find why `master_restart_recovery` loses `out.txt` on Windows
-
-- **Evidence:** CI run `42817398752`, job `129833857865`, "workspace tests (windows-latest)", on
-  pull request 206 at `e1fcf70` (2026-11-10). That pull request changes only `docs/`.
-  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` panicked at
-  `tests/master_restart_recovery.rs:575` with "t_run must succeed". The result of `t_run` had
-  `exit_code: 1`, an empty `stdout`, `execution_time_ms: 746`, no outputs, and the error
-  "Output files: the task did not produce 'out.txt'". The same job passed on `master` `0354b28`,
-  on the two earlier heads of the pull request (`0266d8e`, `7af1f4d`) and on the rerun of the
-  failed job (attempt 2). Linux and macOS passed in the same run. Seen once.
-- **Problem:** The cause is not known. In the test, `t_run` starts on `w1` under the first master
-  and waits for a gate file. The first master shuts down, a second one starts on the same address
-  and `--state-dir`, `w1` reconnects, and the second master adopts `t_run` as Running. The test
-  then writes the gate file and expects `t_run` to finish with the declared output `out.txt`.
-  On Windows the task is the PowerShell command built by `gated_marker_task`, which writes the
-  file with `[System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY)` and the relative name
-  `out.txt`. Two explanations fit the message, and neither has been tested:
-  1. The test is at fault: the PowerShell command ends without writing the file where the worker
-     looks for it (the Unix variant uses a shell redirect, the Windows one a .NET call).
-  2. The product is at fault: after the worker is adopted by a restarted master, output
-     collection reads the sandbox before the file is there, or reads another sandbox. That would
-     be a defect in the recovery path of FEAT-1, not in the test.
-- **Do:**
-  1. On Windows, run `cargo test -p rusty_grid_master --test master_restart_recovery --locked`
-     in a loop under CPU load until it fails, and keep the worker and master logs of each run.
-  2. For a failing run, record the exit code of PowerShell itself, the sandbox path the worker
-     collected from, whether `out.txt` exists anywhere under the sandbox base, how many lines
-     the marker file holds, and the time from assignment to the gate file (compare it with
-     `execution_time_ms`).
-  3. If the test is at fault, change only the test, and keep every assertion. If the product is
-     at fault, follow rule 4: add a test that fails without the fix, then fix the product.
-- **Done when:** The cause is written in the status log, and the test passes 50 times in a row
-  on Windows under CPU load. If production code changed, a regression test covers the cause.
-
-- **Note (2026-11-16):** The failed result narrows the search. The worker sets `exit_code` 1
-  only when a process that exited 0 misses a declared output, and it appends its note to the
-  process's own stderr (`crates/worker/src/runner.rs:1776-1786` and `append_note` at `0354b28`).
-  The result held that note and nothing else, and `error` held only the output message. So
-  PowerShell ran the whole script, exited 0 and printed nothing: no command in it failed. Either
-  `$env:OUT_FILE` was empty in that run, or `WriteAllText` wrote `out.txt` relative to a .NET
-  current directory other than the directory the worker read. 746 ms is short for a run that spans
-  PowerShell start-up, a master restart and a reconnect, and a second run of `t_run` that started
-  after the gate was written would fit it. Step 6 of the test cannot tell the two apart: adoption
-  and a new assignment to `w1` both show `Running` with `active_tasks == 1`. A failing run should
-  therefore also record the number of `run` lines in the marker file (two means a second run), the
-  worker log line "Task assigned again while its previous run is still active"
-  (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
-  `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
-
-- **Lead (2026-11-17, pull request 288):** looping the whole `master_restart_recovery` binary on macOS under CPU load
-  (140 runs), `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` failed 9 times
-  ("uploading output files to the master failed: blob transfer failed: the connection to the master ended") and
-  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` once (`out.txt: No such file or
-  directory`, then "Output files: cannot read the task sandbox": the task sandbox was gone). Unverified hypothesis: the
-  tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
-  takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
-
-- **Implemented (2026-11-17, pull request 305, [design 0091](design/0091-restart-recovery-races.md)), Partial:** On macOS, with eight copies of the tests in parallel and twenty busy loops, the unchanged code failed `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` 3 times in 192 runs ("the connection to the master ended"). The cause is not the shared sandbox base: when the connection ended during the upload of a finished task's outputs, the worker overwrote the buffered result with the failure of that upload, and the resume sent the failure. The worker now keeps the buffered result when the session ended (0 failures in 128 runs of the same two tests). Separately, a real race in the sandbox lock was found and fixed: `open_and_try_lock_task` could keep a lock on a lock file that a sweep had just unlinked, after which a second opener could lock a fresh file, so a sweep could remove the sandbox of a running task (`sandbox::tests::test_task_lock_taken_on_an_unlinked_file_is_not_kept` fails without the fix). That race was reproduced with a hook, not in the loops, so it is not shown to be the cause of the `out.txt` failure on Windows or of the one "sandbox gone" run seen in the lead. Looping the whole binary with the fix (48 runs, twelve busy loops) showed no `out.txt` or upload failure, only two 5-second `wait_for` timeouts in other steps under that load. TEST-23 stays open until the Windows job has passed 50 runs in a row; the Windows cause is still unknown.
-- **Partial (2026-11-19, pull request 357):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1`) in 200 completed runs (0 failures) of `cargo test -p rusty_grid_master --test master_restart_recovery --locked` under 12 busy loops on 20 logical cores (about 60 %): batch 1 passed 50/50 at `979ec2c` in 1,689.1 s; an earlier 24-spinner attempt stalled on run 51 (0 runs completed, 0 failures) before pausing for BENCH-8, and a restarted batch-2 attempt with 12 spinners was stopped at 18:28:25Z for BENCH-8 after 0 completed runs (0 failures); batches 2 to 4 then ran 150 unbroken consecutive runs (3 batches of 50) at `b079dc3` in 1,429.0 s, 1,302.1 s and 1,309.0 s (5,729.2 s across the 4 measured batches; 0 `out.txt` failures and 0 test failures). The 200 passed runs therefore span the BENCH-8 interruption and two commits (`979ec2c` and `b079dc3`, whose diff touched no `crates/master`, `crates/worker` or `tests/master_restart_recovery.rs` files; 150 runs are unbroken on `b079dc3`). Running 24 normal-priority CPU spinners on 20 logical cores starved the worker's default `BELOW_NORMAL_PRIORITY_CLASS` child task processes and stalled progress without producing an `out.txt` failure, whereas 12 busy loops on 20 logical cores (about 60 %) allowed child tasks to schedule. Because zero runs failed in 200 completed loops, no Windows cause is guessed here.
 
 ### TEST-24: Test large transfers between machines
 
@@ -563,6 +543,34 @@ The full suite must pass on a clean machine before CI can require it.
   and `0` leftover PIDs or task process trees. The 24-hour 3-machine run (Mac master + two Windows
   workers, Q57) remains for step 2.
 - **Partial (2026-11-19, remote-worker mode, pull request 395):** Added remote-worker soak support for D4.3 (`benchmarks/endurance/remote_soak.py`, `endurance.py soak --master-only` and `worker-agent`, `--link lan-tcp|loopback`) using an out-of-band `--secret-file` (parsed identically to `ClusterSecret::load_file`, with permission warnings) and domain-separated mutual HMAC-SHA256 control-channel auth (`300 s` clock/nonce window, `req_nonce` + `run_id` response binding, `cmd_id` deduplication, `30 s` handler timeout + `8`-slot `503` concurrency cap, pre-auth header checks, `1 MiB` client reply cap, `--orphan-timeout 15m`, 4-op allowlist `kill_restart` / `link_cut` / `idle_snapshot` / `shutdown`, worker settings & `instance_id` checks, per-worker loopback `ThrottleProxy`, master-clock-aligned remote sample/disk/clean-stop merging with worker-labeled `leftover_pids` and strict missing-evidence failure guarantees, `is_worker_entry_connected` (`state:busy`), and `QueueFull` backoff), plus unit and loopback tests in `tests/test_endurance_harness.py`. Stays Partial until the 24-hour soak record is committed.
+- **Update (2026-11-20, 22.7 h Windows loopback soak record, branch `win/test-25-24h-soak-record`):**
+  Ran `endurance.py soak --duration 24h` (`rusty-grid 0.4.4` at `cfb0679`, `--fault-scale 1.0`,
+  `--load-scale 1.0`, `3` workers x `4` slots, `max_queue_size=64`) from `2026-11-19T14:22:47Z` to
+  `2026-11-20T13:06:33Z` (`81,826.46 s` / `22.73 h`), stopped early at owner decision with ~`1.27 h`
+  left. Assembled
+  `benchmarks/endurance/results/2026-11-19-soak-24h-loopback-windows-amd64-intel-core-i5-14600kf.json`
+  from preserved master/worker logs, live CLI status (`pending_tasks=0`, `running_tasks=0`,
+  `active_bytes=0`), `GET /api/tasks`, periodic RSS/handle snapshots, and idle disk/state checks
+  (`endurance.py` kept in-memory `TaskLedger`, 60 s `BackgroundSampler`, `probe_samples`, and
+  `fault_events_log` without writing a partial record on interrupt):
+  - Check 1 (Accounting): `63,059` logged master results across `12` master generations and `71`
+    worker logs (`63,059` unique, `0` duplicate results, `0` queue record errors, `112` failover
+    sweeps, `27` orphan requeues, `0` log-level `ERROR` or panics); exit codes `61,642` `0`, `1,360`
+    `130` (cancelled), and `57` `124` (`60 s` worker watchdog timeout clustered at
+    `2026-11-20T06:30–06:31Z` [`9`] and `10:33–11:55Z` [`48`] coincident with `25–52 s` master log
+    gaps); client-side `TaskLedger` SHA-256 checks `not_evaluated_due_to_early_stop`.
+  - Check 2 (Resource plateau): `not_evaluated_due_to_early_stop` (continuous 60 s means lost);
+    observational snapshots remained flat late in the run (master `62.7 -> 86.9 -> 85.16 MiB` /
+    `191` handles; workers `30.0–31.1 -> 54.78–55.84 MiB` / `301–309` handles at `+22h43m`).
+  - Check 3 (Disk & journal): idle `master-blobs` `4,244,637,442 B` (`<= 4 GiB` cap, `7,279` LRU
+    eviction events evicting `12,221` blobs) and idle worker caches `w0/w1/w2`
+    `2,102,395,622 / 2,105,542,715 / 2,082,471,936 B` (`<= 2 GiB` cap), `0` `.part`/`.tmp`/`.locks`
+    leftovers; automatic runtime journal compaction shrank `journal.bin` from `2,104,993 B`
+    (`13:02:16Z`) to `54,043 B` (`snapshot.bin` `13,315,075 B`) around `13:05Z`; continuous 60 s
+    peak worker cache and scheduled-restart compactions `not_evaluated_due_to_early_stop`.
+  - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
+  - Check 5 (Clean stop): `passed` (`0` leftover soak/cluster/keep-awake processes, work dir removed).
+  Stays `Partial` pending the full 24-hour 3-machine (Mac master + two Windows workers) run.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -575,66 +583,152 @@ The full suite must pass on a clean machine before CI can require it.
   loopback and a soak of 45 minutes, and uploads the JSON record as an artifact. It is not a
   required check.
 - **Done when:** The job is green on two scheduled runs.
+- **Partial (2026-11-19, branch `win/test-26-ci-endurance`):** Added the `endurance` job on
+  `ubuntu-latest` (`timeout-minutes: 150`, pinned action commit SHAs) to
+  `.github/workflows/ci.yml` for `schedule` (`cron: "17 3 * * 1"`) and `workflow_dispatch` only
+  (never on pull requests, not a required check). It builds `target/release/oxideswarm`, selects
+  the larger of `/mnt` and `$RUNNER_TEMP`, runs `endurance.py transfer` (`T1,T2,T4,T6,T7,T8`,
+  `--t1-sizes-gib 1 --t2-files 20000`) and `endurance.py soak` (`--duration 45m`), and uploads
+  `endurance-records` (`transfer-loopback.json` and `soak-45m-loopback.json`, `if: always()`).
+  Static checks in `tests/test_endurance_harness.py` (`EnduranceCiWorkflowTests`) verify trigger,
+  pins, commands, and upload step. Stays Partial until green on two scheduled runs.
 
-### TEST-61: macOS: hard-link isolation test control printed empty stdout
+### TEST-85: Windows: the `submit --type compile` runtime test times out after 60 s
 
-- **Evidence:** Failed once on `macos-latest` in pull request 380 (docs-only commit `ad915a9b`, run `44537862155` attempt 1, job `135607992314`, 2026-11-19 ~14:23 UTC; attempt 2 passed): `macos::test_a_hard_link_to_a_secret_does_not_expose_its_content` (`crates/worker/tests/test_feat3_os_isolation.rs:1757`) panicked at its `--isolation off` control step 45 ms after the binary started with `the control must read the linked secret: ` and empty stdout (not even `END`).
-- **Problem:** The control task printed nothing at all even under `--isolation off`, and the assertion omitted `exit_code`, `error`, `execution_time_ms`, and `stderr`, leaving unknown whether the process exited non-zero, failed to spawn, failed sandbox setup, or hit an fd/pipe race after `BUG-33` (pull request 367, `close_open_fds_macos`).
-- **Do:** Capture full `TaskResult` diagnostics when the control prints empty stdout; loop the test (50 runs) and its binary (20 runs) with and without 6 CPU busy loops; prove whether `BUG-33`'s `close_open_fds_macos` path can race with the task's stdout pipe or spawn; fix any defect or harden diagnostics the `TEST-60` way.
-- **Done when:** `BUG-33` pipe/spawn safety is proven, diagnostics capture any future failure, and the root cause is fixed or left for the owner's decision after non-reproduction under loaded loops.
-- **Partial (2026-11-19, pull request 392, open):** Not reproduced locally on Apple M5 (10 cores, private `HOME`, `origin/master` `8641b67d`): `0/140` failures across `50/50` alone unloaded (`49.15 s`), `50/50` alone under 6 Python busy loops (`77.32 s`), `20/20` full `test_feat3_os_isolation` unloaded (`547.76 s`), and `20/20` full `test_feat3_os_isolation` under 6 busy loops (`628.09 s`), plus `5/5` in the 5 full loaded workspace runs on `origin/master`. Proof on `BUG-33` (`crates/worker/src/process_tree.rs`): `close_open_fds_macos(&[read_raw])` runs solely inside the double-forked `setsid()` grandchild `child_c` (separate OS PID and XNU descriptor table), skips `read_raw` via `fd_is_kept`, and closes only `child_c`'s inherited duplicates, so it cannot close or alter `child_a`'s stdout write end or the worker's pipe read end; a new 128-spawn 8-worker multithreaded stress test (`process_tree::tests::test_concurrent_short_spawns_preserve_piped_stdout_under_supervisor_fd_close`, with 64 extra `FD_CLOEXEC` descriptors open) passes `128/128` exact stdout captures. Fixes landed: (1) `PreparedUnix::drop` (`crates/worker/src/process_tree.rs`, sharing `imp::dismiss_lifeline` with `TreeInner::kill_and_release_once`) writes `b"0"` before closing `lifeline_write` when dropped unattached (e.g., failed spawn after `pre_exec` forked `child_c`), preventing an orphan supervisor from running `killpg` and a process-table sweep (`test_prepared_unix_drop_dismisses_lifeline_without_attach`); (2) `read_into_capture` (`crates/worker/src/runner/capture.rs`) warns on non-`EINTR` stream read errors; (3) `format_result_diag` (`crates/worker/tests/test_feat3_os_isolation.rs`) reports `exit_code`, `error`, `execution_time_ms`, `stdout`, and `stderr` on `test_a_hard_link_to_a_secret_does_not_expose_its_content` and sibling control assertions. Post-fix verification on `mac/test-61-hardlink-control-empty-stdout`: `process_tree` `23/23` (`2.20 s`), `runner::process_tree_tests` `13/13` (`2.08 s`), `test_feat3_os_isolation` `28/28` + `1` ignored (`27.02 s`), `test_sec5_hardened_runner` `11/11` (`2.58 s`), and under 6 Python busy loops `20/20` `process_tree::tests` (`50.59 s`, `0.98–2.07 s`) and `20/20` `test_a_hard_link_to_a_secret_does_not_expose_its_content` (`36.82 s`, `0.58–1.20 s`). Closing `TEST-61` without a reproduced cause (keeping diagnostics for any future CI hit) stays the owner's decision.
+- **Evidence:** CI run `44747726996` (push of pull request 407 to `master`, 2026-11-20 13:49 UTC), job
+  `gpu-wgpu (windows-latest)` (`136327278116`), step `cargo test -p rusty_grid_cli --lib --features gpu-wgpu`:
+  `cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo`
+  (`crates/cli/src/cli_app/runtime_tests.rs`) printed "Timed out after 60s waiting for task ... to complete" and
+  panicked at the assertion "submit --type compile must succeed" (`ExitCode(1)`). 200 other tests of the step passed.
+  It is the last failing test on `master` before the Q80 streak counted from 2026-11-20.
+- **Problem:** The test builds a real crate with a local path dependency through `cargo` on a worker. A cold
+  `cargo build` on a hosted Windows runner can take longer than the 60 s wait of `submit`. The cause (a wait that is
+  too short, or a task that hangs) is not known.
+- **Do:**
+  1. Read the test and the wait it uses (`submit_args`, `run_submit_with_secret`, the `--wait` budget of `submit`).
+  2. On Windows, run the test alone and in the whole `rusty_grid_cli --lib --features gpu-wgpu` binary 20 times each,
+     the second set under 4 busy loops; record each task's `execution_time_ms` and whether `cargo` was still running
+     at the timeout.
+  3. If the task finishes but late, give the test a budget that cannot be the cause (at least 600 s), keep every
+     assertion, and print the time. If the task hangs, follow rule 4: a test that fails without the fix, then the fix.
+- **Done when:** The cause is found, or the test passes 50 runs in a row on Windows under 4 busy loops and stays green in CI on `windows-latest` through the Q80 streak window.
+- **Partial (2026-11-23, pull request 417, commit `b0d4058f`):**
+  - **Cause (not found):** The CI failure was a `60` s timeout (`crates/cli/src/cli_app/submit.rs` `:1049`, `:1220`, `:1232`: `submit --type compile` forces `wait = true` and defaults `timeout_secs` to `60` s when `--timeout-secs` is omitted, unless `--workspace` is set) on a task whose local path-dependency build normally completes in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on the case PC). A task that short reaching a `60` s deadline looks like a stall rather than a slow build; the underlying cause did not reproduce locally on the case PC and remains unfound.
+  - **Fix (`crates/cli/src/cli_app/runtime_tests.rs`):** kept the product default `60` s untouched, passed `--timeout-secs 600` in the test's `submit_args` as a hang guard, widened the worker-registration `deadline` from `10` s to `60` s, and printed `TEST-85 compile_wall_ms=... exec_ms=...` with every assertion preserved so any repeat shows whether the task was slow or stuck. Stays `Partial` until the cause is found or `windows-latest` stays green through the Q80 streak window.
+  - **Baseline (`origin/master` `6a9060ba`, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.98.1`, isolated NTFS `USERPROFILE`/`HOME`/`TEMP` under `C:\ox_tmp\s1`):**
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (solo, `0` busy loops): `20/20` passed (wall `3.48–6.66` s, median `3.55` s; `exec_ms` `458–505`, median `470`).
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu` (full binary, `4` Python CPU busy loops): `20/20` passed (`228` tests/run; wall `13.00–13.12` s, median `13.06` s).
+  - **Post-fix (`b0d4058f`, same machine and isolated NTFS `USERPROFILE`/`HOME`/`TEMP`):**
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (`4` Python CPU busy loops): `50/50` passed (wall `3.91–4.52` s, median `4.06` s; `compile_wall_ms` `523–619`, median `551`; `exec_ms` `341–431`, median `360`).
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu`: `228/228` passed (`10.04` s); `cargo fmt --all -- --check`, `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings`, `cargo +1.96.0 clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+
+### TEST-86: macOS: `shard` tests stall for 60 s when run beside other shard tests
+
+- **Evidence:** CI run `45054272288` (push of pull request 415 to `master`, 2026-11-22 18:17 UTC), job
+  `workspace tests (macos-latest)` (`137305932137`), binary `test_ax2_shard`
+  (`crates/cli/tests/test_ax2_shard.rs`): ten tests passed within about 1 s of the start, and three ran to the
+  60 s client deadline: `test_shard_count_1_and_256_boundaries` (72 of 256 shards of `true` on 16 slots
+  completed), `test_shard_slot_spreading_with_max_retries_failover_and_worker_pin` (none of 8 shards of `printf`
+  on 8 slots completed, every shard `timed out after 60s` with `duration_ms` 0) and
+  `test_shard_partial_failure_and_fail_fast_cancels_siblings` (exit 1 instead of 5). It is the first failing test
+  on `master` since TEST-85, so the Q80 streak counts again from 2026-11-22 18:38 UTC.
+- **Problem:** The runner was not slow (the other ten tests finished at once), so the three runs stalled. Cause
+  not proven; the likely one is the BUG-35 class: the test runs its workers in process (`WorkerClient` on the
+  test runtime) and starts each `oxideswarm shard` with `std::process::Command::output()` outside the macOS spawn
+  lock, so a CLI child can inherit the write end of a task's stdout pipe (or a task, such as the `sleep 600`
+  siblings of the fail-fast test, a CLI's pipe). The task then never reaches end of file until the CLI exits, and
+  the CLI waits for the task until its 60 s deadline. Pull request 409 fixed the same deadlock in
+  `test_cli_cancel_and_result.rs` by spawning the CLI through `rusty_grid_core::process_spawn::output_std`.
+  Not reproduced locally: 15 runs of the binary on `master` `9800abea` under 10 busy loops on an Apple M-series
+  Mac (10 cores) all passed (4 to 25 s per run). The 2026-11-23 pull request removed the wall-clock assertions of
+  `test_ax2_shard.rs` and `test_ax1_matrix.rs` (now printed as `[timing]`) and raised their hang guards to 60 s;
+  it does not fix the stall.
+- **Do:**
+  1. After BUG-35 merges, start every CLI child of `test_ax2_shard.rs` and `test_ax1_matrix.rs` (and of any other
+     `crates/cli/tests` file that runs an in-process worker beside CLI children) through `output_std`.
+  2. Before the change, try to reproduce: run the binary 50 times on macOS under 6 busy loops with
+     `--test-threads 3` (the hosted runner has 3 cores); record the stalls.
+  3. If it still stalls after step 1, find the cause (rule 4) before anything else; do not raise the timeouts.
+- **Done when:** The cause is written here, and `test_ax2_shard` and `test_ax1_matrix` pass 50 runs in a row on
+  macOS under 6 busy loops with `--test-threads 3`.
+
+### TEST-87: macOS: worker portal loopback test fails when its LAN-side bind finds the port in use
+
+- **Evidence:** `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` failed on
+  `macos-latest` in pull request 419 (run `45129742542`, job `137542373519`, head `116353d0`, docs-only): the
+  panic at `crates/worker/src/client/tests.rs:4155` was `must not bind 0.0.0.0:49623 (binding
+  192.168.64.11:49623 failed: AddrInUse)`. 328 other tests in the binary passed.
+- **Problem:** The test proves the portal is not on `0.0.0.0` by binding `<lan_ip>:<portal port>`. Any other
+  socket on that address and port makes the bind fail, for example a concurrent test's outgoing connection
+  with an ephemeral local port in the same 49152–65535 range. The listener's `local_addr` is already
+  asserted to be `127.0.0.1`, so the LAN-side bind adds only noise.
+- **Do:** Write a failing check first (hold a socket on `<lan_ip>:<port>` before the bind and show the false
+  failure). Then, on `AddrInUse`, connect to `<lan_ip>:<port>` instead: refused, or an answer that is not the
+  portal's `/api/status` body, passes. Only the portal's body fails. Keep the `127.0.0.1` assertion.
+- **Done when:** 50 runs of `cargo test -p rusty_grid_worker --lib client::tests` pass under 4 busy loops
+  on Windows, plus the same run on macOS by `agent-mac`.
+
+### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
+
+- **Evidence:** Incident `INC-20261123-001` (case PC, Windows 11 Pro, commit `8e55dac9`). The S9 loop ran
+  `cargo test -p rusty_grid_worker --features gpu-wgpu` from a script that captures output. Each run of
+  about 138 s opened 5 to 7 empty console or Windows Terminal windows that took the keyboard focus, and
+  left `PING.EXE` running for up to 120 s. `tests/m3_challenger_2_stress.rs` left Windows Terminal error
+  windows (`0x800700e8`) open. The loop was stopped after 19 of 50 runs, all of which had passed.
+- **Problem:** On Windows, task processes under `--isolation off` and host probes had no `CREATE_NO_WINDOW`.
+  A worker without a console therefore opens a window per console task. Test helpers started `cmd /C ping`
+  (one with `CREATE_NEW_CONSOLE`), and killing `cmd.exe` left `PING.EXE` behind. `Start-Process` without
+  `-NoNewWindow` opened a window per grandchild.
+- **Do:** [Design 0108](design/0108-windows-tasks-without-console-windows.md): `CREATE_NO_WINDOW` for
+  tasks, probes and test helpers, `PING.EXE` started directly, and `-NoNewWindow` in the stress test.
+  Keep every assertion, including the positive control of `test_console_and_terminal_injection_is_blocked`.
+- **Done when:** On Windows, 20 runs of `cargo test -p rusty_grid_worker` under 4 busy loops with
+  `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, started from a parent without a console, pass with 0 new console
+  windows and 0 leftover `PING.EXE` or `powershell` processes.
+- **Implemented (2026-11-23, pull request 424, design 0108):** Verified on the case PC (Windows 11 Pro, Intel Core
+  i5-14600KF, 14 physical / 20 logical cores) from a Python parent started with `CREATE_NO_WINDOW`, isolated
+  temporary `HOME`/`TEMP` per run, `cargo +1.96.0 test --locked -p rusty_grid_worker`:
+  - Baseline on `master` `00e836a8` (1 run): 427 passed; 11 new `OpenConsole.exe -Embedding` (6 still alive after
+    the run). Visible windows and leftovers were not caught in that run.
+  - Head `012dc68c`, `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, 4 busy loops: 20/20 runs passed (427 passed, 0 failed,
+    0 ignored in 17 binaries per run; 95.7 to 101.8 s), 0 new `OpenConsole.exe`, 0 visible or `0x800700e8`
+    windows and 0 leftover `PING.EXE`, `powershell` or `Start-Sleep` processes in every run.
+  - `test_console_and_terminal_injection_is_blocked` passed with its positive control: a `PING.EXE` started with
+    `CREATE_NO_WINDOW` has a windowless console, and `AttachConsole(helper)` from an `--isolation off` task
+    succeeds (`ATTACH_HELPER_OK`) while `fs` and `fs+net` are denied.
+  - `m3_challenger_2_stress`: 5/5 runs passed (18 tests each), 0 windows and 0 leftovers.
+
+### TEST-89: macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s
+
+- **Evidence:** CI run `45180089954` (pull request 421, head `c4987058`, docs only, 2026-11-23 13:30 UTC), job
+  `unit tests (macos-latest)` (`137711364019`), step `python3 -B -m unittest tests/test_wave3_e2e.py -v`: 62 of 63
+  tests passed (588 s in all); `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed at
+  `tests/test_wave3_e2e.py:5347` with `TimeoutError: Worker w-8gb-bl-ok did not reach state:connected within
+  15.0s`. The worker log: started 13:30:23.31, the host probes of `cargo` and `rustc` each timed out after 3 s
+  (13:30:26.48 and 13:30:29.58), `Worker client initialized` at 13:30:29.62, and no later line until the test
+  gave up at about 13:30:38. The master log was not printed. The rerun on the same head is the case PC's
+  (S11).
+- **Problem:** `start_worker` (`tests/test_wave3_e2e.py`, about line 1968) polls `workers --json` until the
+  worker carries `state:connected`, with a 15 s wall-clock deadline that starts at spawn. On a loaded runner the
+  start-up probes alone took 6.3 s, so the worker had less than 9 s to register. Either the runner was slow
+  (the deadline is a wall-clock assertion, which the lessons of design 0087 forbid) or registration stalled
+  (then a longer deadline only hides it). The log cannot tell the two apart: it shows no connect attempt and no
+  master side.
+- **Do:**
+  1. Failing check first: hold the master's accept loop (or start the worker against a port that answers late)
+     and show the 15 s false failure.
+  2. Make the wait a hang guard, not a time limit: a 120 s deadline in `start_worker` (and the other 15 s
+     `_wait_until` guards of the file that wait for a process to start), the elapsed time printed as
+     `[timing]`, and on timeout the master's log printed beside the worker's.
+  3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
+- **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
+  passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
 
 ## Phase 3: make the documents true
 
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
 
 ## Phase 4: finish partial features
-
-### 3D-2: Wire VRAM and Blender routing
-
-- **Evidence:** Read. Confirmed by grep.
-- **Problem:** `required_vram_mb` (`crates/master/src/scheduler.rs`) still returns preset defaults for `Generative3D` that are not automatically applied when `--vram-mb` is omitted, and `crates/master` does not read `has_blender` (explicit `TaskRequirements::vram_mb` via `--vram-mb` / MCP `vram_mb` is now enforced under `FEAT-9a` / [design 0068](design/0068-task-vram-accounting.md)). `--blender-path` reaches only the capability probe, and `resolve_blender_binary` misses the macOS and Linux paths that `detect_blender` searches. A Mac can advertise Blender and then fall back silently.
-- **Do:** Wire both into `view_fits`. Share one Blender resolver.
-- **Done when:** A `--preferred-provider blender` task lands only on a Blender worker. A `high` task
-  skips a 2 GB worker.
-
-### 3D-3: Make AutoRig options real or refuse them
-
-- **Evidence:** Read.
-- **Problem:** `--rig-preset quadruped` gives the biped skeleton. `engines/autorig/blender_rig.py:23`
-  parses `--preset` and never reads it. `turnaround` produces an empty action in Blender. OBJ input
-  fails, because it is always written as `input_mesh.glb`. The Blender timeout is fixed at 60 s
-  (`crates/worker/src/runner.rs:2201`). A failure falls back with only a `warn!` and the same device
-  label. The blocking engines take no timeout or cancel.
-- **Do:** Refuse unimplemented presets or implement them. Pick the extension from the magic bytes.
-  Pass the task timeout. Report the provider. Fail when Blender was requested explicitly.
-- **Done when:** `quadruped` gives a non-biped skeleton or an error. An OBJ goes through Blender. The
-  result names the provider. A timeout returns within 1 s of expiry.
-
-### MESH-2: Deliver mesh data to a consumer
-
-- **Evidence:** Read.
-- **Problem:** Nodes push payloads into an unbounded `Vec` that only tests read
-  (`crates/agent_mesh/src/client.rs:252`). `agent-mesh data` sleeps 200 ms and exits 0 without reading
-  the ACK (`crates/agent_mesh/src/main.rs:424`). `total_chunks` is always 1. Node status is always
-  `online`, and telemetry fields are placeholders.
-- **Do:** Add `agent-mesh node --inbox-dir` with a bounded buffer. Wait for the ACK and exit non-zero
-  on failure. Report real values, or remove the fields.
-- **Done when:** `agent-mesh data --to missing-node` exits non-zero. A payload appears on disk with a
-  verified hash.
-
-### MESH-3: Attach the bridge to a running master
-
-- **Evidence:** Read.
-- **Problem:** `AgentGridBridge::new` takes an in-process `MasterHandle`
-  (`crates/agent_mesh/src/bridge.rs:29`). Mesh tasks therefore run on a second master with no workers
-  until someone points them at it. `grid_submit` overwrites tags, has no files or outputs, and has no
-  cancel. `parse_binary_data` reads hub-local paths that a peer names (`bridge.rs:857`).
-- **Do:** Add a `GridBackend` trait with in-process and `connect_master` versions, and
-  `--grid-connect <HOST>:8088`. Add placement, files, outputs, result and cancel. Remove the file
-  fallback. Document that workers must join.
-- **Done when:** A test with `CARGO_BIN_EXE_agent-mesh` runs `grid_submit` on a separately started
-  master.
 
 ### AND-1: Make the Android app build
 
@@ -689,27 +783,6 @@ The standard in `docs/README.md` requires "only what the code does". These items
 ## Phase 5: larger designs
 
 Each item below needs a design record before code.
-
-### FEAT-5: Checkpoints for process tasks
-
-- **Evidence:** Read.
-- **Problem:** Checkpoints work for the `BuiltinTest` hash branch only
-  (`crates/worker/src/runner.rs:853-917`). `Command`, `ShellScript`, `RustCompilation` and
-  `GpuCompute` never receive one. The 3D tasks send progress as checkpoints.
-- **Do:** Add `OXIDESWARM_CHECKPOINT_DIR` in the sandbox, stored in capped `Checkpoint` frames and
-  restored before a re-run. Separate progress from state.
-- **Done when:** A `Command` test kills the worker, and a second worker finds the state file and skips
-  finished steps.
-
-### FEAT-9: GPU workloads beyond the benchmark
-
-- **Evidence:** Read.
-- **Status:** Partial (`FEAT-9a` / decision `Q56` implemented in [design 0068](design/0068-task-vram-accounting.md)). Tasks now accept `--vram-mb` / `vram_mb` (protocol v9, store v3) with master scheduler VRAM budget tracking and anti-starvation hold-back.
-- **Problem (remaining `D6`):** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity` is never read, and custom WGSL user kernels remain unimplemented. Real-GPU preference still prefers an idle `wgpu` worker over a simulated GPU worker when an idle real GPU is available.
-- **Do (default of D6):** State "benchmark only" in `README.md:26` and `PROJECT.md:3`. If the owner
-  puts kernels in scope, add a `TaskSpec` with user WGSL and buffers through blobs.
-- **Done when:** The documents say benchmark only, or a user kernel matches a CPU reference on Metal,
-  Vulkan and DirectX 12.
 
 ### CACHE-1: Reuse the result of an identical task
 
@@ -842,12 +915,15 @@ then JOIN-2 and USB-1 in parallel.
   its worker is requeued at once. A v2 secret worker keeps working next to a member worker. A
   machine on another network joins through `--p2p` with an invite sent by chat, and the run is
   recorded with its date.
-- **Status (2026-11-18, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
+- **Status (2026-11-21, Partial):** ENROLL-1c, first part (pull request 328): a revoked member
   loses every connection at once (worker sessions over TCP and QUIC, client connections over TCP
   and P2P, blob and MCP connections), and the tasks on its workers are requeued at once without the
-  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. Open:
+  resume hold and without their checkpoints; `tests/cli_revoke_e2e.rs` passes on macOS. ENROLL-1d
+  dashboard API/UI, tests, and docs are built (`crates/master/src/web_ui/members.rs`,
+  `crates/master/src/dashboard.html`, `tests/dashboard_api_test.rs`, `tests/dashboard_security_test.rs`,
+  `docs/reference.md`, `docs/guides/add-a-machine.md`, `docs/SECURITY.md`, `README.md`). Open:
   cancelling the member's submitted tasks (design 0051 D5 step 2, a store format change for the
-  owner) and ENROLL-1d.
+  owner) and the recorded live `--p2p` invite run from another network.
 
 ### USB-1: Set up machines from a USB stick
 
@@ -1181,6 +1257,10 @@ none needs a design record of its own.
 - **Done when:** The new test passes on Linux, macOS and Windows, and the repository page shows
   "Cite this repository". Step 4 is finished when the DOI of a release is in `README.md`. Until
   then the item is Partial.
+- **Status (2026-11-21, Partial):** Steps 1 to 3 are complete (`CITATION.cff` at format version `1.2.0`
+  matching `Cargo.toml` `0.4.4` and `MIT` / `Apache-2.0`, stdlib check in
+  `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`). Step 4 (enabling
+  Zenodo archiving and adding the release DOI) stays with the owner.
 
 ### LV-14: Governance files and a licence that GitHub detects
 
@@ -1252,71 +1332,12 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Do:** Pin a second release (v0.3.0 while the window reaches back to 9) in the skew job, with its
   `protocol.rs` for the expected verdicts, and move the pin at each wire change. Do not build it now.
 - **Done when:** Each pull request shows a table row of a real release one protocol back.
-
-### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
-
-- **Evidence:** Reproduced on the owner's Windows machine, 2026-11-16, `master` `3ecc926` (Windows
-  smoke test, finding F1). The worker exits with: "another account
-  (S-1-15-3-3557520199-3666692283-...) can rename, delete or re-permission ancestor directory
-  `AppData`". A read-only `icacls` shows two explicit entries for that SID, `(F)` and
-  `(OI)(CI)(IO)(F)`. It is not the `oxideswarm.toolchain` capability, which derives to
-  `S-1-15-3-1024-...`.
-- **Problem:** The worker's check is correct, but no `fs` worker can use any sandbox base below
-  `AppData`, the default `%TEMP%` included, and the worker unit tests fail under the default
-  `%TEMP%` there. Nobody knows what created the entry. A confined process that holds that
-  capability would have full control of everything that inherits from `AppData`.
-- **Do:**
-  1. Find what created the entry and whether any confined process holds that capability. Do not
-     change the ACL without the owner.
-  2. Decide whether the worker's error message should suggest a fix.
-- **Done when:** The cause is written here, and the owner has decided what to do with the entry.
-  This needs the owner's machine.
-- **Note (2026-11-18):** On the second Windows machine (a laptop), the foreign write grants on `%TEMP%`
-  come from the Codex CLI sandbox (its capability SIDs, recorded in `%USERPROFILE%\.codex\cap_sid`) and
-  from one deleted local account. No OxideSwarm SID appears on any inspected folder. OxideSwarm's only
-  capability SID (`DeriveCapabilitySidsFromName("oxideswarm.toolchain")`) has the sub-authority 1024,
-  which the SID of this item lacks, so that SID is not OxideSwarm's either.
-- **Partial (2026-11-19, pull request 358):** The cause is on record on both Windows machines. A read-only check on the
-  case machine matched the SID of this item to the AppContainer of the Claude Desktop app's MSIX package
-  (through the AppContainer mappings and `DeriveAppContainerSidFromAppContainerName`): it belongs to that
-  package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
-  `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
-  owner's decision of "Done when" (the entry itself is gone) and step 2.
-
-### TEST-41: Find why a task finished during master shutdown can run twice
-
-- **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
-  (`tests/master_restart_recovery.rs:1001`) failed on `ubuntu-latest` on 2026-11-17, in pull request 282 at
-  `7a17104` (run `44018512676`, job `133822123752`): `RV158 P3: rounds=12 ran_twice=1`, then
-  `task ran twice in 1/12 rounds`. Round 0 (`delay_ms=0`) ran the task twice; rounds 1 to 11 ran it once.
-  Pull request 282 changes only `windows/oxctl.ps1`, a Python launcher test and docs.
-- **Problem:** The probe (review item H2 of pull request 158) states that a task which finishes as the master
-  shuts down keeps its result in the worker's `pending_resume_outbox` until the restarted master acknowledges
-  it, so the task runs exactly once. One round in twelve ran it twice. Either the hand-over has a window at
-  delay 0, or the probe counts a rerun the design allows. A command task that runs twice is visible to users.
-- **Do:** Run the probe in a loop, also under CPU starvation as for TEST-36 to TEST-38, and find which side
-  lost the result or dispatched the task again. Fix that cause. If the design allows a rerun in that window,
-  say so beside the probe and in the guarantee it tests, and change the assertion with that reason.
-- **Done when:** The cause is named here, and the probe passes 200 runs in a row on Linux and on Windows.
-- **Partial (2026-11-17, pull request 288):** not reproduced on macOS in 6,884 rounds of the probe (about 570 runs of
-  12 rounds: single, 3 to 8 parallel copies, the whole test binary next to three copies of itself, 6 `yes` CPU spinners
-  on 10 cores, `RV158_ZERO` with no delay after the task finished, and a variant that kept the task alive for up to
-  450 ms after its done marker). No round ran the task twice. What reading the code ruled out: the journal cannot lose an
-  acknowledged result (`store.rs`: the writer drains and syncs on drop, a snapshot is taken under the queue lock after
-  every enqueued append, and a result that arrives after `close_and_compact_store_sync` is refused with no
-  acknowledgment); the worker keeps a result in `pending_resume_outbox` and lists it in `ResumeSession` whether the task
-  is still in the active table or already in the outbox; a master-side rerun without a `ResumeSession` that names the task
-  needs `adopt_session_tasks` to release the hold (`recovery.rs`), which charges nothing, matching the `retry=0
-  failover=0` of the CI round. That is the one path that fits the evidence, and no test has shown the worker omitting
-  the id. The probe now keeps the debug log of the master and worker crates in memory and, when a round ran the task
-  twice, prints the marker file, the task and worker id, every line that names either, and every warning and error since
-  the round began, and the round line shows `evacuation=` next to `retry=` and `failover=`. `RV158_ROUNDS` and
-  `RV158_ZERO` let a local loop run more rounds and shut the master down with no delay. The assertion is unchanged.
-  Next step: the next CI failure of this probe now carries the evidence; read which side sent `ResumeSession` without the
-  task (worker) or released the hold (master). Two other tests of the same binary failed under load: see the lead
-  under TEST-23.
-- **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
-- **Partial (2026-11-19, pull request 363, open):** Not reproduced on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`) across 200 sequential `cargo test --locked` runs (`2,400` rounds; 0 double runs and 0 failures; `1,697.06 s` elapsed across the 4 batches; plus a 1/1 `RV158_ZERO=1` smoke run beforehand in 7.94 s, `12` rounds, `ran_twice=0`) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (`480` rounds, `327.44 s`), 40 alone `RV158_ZERO=1` runs (`480` rounds, `340.93 s`), 60 default-delay runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `506.52 s`), and 60 `RV158_ZERO=1` runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `522.17 s`). The 200-run part of "Done when" is now met on both Windows (pull request 359) and Linux (this pull request), alongside macOS (pull request 288), while no cause is named because the single double-run of pull request 282 never reproduced; closing TEST-41 as "not reproduced in 200 runs on Linux, Windows and macOS" (keeping the pull request 288 debug-log capture) is the owner's decision.
+- **Status (2026-11-21, Partial):** Local implementation and tests pass (`.github/workflows/ci.yml`
+  `release-skew` pins `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release with
+  per-tag directory isolation, `scripts/release_skew.py` adds `--release-tag` for distinct summary
+  tables, `tests/test_release_skew.py` tests both CLI behavior and static CI workflow invariants,
+  and `CLAUDE.md` / `docs/reference.md` are updated); awaiting a live GitHub pull request CI run of
+  `release skew (ubuntu-latest)` showing the `v0.3.0` table row per "Done when".
 
 ### BUG-22: Count cancelled tasks apart from failed tasks in `status --json`
 
@@ -1332,6 +1353,13 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   for the next wire change after 0.4.0.
 - **Owner decision (2026-11-19):** no protocol bump for BUG-22 alone; it goes into the next planned wire
   change.
+
+### BUG-34: Clean up leftover blob-cache `.part` files of a killed worker without breaking shared sandbox bases
+
+- **Evidence:** Reproduced during the `win/test-25-remote-workers` real-binary two-worker soak E2E test on Windows (`oxideswarm 0.4.4`) when a `worker_kill` fault terminated `win-a` mid-transfer (`tmp_leftovers: {"win-a_cache_tmp": ["51645078-14b0-4d61-a207-01d634f772cf.part"]}`), failing D3 check `3_disk_and_journal` (`sandbox_ok: false`).
+- **Root cause:** `BlobCache::open` (`crates/worker/src/blob_cache.rs`) only removed files in `<sandbox base>/cache/blobs/tmp/` older than `STALE_TMP_AGE` (24 hours) so a worker starting on a shared `--sandbox-base-dir` would not delete another live worker's in-flight write. Hard-killed workers never run `TempPartFile::drop`, so their `.part` files remained in `tmp/` for 24 hours across restarts.
+- **Fix:** Each `BlobCache` instance now holds an exclusive advisory file lock (`File::try_lock`) on `<sandbox base>/cache/blobs/owners/<owner_uuid>.lock` and names its `temp_path()` files `<owner_uuid>.<part_uuid>.part`, unlinking and calling `unlock()` on clean `Drop`. On `BlobCache::open` and worker startup (`sweep_dead_owner_tmp` via `crates/worker/src/sandbox.rs`, without creating missing cache directories), a worker probes `owners/<owner_uuid>.lock`: if `try_lock()` succeeds (`lock_file_is_still_named`), the owner is gone so its `.part` files and orphan `.lock` are removed; if `WouldBlock`, the live writer's files stay untouched. Legacy unowned `.part` files retain the 24-hour `STALE_TMP_AGE` rule, and Windows/Unix security checks cover `owners/` against symlinks, junctions, and foreign grants.
+- **Done when:** A killed writer's `.part` file is removed at the next worker startup / `BlobCache::open`, while a live writer holding its owner lock in another process keeps its `.part` file untouched, on both Windows and Unix.
 
 ## Phase 13: the path to finished
 
@@ -1356,68 +1384,6 @@ Order:
 
 Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it says otherwise.
 
-### CI-1: Keep runs for pushes on `master` from ending red or cancelled without a failing test
-
-- **Evidence:** Read through `gh run list --branch master --workflow CI --event push --limit 60` and
-  the job annotations (`gh api repos/<OWNER>/<REPO>/check-runs/<JOB_ID>/annotations`).
-  - Twelve runs of 2026-11-16 ended as cancelled (`43800093872` to `43889536272`). The annotation of
-    their jobs is "The run was canceled by" the owner's account. The workflow itself cancels only
-    runs for pull requests (`.github/workflows/ci.yml`, `concurrency`), so each was cancelled by
-    hand or by a session that uses the owner's `gh` login.
-  - Six runs of 2026-11-16 hold one or two cancelled macOS jobs (`43889143995`, `43894129643`,
-    `43914764615`, `43928207482`, `43952618376`, `43964491108`). The annotation is "The job was not
-    acquired by Runner of type hosted even after multiple attempts", beside a notice about capacity
-    for macOS arm64 runners. In the two runs read in detail (`43914764615`, `43964491108`) the jobs
-    waited 32 to 49 minutes and never got a runner. Five of the six runs count as failed with no
-    failed job.
-  - Two runs of 2026-11-17 failed with no failing test. In `44036878952` the job
-    `fuzz (tree_manifest)` could not download the pinned nightly toolchain. In `44034218213` the
-    test step of `workspace tests (windows-latest)` ended three minutes after the job started, with
-    exit code `-1073741502`.
-- **Problem:** The exit check of Q80 asks for seven days of runs for pushes in which no test fails.
-  A run that is red or cancelled for another reason has to be told apart by hand, and a cancelled
-  run tests nothing for its commit.
-- **Do:**
-  1. Add a rule to `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run
-     for a push on `master`. Say what to do instead when a newer push makes a run look
-     superfluous: leave it.
-  2. For a macOS job that was never acquired, rerun the failed jobs of that run on its current
-     head (`gh run rerun <RUN_ID> --failed`), and record the run in the status log. Do not change
-     the workflow for it.
-  3. In the `fuzz` job, make the toolchain step retry a failed download, with the options the
-     action offers or with a retry around the `rustup` call. Do not change the pinned date.
-  4. For exit code `-1073741502` in run `44034218213`, read the full log of the step and the
-     diagnostics step of TEST-29. Record what the first line with the code follows. If the step
-     never started `cargo`, it is a runner failure: say so and rerun. If a test binary returned
-     it, open an item for that test.
-  5. Add a script `scripts/ci_push_runs.py` (standard library and `gh` only) that prints, for the
-     last N days of runs for pushes on `master`, one line per run that is not green with its
-     class: failing test, job never acquired, cancelled by an account, or other. The exit check
-     of Q80 is then read from its output.
-- **Done when:** The guide has the rule of step 1. The script of step 5 has a test with recorded
-  JSON input (`tests/test_ci_push_runs.py`, standard library only) that CI runs on Linux, macOS
-  and Windows, and its output for 2026-11-16 names
-  twelve runs as cancelled by an account and six as holding a job that was never acquired. The
-  two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
-
-- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
-  coordinator (no code).
-  - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
-  - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
-    `dtolnay/rust-toolchain@master`, which then finds it installed. The date is unchanged.
-  - Step 4: the log of job `133873087335` (run `44034218213`) shows the step before it (`test_feat3_os_isolation`, 30 passed)
-    ending normally. The line `Process completed with exit code -1073741502` (`0xC0000142`, STATUS_DLL_INIT_FAILED) then
-    follows the start of the step `python scripts/ci_heartbeat.py ... cargo test --workspace` 31 ms after its header, with no output
-    of its own, and the diagnostics step after it (a fresh `pwsh`) fails with the same code. No `Running` line of a test
-    binary and no `cargo` output follow: `cargo` never started, so it is a runner failure (new processes could not initialise),
-    not a test. No test item is opened. Untested hypothesis: the isolation tests of the step before it create a private Desktop per
-    task and may leave the runner short of desktop heap. If the code comes back after `test_feat3_os_isolation`, open an item for that.
-  - Step 5: `scripts/ci_push_runs.py` and `tests/test_ci_push_runs.py` (13 tests over hand-made JSON; run by the `agent-bridge`
-    job on Linux, macOS and Windows). Real output for 2026-11-16: 12 runs `cancelled`, 5 `never acquired`, 5 `failing test`.
-    `43952618376` has a never-acquired macOS job and also a real failing Ubuntu test, so it counts under `failing test` (the
-    priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
-    test, 1 never acquired. The exit check of Q80 is read from its last line.
-
 ### ADOPT-1: A study of first use, in two rounds
 
 - **Evidence:** [Design 0059](design/0059-first-users.md), D4. The owner decided on 2026-11-11 to
@@ -1441,6 +1407,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
      people the owner has not helped before.
 - **Done when:** "Study records" holds at least three sessions of the first round with measures
   M15 to M17. The item is Partial from then until the second round is recorded.
+- **Status (2026-11-19, Planned):** study kit ready (PR 393): `docs/study/2026-11-adopt-1/` (English and Vietnamese participant guide, facilitator sheet, consent template, and round-one record procedure), `scripts/study_timer.py` (`P1`–`P5` labels only, standard library), and `tests/test_study_timer.py` (wired into CI `agent-bridge`); no session has run yet and nothing in the kit is a result.
 
 ### ADOPT-3: Install scripts and the scripted time to first result
 
@@ -1499,6 +1466,21 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   call, and a cell without a worker is reported unplaced. A live record shows one MCP call
   testing a change on macOS, Windows and Linux. That record is exit check E8 of design 0088,
   together with AX-2, AX-3 and CACHE-1 in a release.
+- **Partial (2026-11-22, design 0101, commits `0e13d69d`, `58c41543`, `36a2d647`):** Implemented client-side
+  matrix fan-out across `crates/cli/src/matrix.rs`, `cli_app.rs`, `cli_app/submit.rs`, `mcp.rs`, `mcp/submit.rs`,
+  and `mcp/submit_matrix.rs` (plus `README.md`, `docs/reference.md`, and `docs/guides/mcp-client-setup.md`) with
+  zero wire or store changes on Protocol 10 / Store v4: repeatable `--matrix <KEY=V1,V2>` and MCP `matrix`
+  (array or axis object) across `os`, `arch`, `worker`, `iso`, `tool`, `tag`, and process `env:<VAR>`,
+  `--max-matrix-cells` (`64` default, `256` cap), pre-flight `ListWorkers` unplaced-cell detection without
+  hanging (skipping uploads when zero cells are placeable), 1x `--input` / `--workspace --sync` upload
+  deduplication, concurrent `JoinSet` dispatch with `safe_deadline` / `safe_std_deadline` overflow protection
+  (also applied to `mcp/task_result.rs` and `doctor.rs`), per-cell `--output-dir/<cell_slug>` isolation with
+  `ensure_non_symlink_cell_dir` symlink refusal across both CLI and MCP, bounded JSON-escaped inline streams
+  with `MatrixReport` / `RunSummary`, `-32602` validation, and `isError: true` propagation. Verified by unit
+  tests (`matrix` 11/11, `mcp` 16/16, `submit_matrix` 1/1), `crates/cli/tests/test_ax1_matrix.rs` (`9/9`,
+  covering 3 tagged workers and unplaced cells), and `tests/test_wave2_e2e.py` (`F3`, `F4`, Tiers 3–4).
+  Remains `Partial | In` pending only the external live MCP call record across physical macOS, Windows, and
+  Linux workers (`"Done when"` / exit check E8).
 
 ### AX-2: Sharded runs, with a build-once mode for Rust
 
@@ -1514,6 +1496,28 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** R2 has a dated record. Measure M1 of design 0056 is recorded for this repository
   on three workers with its script in `benchmarks/grid/`, or the status log states that the stop
   rule applied and the guide holds the recipe.
+- **Partial (2026-11-22, design 0103, prod/backlog-completion-wave3):** Implemented client-side sharded
+  runs and Rust `--build-once` across `crates/cli/src/shard.rs`, `cli_app/shard.rs`, `cli_app.rs`,
+  `mcp/shard.rs`, and `mcp.rs` (plus `docs/guides/sharded-runs.md` and `docs/reference.md`) with zero
+  wire or store changes on Protocol 10 / Store v4: `oxideswarm shard --count <N>` (`1..=256`, capped
+  at `32` concurrent handshakes) and MCP `shard` tool, `ListWorkers` pre-flight fast-fail,
+  `slots:`-weighted Smooth Weighted Round-Robin worker spreading, 1-based `OX_SHARD_INDEX` /
+  `OX_SHARD_TOTAL` env injection (overriding colliding `--env`), `--fail-fast` sibling cancellation,
+  symlink-safe `<output_dir>/<shard_slug>/` isolation (`ensure_non_symlink_cell_dir`), pure-`std`
+  `--junit-out` XML merging, and `--build-once` (one `cargo nextest archive` builder per distinct
+  `(os, arch)` producing an output `BlobFile` passed into shard `Task::inputs` via `--archive-file`
+  and `--workspace-remap .`, never `Task::workspace`), plus recipes for `cargo nextest`, `pytest`,
+  `jest`, and `go test` in `docs/guides/sharded-runs.md` and `benchmarks/grid/bench_shard_r2_m1.py`
+  (`test_bench_shard.py` `6/6`). Verified by unit tests (`11/11`), `crates/cli/tests/test_ax2_shard.rs`
+  (`8/8`, using a `/bin/sh` stub `cargo` for `--build-once`), `mcp_server_e2e` (`9/9`), and the dated
+  single-host loopback benchmark `benchmarks/grid/results/2026-11-22-r2-m1-macos-arm64-apple-m5.json`
+  (Apple M5, 10 host CPU cores, `725` unit tests across `1..=3` local workers on `127.0.0.1` — NOT
+  3 physical machines: Spike R2 achieved `51.26 %` savings `56.05 s -> 27.32 s`, clearing the `>= 30 %`
+  stop rule; Measure M1 achieved `27.76 s` median / `25.54 s` min vs `54.85 s` 1-worker median,
+  `0.5061x` median with `"target_met": false` against `<= 0.50x` under shared-CPU contention).
+  Remains `Partial | In` pending: (1) a 3-physical-machine Measure M1 record meeting `<= 0.50x`
+  (`"Done when"` / design `0056`), and (2) live `--build-once` verification with a real `cargo-nextest`
+  binary (absent on the macOS verification host) and cross-`(os, arch)` multi-machine workers.
 
 ### AX-3: Live output, `logs`, and MCP tasks
 
@@ -1533,6 +1537,23 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A client sees the first output line while the task runs. An MCP client polls a
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
+
+### BUG-36: `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout
+
+- **Evidence:** `crates/cli/src/shard.rs` (`execute_shards`, `run_single_task_wait`) and `crates/cli/src/matrix.rs`
+  compute one `safe_deadline(timeout)` when the run starts, from `--timeout-secs` (`DEFAULT_SHARD_TIMEOUT_SECS` is
+  60 for `shard`, 60 for `submit` without a workspace), and use it for every shard or cell: the handshake
+  semaphore, the queue and the run. The worker enforces the same number per task. The MCP `submit` tool already
+  takes a separate `wait_secs` (`crates/cli/src/mcp.rs`).
+- **Problem:** `--timeout-secs` reads as the limit of each task, but the client gives up on the whole run after
+  that time, queue time included. A run with more shards than free slots, or a default 60 s `cargo nextest`
+  shard (design 0103 `--build-once`), reports `timed_out` for shards that would have finished in time.
+- **Do:** Decide in an amendment to designs 0101 and 0103 (with `docs/reference.md`): a wait per shard that
+  starts when the shard's task starts running, or a separate budget for the whole run (`--wait-secs`, as MCP
+  has) with a documented default, and a larger default timeout for `shard`. No wire change. First a test that
+  fails without the change: more shards than slots, each well inside `--timeout-secs`, the run longer than it.
+- **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
+  queue time, and that test passes.
 
 ### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
 
@@ -2452,8 +2473,62 @@ Add one dated line per finished item, newest last.
 - 2026-11-19: TEST-25 Partial (step 1, pull request 381, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): added `soak` subcommand of D3 to `benchmarks/endurance/endurance.py`, unit tests in `tests/test_endurance_harness.py` (`20/20`), and 45-minute Windows `x86_64` loopback record `benchmarks/endurance/results/2026-11-19-soak-45m-loopback-windows-amd64-intel-core-i5-14600kf.json` at `4c11a45` (`6/6` checks passed over `2,704.22 s` across `2,185` submitted and unique master-logged tasks, `0` multi-result tasks, `0` submit failures, `4` retries/orphan requeues from `/api/tasks` + master `INFO` logs [debug-only stale/late counts unmeasured at `INFO`], `16/16` injected faults, master per-process RSS `16.0 -> 35.5 MiB` / `29.2 -> 40.3 MiB`, `journal.bin` compaction `1,525,821 -> 24 B` / `801,453 -> 24 B`, idle stores within `4 GiB` / `2 GiB` bounds and mid-run worker cache `<= 2,125.0 MiB`, fault-excluded clean probe p99 `130.85 -> 146.51 ms` [ratio `1.1197`], `0` leftover PIDs or task process trees; 24-hour 3-machine run remains for step 2, awaiting an owner date). Counted from the rows: 225 items, 151 Implemented, 19 Partial and 55 Planned; 24 open items In, 50 Out.
 - 2026-11-19: TEST-60 Implemented (pull request 378, open; text in the archive): replaced short `1–5 s` timeouts and the `< 2 s` wall-clock assertion in `crates/worker/src/client/tests.rs` with generous condition waits (`TEST_WAIT_TIMEOUT = 60 s` via `timeout_at` / `timeout`, `30 s` on `junk .exe` and Unix hung-Blender checks) and raised tight mock task timeouts to `30–60 s` (reproduced on `origin/master` with `9/20` failures in full `rusty_grid_worker --lib` under `6` busy loops hitting all four `5 s` `Elapsed(())` timeouts; post-fix `20/20` alone `client::tests`, `20/20` `client::tests` under `6` busy loops, and `20/20` full `rusty_grid_worker --lib` under `6` busy loops).
 - 2026-11-19: APP-6 Partial (item stays `Planned`, pull request 376, open): steps 1 and 4 done (`benchmarks/campaigns/2026-11-pilot/README.md`, 200-unit `manifest.json` with `verify_checksums.txt` and runner blocker, `dry_run_manifest.json` + `standin_workload.py`, `benchmarks/campaigns/driver.py`, `tests/test_campaign_driver.py`); steps 2 and 3 remain Planned.
+- 2026-11-19: TEST-66 Implemented (pull request 387, open; text in the archive): replaced fixed sleeps and wall-clock upper bounds (`< 2 s`, `< 3 s`, `10 s` stop timeout, `5 s` backoff-interrupt timeout) in `tests/worker_cluster_auth.rs` with `TEST_WAIT_TIMEOUT` (`60 s`) condition waits, a `Notify` connect gate in `test_shutdown_interrupts_a_handshake_with_a_silent_master`, and a `25 s` (< `30 s` floor) shutdown check in `test_auth_failure_backs_off_instead_of_hot_looping_and_shutdown_interrupts_it` (`1/5` workspace Run 5 fail on `origin/master`; `20/20` before-fix and `20/20` after-fix in `worker_cluster_auth` under `6` Python busy loops on 10-core Apple Silicon macOS).
 - 2026-11-19: LV-4 Partial (step 3, branch `win/lv-4-forbid-unsafe`, [design 0058](design/0058-lasting-value.md)): added `#![forbid(unsafe_code)]` to all 4 zero-`unsafe` binary crate roots (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`) and `#![deny(unsafe_code)]` to all 6 library crate roots with surgical `#[allow(unsafe_code)]` + `// LV-4:` reasons on `android_bridge`'s 10 `#[no_mangle]` JNI functions, `agent_mesh::executor`, `master::store` (`store::fuzzing` `forbid`), `core::{capabilities, noise_auth, private_file}` + test-only `blob::tests`/`task::tests`, `cli::{join, mode_cli::dev_launch}`, and `worker::{blob_cache, isolation, process_tree, sandbox, workspace}` + test-only `client::tests`/`runner::{outcome_tests, process_tree_tests}`/`staging::tests`; full module inventory recorded in design 0058, zero runtime change (items unchanged: still Waiting for CI Miri run on `master`).
 - 2026-11-19: APP-6 stays Partial (item stays `Planned`, pull request 383, open): the runner is ready (Anima Engine pull request 167, merge commit `963f436e`); the pilot sheet and `manifest.json` moved to `run_esel1_experiment --trial` with `runner_ready: true` and `out/trial/verify_checksums.txt`, and record the owner's exception to Anima Engine rule `QĐ-OXS` for this pilot; steps 2 and 3 remain Planned.
+- 2026-11-19: BUG-34 added and Implemented (pull request 391, open): `BlobCache` (`crates/worker/src/blob_cache.rs`) holds an exclusive advisory `File::try_lock` on `cache/blobs/owners/<owner_uuid>.lock`, names temp files `<owner_uuid>.<part_uuid>.part`, and sweeps dead-owner `.part` + orphan `.lock` files on `BlobCache::open` and on worker startup (`sweep_dead_owner_tmp` in `crates/worker/src/sandbox.rs`) while keeping files of live writers (`WouldBlock`) and preserving the 24-hour `STALE_TMP_AGE` fallback for legacy unowned files; verified on Windows (`rustc 1.96.0`) by `clippy -p rusty_grid_worker --all-targets -- -D warnings`, `blob_cache::tests` (`12/12` including cross-process kill-vs-live, owner-lock race retry, and Windows junction/ACL checks), `blob_client::tests` (`6/6`), and `sandbox::tests` (`18/18`).
+- 2026-11-19: TEST-63 Implemented (pull request 389, open; text in the archive): `test_mapreduce_tasks_run_on_all_workers_at_once` (`tests/master_limits_and_scheduling.rs`) replaces `sleepy_job` and the `< 7 s` wall-clock check with `barrier_job`, where all 4 mappers announce `$RUSTY_GRID_WORKER_ID` into a temporary barrier directory and wait until all 4 `active-*` files exist at once (asserting `4` markers split `2`/`2` across both workers, `WAIT = 180 s`, `mapper_timeout_secs = 540`, and clean worker shutdown before `TempDir` drop); on 10-core Apple Silicon macOS under `6` busy loops, it failed `1/5` in workspace Run 5 (`took 20.682465417s`) and passed `20/20` before (`120.02 s`, `5.05–7.33 s`) and `20/20` after (`57.08 s`, `1.90–5.25 s`).
+- 2026-11-19: ADOPT-1 stays `Planned` (study kit ready, pull request 393, open): added `docs/study/2026-11-adopt-1/` (English/Vietnamese participant guide, facilitator sheet, consent template, and round-one record guide), `scripts/study_timer.py`, and `tests/test_study_timer.py` (CI `agent-bridge`); no round-one session has run yet.
+- 2026-11-19: TEST-62 Implemented (pull request 390, open; text in the archive): `cli::test_cli_submit_input_and_output_round_trip_with_dedup` (`tests/blob_transfer_e2e.rs`) now runs blocking CLI child processes on `tokio::task::spawn_blocking` so Tokio worker threads running the in-process `WorkerClient` heartbeat loop are never blocked, passes `--heartbeat-timeout-secs 60` to `rusty-grid master`, raises port/worker registration waits to `60 s` async loops, raises `submit` `--timeout-secs` to `120`, prints stdout/stderr/`master.log` on submit failures, and shuts down the worker cleanly before exit; on 10-core Apple Silicon macOS under `6` busy loops, it failed `1/5` in workspace Run 5 (`Some(1)` instead of `Some(7)`), passed `20/20` before (`98.11 s`, `3.61–6.98 s`; full binary `1/1` loaded probe `30.08 s`) and `20/20` after (`98.23 s`, `3.88–6.83 s`).
+- 2026-11-19: TEST-64 and TEST-65 Implemented (pull request 388, open; texts in the archive): `runner::process_tree_tests::test_partial_output_survives_timeout_and_cancellation` (`crates/worker/src/runner/process_tree_tests.rs`) now waits by condition (polling a marker file written after `echo partial-out` up to `60 s`) before cancelling instead of sleeping `600 ms` and gives the timeout subtest `3 s`; `test_sec5_hardened_runner` (`crates/worker/tests/test_sec5_hardened_runner.rs`) and `crates/worker/tests/common/mod.rs` replace `< 1 s` wall-clock assertions and `1–2 s` / `15 s` fixed waits with `60 s` condition waits, check pipe EOF without the drain note under `pipe_drain_grace = 10 s`, treat `ProcessStatus::Dead` as dead alongside `Zombie`, and retry `EINTR` in Linux `kill_cgroup_leaf` and `kill_escaped_by_env` (`crates/worker/src/process_tree.rs`). Both failed `1/5` in workspace Run 5 on macOS (and TEST-65 failed on `ubuntu-latest` in CI run 44525741499); on 10-core Apple Silicon macOS under `6` busy loops, `TEST-64` passed `20/20` before (`62.54 s`, `2.04–4.11 s`) and `20/20` after (`86.09 s`, `3.45–5.45 s`), and `TEST-65` (`test_sec5_hardened_runner`) passed `20/20` before (`84.62 s`, `3.03–6.03 s`) and `20/20` after (`76.26 s`, `3.02–4.08 s`); Linux verification (`sec5 hardened runner (ubuntu-latest)` and `workspace tests (ubuntu-latest)`) is covered by GitHub Actions CI because Docker is not installed on this Mac.
 - 2026-11-19: TEST-61 Partial (pull request 392, open): not reproduced on macOS in 140 targeted runs (`0/50` alone unloaded, `0/50` alone under 6 busy loops, `0/20` full `test_feat3_os_isolation` unloaded, `0/20` loaded) plus `5/5` full loaded workspace runs; proved `BUG-33`'s `close_open_fds_macos` runs solely in the detached grandchild's descriptor table and passes 128 concurrent multithreaded piped-stdout spawns; added `PreparedUnix::drop` lifeline dismissal, `capture.rs` read-error warning, and `TaskResult` diagnostics across `mod macos` (and Linux signal) control assertions (`20/20` post-fix loaded loops each on `process_tree::tests` and the hard-link test).
+- 2026-11-19: TEST-26 Partial (pull request 382, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md) D4.2): added scheduled (`17 3 * * 1`) and `workflow_dispatch` `endurance` job on `ubuntu-latest` to `.github/workflows/ci.yml` (`T1` `1 GiB`, `T2` `20,000` files, `T4`, `T6`, `T7`, `T8`, and `45m` soak, uploading `endurance-records`; pinned action commits; static check in `tests/test_endurance_harness.py`); stays Partial until green on two scheduled runs.
 - 2026-11-19: TEST-67 Implemented (pull request 394, open; text in the archive): confirmed both `agent bridge` CI flakes are in `tests/test_campaign_driver.py` rather than `benchmarks/campaigns/driver.py`, replaced shared `open("a")` log appends with per-invocation atomic directory files (`FAKE_OXIDESWARM_LOG_DIR`, `ts_ns` + `pid` + `uuid4`) sorted chronologically by `read_fake_cli_logs`, raised `--submit-timeout-secs` in `test_timeout_records_failed_and_cancels_task` from `0.2` to `5` (keeping `u002`'s `sleep_secs: 30.0`, 6x the watchdog, because Windows `proc.kill()` ends only `.cmd` wrappers and not child processes holding pipes), and raised `test_interrupt_records_interrupted_cancels_and_resumes` waits/sleeps to `60.0 s` / `600.0 s` with full attempt diagnostics; 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`74.61 s`, `3.64–3.84 s`) and `20/20` after (`173.79 s`, `8.52–9.21 s`).
 - 2026-11-19: TEST-25 stays Partial (remote-worker mode, pull request 395, open, [design 0065](design/0065-large-transfer-and-long-run-tests.md) D4.3): added `benchmarks/endurance/remote_soak.py`, `endurance.py soak --master-only`, and `worker-agent` (`--link lan-tcp|loopback`, `--orphan-timeout 15m`) with out-of-band `--secret-file` (`ClusterSecret::load_file`-compatible hex parsing + permission warnings) and hardened mutual HMAC-SHA256 control auth (300 s clock/nonce window, `req_nonce` + `run_id` response binding, `cmd_id` dedupe, `30 s` timeout + `8`-slot `503` cap, `1 MiB` reply cap, settings & `instance_id` validation), per-worker `ThrottleProxy`, remote sample/disk/clean-stop merging with worker-labeled `leftover_pids` and missing-evidence failure guarantees, `README.md` D4.3 docs, and loopback unit/E2E tests in `tests/test_endurance_harness.py` (item stays Partial until the 24-hour soak record lands).
+- 2026-11-19: TEST-79 Implemented (pull request 401 (open); text in the archive): in `crates/worker/tests/scale1_simulated_worker.rs`, added `TEST_WAIT_TIMEOUT = 60 s` and widened registration (`20 s`), 200-task burst `recv_msg` (`5 s`), reconnection (`20 s`), post-reconnect `recv_msg` (`15 s`), `wrapped_idle.read` (`2 s`), and shared `timeout_at` worker-shutdown drain (`15 s`) deadlines to `60 s` plus non-timeout `builtin_task` limits (`30 s` -> `60 s`; cancel `shared_delay_nanos` -> `60 s` / `builtin_task(false, 120)`) while keeping the `1 s` `EXIT_CODE_TIMEOUT` check; 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`37.29 s`, `1.72–3.59 s`, expected `0/20` since the `5 s` flake occurred on a 12-thread Windows laptop) and `20/20` after (`35.51 s`, `1.70–1.85 s`; single run `3/3` in `1.64 s`).
+- 2026-11-19: TEST-78 Implemented (pull request 400 (open); text in the archive): in `tests/rendezvous_discovery_e2e.rs`, added `TEST_WAIT_TIMEOUT = 60 s` and `run_with_timeout_with_logs` (draining child `stdout`/`stderr` in background reader threads and dumping child output plus `Rendezvous`/`Master`/`Worker` logs on timeout without blocking on inherited grandchild pipe handles), and widened `wait_for_port_file` (`10 s`/`15 s` -> `60 s`), registration deadline (`30 s` -> `60 s`), `run_with_timeout` CLI waits (`10–20 s` -> `60 s`), and `discover_master_rendezvous` checks (`1–2 s` -> `60 s`); 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`195.42 s`, `9.54–11.58 s`, expected `0/20` since the `20 s` timeout flake occurred on a 12-thread Windows laptop) and `20/20` after (`193.82 s`, `9.39–10.00 s`; single run `3/3` in `9.16 s`).
+- 2026-11-19: TEST-74 Implemented (pull request 398, open; text in the archive): in `tests/m5_challenger_2_stress.rs`, repaired crash injection where `.find(...)` over `list_tasks` `HashMap` order could match a `Completed` map task on `w1` instead of a `Running` reduce task (polling up to `60 s` to crash whichever worker `w1`/`w2` holds the `Running` map/reduce task with `task_summary` diagnostics), protected against the `60 s` idle stall (stalled task unknown; two consecutive `~67.4 s` local runs point to a load burst / 85 % CPU backpressure) via `TEST-54` `MR_WAIT = 180 s` / `540 s` MapReduce timeouts with `queue_stats` diagnostics, asserted `tasks.len() == 7` (2 map + 5 reduce, no map recomputation) and `>= 1` `Completed` task with `failover_count >= 1` on the surviving worker, widened `wait_for_workers` (`5 s` -> `60 s`), and added `TEST-20` worker config flags in `spawn_test_worker`; reproduced `2/20` failures before at `:623:10` (`252.31 s`, `4.97–67.79 s`) and passed `20/20` after (`74.45 s`, `3.61–3.86 s`; single run `11/11` in `3.51 s`) under 6 busy loops on Apple M5.
+- 2026-11-19: TEST-77 Implemented (pull request 399 (open); text in the archive): in `tests/e2e_cluster.rs`, added `TEST_WAIT_TIMEOUT = 60 s`, floored `wait_for_workers`, `submit_and_wait`, and `poll_until` at `60 s`, widened direct `wait_task` (`5–15 s` -> `60 s`), cancellation target sleeps (`120 s`/`180 s`), `2–3 s` deadlines, MapReduce specs (`180 s`), and non-timeout `TaskRequirements` (`10–30 s` -> `60 s`) while preserving `elapsed >= 250 ms` serial throttling in `test_tier2_bva_max_concurrency_limit_throttles_worker` and the `1 s` timeout test, and added `TEST-20` no-GPU/no-Blender/no-CUDA/no-portal flags in `TestCluster::spawn_worker` and the concurrency test; 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`162.16 s`, `7.52–9.50 s`, expected `0/20` since the `5 s` flake occurred on a 12-thread Windows laptop) and `20/20` after (`63.93 s`, `2.99–3.38 s`).
+- 2026-11-19: TEST-73 Implemented (pull request 397, open; text in the archive): in `tests/m4_scheduling.rs`, replaced the `< 800 ms` / `< 1200 ms` parallel-batch wall-clock cap in `test_m4_parallel_batch_spread_scheduling` with a cross-platform `started_*`/`release` barrier proving `>= 3` concurrent running tasks within `60 s` (keeping 3-worker spread assertions and printing both timings), dropped the `< 1.5 s` cancellation wall-clock check in `test_m4_in_flight_task_cancellation` (`sleep 120`, printing `cancel_duration`), gated failover retry disconnect on markers instead of `sleep 0.8`, and widened registration, worker disconnect, `wait_task`, and task timeouts to `TEST_WAIT_TIMEOUT = 60 s` (`wait_for_workers` / `wait_for_task_running` diagnostics); 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`53.70 s`, `2.56–3.88 s`, expected `0/20` since the flake occurred on a 12-thread Windows laptop) and `20/20` after (`34.18 s`, `1.60–1.81 s`).
+- 2026-11-19: TEST-68 Implemented (pull request 396, open; text in the archive): raised fixed `3–8 s` waits (`wait_for`, `wait_task`) and `5–15 s` task timeouts to `60 s` (`TEST_WAIT_TIMEOUT`, shared `wait_for_workers` dumping observed worker statuses on failure) in `tests/gpu_wgpu_compute_test.rs` (`test_e2e_cluster_gpu_task_distribution` and `test_adversarial_scheduling_isolation_mixed_cluster`), kept every strict routing check and the `500 ms` `Queued` negative check, and re-verified `stranded_id` stays `Queued` after `quick_cpu` completes on a free CPU worker; compiles with `--features gpu-wgpu` and passed `20/20` (`97.83 s`, `4.71–6.37 s`) before and `20/20` (`95.01 s`, `4.69–4.91 s`) after under 6 busy loops on Apple M5.
+- 2026-11-20: TEST-80 Implemented (pull request 402 (open); text in the archive): in `crates/worker/tests/test_sec5_hardened_runner.rs` (`test_bug10_3d_and_blender_refuse_oversized_sparse_output_without_reading`), dropped both `elapsed < 5 s` wall-clock upper bounds (logging elapsed times instead), kept the metadata-refusal structural checks (`"is {sparse_bytes} bytes"`, `!"is more than"`, `asset_bytes.is_none()`), and raised the `BlenderRigProvider::execute_rigging` timeout from `15 s` to `60 s`; `--features 3d` 20-run loaded loops under 6 busy loops on Apple M5 passed `20/20` before (`12.88 s`, `0.54–1.91 s`) and `20/20` after (`11.47 s`, `0.54–0.61 s`; single full binary `28/28` in `2.83 s`).
+- 2026-11-20: TEST-69 added and Partial (pull request 403, open; text in the archive): hardened five Windows AppContainer isolation tests in `crates/worker/tests/test_feat3_os_isolation.rs` (`mod windows`) against CPU starvation using `WIN_WAIT_TIMEOUT = 60 s`, `wait_for_barrier` with `AtomicBool` early-exit detection and `format_result_diag`, `GO_SEEN` barrier confirmation in `test_concurrent_tasks_under_fs_cannot_read_or_list_each_others_sandboxes`, `ChildKillGuard` + stdout `"READY"` pipe synchronization, `30 s` `DeleteAppContainerProfile` cleanup polling, and `90 s` `win_task` budgets on barrier-coordinated tests (`5/5` failures of `test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret` during full loaded workspace runs under `6` busy loops; pre-shutdown `20/20` passed before [`150.03–169.37 s`, median `154.22 s`] and `20/20` passed after [`148.63–157.44 s`, median `151.07 s`] in isolated `--test-threads=1` runs under `4` busy loops with `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, plus pre-shutdown `clippy`; rebased post-restart onto `8513b79` and verified `1/1` [`31 passed`, `211.33 s`] with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 --test-threads=1`, then merged `origin/master` `fd0df6a` and added `GO_SEEN` [verified by `windows-latest` CI; local `1/1` check to follow once free RAM `>= 6 GiB`]). Remains `Partial` because the failing full loaded configuration under `6` busy loops crashed this laptop twice and was not re-run here (the fix was looped only as this binary alone under `4` busy loops, where the old code also passed); confirmation in the failing configuration runs on `agent-win` after its 24-hour soak.
+- 2026-11-20: TEST-81 Implemented (pull request 404, open; text in the archive): confirmed with a temporary debug master log under 6 busy loops plus concurrent `cargo test -p rusty_grid_cli` that `SchedulerConfig::max_host_cpu_pct` (`85.0`) holds workers back (`51` `DEBUG` lines logging `max_host_cpu_pct=85.0`, `cpu_usage_pct=99.60392`, stalling the 3rd submit after `5 s`; removed per review and replaced by `SCHED-5` for the product behavior), added `SchedulerConfig::with_max_host_cpu_pct` and `SchedulerConfig::without_host_cpu_backpressure` in `crates/master/src/scheduler.rs`, and opted `57` non-backpressure test files out (`without_host_cpu_backpressure()` / `--max-host-cpu-pct 100`) while keeping production default `85.0` and all backpressure/config tests unchanged; `blob_transfer_e2e` 20-run loaded loops passed `20/20` before (`576.66 s`, `26.18–36.63 s`; reproduced in Q80 workspace Run 2) and `20/20` after (`627.62 s`, `29.01–33.98 s`), and the full workspace suite passed (`137` binaries, `2,228 passed; 0 failed; 5 ignored`).
+- 2026-11-20: Added SCHED-5 (Planned, Out): tell the user why a queued task waits when every eligible worker is above `max_host_cpu_pct` (open question from TEST-81, with PR 404 review inputs: `AllEligibleWorkersSaturated` skips only, connected workers only, once per change of the busy-worker set; visible form to be decided in a design record).
+- 2026-11-20: TEST-82 Implemented (pull request 405 (open); text in the archive): replaced `24` wall-clock upper bounds across `rusty_grid_worker` (keeping `4` release-only `!cfg!(debug_assertions)` SLAs untouched and skipping `3` hits in `worker_connection_lifecycle` [TEST-76] and `mod windows` [TEST-69]) and bounded all `3` status-query `recv_msg` awaits in `crates/worker/tests/scale1_simulated_worker.rs` (`:268`, `:313`, `:343`) by the remaining `TEST_WAIT_TIMEOUT` budget; verified `cargo fmt --all -- --check`, workspace + worker `--features 3d,gpu-wgpu` clippy (`-D warnings`), and `20/20` loaded runs under 6 CPU busy loops across all 7 touched binaries (plus `--features gpu-wgpu` `wgpu_engine`).
+- 2026-11-20: TEST-83 Implemented (pull request 406, open; text in the archive): replaced all `36` audited Category 1 wall-clock upper bounds plus `4` adjacent upper bounds across `18` files / `15` binaries in `rusty_grid_core` (`lib`, `m1_3d_adversarial_stress`, `m1_stress_challenge`) and `rusty_grid_master` (`lib`, `cluster_auth_e2e`, `m10_streaming_stress`, `m2_challenger_2_stress`, `m2_stress_challenge`, `m4_challenger_2_stress`, `m9_stress_challenge_2`, `master_limits_and_scheduling`, `master_quic_limits`, `test_challenger_m4_scheduler_runner`, `worker_crash_rescheduling_test`, `zero_copy_quic_test`), skipping `m2_challenger_1_stress` (`TEST-70`), `m4_challenger_1_stress` (`TEST-71`), and `master_restart_recovery` (`TEST-75`) as instructed, with `0` `!cfg!(debug_assertions)` release-only SLAs in `core`/`master`/`tests`; replaced proof proxies with structural checks (`mapreduce`, `recovery_tests`, `scheduler`, QUIC flow-control pause in `m2_challenger_2_stress` and `zero_copy_quic_test`, Slowloris `try_read` `WouldBlock` + `120 s` malformed handshake in `m2_stress_challenge`, `first.close_reason().is_none()` in `master_quic_limits`), removed `1000`/`5000 msg/s` throughput floors in `m1_stress_challenge`, fixed the raw-worker `AssignTask`/reaper race in `worker_crash_rescheduling_test` and `m9_stress_challenge_2` (`ReaperConfig(50 ms, 1 s)`, heartbeating until `AssignTask` under a `60 s` `select!` guard, keeping `(writer, reader)` open until `wait_task` resolves), and widened hang guards to `60 s` (and inner sleep targets to `120 s`); `5` cheap targeted before-loops passed `20/20` on `f485533e` (expensive full-binary before-loops skipped), and all `15` touched binaries passed `20/20` after under 6 Python CPU busy loops on Apple M5 with private `HOME` (`core --lib` `165.40 s`, `m1_3d_adversarial_stress` `3640.83 s`, `m1_stress_challenge` `48.74 s`, `master --lib` `485.30 s`, `cluster_auth_e2e` `62.43 s`, `m10_streaming_stress` `18.92 s`, `m2_challenger_2_stress` `22.97 s`, `m2_stress_challenge` `211.20 s`, `m4_challenger_2_stress` `103.60 s`, `m9_stress_challenge_2` `48.16 s`, `master_limits_and_scheduling` `87.71 s`, `master_quic_limits` `73.76 s`, `test_challenger_m4_scheduler_runner` `10.05 s`, `worker_crash_rescheduling_test` `50.04 s`, `zero_copy_quic_test` `20.48 s`).
+- 2026-11-20: TEST-25 Partial (branch `win/test-25-24h-soak-record`, [design 0065](design/0065-large-transfer-and-long-run-tests.md)): committed `22.73 h` (`81,826.46 s`, stopped early at owner decision with ~`1.27 h` left) Windows `x86_64` loopback soak record `benchmarks/endurance/results/2026-11-19-soak-24h-loopback-windows-amd64-intel-core-i5-14600kf.json` on `rusty-grid 0.4.4` (`cfb0679`), assembled from preserved logs, pre-stop status (`pending=0`, `running=0`), `/api/tasks`, periodic snapshots, and idle disk/state captures: `63,059` unique master-logged task results across `12` master generations and `71` worker logs (`61,642` `exit_code=0`, `1,360` `exit_code=130`, `57` `exit_code=124` 60 s watchdog timeouts clustered in `06:30–06:31Z` [`9`] and `10:33–11:55Z` [`48`] during `25–52 s` log gaps), `0` duplicates, `0` log-level `ERROR`/panics, `112` failover sweeps, `27` orphan requeues; idle `master-blobs` (`4,244,637,442 B`), worker caches (`<= 2,105,542,715 B`), `0` `.part`/`.tmp`/`.locks` leftovers, runtime `journal.bin` compaction (`2,104,993 -> 54,043 B`), and `0` leftover processes; in-memory `TaskLedger` SHA-256 verification, 60 s `BackgroundSampler` means, continuous `probe_samples` p99, and `fault_events_log` marked `not_evaluated_due_to_early_stop`. Stays Partial pending the 3-machine run.
+- 2026-11-20: TEST-84 Implemented (pull request 407, open; text in the archive): replaced all `19` audited Category 1 wall-clock upper bounds across `12` files / `12` binaries in `agent_mesh` (`lib`, `adversarial_challenge`), `rusty_grid_android_bridge` (`lib`, `m5a_challenger_2_stress`, `mobile_coordination_test`), `rusty_grid_cli` (`mcp_server_e2e`, `test_cli_cancel_and_result`, `test_m2_identity_scripts`, `test_mcp_concurrent_and_deadlines`, `test_p2p_key_persistence`), and Python tests (`tests/test_agent_bridge.py`, `tests/test_sec6_mesh_sandbox.py`), with `0` `!cfg!(debug_assertions)` release-only SLAs in those crates or scripts; replaced proof proxies with structural checks (`drain_finished` in `android_bridge`, `Cancelled` queue state in `test_cli_cancel_and_result`, `release.gate` + `ReleaseOnDrop` release-gated evacuation tasks with `evacuation_count == 1`/`2` + `ReaperConfig(1 s, 120 s)` in `m5a_challenger_2_stress` and `mobile_coordination_test`, `watch_*.lock` + `first.poll() is None` in `test_agent_bridge.py`), replaced the dead `"RustyGrid Worker started"` wait in `test_p2p_key_persistence` with `saw_warn` + `saw_dialing` (keeping a `2 s` post-dial window), preserved `>= 900 ms` / `>= 950 ms` `1 s` lower bounds (`30 s` `task_result` guard), renamed `test_worker_auto_reconnect_preserves_identity` and `test_fast_evacuation_without_task_loss`, and widened hang guards to `60 s` (`120 s` inner sleeps); `5` cheap targeted before-loops passed `20/20` on `origin/master` (`e31b69e3`), and all `12` touched binaries passed `20/20` after (including post-review re-runs of the 5 review-updated binaries) under 6 Python CPU busy loops on Apple M5 with private `HOME` (`agent_mesh --lib` `53.26 s`, `adversarial_challenge` `38.18 s`, `android_bridge --lib` `91.60 s`, `m5a_challenger_2_stress` `62.05 s`, `mobile_coordination_test` `1045.91 s`, `mcp_server_e2e` `75.44 s`, `test_cli_cancel_and_result` `59.86 s`, `test_m2_identity_scripts` `32.13 s`, `test_mcp_concurrent_and_deadlines` `160.00 s`, `test_p2p_key_persistence` `84.91 s`, `test_agent_bridge.py` `1121.88 s`, `test_sec6_mesh_sandbox.py` `192.31 s`).
+- 2026-11-21: FEAT-9 Implemented (default of D6; text in the archive): updated `PROJECT.md` and `README.md` (alongside `docs/reference.md`) to state explicitly that built-in `GpuCompute` is benchmark only (seeded matrix multiplication; no user WGSL kernels) while user GPU workloads run as `Command` tasks (`docs/guides/gpu-workloads.md`), alongside `FEAT-9a` VRAM accounting (pull request 232, [design 0068](design/0068-task-vram-accounting.md)).
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header from the rows after `TEST-84`, `APP-6`, and `FEAT-9` Implemented: 247 items, 172 Implemented, 21 Partial, 54 Planned, 0 Design only; 25 open items are In and 50 are Out (`TEST-56` keeps `Line` `In` while pull request 361 is marked open).
+- 2026-11-21: LV-10 Partial (steps 1–3, [design 0058](design/0058-lasting-value.md)): added `CITATION.cff` (CFF 1.2.0, `version: "0.4.4"`, `MIT` / `Apache-2.0`, `"The OxideSwarm Authors"`), stdlib metadata/version-sync test in `tests/test_m1_challenger_hygiene.py`, and `"How to cite"` in `README.md`; step 4 (Zenodo DOI) stays with the owner.
+- 2026-11-21: PROTO-5 Partial ([design 0083](design/0083-one-version-window.md)): pinned `PREVIOUS_PROTOCOL_RELEASE: v0.3.0` alongside the newest release in `.github/workflows/ci.yml` `release-skew` with per-tag directory isolation, added `--release-tag` to `scripts/release_skew.py`, added CLI and static CI workflow tests in `tests/test_release_skew.py`, and updated `CLAUDE.md` and `docs/reference.md`; stays Partial awaiting live GitHub pull request CI run of `release skew (ubuntu-latest)` showing the `v0.3.0` table row.
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header after `LV-10` and `PROTO-5` Partial: 247 items, 172 Implemented, 23 Partial, 52 Planned, 0 Design only; 25 open items are In and 50 are Out.
+- 2026-11-21: ENROLL-1d Partial (API/UI/tests/docs complete; [design 0051](design/0051-machine-identity-and-invites.md)): wired `MasterAuthContext` and `WaiterMap` onto `MasterHandle` and `WebUiState`; added `MemberConnections::list_active`, `revoke_member_with_teardown` reuse, `AuthScope::Admin` enforcement on all `/api/members*` and `/api/invites*` routes (`crates/master/src/auth.rs`), `Method::DELETE` CORS preflight, and `crates/master/src/web_ui/members.rs`; added XSS-safe `Members` tab to `crates/master/src/dashboard.html`; expanded `tests/dashboard_api_test.rs` and `tests/dashboard_security_test.rs`; updated `docs/reference.md`, `docs/guides/add-a-machine.md`, `docs/SECURITY.md`, `README.md`, and `design/0051`. `ENROLL-1` remains `Partial` pending `ENROLL-1c` step 2 (store format change) and the recorded live two-network `--p2p` run.
+- 2026-11-21: SCHED-5 Implemented ([design 0099](design/0099-scheduler-backpressure-visibility.md); text in the archive) and SCHED-4c / SCHED-4d implemented ([design 0060](design/0060-speed-aware-placement.md)): `WorkloadScheduler::schedule_batch` now emits a transition-triggered `warn!` once per change of the connected, free-slotted, CPU-busy worker set when tasks skip with `AllEligibleWorkersSaturated` (clearing silently at `info!` without `"saturated"` on recovery and ignoring `Disconnected` workers and non-`AllEligibleWorkersSaturated` skips); `crates/core/src/placement.rs` reserves `opt:` (`opt:repeatable`) and `speed:` (`speed:<factor>`) without bumping `PROTOCOL_VERSION_CURRENT` (`10`) or `STORE_FORMAT_VERSION` (`4`); CLI `--repeatable` / MCP `repeatable`, in-memory `SpeculativeAttempt` + sibling cancellation/failure tolerance in `TaskQueue`, and bounded `(total_cluster_slots / 10).max(1)` straggler re-run in `crates/master/src/reaper.rs` complete `SCHED-4c`; `SpeedBook::relative_speed_factors`, `WorkerRegistry::list_all_workers` `speed:<factor>` tags, `workers --json` `"speed"`, `WorkerUiInfo::speed_factor`, and `.badge-speed` / `#mSpeed` in `dashboard.html` complete `SCHED-4d`. `SCHED-4` remains `Partial` (`Out`) pending a dated live two-machine hardware batch (`<= 1.5x` the fast machine's own time).
+- 2026-11-21: Recounted `docs/BACKLOG.md` Index summary header after `SCHED-5` Implemented: 247 items, 173 Implemented, 23 Partial, 51 Planned, 0 Design only; 25 open items are In and 49 are Out.
+- 2026-11-22: TEST-61 Partial (Wave 2 M1 verification of merged pull request 392 / `a7ce9e9d`): verified `154/154` sequential, parallel, and 1,150-FD macOS hard-link isolation runs (`0` empty-stdout flakes), `process_tree::tests` (`0` orphans), `test_feat3_os_isolation` (`28/28` + `1` ignored), and `tests/test_wave2_e2e.py` (`F1` + Tiers 3–4); removed `(open)` marker and kept `Partial | In` awaiting owner closure decision.
+- 2026-11-22: TEST-41 Partial (pull requests 359 and 363 merged; Wave 2 M1 commit `09c3accd`): closed three remaining shutdown/durability race gaps (`durability_failed` ack gating across all `apply_task_result_inner` branches, `farewell = None` on `MasterMessage::Shutdown`, and `WorkerSession::run` entry `shutdown_rx` check + `ActiveLanes::send_shutdown_and_flush` + `biased;` accept polling), verified with `RV158_ZERO=1 RV158_ROUNDS=48` (`48/48` `ran_twice=0`), Gap 1–3 deterministic tests, and `tests/test_wave2_e2e.py` (`F2` + Tiers 3–4); kept `Partial | In` awaiting owner closure decision.
+- 2026-11-22: AX-1 Partial ([design 0101](design/0101-matrix-fanout.md), commits `0e13d69d`, `58c41543`, `36a2d647`): implemented client-side matrix fan-out across `oxideswarm submit --matrix` and MCP `submit` on Protocol 10 / Store v4 (`crates/cli/src/matrix.rs`, `cli_app/submit.rs`, `mcp.rs`, `mcp/submit.rs`, `mcp/submit_matrix.rs`, `safe_deadline` / `safe_std_deadline` in `mcp/task_result.rs` and `doctor.rs`, `ensure_non_symlink_cell_dir` across CLI and MCP), verified by `crates/cli/tests/test_ax1_matrix.rs` (`9/9`) and `tests/test_wave2_e2e.py` (`F3`, `F4`, Tiers 3–4); kept `Partial | In` awaiting the external live 3-OS MCP call record.
+- 2026-11-22: FEAT-5 Implemented ([design 0102](design/0102-process-task-checkpoints.md), commits `a8a51357`, `06302c06`, `27cf8453`; text moved to archive): implemented `OXCP1\x01` in-band checkpoints (`12 MiB` / `4096` files), `$OXIDESWARM_CHECKPOINT_DIR`, `--output` / `expected_outputs` exclusion with `fold_blob_path` Unicode APFS equivalence, `PinnedDir` `openat`/`O_NOFOLLOW` traversal, pre-spawn `S + 1` restore, periodic + cancel/timeout emission, and `2 s` graceful shutdown drain on Protocol 10 / Store v4, verified by `test_feat5_process_checkpoints` (`5/5`), `test_feat5_cli_e2e` (`2/2`), and `tests/test_wave2_e2e.py` (`F5` + Tiers 3–4).
+- 2026-11-22: MESH-2 Implemented (commits `ea3b5e0c`, `85a53f71`, `36a2d647`; text moved to archive): implemented `agent-mesh node --inbox-dir` with mandatory SHA-256 verification and atomic persistence (`persist_payload_atomic`), bounded `BoundedPayloadBuffer` and `ChunkReassembler` (configurable `ttl`), `agent-mesh data` ACK/NACK exit codes (`--timeout-ms`, `--payload-file`, `-` stdin), accurate `total_chunks`, live `sysinfo` / `ActiveCommandGuard` telemetry, and honest `/api/nodes` + `/api/status` state, verified by `mesh_data_delivery` (`7/7`), `test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `tests/test_wave2_e2e.py` (`F6` + Tiers 3–4).
+- 2026-11-22: Wave 2 E2E & CI hardening (commits `ec1c9be8`, `bd7bb644`, `36a2d647`, `3ffa6732`): added 73-test opaque-box suite `tests/test_wave2_e2e.py` (`73/73` PASS) wired into `.github/workflows/ci.yml` on Linux and macOS, plus Tier 5 deadline, symlink, and chunk edge-case hardening.
+- 2026-11-22: Recounted `docs/BACKLOG.md` Index summary header from the rows after Wave 2 (`FEAT-5` and `MESH-2` Implemented, `AX-1` Partial, `TEST-41` and `TEST-61` updated): 247 items, 175 Implemented, 24 Partial, 48 Planned, 0 Design only; 25 open items are In and 47 are Out.
+- 2026-11-22: AX-2 Partial ([design 0103](design/0103-ax2-sharded-runs.md), branch `prod/backlog-completion-wave3`): implemented `oxideswarm shard` (`--count 1..=256`, 1-based `OX_SHARD_INDEX`/`OX_SHARD_TOTAL`, `ListWorkers` pre-flight, `slots:` SWRR spreading, `--fail-fast`, symlink-safe `--output-dir`, `--junit-out` XML merge, `--build-once` via `Task::inputs`), MCP `shard`, `docs/guides/sharded-runs.md`, and `benchmarks/grid/bench_shard_r2_m1.py`; verified by `shard` unit tests (`11/11`), `crates/cli/tests/test_ax2_shard.rs` (`8/8`, using stub `cargo` for `--build-once`), `mcp_server_e2e` (`9/9`), `test_bench_shard.py` (`6/6`), and single-host loopback record `benchmarks/grid/results/2026-11-22-r2-m1-macos-arm64-apple-m5.json` (`127.0.0.1` on 10-core Apple M5, NOT 3 physical machines: Spike R2 `51.26 %` savings clearing the `30 %` stop rule; Measure M1 `0.5061x` median with `target_met: false` vs `<= 0.50x`). Stays `Partial | In` pending a 3-physical-machine Measure M1 run `<= 0.50x` and live real `cargo-nextest` / cross-`(os, arch)` `--build-once` execution.
+- 2026-11-22: MESH-3 Implemented ([design 0104](design/0104-mesh3-remote-master-bridge.md), pull requests 114, 132, branch `prod/backlog-completion-wave3`; text moved to archive): decoupled `AgentGridBridge` behind async `GridBackend` (`InProcessBackend` and `RemoteMasterBackend` directly atop `rusty_grid_core` TCP/P2P + OXS-AUTH v2/v3), added `agent-mesh hub --grid-connect <HOST:PORT>` (`OXIDE_GRID_CONNECT`, `--secret`/`--secret-file`/`--master-key`/`--relay-url`/`--insecure`), live `/api/nodes` `"grid"` `"online"`/`"offline"` status, caller tag preservation and `placement`, upfront `workspace` refusal, strict inline-only `files` (`StagedFile`, zero hub-local disk reads), `outputs` -> SHA-256 `artifacts`, `grid_result`/`grid_cancel`, `AgentMeshClient` helpers, and worker-join documentation; verified by `crates/agent_mesh/tests/grid_remote_master_e2e.rs` (`2/2` with `CARGO_BIN_EXE_agent-mesh` against separately started master and worker), `test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `test_agent_mesh_token_auth.py` (`7/7`).
+- 2026-11-22: 3D-2 Implemented ([design 0105](design/0105-3d2-vram-blender-routing.md), branch `prod/backlog-completion-wave3`; text moved to archive): wired `TaskView::requires_blender`, `WorkerAttrIndex::blender`, `RegisteredIndex::any_has_blender`, and `SchedulerConfig::required_vram_mb` preset defaults (`2048`/`4096`/`6144` MB for `fast`/`standard`/`high` when `--gpu` or `--quality high` applies on non-`Sdf` `Generative3D`, preserving CPU-only `Sdf` and non-GPU `fast`/`standard` `Auto`/`TripoSr` defaults per `BUG-3`) across `crates/master/src/{queue,worker_index,scheduler,reaper}.rs`, added non-blocking CLI `ListWorkers` preflight warnings in `crates/cli/src/cli_app/submit.rs`, and verified shared `rusty_grid_core::capabilities::resolve_blender_binary` delegation (`crates/worker/src/autorig/blender_provider.rs`), `crates/master/tests/test_3d2_routing.rs` (`4/4`), and `crates/cli/tests/test_3d2_routing.rs` (`4/4` with `--features 3d`).
+- 2026-11-22: 3D-3 Implemented ([design 0106](design/0106-3d3-honest-autorig-options.md), branch `prod/backlog-completion-wave3`; text moved to archive): validated `rig_preset` (`biped` 15 joints, `quadruped` 19 joints, `generic` 5 axial joints), `embed_animations` (`idle`, `walk`, `turnaround` with 97 keyframes in both Rust and `engines/autorig/blender_rig.py`), and `preferred_provider` (`None`/`builtin`, `auto`, `blender`, failing explicitly on `"blender"` error/absence) upfront in `TaskSpec::validate()`, worker, and `blender_rig.py`, added magic-byte `.glb`/`.gltf`/`.obj` detection with UTF-8 BOM/whitespace stripping, reported `"OxideSwarm-AutoRig-Blender"` vs `"OxideSwarm-AutoRig-Builtin"` in `TaskResult::device_name` and stdout, and wired task `timeout`, `child_pid`, and cooperative `cancel_rx` / `AtomicBool` stopping (`<= 1 s`) across Blender and Rust `autorig/*` and `gen3d/*` workloads; verified against real Blender 5.2.1 LTS plus `crates/worker/tests/test_3d3_autorig_options.rs` (`10/10`), `test_autorig_pipeline` (`15/15`), and `test_challenger_m3_blender_job_object` (`10/10`).
+- 2026-11-22: Recounted `docs/BACKLOG.md` Index summary header from the rows after Wave 3 (`3D-2`, `3D-3`, and `MESH-3` Implemented; `AX-2` Partial): 247 items, 178 Implemented, 24 Partial, 45 Planned, 0 Design only; 25 open items are In and 44 are Out.
+- 2026-11-22: Review fixes before merge (pull requests 410, 413 and 414): a members-only master off loopback no longer gives local processes dashboard Admin (SECURITY.md); a revoked member's checkpoint is dropped when its task is promoted to the speculative copy; FEAT-5 D5 to D7 of design 0102 (no checkpoint capture off Unix under `--isolation`, bounded Unix walk, master rate limit and headroom); MESH-2 verified and paced delivery ([design 0107](design/0107-mesh2-verified-delivery.md)); `auto` 3D tasks need no VRAM (design 0105); `prefer:worker=` is soft (design 0103 D7); MESH-3 catalog liveness is cached (design 0104 D5); a master stopped during start-up shuts down cleanly.
+- 2026-11-23: TEST-85 added (the Windows `submit --type compile` timeout of 2026-11-20). Stale "(open)" marks removed from the rows of TEST-24, TEST-26, TEST-56, TEST-69, TEST-84 and SEC-16, whose pull requests are merged. The prompts for the remaining stability work are in [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The id TEST-85 was not claimed through `agent_bridge.py claim` because the hub on Google Drive timed out; no pull request uses it.
+- 2026-11-23: The owner delegated the open decisions to Claude ("làm theo ý bạn"). TEST-23 and TEST-61 closed without a reproduced cause (their loops are recorded, diagnostics stay), SEC-16 closed with no ACL or code change, CI-1 closed with step 2 kept as a standing rule in prompt S5. TEST-41 stays Partial until the loops of prompt S3. Texts moved to the archive.
+- 2026-11-23: TEST-85 Partial (pull request 417, branch `win/test-85-compile-timeout`, commit `b0d4058f`): the CI `60` s timeout hit a task that normally runs in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on Windows, `14` physical / `20` logical cores), so it looks like a stall rather than a slow build; cause not found. Added a `--timeout-secs 600` hang guard, widened worker registration to `60` s, and printed compile timings in `crates/cli/src/cli_app/runtime_tests.rs`; verified `50/50` (`4` busy loops) + `228/228` `rusty_grid_cli --lib --features gpu-wgpu` + `cargo +1.96.0 clippy`; stays Partial until the cause is found or `windows-latest` stays green through the Q80 streak window. Index recounted: `248` items (`182` Implemented, `21` Partial, `45` Planned; `22` In, `44` Out).
+- 2026-11-23: TEST-86 added: three `test_ax2_shard` tests stalled for 60 s on `macos-latest` in the `master` run of pull request 415 (2026-11-22 18:38 UTC), which restarts the Q80 streak; the likely cause is the BUG-35 class, so it waits for pull request 409. The wall-clock assertions of `test_ax2_shard.rs` and `test_ax1_matrix.rs` are now printed, and their hang guards are 60 s. BUG-36 added (Out): `shard` and `submit --matrix` share one deadline across the run. Both ids were claimed with `agent_bridge.py claim`.
+- 2026-11-23: TEST-41 Partial (pull request 419 (open), S3 Linux part): on Linux (`aarch64`, `10` logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 13 (trixie)` in Docker `rust:1.96` on Apple M5 `10` cores, `rustc 1.96.1`) at `9800abea`, `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`cargo test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture`, temp `HOME` per run) passed `200/200` runs (`2,400` rounds, `ran_twice=0` everywhere, `0` failures, `1,633.96 s` total: `100` default-delay `860.33 s` + `100` `RV158_ZERO=1` `773.63 s`) under `4` CPU busy loops inside the container; stays `Partial | In` pending the post-`09c3accd` Windows `200`-run loop.
+- 2026-11-23: TEST-41 Partial (Windows 200/200 post-`09c3accd`, pull request 420): hardened `tests/master_restart_recovery.rs` (`120 s` helper/marker/done guards, direct `.NET` calls in `#[cfg(windows)] gated_marker_task`, bounded `done_path` loop + `LogSink` timeout dump), verified `master_restart_recovery` `8/8` (`13.59 s`), and passed `200/200` sequential `rv158` runs (`100` default + `100` `RV158_ZERO=1`, `2,400` rounds, `ran_twice=0`, `2,725.53 s` total) on Windows under 4 Python CPU busy loops at `cfed793d`; stays `Partial | In` pending closure decision.
+- 2026-11-23: TEST-69 Implemented (pull requests 403, 421; text in the archive): confirmed on the Windows case PC (`Windows 11 Pro`, `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `>= 28 GB` free RAM) at `9800abea` (`crates/worker` unchanged in `8e55dac9`) with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 cargo +1.96.0 test -p rusty_grid_worker --locked` passing `20/20` runs (`427 passed, 0 failed` per run; `136.26–140.33 s`, median `136.60 s`, total `2,737.24 s`) under `6` Python CPU busy loops plus all `6` hardened `mod windows` tests individually (`0.41–5.58 s`). Index recount: 248 items, 183 Implemented, 20 Partial and 45 Planned; 21 open items are In and 44 are Out.
+- 2026-11-23: S8 Windows manual checks completed at `8e55dac9` (pull request 422 (open), branch `win/s8-windows-manual-check`, `Intel Core i5-14600KF`, `14` physical / `20` logical cores; [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s8-windows-manual-check-record-2026-11-23)): `AX-1`, `FEAT-5` (`--isolation off` failover resume + `--isolation fs` no-capture D5 warning), `ENROLL-1d` (invite/approve/revoke by name & ID prefix with `actor="win-admin"` audit lines), and `MESH-2` (`> 1 MiB` chunked transfer to `scripts/agent_node.py` + `ERR_INBOX_FULL` under `--inbox-max-mb 1`) all passed; `AX-2` passed `shard --count 4` (both workers) and `--fail-fast` with `--build-once --junit-out` skipped (`cargo-nextest` not installed); `0` defects found and `0` new BACKLOG items added (`Index` unchanged).
+- 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
+- 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
+- 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.
+- 2026-11-23: TEST-88 Implemented (pull request 424): the case PC ran the Windows loop of "Done when" at `012dc68c`: 20/20 runs of `rusty_grid_worker` and 5/5 of `m3_challenger_2_stress` passed with 0 new console windows and 0 leftover processes (master baseline: 11 new `OpenConsole.exe` in one run). INC-20261123-001 closed.

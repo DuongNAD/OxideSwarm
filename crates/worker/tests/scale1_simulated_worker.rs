@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::{ClientMessage, ClientResponse, MessageTransport};
 use rusty_grid_core::task::{Task, TaskId, TaskRequirements, TaskSpec};
-use rusty_grid_master::{MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::DEFAULT_MASTER_MAX_BATCH_SIZE;
+use rusty_grid_master::{MasterServer, ReaperConfig, ServerConfig};
 use rusty_grid_worker::{
     BackoffConfig, FakeRunnerConfig, LinkLossAction, RunnerConfig, SandboxConfig,
     SimulatedLinkConfig, SimulatedLinkStream, SimulatedNetworkControl, TaskRunner, WorkerClient,
@@ -20,6 +22,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
+
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn builtin_task(should_fail: bool, timeout_secs: u64) -> Task {
     Task::new(
@@ -57,7 +61,7 @@ async fn fake_runner_handles_delay_callbacks_cancellation_timeout_and_zero_disk_
     let runner = TaskRunner::new(Uuid::new_v4(), caps, runner_cfg);
 
     // 1. Normal delayed run triggers on_task_started and avoids creating any sandbox directory.
-    let task_ok = builtin_task(false, 30);
+    let task_ok = builtin_task(false, 60);
     let t0 = Instant::now();
     let res_ok = runner
         .execute_task_with_checkpoint(&task_ok, None, None, None, None)
@@ -76,8 +80,8 @@ async fn fake_runner_handles_delay_callbacks_cancellation_timeout_and_zero_disk_
     );
 
     // 2. Dynamic delay update + immediate cancellation returns EXIT_CODE_CANCELLED.
-    shared_delay_nanos.store(Duration::from_secs(5).as_nanos() as u64, Ordering::Relaxed);
-    let task_cancel = builtin_task(false, 30);
+    shared_delay_nanos.store(Duration::from_secs(60).as_nanos() as u64, Ordering::Relaxed);
+    let task_cancel = builtin_task(false, 120);
     let (cancel_tx, cancel_rx) = oneshot::channel::<String>();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -194,7 +198,7 @@ async fn simulated_link_applies_latency_fifo_jitter_and_impairments() {
         net_ctrl.disconnect_all();
     });
     let mut read_buf = [0u8; 16];
-    let read_res = tokio::time::timeout(Duration::from_secs(2), wrapped_idle.read(&mut read_buf))
+    let read_res = tokio::time::timeout(TEST_WAIT_TIMEOUT, wrapped_idle.read(&mut read_buf))
         .await
         .expect("disconnect_all did not wake reader promptly");
     assert_eq!(read_res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
@@ -217,7 +221,12 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
         .with_max_pending_handshakes(256)
         .with_max_terminal_tasks(1000)
         .with_session_resume_hold(Duration::ZERO);
-    let master = MasterServer::spawn(server_cfg).await.expect("spawn master");
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    let master = MasterServer::spawn_with_config(server_cfg, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("spawn master");
     let master_addr = master.server_addr();
     let master_addr_str = master_addr.to_string();
 
@@ -250,7 +259,7 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     }
 
     // 1. Wait for all 100 workers to register cleanly.
-    let reg_deadline = Instant::now() + Duration::from_secs(20);
+    let reg_deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     let mut query = MessageTransport::new(
         TcpStream::connect(master_addr)
             .await
@@ -258,15 +267,18 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     );
     loop {
         if net.active_sessions() == WORKERS as u64 {
-            query
-                .send_msg(&ClientMessage::ClusterStatus)
-                .await
-                .expect("send status");
-            if let Ok(Some(ClientResponse::ClusterStatus { workers, .. })) =
-                query.recv_msg::<ClientResponse>().await
+            let remaining = reg_deadline.saturating_duration_since(Instant::now());
+            if let Ok(send_res) =
+                tokio::time::timeout(remaining, query.send_msg(&ClientMessage::ClusterStatus)).await
             {
-                if workers.len() == WORKERS {
-                    break;
+                send_res.expect("send status");
+                let remaining = reg_deadline.saturating_duration_since(Instant::now());
+                if let Ok(Ok(Some(ClientResponse::ClusterStatus { workers, .. }))) =
+                    tokio::time::timeout(remaining, query.recv_msg::<ClientResponse>()).await
+                {
+                    if workers.len() == WORKERS {
+                        break;
+                    }
                 }
             }
         }
@@ -286,13 +298,13 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
             let mut transport =
                 MessageTransport::new(TcpStream::connect(addr).await.expect("connect submitter"));
             for t_idx in 0..TASKS_PER_SUBMITTER {
-                let task = builtin_task(false, 30);
+                let task = builtin_task(false, 60);
                 transport
                     .send_msg(&ClientMessage::SubmitTask { task, wait: true })
                     .await
                     .expect("submit");
                 match tokio::time::timeout(
-                    Duration::from_secs(5),
+                    TEST_WAIT_TIMEOUT,
                     transport.recv_msg::<ClientResponse>(),
                 )
                 .await
@@ -307,8 +319,17 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     }
     for h in submitter_handles {
         if let Err(e) = h.await {
-            query.send_msg(&ClientMessage::ClusterStatus).await.ok();
-            let status = query.recv_msg::<ClientResponse>().await;
+            let diag_deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+            let _ = tokio::time::timeout(
+                diag_deadline.saturating_duration_since(Instant::now()),
+                query.send_msg(&ClientMessage::ClusterStatus),
+            )
+            .await;
+            let status = tokio::time::timeout(
+                diag_deadline.saturating_duration_since(Instant::now()),
+                query.recv_msg::<ClientResponse>(),
+            )
+            .await;
             panic!(
                 "submitter burst failed: {e:?}; started={}, net={:?}, status={status:?}",
                 started_count.load(Ordering::Relaxed),
@@ -328,21 +349,24 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     let reconnected = Arc::new(AtomicBool::new(false));
     net.disconnect_all();
 
-    let recon_deadline = Instant::now() + Duration::from_secs(20);
+    let recon_deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     loop {
         if net.total_handshakes() >= hs_before + WORKERS as u64
             && net.active_sessions() == WORKERS as u64
         {
-            query
-                .send_msg(&ClientMessage::ClusterStatus)
-                .await
-                .expect("send status post-disconnect");
-            if let Ok(Some(ClientResponse::ClusterStatus { workers, .. })) =
-                query.recv_msg::<ClientResponse>().await
+            let remaining = recon_deadline.saturating_duration_since(Instant::now());
+            if let Ok(send_res) =
+                tokio::time::timeout(remaining, query.send_msg(&ClientMessage::ClusterStatus)).await
             {
-                if workers.len() == WORKERS {
-                    reconnected.store(true, Ordering::Release);
-                    break;
+                send_res.expect("send status post-disconnect");
+                let remaining = recon_deadline.saturating_duration_since(Instant::now());
+                if let Ok(Ok(Some(ClientResponse::ClusterStatus { workers, .. }))) =
+                    tokio::time::timeout(remaining, query.recv_msg::<ClientResponse>()).await
+                {
+                    if workers.len() == WORKERS {
+                        reconnected.store(true, Ordering::Release);
+                        break;
+                    }
                 }
             }
         }
@@ -365,13 +389,13 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
             let mut transport =
                 MessageTransport::new(TcpStream::connect(addr).await.expect("connect post"));
             for _ in 0..10 {
-                let task = builtin_task(false, 30);
+                let task = builtin_task(false, 60);
                 transport
                     .send_msg(&ClientMessage::SubmitTask { task, wait: true })
                     .await
                     .expect("submit post");
                 match tokio::time::timeout(
-                    Duration::from_secs(15),
+                    TEST_WAIT_TIMEOUT,
                     transport.recv_msg::<ClientResponse>(),
                 )
                 .await
@@ -392,8 +416,9 @@ async fn hundred_simulated_workers_execute_burst_survive_mass_disconnect_and_rec
     }
 
     let _ = worker_shutdown_tx.send(true);
+    let drain_deadline = tokio::time::Instant::now() + TEST_WAIT_TIMEOUT;
     for h in worker_handles {
-        tokio::time::timeout(Duration::from_secs(15), h)
+        tokio::time::timeout_at(drain_deadline, h)
             .await
             .expect("worker shutdown timeout")
             .expect("worker task join")

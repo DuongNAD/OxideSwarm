@@ -17,7 +17,11 @@ use tokio::sync::watch;
 
 use rusty_grid_core::capabilities::MobileCapabilities;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::MobileTelemetryHandle;
 
@@ -36,7 +40,12 @@ impl Cluster {
         let store = tempfile::tempdir().unwrap();
         let config = ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_blob_store(store.path(), 64 * 1024 * 1024);
-        let master = MasterServer::spawn(config).await.expect("master starts");
+        let sched_cfg = SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure();
+        let master = MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
+            .await
+            .expect("master starts");
         let addr = master.server_addr().to_string();
         let mut cluster = Self {
             master,

@@ -428,7 +428,7 @@ async fn collect_with(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<HashMap<TaskId, Collected>, GridError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = crate::matrix::safe_std_deadline(timeout);
     let mut done: HashMap<TaskId, Collected> = HashMap::new();
     let mut last_state: HashMap<TaskId, String> = HashMap::new();
     loop {

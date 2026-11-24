@@ -5,7 +5,13 @@ and many-file transfers, memory flatness across sizes, output-limit enforcement,
 deduplication, mid-transfer disconnects, throttled TCP behavior, blob-store capacity
 refusals, and multi-worker fault-injection soak runs. It uses only the Python 3 standard library.
 
-The scheduled CI workflow comes in `TEST-26`.
+## Scheduled CI (`TEST-26`, design 0065 D4.2)
+
+`.github/workflows/ci.yml` defines an `endurance` job on `ubuntu-latest` triggered only on
+`schedule` (weekly Monday `03:17 UTC`) and `workflow_dispatch` (never on pull requests, not a
+required check). It builds `target/release/oxideswarm`, runs `transfer` (`T1` `1 GiB`, `T2`
+`20,000` files, `T4`, `T6`, `T7`, `T8`) followed by a `45m` loopback `soak`, and uploads
+`transfer-loopback.json` and `soak-45m-loopback.json` as the `endurance-records` artifact.
 
 ## Usage
 

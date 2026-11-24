@@ -444,7 +444,9 @@ async fn test_assign_refuses_a_task_before_touching_a_replaced_sandbox_base_on_w
     let elsewhere = temp.path().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
     let base_junction = temp.path().join("sandboxes_junction");
+    use std::os::windows::process::CommandExt;
     let mk = std::process::Command::new("cmd")
+        .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
         .args(["/C", "mklink", "/J"])
         .arg(&base_junction)
         .arg(&elsewhere)
@@ -2992,14 +2994,20 @@ async fn test_portal_caps_concurrent_connections() {
 
 #[tokio::test]
 async fn test_cancel_during_output_upload_reports_result_and_decrements_master_active_tasks() {
-    use rusty_grid_master::server::{MasterServer, ServerConfig};
+    use rusty_grid_master::reaper::ReaperConfig;
+    use rusty_grid_master::scheduler::SchedulerConfig;
+    use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 
     let master_dir = tempfile::tempdir().unwrap();
     let worker_dir = tempfile::tempdir().unwrap();
-    let master = MasterServer::spawn(
+    let master = MasterServer::spawn_with_config(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_blob_store(master_dir.path(), 16 * 1024 * 1024)
             .with_heartbeat_interval(30),
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
     )
     .await
     .expect("spawn master");
@@ -3371,7 +3379,7 @@ async fn test_worker_client_with_blender_path_plumbs_override_to_runner() {
         )
         .expect("procedural 3d mesh");
         let spec = rusty_grid_core::task::AutoRigSpec::new(
-            rusty_grid_core::task::Bytes::from(glb_bytes),
+            rusty_grid_core::task::Bytes::from(glb_bytes.clone()),
             "biped",
         )
         .with_provider("blender");
@@ -3384,13 +3392,47 @@ async fn test_worker_client_with_blender_path_plumbs_override_to_runner() {
             .execute_task_with_checkpoint(&task, None, None, None, None)
             .await;
         assert!(
-                marker_file.exists(),
-                "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
-            );
+            marker_file.exists(),
+            "TaskRunner constructed by WorkerClient must invoke the configured blender_path override"
+        );
         assert!(
-            result.is_success(),
-            "AutoRig should fall back cleanly after fake Blender exits 42: {:?}",
-            result.error
+            !result.is_success(),
+            "Explicit preferred_provider='blender' must fail when fake Blender exits 42"
+        );
+        assert_ne!(result.exit_code, 0);
+        let err_str = result.error.as_deref().unwrap_or("");
+        assert!(
+            err_str.contains("42"),
+            "Expected exit code 42 diagnostic in error, got: {err_str}"
+        );
+
+        // Explicit "auto" provider falls back cleanly to Builtin on Blender failure
+        let _ = std::fs::remove_file(&marker_file);
+        let auto_spec = rusty_grid_core::task::AutoRigSpec::new(
+            rusty_grid_core::task::Bytes::from(glb_bytes),
+            "biped",
+        )
+        .with_provider("auto");
+        let auto_task = Task::new(
+            rusty_grid_core::task::TaskSpec::AutoRig(auto_spec),
+            rusty_grid_core::task::TaskRequirements::generic(1, 30),
+        );
+        let auto_result = client
+            .runner
+            .execute_task_with_checkpoint(&auto_task, None, None, None, None)
+            .await;
+        assert!(
+            marker_file.exists(),
+            "AutoRig 'auto' must attempt configured blender_path before falling back"
+        );
+        assert!(
+            auto_result.is_success(),
+            "AutoRig 'auto' should fall back cleanly after fake Blender exits 42: {:?}",
+            auto_result.error
+        );
+        assert_eq!(
+            auto_result.device_name.as_deref(),
+            Some("OxideSwarm-AutoRig-Builtin")
         );
     }
     #[cfg(not(feature = "3d"))]

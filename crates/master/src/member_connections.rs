@@ -64,6 +64,17 @@ impl MemberLane {
         }
     }
 
+    /// Stable machine-readable lane identifier for HTTP/JSON APIs.
+    #[allow(dead_code)]
+    pub(crate) const fn api_name(self) -> &'static str {
+        match self {
+            Self::WorkerTcp => "worker_tcp",
+            Self::WorkerQuic => "worker_quic",
+            Self::ClientTcp => "client_tcp",
+            Self::ClientP2p => "client_p2p",
+        }
+    }
+
     /// Returns `true` for a worker session.
     pub(crate) const fn is_worker(self) -> bool {
         matches!(self, Self::WorkerTcp | Self::WorkerQuic)
@@ -73,6 +84,23 @@ impl MemberLane {
 /// Identifies one registered connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectionId(u64);
+
+impl ConnectionId {
+    /// Numeric identifier of this connection registration.
+    #[allow(dead_code)]
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Read-only snapshot of an active member connection (never exposes `CancellationToken`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ActiveMemberConnection {
+    pub connection_id: u64,
+    pub member_id: String,
+    pub lane: &'static str,
+}
 
 struct Entry {
     lane: MemberLane,
@@ -186,6 +214,29 @@ impl MemberConnections {
             .by_member
             .get(member_id)
             .is_some_and(|conns| conns.contains_key(&id))
+    }
+
+    /// Lists all active registered member connections sorted deterministically by
+    /// `(member_id, connection_id)`.
+    #[allow(dead_code)]
+    pub(crate) fn list_active(&self) -> Vec<ActiveMemberConnection> {
+        let inner = self.lock();
+        let mut active = Vec::new();
+        for (member_id, conns) in &inner.by_member {
+            for (&id, entry) in conns {
+                active.push(ActiveMemberConnection {
+                    connection_id: id.as_u64(),
+                    member_id: member_id.clone(),
+                    lane: entry.lane.api_name(),
+                });
+            }
+        }
+        active.sort_by(|a, b| {
+            a.member_id
+                .cmp(&b.member_id)
+                .then_with(|| a.connection_id.cmp(&b.connection_id))
+        });
+        active
     }
 
     /// Number of registered connections of `member_id`.
@@ -351,5 +402,41 @@ mod tests {
         assert_eq!(MemberLane::classify(false, true), MemberLane::ClientP2p);
         assert!(MemberLane::WorkerQuic.is_worker());
         assert!(!MemberLane::ClientP2p.is_worker());
+        assert_eq!(MemberLane::WorkerTcp.api_name(), "worker_tcp");
+        assert_eq!(MemberLane::WorkerQuic.api_name(), "worker_quic");
+        assert_eq!(MemberLane::ClientTcp.api_name(), "client_tcp");
+        assert_eq!(MemberLane::ClientP2p.api_name(), "client_p2p");
+    }
+
+    #[test]
+    fn list_active_returns_sorted_snapshots_and_clears_on_drop() {
+        let reg = MemberConnections::default();
+        let b1 = reg.register("member-b", MemberLane::ClientP2p);
+        let a1 = reg.register("member-a", MemberLane::WorkerTcp);
+        let a2 = reg.register("member-a", MemberLane::ClientTcp);
+        assert_eq!(
+            reg.list_active(),
+            vec![
+                ActiveMemberConnection {
+                    connection_id: a1.id().as_u64(),
+                    member_id: "member-a".to_string(),
+                    lane: "worker_tcp",
+                },
+                ActiveMemberConnection {
+                    connection_id: a2.id().as_u64(),
+                    member_id: "member-a".to_string(),
+                    lane: "client_tcp",
+                },
+                ActiveMemberConnection {
+                    connection_id: b1.id().as_u64(),
+                    member_id: "member-b".to_string(),
+                    lane: "client_p2p",
+                },
+            ]
+        );
+        drop(a1);
+        drop(a2);
+        drop(b1);
+        assert!(reg.list_active().is_empty());
     }
 }

@@ -17,8 +17,24 @@ use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_core::transport::{
     inspect_connection_paths, iroh, parse_p2p_ticket, serialize_p2p_ticket,
 };
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("Failed to spawn master")
+}
 
 /// Verifies that binding Master with a persistent key file publishes a valid ticket
 /// that contains the discovered N0 home DERP relay URL and remains deterministic across restarts.
@@ -38,9 +54,7 @@ async fn test_master_persistent_key_yields_relay_ticket() {
         .with_p2p_ticket_file(&ticket_file);
 
     // 1. First run: Generates key and publishes ticket with discovered home relay
-    let master1 = MasterServer::spawn(config1)
-        .await
-        .expect("Failed to spawn master run 1");
+    let master1 = spawn_test_master(config1).await;
 
     assert!(key_file.exists(), "P2P secret key file must be created");
     let key_bytes = tokio::fs::read(&key_file).await.expect("read key file");
@@ -85,9 +99,7 @@ async fn test_master_persistent_key_yields_relay_ticket() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master2 = MasterServer::spawn(config2)
-        .await
-        .expect("Failed to spawn master run 2");
+    let master2 = spawn_test_master(config2).await;
 
     let ticket2 = tokio::fs::read_to_string(&ticket_file)
         .await
@@ -141,9 +153,7 @@ async fn test_pure_relay_dialing_fallback_under_udp_block() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master_handle = MasterServer::spawn(config)
-        .await
-        .expect("Failed to spawn master");
+    let master_handle = spawn_test_master(config).await;
 
     let raw_ticket = tokio::fs::read_to_string(&ticket_file)
         .await
@@ -297,9 +307,7 @@ async fn test_normal_dialing_direct_p2p_and_path_introspection() {
         .with_ephemeral_key(true)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master_handle = MasterServer::spawn(config)
-        .await
-        .expect("Failed to spawn master");
+    let master_handle = spawn_test_master(config).await;
 
     let raw_ticket = tokio::fs::read_to_string(&ticket_file)
         .await
@@ -399,7 +407,7 @@ async fn test_ticket_determinism_and_reconnection() {
         .with_p2p_ticket_file(&ticket_file);
 
     // 1. Start Master Run 1
-    let master1 = MasterServer::spawn(config1).await.expect("spawn master 1");
+    let master1 = spawn_test_master(config1).await;
     let ticket1 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 1");
@@ -460,7 +468,7 @@ async fn test_ticket_determinism_and_reconnection() {
         .with_p2p_key_file(&key_file)
         .with_p2p_ticket_file(&ticket_file);
 
-    let master2 = MasterServer::spawn(config2).await.expect("spawn master 2");
+    let master2 = spawn_test_master(config2).await;
     let ticket2 = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket 2");
@@ -536,9 +544,7 @@ async fn test_p2p_client_submits_task_and_downloads_output_and_refuses_without_s
         .with_cluster_secret(secret.clone())
         .with_blob_store(&blob_dir, 64 * 1024 * 1024);
 
-    let master_handle = MasterServer::spawn(config)
-        .await
-        .expect("Failed to spawn master");
+    let master_handle = spawn_test_master(config).await;
 
     let raw_ticket = tokio::fs::read_to_string(&ticket_file)
         .await
@@ -743,9 +749,7 @@ async fn test_p2p_ticket_only_peer_sending_plaintext_cluster_status_gets_no_stat
         .with_p2p_ticket_file(&ticket_file)
         .with_cluster_secret(secret);
 
-    let master_handle = MasterServer::spawn(config)
-        .await
-        .expect("Failed to spawn master");
+    let master_handle = spawn_test_master(config).await;
 
     let raw_ticket = tokio::fs::read_to_string(&ticket_file)
         .await
@@ -827,7 +831,7 @@ async fn test_log_1_cli_client_commands_over_p2p_ticket_close_endpoints_without_
         .with_blob_store(&blob_dir, 64 * 1024 * 1024)
         .with_cluster_secret(secret.clone());
 
-    let master_handle = MasterServer::spawn(config).await.expect("spawn P2P master");
+    let master_handle = spawn_test_master(config).await;
 
     let raw_ticket = tokio::fs::read_to_string(&ticket_file)
         .await

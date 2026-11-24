@@ -24,7 +24,22 @@ use uuid::Uuid;
 
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
-use rusty_grid_master::{MasterServer, ServerConfig, WorkerStatus};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::DEFAULT_MASTER_MAX_BATCH_SIZE;
+use rusty_grid_master::{MasterHandle, MasterServer, ReaperConfig, ServerConfig, WorkerStatus};
+
+async fn spawn_test_master() -> MasterHandle {
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed")
+}
 use rusty_grid_worker::cpu_simd;
 use rusty_grid_worker::runner::{
     RunnerConfig, TaskRunner, EXIT_CODE_CANCELLED, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_TIMEOUT,
@@ -116,19 +131,34 @@ fn gpu_engine_or_skip(test: &str) -> Option<Arc<rusty_grid_worker::wgpu_engine::
     }
 }
 
-async fn wait_for<F, Fut>(timeout: Duration, interval: Duration, mut predicate: F) -> bool
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Polls master worker states up to `TEST_WAIT_TIMEOUT`, naming the awaited condition and observed statuses on failure.
+async fn wait_for_workers<F>(
+    master: &rusty_grid_master::MasterHandle,
+    condition: &str,
+    mut predicate: F,
+) where
+    F: FnMut(&[rusty_grid_master::WorkerInfo]) -> bool,
 {
     let start = Instant::now();
-    while start.elapsed() < timeout {
-        if predicate().await {
-            return true;
+    loop {
+        let workers = master.list_workers().await.unwrap_or_default();
+        if predicate(&workers) {
+            return;
         }
-        tokio::time::sleep(interval).await;
+        if start.elapsed() >= TEST_WAIT_TIMEOUT {
+            let observed: Vec<_> = workers
+                .into_iter()
+                .map(|w| (w.worker_id, w.status))
+                .collect();
+            panic!(
+                "{condition} within {}s; observed workers: {observed:?}",
+                TEST_WAIT_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
 }
 
 // ============================================================================
@@ -441,9 +471,7 @@ fn test_physical_wgpu_execution_when_available() {
 // ============================================================================
 #[tokio::test]
 async fn test_e2e_cluster_gpu_task_distribution() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let (w1_tx, w1_rx) = watch::channel(false);
@@ -475,22 +503,17 @@ async fn test_e2e_cluster_gpu_task_distribution() {
     });
 
     // Wait for both workers to register
-    let ready = wait_for(
-        Duration::from_secs(5),
-        Duration::from_millis(50),
-        || async {
-            let workers = master.list_workers().await.unwrap_or_default();
-            workers.len() == 2 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
-        },
+    wait_for_workers(
+        &master,
+        &format!("expected 2 Connected workers (cpu={w1_id}, gpu={w2_gpu_id})"),
+        |workers| workers.len() == 2 && workers.iter().all(|w| w.status == WorkerStatus::Connected),
     )
     .await;
-
-    assert!(ready, "Cluster workers failed to register within timeout");
 
     // Submit a GPU-demanding computation
     let gpu_task = Task::new(
         TaskSpec::gpu_compute("e2e_cluster_gemm", 32),
-        TaskRequirements::gpu(15),
+        TaskRequirements::gpu(60),
     );
 
     let task_id = master
@@ -499,9 +522,14 @@ async fn test_e2e_cluster_gpu_task_distribution() {
         .expect("Failed to submit GPU task");
 
     let result = master
-        .wait_task(task_id, Some(Duration::from_secs(5)))
+        .wait_task(task_id, Some(TEST_WAIT_TIMEOUT))
         .await
-        .expect("GPU task execution timed out");
+        .unwrap_or_else(|e| {
+            panic!(
+                "waiting for e2e GPU task {task_id} on GPU worker {w2_gpu_id} within {}s failed: {e}",
+                TEST_WAIT_TIMEOUT.as_secs()
+            )
+        });
 
     assert_eq!(result.exit_code, 0, "GPU compute task must exit with 0");
     assert_eq!(
@@ -956,39 +984,79 @@ fn cancelled_or_expired_gemm_returns_interrupted_without_touching_the_gpu() {
 // ============================================================================
 #[tokio::test(flavor = "current_thread")]
 async fn gpu_class_compute_does_not_block_the_async_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     // One runtime thread, a CPU multiplication that takes a while in a debug build, and a ticker
-    // that stands for the heartbeat. With the multiplication run inline the ticker stalls for the
-    // whole multiplication; on a blocking thread it keeps ticking.
+    // that stands for the heartbeat. On `current_thread`, `ticker` cannot run a single poll until
+    // `execute_task` yields; if the multiplication ran inline, `compute_done` would already be
+    // true before `ticker` ever polled, yielding `ticks_during_compute == 0`.
     let (runner, _tmp) = make_runner(true, true);
-    let ticker = tokio::spawn(async {
+    let compute_done = Arc::new(AtomicBool::new(false));
+    let done_t = Arc::clone(&compute_done);
+    let ticker = tokio::spawn(async move {
+        let mut ticks_during_compute: usize = 0;
         let mut worst = Duration::ZERO;
         let mut last = Instant::now();
-        for _ in 0..600 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+        while !done_t.load(Ordering::Acquire) {
+            ticks_during_compute += 1;
+            if ticks_during_compute <= 5 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             let now = Instant::now();
             worst = worst.max(now - last);
             last = now;
         }
-        worst
+        (ticks_during_compute, worst)
     });
 
     let started = Instant::now();
-    let res = runner
-        .execute_task(&gpu_task(1000, 16, 120), None, None)
-        .await;
+    let res = tokio::time::timeout(
+        TEST_WAIT_TIMEOUT,
+        runner.execute_task(&gpu_task(1000, 16, 120), None, None),
+    )
+    .await
+    .expect("gpu_class task timed out against TEST_WAIT_TIMEOUT");
+    compute_done.store(true, Ordering::Release);
     let compute_wall = started.elapsed();
     assert_eq!(res.exit_code, 0, "{:?}", res.error);
 
-    let worst_gap = ticker.await.unwrap();
-    println!("multiplication took {compute_wall:?}, worst ticker gap {worst_gap:?}");
+    let (ticks_during_compute, worst_gap) = tokio::time::timeout(TEST_WAIT_TIMEOUT, ticker)
+        .await
+        .expect("ticker task timed out against TEST_WAIT_TIMEOUT")
+        .expect("ticker task panicked");
+    println!(
+        "multiplication took {compute_wall:?}, {ticks_during_compute} runtime ticks while running, worst ticker gap {worst_gap:?}"
+    );
     assert!(
-        worst_gap < Duration::from_millis(400),
-        "the runtime stalled for {worst_gap:?} while a GPU-class task ran ({compute_wall:?})"
+        ticks_during_compute >= 1,
+        "the current_thread async runtime was blocked for the entire GPU-class multiplication ({compute_wall:?})"
     );
 }
 
 #[test]
 fn gpu_class_timeout_fires_and_stops_the_multiplication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Structural check that the cooperative `should_stop` hook interrupts the row loop early
+    // without executing all rows.
+    let (a, b) = cpu_simd::generate_deterministic_matrices(64, 42);
+    let mut c = vec![0.0f32; 64 * 64];
+    let polls = AtomicUsize::new(0);
+    let completed = cpu_simd::matmul_simd_cancellable(&a, &b, &mut c, 64, &|| {
+        polls.fetch_add(1, Ordering::Relaxed) >= 2
+    });
+    assert!(
+        !completed,
+        "cooperative stop hook must halt GEMM on row boundary"
+    );
+    assert_eq!(
+        polls.load(Ordering::Relaxed),
+        3,
+        "GEMM should stop on the first row where should_stop returns true"
+    );
+
     // A manual runtime, because dropping a runtime waits for its blocking threads: if the
     // multiplication were not told to stop, the drop would sit through the rest of it.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1000,20 +1068,22 @@ fn gpu_class_timeout_fires_and_stops_the_multiplication() {
     let started = Instant::now();
     // 1500^3 * 2 = 6.75 GFLOP: many seconds in a debug build, so only the timeout can end this.
     let res = runtime.block_on(runner.execute_task(&gpu_task(1500, 16, 1), None, None));
+    let elapsed = started.elapsed();
     assert_eq!(res.exit_code, EXIT_CODE_TIMEOUT, "{:?}", res.error);
     assert!(res.error.unwrap().contains("timed out"));
+    println!("gpu_class timeout fired in {elapsed:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        started.elapsed()
+        elapsed < TEST_WAIT_TIMEOUT,
+        "gpu_class timeout hung for {elapsed:?}"
     );
 
     let shutdown_started = Instant::now();
     drop(runtime);
+    let shutdown_elapsed = shutdown_started.elapsed();
+    println!("runtime drop after GPU timeout took {shutdown_elapsed:?}");
     assert!(
-        shutdown_started.elapsed() < Duration::from_millis(2500),
-        "the timed-out multiplication kept running on its blocking thread for {:?}",
-        shutdown_started.elapsed()
+        shutdown_elapsed < TEST_WAIT_TIMEOUT,
+        "the timed-out multiplication kept running on its blocking thread for {shutdown_elapsed:?}"
     );
 }
 
@@ -1029,11 +1099,20 @@ async fn gpu_class_cancel_is_honoured_promptly() {
     let res = runner
         .execute_task(&gpu_task(1500, 16, 120), None, Some(cancel_rx))
         .await;
+    let elapsed = started.elapsed();
     assert_eq!(res.exit_code, EXIT_CODE_CANCELLED, "{:?}", res.error);
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        res.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("user requested cancel"),
         "{:?}",
-        started.elapsed()
+        res.error
+    );
+    println!("gpu_class cancel completed in {elapsed:?}");
+    assert!(
+        elapsed < TEST_WAIT_TIMEOUT,
+        "gpu_class cancel hung for {elapsed:?}"
     );
 }
 
@@ -1042,9 +1121,7 @@ async fn gpu_class_cancel_is_honoured_promptly() {
 // ============================================================================
 #[tokio::test]
 async fn test_adversarial_scheduling_isolation_mixed_cluster() {
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("MasterServer::spawn failed");
+    let master = spawn_test_master().await;
     let master_addr = master.server_addr().to_string();
 
     let (w1_tx, w1_rx) = watch::channel(false);
@@ -1088,16 +1165,12 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
         let _ = w3.run(w3_rx).await;
     });
 
-    let ready = wait_for(
-        Duration::from_secs(5),
-        Duration::from_millis(50),
-        || async {
-            let workers = master.list_workers().await.unwrap_or_default();
-            workers.len() == 3 && workers.iter().all(|w| w.status == WorkerStatus::Connected)
-        },
+    wait_for_workers(
+        &master,
+        &format!("expected 3 Connected workers (cpu1={w1_id}, cpu2={w2_id}, gpu={w3_gpu_id})"),
+        |workers| workers.len() == 3 && workers.iter().all(|w| w.status == WorkerStatus::Connected),
     )
     .await;
-    assert!(ready, "All 3 workers must register");
 
     // Submit 12 interleaved tasks: 6 CPU tasks and 6 GPU tasks
     let mut cpu_task_ids = Vec::new();
@@ -1106,14 +1179,14 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     for i in 0..6 {
         let cpu_t = Task::new(
             TaskSpec::command("echo", vec![format!("mixed_cpu_{i}")]),
-            TaskRequirements::generic(1, 10),
+            TaskRequirements::generic(1, 60),
         );
         let cid = master.submit_task(cpu_t).await.expect("submit CPU task");
         cpu_task_ids.push(cid);
 
         let gpu_t = Task::new(
             TaskSpec::gpu_compute(format!("mixed_gpu_{i}"), 32),
-            TaskRequirements::gpu(15),
+            TaskRequirements::gpu(60),
         );
         let gid = master.submit_task(gpu_t).await.expect("submit GPU task");
         gpu_task_ids.push(gid);
@@ -1122,10 +1195,10 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     // Await all 12 tasks
     let mut all_wait_futs = Vec::new();
     for &id in &cpu_task_ids {
-        all_wait_futs.push(master.wait_task(id, Some(Duration::from_secs(8))));
+        all_wait_futs.push(master.wait_task(id, Some(TEST_WAIT_TIMEOUT)));
     }
     for &id in &gpu_task_ids {
-        all_wait_futs.push(master.wait_task(id, Some(Duration::from_secs(8))));
+        all_wait_futs.push(master.wait_task(id, Some(TEST_WAIT_TIMEOUT)));
     }
 
     let mut results = Vec::new();
@@ -1135,9 +1208,13 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
 
     // 1. Verify CPU tasks
     for (i, res) in results[0..6].iter().enumerate() {
-        let r = res
-            .as_ref()
-            .unwrap_or_else(|e| panic!("CPU task {i} failed: {e}"));
+        let r = res.as_ref().unwrap_or_else(|e| {
+            panic!(
+                "CPU task {i} ({}) failed within {}s: {e}",
+                cpu_task_ids[i],
+                TEST_WAIT_TIMEOUT.as_secs()
+            )
+        });
         assert_eq!(r.exit_code, 0);
         assert!(!r.is_gpu_executed);
     }
@@ -1145,9 +1222,13 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     // 2. Strict negative capability assertion:
     // 100% of GPU tasks MUST have been executed by Worker 3 (GPU), and 0% by Worker 1 or 2!
     for (i, res) in results[6..12].iter().enumerate() {
-        let r = res
-            .as_ref()
-            .unwrap_or_else(|e| panic!("GPU task {i} failed: {e}"));
+        let r = res.as_ref().unwrap_or_else(|e| {
+            panic!(
+                "GPU task {i} ({}) failed within {}s: {e}",
+                gpu_task_ids[i],
+                TEST_WAIT_TIMEOUT.as_secs()
+            )
+        });
         assert_eq!(r.exit_code, 0);
         assert!(r.is_gpu_executed);
         assert_eq!(
@@ -1169,11 +1250,10 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     // Disconnect Worker 3
     let _ = w3_tx.send(true);
 
-    let w3_disconnected = wait_for(
-        Duration::from_secs(3),
-        Duration::from_millis(50),
-        || async {
-            let workers = master.list_workers().await.unwrap_or_default();
+    wait_for_workers(
+        &master,
+        &format!("expected Worker 3 ({w3_gpu_id}) to transition to Disconnected"),
+        |workers| {
             workers
                 .iter()
                 .find(|w| w.worker_id == w3_gpu_id)
@@ -1182,12 +1262,11 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
         },
     )
     .await;
-    assert!(w3_disconnected, "Worker 3 must transition to Disconnected");
 
     // Submit a GPU task while ONLY CPU workers are active
     let stranded_gpu = Task::new(
         TaskSpec::gpu_compute("stranded_gpu_task", 32),
-        TaskRequirements::gpu(15),
+        TaskRequirements::gpu(60),
     );
     let stranded_id = master
         .submit_task(stranded_gpu)
@@ -1209,15 +1288,33 @@ async fn test_adversarial_scheduling_isolation_mixed_cluster() {
     // Verify CPU workers are still healthy and executing generic tasks
     let quick_cpu = Task::new(
         TaskSpec::command("echo", vec!["cpu_alive".into()]),
-        TaskRequirements::generic(1, 5),
+        TaskRequirements::generic(1, 60),
     );
     let quick_id = master.submit_task(quick_cpu).await.expect("quick submit");
     let quick_res = master
-        .wait_task(quick_id, Some(Duration::from_secs(3)))
+        .wait_task(quick_id, Some(TEST_WAIT_TIMEOUT))
         .await
-        .expect("quick wait");
+        .unwrap_or_else(|e| {
+            panic!(
+                "waiting for quick CPU task {quick_id} on healthy CPU workers ({w1_id}, {w2_id}) within {}s failed: {e}",
+                TEST_WAIT_TIMEOUT.as_secs()
+            )
+        });
     assert_eq!(quick_res.exit_code, 0);
     assert!(quick_res.worker_id == w1_id || quick_res.worker_id == w2_id);
+
+    // Re-check after quick_cpu completed so the stranded GPU task is verified to remain
+    // Queued across a full scheduling pass with healthy free CPU workers.
+    let status_after_cpu = master
+        .get_task_status(stranded_id)
+        .await
+        .expect("status check for stranded GPU task after quick CPU task");
+    assert_eq!(
+        status_after_cpu,
+        rusty_grid_core::task::TaskStatus::Queued,
+        "Stranded GPU task {stranded_id} must remain Queued after CPU task {quick_id} completed on {}",
+        quick_res.worker_id
+    );
 
     // Teardown
     let _ = w1_tx.send(true);

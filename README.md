@@ -20,6 +20,9 @@
   `status`, `workers`, `submit`, `task_result`, `cancel`, `doctor` and `workspaces`.
 - **Moves files in and out.** `submit --input` sends files and directories, and `--output` brings
   back the files its patterns select. A file the other side already holds is not sent again.
+- **Fans out across a matrix.** `oxideswarm submit --matrix os=macos,windows,linux -- ...` runs one
+  task per cell across matching workers, detects unplaced cells upfront, and returns per-cell
+  outcomes ([flags](docs/reference.md#oxideswarm-submit-flags)).
 - **Works across networks.** On a LAN, workers connect to the master over TCP. With `master --p2p`,
   machines on other networks connect through NAT or a relay (iroh QUIC), with no router ports to
   open. Traffic beyond loopback is authenticated and encrypted.
@@ -55,7 +58,7 @@ The binaries are not signed. On macOS, remove the quarantine flag before the fir
 `xattr -dr com.apple.quarantine oxideswarm-0.4.4-aarch64-apple-darwin`. Targets, the `-gpu` archives,
 what the attestation proves and the service installers: [docs/reference.md](docs/reference.md#install).
 
-Build from source (Rust 1.91 or newer; add `--features gpu-wgpu` for a worker whose GPU should do work):
+Build from source (Rust 1.91 or newer; add `--features gpu-wgpu` for hardware GPU detection and the built-in `GpuCompute` benchmark):
 
 ```bash
 cargo build --release --bin oxideswarm
@@ -87,9 +90,9 @@ Then add each machine in one of three ways:
 
 - **Same LAN:** run `oxideswarm invite --code` on the master and `oxideswarm join --code <N>-<word>-<word>`
   on the new machine, then compare the 6-digit check on both ([guide](docs/guides/add-a-machine.md)).
-- **Another network:** start the master with `--p2p` and run `oxideswarm invite` on it. Send the
+- **Another network:** start the master with `--p2p` and run `oxideswarm invite` on it (or create one in the dashboard **Members** tab). Send the
   `oxs1-invite:...` string by chat, paste it into `oxideswarm join` on the new machine, and approve it
-  on the master with `oxideswarm members approve <PENDING_ID> --code <NNNNNN>`
+  on the master with `oxideswarm members approve <PENDING_ID> --code <NNNNNN>` or in the dashboard **Members** tab
   ([design 0051](docs/design/0051-machine-identity-and-invites.md)).
 - **Without a terminal:** `oxideswarm usb create <DIR> --machines <N>` writes an encrypted USB setup kit.
   One double-click on macOS or Windows installs, joins and starts a worker ([packaging/usb/README.md](packaging/usb/README.md)).
@@ -114,6 +117,8 @@ Add `oxideswarm mcp` as a stdio MCP server in Claude Code, Codex or Cursor:
   review has been published yet.
 - Android: the app does not build yet (AND-1), and the Termux worker has not run on a device.
 - No language model serving yet: release `0.5.0` is Design only.
+- Built-in GPU compute (`GpuCompute`) is benchmark only (seeded matrix multiplication, no user WGSL
+  kernels); user GPU workloads run as `Command` tasks ([docs/guides/gpu-workloads.md](docs/guides/gpu-workloads.md)).
 - Mixed versions: upgrade the master first; it accepts peers one protocol version back.
 
 The full list is in [docs/reference.md](docs/reference.md#status-and-limits), the plan in
@@ -134,6 +139,11 @@ The full list is in [docs/reference.md](docs/reference.md#status-and-limits), th
 Read [CONTRIBUTING.md](CONTRIBUTING.md) first. A change to behaviour, a CLI flag, an environment
 variable or the wire format comes with a design record in [docs/design/](docs/design/) and an update
 of [docs/reference.md](docs/reference.md), in the same pull request.
+
+## How to cite
+
+If you use OxideSwarm in research, coursework, or a published project, please cite it using the
+metadata in [CITATION.cff](CITATION.cff) (or GitHub's "Cite this repository" button).
 
 ## License
 

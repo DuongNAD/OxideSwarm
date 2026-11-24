@@ -5,7 +5,7 @@
 //! averages during placement so batches of identical tasks wait for a clearly faster worker
 //! instead of filling slow slots that would stretch total batch time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
@@ -352,6 +352,73 @@ impl SpeedBook {
             !bucket.workers.is_empty()
         });
     }
+
+    /// Computes each active worker's median speed ratio (`avg_ms / fastest_avg_ms`) across
+    /// [`TaskKey`] buckets shared by at least two active workers (`0060` D4).
+    ///
+    /// The fastest worker on a shared key gets ratio `1.0` (`speed:1.0`); slower workers get
+    /// values `>= 1.0`. Keys with samples on only one active worker are ignored so a slow worker
+    /// running a unique key alone does not receive a false `1.0`.
+    pub fn relative_speed_factors(&self, active_workers: &HashSet<Uuid>) -> HashMap<Uuid, f64> {
+        let mut per_worker: HashMap<Uuid, Vec<f64>> = HashMap::new();
+        if active_workers.len() < 2 || self.buckets.is_empty() {
+            return HashMap::new();
+        }
+        for bucket in self.buckets.values() {
+            let entries: Vec<(Uuid, f64)> = bucket
+                .workers
+                .iter()
+                .filter(|(wid, entry)| {
+                    active_workers.contains(wid)
+                        && entry.samples >= 1
+                        && entry.avg_ms.is_finite()
+                        && entry.avg_ms > 0.0
+                })
+                .map(|(wid, entry)| (*wid, entry.avg_ms))
+                .collect();
+            if entries.len() < 2 {
+                continue;
+            }
+            let Some(fastest_ms) = entries.iter().map(|(_, avg)| *avg).reduce(f64::min) else {
+                continue;
+            };
+            if !fastest_ms.is_finite() || fastest_ms <= 0.0 {
+                continue;
+            }
+            for (wid, avg) in entries {
+                per_worker.entry(wid).or_default().push(avg / fastest_ms);
+            }
+        }
+        let mut factors = HashMap::with_capacity(per_worker.len());
+        for (wid, mut ratios) in per_worker {
+            ratios.sort_by(f64::total_cmp);
+            let n = ratios.len();
+            let median = if n % 2 == 1 {
+                ratios[n / 2]
+            } else {
+                0.5 * (ratios[n / 2 - 1] + ratios[n / 2])
+            };
+            factors.insert(wid, median);
+        }
+        factors
+    }
+}
+
+/// Formats a relative speed factor for the `speed:<factor>` tag (`0060` D4).
+///
+/// Rounds to 2 decimal places and trims a trailing `0` after the tenths digit so `1.0` renders as
+/// `"1.0"`, `1.50` as `"1.5"`, and `1.25` as `"1.25"`.
+pub fn format_speed_factor(factor: f64) -> String {
+    if !factor.is_finite() || factor <= 0.0 {
+        return "1.0".to_string();
+    }
+    let rounded = (factor * 100.0).round() / 100.0;
+    let formatted = format!("{rounded:.2}");
+    if let Some(trimmed) = formatted.strip_suffix('0') {
+        trimmed.to_string()
+    } else {
+        formatted
+    }
 }
 
 #[cfg(test)]
@@ -697,5 +764,47 @@ mod tests {
             assert!(guard.get(&w2, key).is_none());
             assert!(guard.is_empty());
         }
+    }
+
+    #[test]
+    fn relative_speed_factors_computes_median_over_shared_keys_and_formats() {
+        let mut sb = SpeedBook::new();
+        let w_fast = Uuid::new_v4();
+        let w_slow = Uuid::new_v4();
+        let w_disc = Uuid::new_v4();
+        let k1 = TaskKey(1);
+        let k2 = TaskKey(2);
+        let k_unique = TaskKey(3);
+
+        // Single worker or disconnected second worker yields empty factors.
+        sb.record_sample(w_fast, k1, 100, 60);
+        sb.record_sample(w_disc, k1, 500, 60);
+        let active_one: HashSet<Uuid> = [w_fast].into_iter().collect();
+        assert!(sb.relative_speed_factors(&active_one).is_empty());
+
+        // Unique unshared key on w_slow must not give w_slow a 1.0 factor.
+        sb.record_sample(w_slow, k_unique, 900, 60);
+        let active: HashSet<Uuid> = [w_fast, w_slow].into_iter().collect();
+        assert!(sb.relative_speed_factors(&active).is_empty());
+
+        // Add k1 on w_slow (ratio 2.0) -> odd median [2.0] = 2.0.
+        sb.record_sample(w_slow, k1, 200, 60);
+        let factors = sb.relative_speed_factors(&active);
+        assert!((factors[&w_fast] - 1.0).abs() < 1e-9);
+        assert!((factors[&w_slow] - 2.0).abs() < 1e-9);
+        assert!(!factors.contains_key(&w_disc));
+
+        // Add k2 shared (fast=100, slow=300 => ratio 3.0) -> even median (2.0 + 3.0) / 2 = 2.5.
+        sb.record_sample(w_fast, k2, 100, 60);
+        sb.record_sample(w_slow, k2, 300, 60);
+        let factors = sb.relative_speed_factors(&active);
+        assert!((factors[&w_fast] - 1.0).abs() < 1e-9);
+        assert!((factors[&w_slow] - 2.5).abs() < 1e-9);
+
+        assert_eq!(format_speed_factor(1.0), "1.0");
+        assert_eq!(format_speed_factor(1.500), "1.5");
+        assert_eq!(format_speed_factor(1.25), "1.25");
+        assert_eq!(format_speed_factor(1.22), "1.22");
+        assert_eq!(format_speed_factor(2.0), "2.0");
     }
 }

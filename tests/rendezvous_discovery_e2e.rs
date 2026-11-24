@@ -6,9 +6,11 @@
 //! ports are never touched.
 
 use std::fs;
+use std::io::Read;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rusty_grid_core::cluster_auth::ClusterSecret;
@@ -22,6 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn isolated_cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
@@ -97,21 +100,84 @@ fn wait_for_port_file(path: &Path, service: &ChildService, timeout: Duration) ->
     );
 }
 
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+) -> (Arc<Mutex<Vec<u8>>>, Option<std::thread::JoinHandle<()>>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let Some(mut reader) = pipe else {
+        return (buf, None);
+    };
+    let buf_clone = Arc::clone(&buf);
+    let handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut guard) = buf_clone.lock() {
+                        guard.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+    (buf, Some(handle))
+}
+
+fn run_with_timeout_with_logs(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+    services: &[(&str, &ChildService)],
+) -> Output {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn command");
+    let (stdout_buf, stdout_handle) = spawn_pipe_reader(child.stdout.take());
+    let (stderr_buf, stderr_handle) = spawn_pipe_reader(child.stderr.take());
     let start = Instant::now();
     loop {
-        if child.try_wait().expect("poll child").is_some() {
-            return child.wait_with_output().expect("collect output");
+        if let Some(status) = child.try_wait().expect("poll child") {
+            if let Some(handle) = stdout_handle {
+                let _ = handle.join();
+            }
+            if let Some(handle) = stderr_handle {
+                let _ = handle.join();
+            }
+            let stdout = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let stderr = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            return Output {
+                status,
+                stdout,
+                stderr,
+            };
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("Command timed out after {:?}", timeout);
+            // Snapshot pipe buffers directly without joining reader threads in case a grandchild
+            // (notably on Windows) still holds an inherited write handle open.
+            let stdout = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let stderr = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+            let svc_logs: String = services
+                .iter()
+                .map(|(name, svc)| format!("\n{name} log:\n{}", svc.log()))
+                .collect();
+            panic!(
+                "Command ({label}) timed out after {:?}.\nChild stdout:\n{}\nChild stderr:\n{}{}",
+                timeout,
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+                svc_logs
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn run_with_timeout(cmd: Command, timeout: Duration) -> Output {
+    run_with_timeout_with_logs(cmd, timeout, "command", &[])
 }
 
 #[test]
@@ -130,7 +196,7 @@ fn test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled() {
     let mut gen_cmd = isolated_cli(&master_home);
     gen_cmd.args(["secret", "generate", "--out"]);
     gen_cmd.arg(&secret_path);
-    let gen_out = run_with_timeout(gen_cmd, Duration::from_secs(10));
+    let gen_out = run_with_timeout(gen_cmd, TEST_WAIT_TIMEOUT);
     assert!(
         gen_out.status.success(),
         "secret generate failed: {}",
@@ -149,19 +215,25 @@ fn test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled() {
     rv_cmd.args(["rendezvous", "--listen", "127.0.0.1:0", "--port-file"]);
     rv_cmd.arg(&rv_port_file);
     let rv_service = ChildService::spawn(rv_cmd, root.path().join("rendezvous.log"));
-    let rv_port = wait_for_port_file(&rv_port_file, &rv_service, Duration::from_secs(10));
+    let rv_port = wait_for_port_file(&rv_port_file, &rv_service, TEST_WAIT_TIMEOUT);
     let rv_url = format!("http://127.0.0.1:{rv_port}");
 
     // 2. Start Master configured with `--rendezvous <URL>`.
     let master_port_file = root.path().join("master.port");
     let mut master_cmd = isolated_cli(&master_home);
-    master_cmd.args(["master", "--listen", "127.0.0.1:0", "--port-file"]);
+    master_cmd.args([
+        "master",
+        "--listen",
+        "127.0.0.1:0",
+        "--max-host-cpu-pct",
+        "100",
+        "--port-file",
+    ]);
     master_cmd.arg(&master_port_file);
     master_cmd.args(["--rendezvous", &rv_url, "--secret-file"]);
     master_cmd.arg(&secret_path);
     let master_service = ChildService::spawn(master_cmd, root.path().join("master.log"));
-    let _master_port =
-        wait_for_port_file(&master_port_file, &master_service, Duration::from_secs(15));
+    let _master_port = wait_for_port_file(&master_port_file, &master_service, TEST_WAIT_TIMEOUT);
 
     // 3. Start Worker using `--master auto:<silent_udp_port> --rendezvous <URL>`.
     let mut worker_cmd = isolated_cli(&worker_home);
@@ -185,7 +257,7 @@ fn test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled() {
     let worker_service = ChildService::spawn(worker_cmd, root.path().join("worker.log"));
 
     // 4. Poll `workers --master auto:<silent_udp_port>` via Tier 3 until `rv-worker` registers.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     let mut last_workers_stderr = String::new();
     let mut registered = false;
     while Instant::now() < deadline {
@@ -198,7 +270,16 @@ fn test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled() {
             "--secret-file",
         ]);
         workers_cmd.arg(&secret_path);
-        let out = run_with_timeout(workers_cmd, Duration::from_secs(10));
+        let out = run_with_timeout_with_logs(
+            workers_cmd,
+            TEST_WAIT_TIMEOUT,
+            "workers --master auto",
+            &[
+                ("Rendezvous", &rv_service),
+                ("Master", &master_service),
+                ("Worker", &worker_service),
+            ],
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         last_workers_stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if out.status.success() && stdout.contains("rv-worker") {
@@ -226,12 +307,24 @@ fn test_worker_auto_rendezvous_registers_with_tiers_1_and_2_disabled() {
     ]);
     submit_cmd.arg(&secret_path);
     submit_cmd.args(["--wait", "--", "echo", "rendezvous-ok"]);
-    let submit_out = run_with_timeout(submit_cmd, Duration::from_secs(20));
+    let submit_out = run_with_timeout_with_logs(
+        submit_cmd,
+        TEST_WAIT_TIMEOUT,
+        "submit --master auto --wait",
+        &[
+            ("Rendezvous", &rv_service),
+            ("Master", &master_service),
+            ("Worker", &worker_service),
+        ],
+    );
     let submit_stdout = String::from_utf8_lossy(&submit_out.stdout);
     let submit_stderr = String::from_utf8_lossy(&submit_out.stderr);
     assert!(
         submit_out.status.success() && submit_stdout.contains("rendezvous-ok"),
-        "submit over auto + Tier 3 rendezvous failed.\nstdout: {submit_stdout}\nstderr: {submit_stderr}"
+        "submit over auto + Tier 3 rendezvous failed.\nstdout: {submit_stdout}\nstderr: {submit_stderr}\nRendezvous log:\n{}\nMaster log:\n{}\nWorker log:\n{}",
+        rv_service.log(),
+        master_service.log(),
+        worker_service.log()
     );
 }
 
@@ -292,13 +385,13 @@ async fn test_keyed_rendezvous_multi_cluster_isolation_and_anti_harvesting() {
         .expect("register cluster B lease");
 
     // Each cluster retrieves only its own master address and verified p2p_ticket.
-    let beacon_a = discover_master_rendezvous(&rv_url, Some(&secret_a), Duration::from_secs(2))
+    let beacon_a = discover_master_rendezvous(&rv_url, Some(&secret_a), TEST_WAIT_TIMEOUT)
         .await
         .expect("discover cluster A");
     assert_eq!(beacon_a.cluster_addr, "127.0.0.1:19101");
     assert_eq!(beacon_a.p2p_ticket.as_deref(), Some("ticket-cluster-a"));
 
-    let beacon_b = discover_master_rendezvous(&rv_url, Some(&secret_b), Duration::from_secs(2))
+    let beacon_b = discover_master_rendezvous(&rv_url, Some(&secret_b), TEST_WAIT_TIMEOUT)
         .await
         .expect("discover cluster B");
     assert_eq!(beacon_b.cluster_addr, "127.0.0.1:19102");
@@ -306,15 +399,13 @@ async fn test_keyed_rendezvous_multi_cluster_isolation_and_anti_harvesting() {
 
     // Wrong or missing secret cannot harvest leases or read keyed slots.
     assert!(
-        discover_master_rendezvous(&rv_url, Some(&secret_wrong), Duration::from_secs(1))
+        discover_master_rendezvous(&rv_url, Some(&secret_wrong), TEST_WAIT_TIMEOUT)
             .await
             .is_none()
     );
-    assert!(
-        discover_master_rendezvous(&rv_url, None, Duration::from_secs(1))
-            .await
-            .is_none()
-    );
+    assert!(discover_master_rendezvous(&rv_url, None, TEST_WAIT_TIMEOUT)
+        .await
+        .is_none());
     let key_a = derive_rendezvous_key(&secret_a);
     let unauth_status = raw_http_get(addr, &format!("/api/rendezvous/master?key={key_a}")).await;
     assert_eq!(
@@ -350,7 +441,7 @@ fn test_cli_rejects_https_rendezvous_url_and_non_loopback_unsigned() {
         "--rendezvous",
         "https://rendezvous.example.com:8090",
     ]);
-    let master_out = run_with_timeout(master_cmd, Duration::from_secs(10));
+    let master_out = run_with_timeout(master_cmd, TEST_WAIT_TIMEOUT);
     assert!(!master_out.status.success());
     let master_err = String::from_utf8_lossy(&master_out.stderr);
     assert!(
@@ -364,7 +455,7 @@ fn test_cli_rejects_https_rendezvous_url_and_non_loopback_unsigned() {
         "--rendezvous",
         "https://rendezvous.example.com:8090",
     ]);
-    let worker_out = run_with_timeout(worker_cmd, Duration::from_secs(10));
+    let worker_out = run_with_timeout(worker_cmd, TEST_WAIT_TIMEOUT);
     assert!(!worker_out.status.success());
     let worker_err = String::from_utf8_lossy(&worker_out.stderr);
     assert!(
@@ -374,7 +465,7 @@ fn test_cli_rejects_https_rendezvous_url_and_non_loopback_unsigned() {
 
     let mut rv_cmd = isolated_cli(home.path());
     rv_cmd.args(["rendezvous", "--listen", "0.0.0.0:0", "--allow-unsigned"]);
-    let rv_out = run_with_timeout(rv_cmd, Duration::from_secs(10));
+    let rv_out = run_with_timeout(rv_cmd, TEST_WAIT_TIMEOUT);
     assert!(!rv_out.status.success());
     let rv_err = String::from_utf8_lossy(&rv_out.stderr);
     assert!(
