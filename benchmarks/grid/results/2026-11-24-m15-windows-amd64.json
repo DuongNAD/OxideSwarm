@@ -1,0 +1,103 @@
+{
+  "benchmark": "ADOPT-3 M15 scripted Quick start from empty HOME",
+  "measure": "M15",
+  "date_utc": "2026-11-23T21:10:52Z",
+  "git": {
+    "commit": "c0d86c6a7ec4833fa3c0d6f3f43e2d3c918af54b",
+    "dirty_tree": false
+  },
+  "release_version": "0.4.4",
+  "target": "x86_64-pc-windows-msvc",
+  "local_archive_http": true,
+  "attestation_checked": true,
+  "installed_binary_version": "rusty-grid 0.4.4",
+  "hardware": {
+    "cpu_model": "13th Gen Intel(R) Core(TM) i7-1355U",
+    "cores": 12,
+    "ram_bytes": 16849256448
+  },
+  "os": {
+    "system": "Windows",
+    "release": "11",
+    "version": "10.0.26300",
+    "machine": "AMD64"
+  },
+  "network": "loopback (127.0.0.1), single machine",
+  "power": "unknown (not recorded on this platform)",
+  "load_average_before": null,
+  "load_average_after": null,
+  "python": "3.13.3",
+  "note": "",
+  "summary": {
+    "install_s": {
+      "median": 6.378,
+      "min": 5.789,
+      "max": 6.564,
+      "runs": 3
+    },
+    "master_ready_s": {
+      "median": 1.553,
+      "min": 1.437,
+      "max": 1.565,
+      "runs": 3
+    },
+    "worker_ready_s": {
+      "median": 0.355,
+      "min": 0.301,
+      "max": 0.379,
+      "runs": 3
+    },
+    "first_submit_s": {
+      "median": 0.194,
+      "min": 0.128,
+      "max": 0.464,
+      "runs": 3
+    },
+    "total_s": {
+      "median": 8.551,
+      "min": 7.939,
+      "max": 8.641,
+      "runs": 3
+    },
+    "all_attestation_checked": true,
+    "all_succeeded": true
+  },
+  "runs": [
+    {
+      "run": 1,
+      "install_s": 6.378,
+      "master_ready_s": 1.437,
+      "worker_ready_s": 0.355,
+      "first_submit_s": 0.464,
+      "total_s": 8.641,
+      "attestation_checked": true,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 277,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    },
+    {
+      "run": 2,
+      "install_s": 6.564,
+      "master_ready_s": 1.553,
+      "worker_ready_s": 0.301,
+      "first_submit_s": 0.128,
+      "total_s": 8.551,
+      "attestation_checked": true,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 276,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    },
+    {
+      "run": 3,
+      "install_s": 5.789,
+      "master_ready_s": 1.565,
+      "worker_ready_s": 0.379,
+      "first_submit_s": 0.194,
+      "total_s": 7.939,
+      "attestation_checked": true,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 277,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    }
+  ]
+}

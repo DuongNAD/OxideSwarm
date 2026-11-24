@@ -1,6 +1,6 @@
 # 0064: Research of 2026-11-13 and the route that follows
 
-Status: Draft (plan; builds nothing; Q54 to Q56 are open)
+Status: Draft (plan; builds nothing; Q54 decided on 2026-11-24, Q56 decided, Q55 open)
 Created: 2026-11-13    Updated: 2026-11-13
 
 ## Summary
@@ -200,7 +200,7 @@ The right column is a recommended default, not a decision. They are listed in
 
 | ID | Question | Recommended default |
 |---|---|---|
-| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21, and close where Mesh-LLM already does the work? | Yes. No model item is built before R21 has a record |
+| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21, and close where Mesh-LLM already does the work? | Decided on 2026-11-24: yes. No model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running call that works without the tasks extension (D2), with the extension used when a client has it? | Yes |
 | Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9? | Yes, after R20. It is a wire change and gets a design record (`0068`, approved and implemented) |
 
@@ -226,3 +226,8 @@ The right column is a recommended default, not a decision. They are listed in
   is in the backlog.
 - 2026-11-15: Owner approved `Q56` and implementation landed as `FEAT-9a` in design `0068`.
 - 2026-11-16: Recorded `R20` GPU sandbox results on macOS (`Apple M5` Metal) and Windows 11 (`NVIDIA` Vulkan/CUDA/OptiX) and added worker `--isolation-read-dir` external runtime allowlisting in design `0074`; Linux `R20` GPU device rules remain `Planned`.
+- 2026-11-24: The owner decided Q54 at its default: the model items (LLM-1, LLM-6, LLM-12, LLM-13)
+  wait for a record of spike R21, and an item closes where Mesh-LLM already does the work, in favour
+  of running Mesh-LLM as a service. Part 1 of R21 (reading Mesh-LLM's documents and code) is
+  assigned to an agent; part 2 (install it on the owner's two machines and serve one model) stays
+  with the owner.
