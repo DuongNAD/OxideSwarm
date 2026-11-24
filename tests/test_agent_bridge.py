@@ -55,6 +55,8 @@ class BridgeCase(unittest.TestCase):
         self.env.pop("PYTHONIOENCODING", None)
         # Never probe the host's real ports (an owner's master may listen on 8088).
         self.env["OXIDESWARM_BRIDGE_ASSUME_LISTENING"] = ""
+        # Never discover a real Google Drive mount on G:/H:/D: during isolated tests.
+        self.env["OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN"] = "1"
         self.children = []
         self.addCleanup(self.stop_children)
 
@@ -491,7 +493,6 @@ class GitCalls(unittest.TestCase):
             self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
 
 
-@unittest.skipIf(os.path.exists("G:\\"), "a real Google Drive is mounted on this machine")
 class WithoutHub(BridgeCase):
     def assert_inert(self, result):
         self.assertEqual(result.returncode, 0)
@@ -504,6 +505,27 @@ class WithoutHub(BridgeCase):
 
     def test_the_hook_watcher_leaves_at_once_and_creates_nothing(self):
         self.assert_inert(self.run_bridge("watch", "--hook", use_hub=False, stdin="{}", timeout=10))
+
+    def test_drive_scan_opt_out_isolates_hub_discovery(self):
+        drive_hub = os.path.join("G:\\", "My Drive", "OxideSwarm_Agent_Hub")
+        base_env = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
+        base_env.pop("OXIDESWARM_AGENT_HUB", None)
+        base_env.pop(bridge_module.DISABLE_DRIVE_SCAN_ENV, None)
+        with (
+            mock.patch.object(bridge_module.glob, "glob", return_value=[]),
+            mock.patch.object(
+                bridge_module.os.path,
+                "exists",
+                side_effect=lambda p: p in ("G:\\", drive_hub),
+            ),
+            mock.patch.object(bridge_module.os, "listdir", return_value=[]),
+        ):
+            with mock.patch.dict(os.environ, dict(base_env, **{bridge_module.DISABLE_DRIVE_SCAN_ENV: "1"}), clear=True):
+                self.assertNotIn(drive_hub, bridge_module.hub_candidates())
+                self.assertIsNone(bridge_module.discover_hub_dir(None))
+            with mock.patch.dict(os.environ, base_env, clear=True):
+                self.assertIn(drive_hub, bridge_module.hub_candidates())
+                self.assertEqual(bridge_module.discover_hub_dir(None), os.path.abspath(drive_hub))
 
 
 class Peek(BridgeCase):
