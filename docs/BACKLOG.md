@@ -313,7 +313,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
-| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Planned | In |  |
+| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Partial | In |  |
 | TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
@@ -841,12 +841,14 @@ The full suite must pass on a clean machine before CI can require it.
   line `1430`). When `--fail-fast` tears down remaining shards while a sibling child is creating/truncating
   or writing `shard_<N>.pid`, the test's reader (`line 4784`, and `line 3777` in `test_t2_ax2_03`) can observe
   a zero-byte `.pid` file and raise `ValueError`.
-- **Do:** (Code fix and 20-run busy-loop verification wait until after the Stage C `S7` 24-hour soak finishes.)
-  1. Failing check first: demonstrate the empty `shard_*.pid` `ValueError` in `test_t3_03` / `test_t2_ax2_03`.
+- **Do:** (Code fix landed on `mac/test-95-atomic-pid-writes`; 20-run loaded loop under busy loops waits until after the Stage C `S7` 24-hour soak finishes — `loop after S7`.)
+  1. Failing check first: `HarnessAtomicWriteTests` reproduced empty `shard_2.pid` `ValueError: invalid literal for int() with base 10: ''` and failed before the fix (`AssertionError: 'os.replace(' not found`).
   2. Write all `.pid` and marker files via a temporary file in the same directory followed by atomic
-     rename (`os.replace` in `install_fake_cargo_nextest` line `1100` and `install_fake_blender` lines
-     `1353`, `1421`, `1430`; temp file + `mv -f` in `test_t2_ax2_03` line `3757`), so readers (`lines 3774`,
-     `4783`) only see complete `*.pid` files.
+     rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_<N>.pid` and
+     `install_fake_blender` `PROBE_PID_FILE` / `HANG_PID_FILE` / `HANG_MARKER_FILE`; temp file + `mv -f`
+     in `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards`), so readers only see complete `*.pid`
+     and marker files.
+  3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`. Remaining: `20/20` runs under busy loops (`loop after S7`).
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
@@ -3119,3 +3121,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-95 added (Planned, In; claim `claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`): in `tests/test_wave3_e2e.py`, `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed in pull request 432 CI (run `45272824360`, job `138036810990`) with `ValueError: invalid literal for int() with base 10: ''` reading an empty `shard_*.pid` written non-atomically under `--fail-fast`; code fix and 20-run loop wait until after Stage C `S7` (Index header recounted: 259 items, 194 Implemented, 16 Partial and 49 Planned; 20 open items are In and 45 are Out).
 - 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
 - 2026-11-24: TEST-96 added (Planned, In; claim `claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`): `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` timed out waiting 5 s for the multi-chunk `DeliveryAck` on master push `016f39c4` (CI run `45349647014`, job `138292591350`, `unit tests (ubuntu-latest)`); root cause (starved runner or lost ACK) and fix wait until after Stage C `S7` (Index header recounted: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out).
+- 2026-11-24: TEST-95 Partial (`mac/test-95-atomic-pid-writes`, `loop after S7`): added `HarnessAtomicWriteTests` (failing-first check reproduced `ValueError: invalid literal for int() with base 10: ''` on empty `shard_2.pid` and failed on unpatched shims/scripts before fix) and converted all five `.pid`/marker writers in `tests/test_wave3_e2e.py` to same-directory temp-file + atomic rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_*.pid` and `install_fake_blender` `PROBE_PID_FILE`/`HANG_PID_FILE`/`HANG_MARKER_FILE`; temp file + `mv -f` in `test_t2_ax2_03`); verified `test_m1_challenger_hygiene.py` (`5/5 OK`) and `20/20` sequential runs of `tests/test_wave3_e2e.py` (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures, no busy loops during Stage C `S7`); stays `Partial | In` until the `20`-run loaded loop runs after `S7`.
