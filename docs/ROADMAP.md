@@ -66,7 +66,8 @@ stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.
 - A first application for the model track (Draft, 2026-11-11): LIVA, the owner's desktop
   assistant. A trial comes first (Q40, decided), then a client tunnel to a model server, usage
   records and a balance per member, all proposals. The plan is in
-  [design 0061](design/0061-first-application-model-tunnel.md). Q41 to Q43 are open.
+  [design 0061](design/0061-first-application-model-tunnel.md). Q41 was decided on 2026-11-24, Q43 on
+  2026-11-19 (Q96); Q42 is open.
 - Model weights into the memory of another machine (Draft, 2026-11-11): a worker that holds no
   model file runs a model whose file is on another machine, with no copy written to its disk
   first (Q44, decided). Four spikes come first (R15 to R18). A model server that takes its
@@ -236,10 +237,11 @@ report that design 0067 names.
 
 In order:
 
-1. The owner answers Q54 ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q41
-   (design 0061). Q60 to Q63 (design 0067) were decided on 2026-11-24 at the recommended defaults.
-2. Spike R21, a reading of what Mesh-LLM already does, has no record. Q54 recommends that no model
-   item is built before it has one.
+1. Done on 2026-11-24: the owner decided Q41 (design 0061), Q54
+   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q60 to Q63 (design 0067) at the
+   recommended defaults.
+2. Spike R21, a reading of what Mesh-LLM already does, has no record. By Q54 no model item is built
+   before it has one.
 3. Trial APP-1 (Q40, decided): LIVA on a Mac with the model on another machine. No trial has run.
 4. The items that the answers keep enter [BACKLOG.md](BACKLOG.md) as a phase of their own, each
    with files and a check.
@@ -633,7 +635,7 @@ AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for
 row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
 with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
 server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
-for the trial records. Q41 to Q43 are open.
+for the trial records. Q41 (decided on 2026-11-24) and Q43 are decided; Q42 is open.
 
 [Design 0062](design/0062-model-weights-into-remote-memory.md) (Draft, 2026-11-11) plans how a
 worker gets a model whose file is on another machine, with no copy on its disk first (Q44,
@@ -726,7 +728,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
 | Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
 | Q40 | Does a trial of LIVA on the owner's Mac, with the language model on another machine, come before any build item of design 0061? | Yes, decided by the owner on 2026-11-11. No trial has run yet |
-| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
+| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Yes, decided by the owner on 2026-11-24, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
 | Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Display only; it refuses nobody. Decided by the owner on 2026-11-19 through Q96 (design 0094) |
 | Q44 | Is the path to develop the one where model weights go from the file on one machine into the memory of another, with no file written there first (design 0062)? | Yes, decided by the owner on 2026-11-11. Nothing is measured or built yet |
@@ -739,7 +741,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q51 | For the workload of design 0045 D6, which grades edits to the weights of a small model: does the first step use only edits that others have published, with no paid model that writes them? | Open. Recommended: yes; spike R19 needs no paid model |
 | Q52 | Does Anima Engine, the owner's simulation project, become the public showcase of the grid: a world that the machines of several people evolve together (design 0063, D5)? | Open. Recommended: not yet; after trial APP-4 and after Anima Engine has a release of its own |
 | Q53 | Which of the owner's workloads is FEAT-9 (GPU workloads beyond the benchmark) designed for first: 3D assets through Blender, or the grading and training of models (design 0063, D6)? | Open. Recommended: 3D assets through Blender, after trial APP-4; workers already report Blender |
-| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
+| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Yes, decided by the owner on 2026-11-24: no model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
 | Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Yes, approved by the owner and implemented in `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md)) |
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Yes, decided by the owner on 2026-11-19: the 24-hour soak runs on the owner's three machines, now (apart from the trial cluster) |

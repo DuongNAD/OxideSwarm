@@ -265,8 +265,8 @@ No product code is added by this record.
 
 Sizes follow `BACKLOG.md` (`S`, `M`, `L`). The owner decided `Q60` to `Q63` on 2026-11-24. The
 items enter [BACKLOG.md](../BACKLOG.md) with the model phase that
-[ROADMAP.md](../ROADMAP.md) ("Before 0.5.0 has items") describes, which still waits for `Q41`, `Q54`
-and spike `R21`.
+[ROADMAP.md](../ROADMAP.md) ("Before 0.5.0 has items") describes, which still waits for spike `R21` (`Q54`)
+and the trial `APP-1` (`Q41`).
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|

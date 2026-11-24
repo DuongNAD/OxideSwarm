@@ -1,6 +1,6 @@
 # 0061: A first application for the model track: trial, client tunnel and usage records
 
-Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 and Q42 are open; Q43 was closed by Q96 of design 0094 on 2026-11-19: display only)
+Status: Draft (plan; builds nothing; the owner decided Q40 on 2026-11-11; Q41 was decided on 2026-11-24 at its default; Q42 is open; Q43 was closed by Q96 of design 0094 on 2026-11-19: display only)
 Created: 2026-11-11    Updated: 2026-11-19
 
 ## Summary
@@ -315,7 +315,7 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q40 to Q43.
 | ID | Question | Recommended default |
 |---|---|---|
 | Q40 | Does a trial of LIVA on the Mac, with the model on another machine, come before any build item of this record? | Decided on 2026-11-11: yes, the owner asked for it |
-| Q41 | After the trial: build the client tunnel (LLM-9) before the gateway (LLM-6), and let LLM-4 reuse it? | Yes, if the trial records show that the remote model is worth using |
+| Q41 | After the trial: build the client tunnel (LLM-9) before the gateway (LLM-6), and let LLM-4 reuse it? | Decided on 2026-11-24: yes, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough, so that the master can read model traffic it relays? | Yes while every machine has one owner. End to end, with ENROLL-1, before a cluster of several owners uses LLM-9 |
 | Q43 | Does a balance only display, or does it refuse a member whose balance is below zero? | Display only in the first version |
 
@@ -352,3 +352,6 @@ None yet.
 - 2026-11-19: The owner decided Q96 of [design 0094](0094-road-to-a-shared-research-grid.md): credits
   only display, are never spent or transferred and have no cash value. It closes Q43 at its default:
   the balance of LLM-11 displays and refuses nobody.
+- 2026-11-24: The owner decided Q41 at its default: after the trial, the client tunnel (LLM-9) comes
+  before the gateway (LLM-6), and LLM-4 reuses it, if the trial records show that the remote model is
+  worth using. No trial has run yet; the texts of LLM-4 and LLM-6 are unchanged until it has.
