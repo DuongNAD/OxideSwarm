@@ -429,7 +429,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
-| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
+| LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
 | LAUNCH-1 | Hold the public launch for the stability release and its records | P1 | S | TEST-24, TEST-25, LINK-1, ADOPT-1 | Yes | Planned | Out |  |
@@ -1562,49 +1562,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
   queue time, and that test passes.
 
-### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
-
-- **Evidence:** [Design 0058](design/0058-lasting-value.md), D2. A search for `unsafe {`,
-  `unsafe fn`, `unsafe impl` and `unsafe extern` in `crates/*/src` finds 285 sites: 176 in
-  `crates/worker`, 77 in `crates/core`, 29 in `crates/cli`, 2 in `crates/agent_mesh` and 1 in
-  `crates/master`. A search for `// SAFETY` finds 103 comments, 23 of them in `crates/worker`. No
-  crate sets `clippy::undocumented_unsafe_blocks`, `forbid(unsafe_code)` or `deny(unsafe_code)`,
-  and no workflow runs Miri.
-- **Problem:** Most `unsafe` sites are in the code that confines tasks and kills process trees. A
-  reviewer cannot tell which invariant each one relies on, and nothing stops a new site without a
-  comment.
-- **Do:**
-  1. Give every `unsafe` site a `SAFETY:` comment that states the invariant it relies on. Read
-     the site before writing the comment. Where the invariant does not hold, write the failing
-     test first, then the fix (rule 4), and use the private route of `docs/SECURITY.md` if a
-     remote peer can reach it.
-  2. Turn on `clippy::undocumented_unsafe_blocks` for the workspace, as an error.
-  3. Add `#![forbid(unsafe_code)]` to every crate and module that has no `unsafe` site.
-  4. Add a CI job on Linux that runs Miri on the unit tests it can run, and list in the job's
-     comment which tests it skips and why. Miri cannot run calls into the operating system.
-  5. Start with `crates/worker/src/isolation.rs`, together with MAINT-2.
-- **Done when:** Measure M11 of design 0058 is met: every `unsafe` site has a `SAFETY:` comment.
-  The clippy job fails on a site without one, and that job is a required check. The Miri job has
-  run once on `master`.
-- **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
-  request 324, 145 sites documented.
-- **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
-- **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
-- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
-- **Note (2026-11-18):** Do steps 2 and 4: pull request 340. `clippy::undocumented_unsafe_blocks`
-  is `deny` in `[workspace.lints.clippy]`, and every crate has `[lints] workspace = true`; the clippy
-  jobs are required checks. The `miri (rusty_grid_core)` CI job runs `cargo miri test -p
-  rusty_grid_core --lib` on Linux; 93 of the 295 tests that Miri cannot run carry
-  `#[cfg_attr(miri, ignore = "Miri: <reason>")]`. Open: the Miri job has not run on GitHub yet.
-- **Note (2026-11-19):** Do step 3 (`win/lv-4-forbid-unsafe`): `#![forbid(unsafe_code)]` added at the
-  root of all 4 zero-`unsafe` binaries (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`), and
-  `#![deny(unsafe_code)]` at the root of all 6 library crates (`android_bridge`, `agent_mesh`,
-  `master`, `core`, `cli`, `worker`) with `#[allow(unsafe_code)]` (one-line `// LV-4:` reason on
-  each) limited to the modules/test submodules/10 `#[no_mangle]` JNI functions that require it, plus
-  `#[forbid(unsafe_code)]` on `master::store::fuzzing`; production code in `core::{blob,task}` and
-  `worker::{client,runner,staging}` stays denied. Complete module inventory is recorded in
-  [design 0058](design/0058-lasting-value.md). Open: CI Miri job run on `master`.
-
 ### LV-15: Release runbook, secret inventory and a second releaser
 
 - **Evidence:** [Design 0058](design/0058-lasting-value.md), D5 and proof run V3. Six releases
@@ -2546,3 +2503,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-90 added (`Planned | In`, claimed via `claims/item/TEST-90`): scheduled CI run `45180525786` (`2026-11-23T13:05:51Z`, `edd82f64`), job `endurance (loopback)` (`137725714467`) failed in step 9 (`soak`) because `benchmarks/endurance/endurance.py:2950` creates `workspaces-w0` with `os.makedirs(..., exist_ok=True)` (mode `0755` under default `ubuntu-latest` umask instead of `0700`); `schedule` event does not reset the Q80 push streak, and `TEST-26` remains `0/2` green scheduled runs.
 - 2026-11-24: TEST-91 Implemented (pull request 434, branch `win/s9-gpu-stability-record`, claimed via `claims/item/TEST-91`, text moved to the archive): Local S9.1–S9.5 passed on PR #424 head `055ca0c7` [open] on Windows case PC (`NVIDIA GeForce RTX 5060 Ti`, `16311 MiB`, driver `621.24`, `14` physical / `20` logical cores, `rustc 1.96.0`): `443/443` warm-up + `50/50` `RUSTY_GRID_REQUIRE_GPU=1` `rusty_grid_worker --features gpu-wgpu` runs (`96.203–106.968 s`, median `96.757 s`, total `4,891.748 s`), `3 + 3` `gemm_bench` runs (`1024` GPU median `3–4 ms` / CPU `397–401 ms`; `2048` GPU median `19–21 ms` / CPU `3419–3733 ms`), `20/20` loopback `--type gpu --gpu` GEMM (`VERIFIED_OK`), `triposr` `high` placed on `win-gpu` only vs `auto`/`sdf` running on `win-cpu`, and killing `win-gpu` mid-`8192x8192` GEMM requeued without CPU fallback and finished on restarted `win-gpu` (`1143 ms`, `VERIFIED_OK`). Stage B W6 cross-machine verification passed on `720106d8` across Mac lab master + `win-case-lab` (`--isolation fs --gpu --vram-mb 16311 --workspaces --no-portal`) + `mac-lab-worker` + `linux-docker-lab` (`3-worker doctor`: `15/0/0/0`, `C5 GPU probe`: `512x512` in `4 ms`, `67.1 GFLOP/s`; `20/20` `--type gpu --gpu --require-isolation fs` on `win-case-lab` with `VERIFIED_OK`; unpinned `triposr` `high` routed strictly to `win-case-lab`; `sdf` exited `0` in `78 ms`).
 - 2026-11-24: TEST-85 Implemented (pull request 417 + pull request 430, branch `win/test-85-windows-50-runs`, text moved to the archive): confirmed `50/50` consecutive passes on clean `origin/master` `720106d8` under `4` Python CPU busy loops on Windows (`14` physical / `20` logical cores, isolated NTFS temp/home, `rustc 1.96.0`; wall `2.34–2.88 s`, median `2.55 s`, total `127.69 s`; `compile_wall_ms` `1078–1532`, median `1247.0`; `exec_ms` `555–667`, median `581.5`), and verified all `14` subsequent `master` push CI runs after `44747726996` (`44755048283` through `45261621774`, including all `8` runs from pull request 417 onward) passed `100%` of `windows-latest` jobs through the Q80 window so far.
+- 2026-11-24: LV-4 Implemented (`mac/lv-4-close`, text moved to `docs/BACKLOG-ARCHIVE.md`): audited `origin/master` (`abff2514`) — all `384` non-comment `unsafe` sites (`352` blocks, `32` fns/impl/extern) across `crates/` and `tests/` carry `SAFETY:` / `# Safety` documentation, all `6` workspace member crates inherit `[lints] workspace = true` (`undocumented_unsafe_blocks = "deny"`), `cargo clippy --workspace --all-targets --locked -- -D warnings` passes (`0` warnings), all three `clippy (*)` jobs are required status checks on `master`, and `miri (rusty_grid_core)` passed on `master` push CI (`run 45297098266`, job `138120143503`: `203 passed; 0 failed; 93 ignored` in `491.91 s`). Index recount deferred to stage D (`M9`).
