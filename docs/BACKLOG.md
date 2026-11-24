@@ -187,6 +187,10 @@ Recounted on 2026-11-23 after TEST-41 Partial (pull request 420): 250 items, 182
 Recounted on 2026-11-23 after TEST-69 Implemented (pull request 421): 250 items, 183 Implemented, 20 Partial and 47 Planned; 22 open items are In and 45 are Out.
 Recounted on 2026-11-23 after TEST-89 was added (Planned, In): 251 items, 183 Implemented, 20 Partial and 48 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-23 from the rows after TEST-41 Implemented (pull request 426) and TEST-87 Planned (In): 252 items, 184 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-23 after TEST-88 was added as Implemented (pull request 424): 253 items, 185 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows with pull request 431: 253 items, 186 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows with pull request 427: 253 items, 187 Implemented, 19 Partial and 47 Planned; 21 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows with pull request 433: 254 items, 188 Implemented, 19 Partial and 47 Planned; 21 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -297,7 +301,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Partial | In | 417 |
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
-| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Planned | In |  |
+| TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
+| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 (open) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 (open) |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
@@ -417,7 +422,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | DOC-11 | Make the backlog show open work first | P2 | S |  |  | Implemented |  | 322, (design 0088) |
 | ADOPT-1 | A study of first use, in two rounds | P1 | S |  | Yes | Planned | In | study kit ready (PR 393), (design 0059) |
 | ADOPT-2 | Run summary in `submit --wait`, its JSON output and the MCP results | P2 | S |  |  | Implemented |  | 350, (design 0059) |
-| ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Planned | In | (design 0059) |
+| ADOPT-3 | Install scripts and the scripted time to first result | P2 | M | REL-4, ADOPT-1 |  | Implemented |  | 431, (design 0059) |
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
@@ -666,6 +671,36 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** 50 runs of `cargo test -p rusty_grid_worker --lib client::tests` pass under 4 busy loops
   on Windows, plus the same run on macOS by `agent-mac`.
 
+### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
+
+- **Evidence:** Incident `INC-20261123-001` (case PC, Windows 11 Pro, commit `8e55dac9`). The S9 loop ran
+  `cargo test -p rusty_grid_worker --features gpu-wgpu` from a script that captures output. Each run of
+  about 138 s opened 5 to 7 empty console or Windows Terminal windows that took the keyboard focus, and
+  left `PING.EXE` running for up to 120 s. `tests/m3_challenger_2_stress.rs` left Windows Terminal error
+  windows (`0x800700e8`) open. The loop was stopped after 19 of 50 runs, all of which had passed.
+- **Problem:** On Windows, task processes under `--isolation off` and host probes had no `CREATE_NO_WINDOW`.
+  A worker without a console therefore opens a window per console task. Test helpers started `cmd /C ping`
+  (one with `CREATE_NEW_CONSOLE`), and killing `cmd.exe` left `PING.EXE` behind. `Start-Process` without
+  `-NoNewWindow` opened a window per grandchild.
+- **Do:** [Design 0108](design/0108-windows-tasks-without-console-windows.md): `CREATE_NO_WINDOW` for
+  tasks, probes and test helpers, `PING.EXE` started directly, and `-NoNewWindow` in the stress test.
+  Keep every assertion, including the positive control of `test_console_and_terminal_injection_is_blocked`.
+- **Done when:** On Windows, 20 runs of `cargo test -p rusty_grid_worker` under 4 busy loops with
+  `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, started from a parent without a console, pass with 0 new console
+  windows and 0 leftover `PING.EXE` or `powershell` processes.
+- **Implemented (2026-11-23, pull request 424, design 0108):** Verified on the case PC (Windows 11 Pro, Intel Core
+  i5-14600KF, 14 physical / 20 logical cores) from a Python parent started with `CREATE_NO_WINDOW`, isolated
+  temporary `HOME`/`TEMP` per run, `cargo +1.96.0 test --locked -p rusty_grid_worker`:
+  - Baseline on `master` `00e836a8` (1 run): 427 passed; 11 new `OpenConsole.exe -Embedding` (6 still alive after
+    the run). Visible windows and leftovers were not caught in that run.
+  - Head `012dc68c`, `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, 4 busy loops: 20/20 runs passed (427 passed, 0 failed,
+    0 ignored in 17 binaries per run; 95.7 to 101.8 s), 0 new `OpenConsole.exe`, 0 visible or `0x800700e8`
+    windows and 0 leftover `PING.EXE`, `powershell` or `Start-Sleep` processes in every run.
+  - `test_console_and_terminal_injection_is_blocked` passed with its positive control: a `PING.EXE` started with
+    `CREATE_NO_WINDOW` has a windowless console, and `AttachConsole(helper)` from an `--isolation off` task
+    succeeds (`ATTACH_HELPER_OK`) while `fs` and `fs+net` are denied.
+  - `m3_challenger_2_stress`: 5/5 runs passed (18 tests each), 0 windows and 0 leftovers.
+
 ### TEST-89: macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s
 
 - **Evidence:** CI run `45180089954` (pull request 421, head `c4987058`, docs only, 2026-11-23 13:30 UTC), job
@@ -682,6 +717,11 @@ The full suite must pass on a clean machine before CI can require it.
   (the deadline is a wall-clock assertion, which the lessons of design 0087 forbid) or registration stalled
   (then a longer deadline only hides it). The log cannot tell the two apart: it shows no connect attempt and no
   master side.
+- **Cause:** Likely a slow runner; not proven. The 15 s deadline was a wall-clock assertion, not a hang guard.
+  Local stress loops set/inherited `RUSTUP_HOME`/`CARGO_HOME` (and without `RUSTUP_TOOLCHAIN`, local `rustup`
+  fails fast rather than timing out), so the CI run's `3 s` `cargo`/`rustc` probe timeouts (`6.3 s` total) never
+  happened locally, and local connect times (`0.4–3.2 s`, max `3.19 s`) do not show what the CI runner spent the
+  remaining ~8.7 s doing.
 - **Do:**
   1. Failing check first: hold the master's accept loop (or start the worker against a port that answers late)
      and show the 15 s false failure.
@@ -691,6 +731,18 @@ The full suite must pass on a clean machine before CI can require it.
   3. If a run still needs more than 30 s to connect, find out why (rule 4) before anything else.
 - **Done when:** the cause is written here (slow runner or stalled registration), and `tests/test_wave3_e2e.py`
   passes 20 runs in a row on macOS under 4 busy loops, with the connect times printed.
+- **Done:** Cause is recorded as "likely a slow runner; not proven" (see above). Step 2 late-connect TCP proxy
+  check (`w-late-proxy`, registration connections held until `+20.0 s` using `ox-wt-t89-mac/target/debug/oxideswarm`):
+  - Before fix (`27a910ec`, `timeout=15.0`): failed at `15.06 s` with
+    `TimeoutError: Worker w-late-proxy did not reach state:connected within 15.0s:` (`registration_handshake`
+    timed out after `5s` at attempt 1 and attempt 2 before the `15.0 s` guard fired).
+  - After fix (`8ccf776f`, `timeout=120.0`): passed at `20.07 s` with
+    `[timing] w-late-proxy connected after 20.07 s` (`RESULT=PASS elapsed=20.07s worker=w-late-proxy`).
+  Changes: `start_worker` timeout `15 s → 120 s` with `[timing]` print and master log dump on timeout;
+  `_wait_until` default `15 s → 120 s` with `[timing]` print; 12 explicit `timeout=15.0` marker/start waits
+  raised to `120 s`; process-exit, CLI-command and result waits left unchanged. `tests/test_wave3_e2e.py`
+  (`63` tests, per-run time ~`2` minutes: `115.4–122.4 s`) passed `20/20` runs (`2,369.8 s` total, max connect
+  `3.19 s`) on Apple M5 (`10` logical cores) under `4` Python CPU busy loops at `4b87e64b`.
 
 ## Phase 3: make the documents true
 
@@ -1376,24 +1428,6 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** "Study records" holds at least three sessions of the first round with measures
   M15 to M17. The item is Partial from then until the second round is recorded.
 - **Status (2026-11-19, Planned):** study kit ready (PR 393): `docs/study/2026-11-adopt-1/` (English and Vietnamese participant guide, facilitator sheet, consent template, and round-one record procedure), `scripts/study_timer.py` (`P1`–`P5` labels only, standard library), and `tests/test_study_timer.py` (wired into CI `agent-bridge`); no session has run yet and nothing in the kit is a result.
-
-### ADOPT-3: Install scripts and the scripted time to first result
-
-- **Evidence:** [Design 0059](design/0059-first-users.md), D6. `scripts/install.sh` and
-  `scripts/install.ps1` do not exist. `README.md` tells a user to download an archive, compare
-  `SHA256SUMS` and unpack by hand. No record gives the time from the release page to a first
-  result.
-- **Problem:** The install is the first thing a stranger does, and it is the step with the most
-  manual commands.
-- **Do:** As D6 of design 0059, with its rules: no `sudo`, no service, no start of a master or a
-  worker, a pinned release, a checksum comparison before unpacking, `--version`, `--dir` and
-  `--dry-run`, and no pipe into a shell in `README.md`. Verify the attestation of the archive
-  when LV-5 has landed and `gh` is present. Then write the scripted measure of M15, which times
-  the Quick start from an empty home directory, with its records in `benchmarks/grid/`.
-- **Done when:** The ADOPT-3 cases in `tests/test_launcher_scripts.py` pass (a matching checksum
-  installs, a mismatch refuses and leaves no file, an unknown architecture is named, `--dry-run`
-  writes nothing, a second run replaces the binaries), and M15 by script is recorded for macOS,
-  Windows and Linux.
 
 ### ADOPT-4: Guides for common jobs, each with a recorded run
 
@@ -2498,3 +2532,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-89 added (Planned, In): `test_t4_05_concurrent_mixed_vram_blender_builtin_and_cancel_stress` failed on `macos-latest` in the CI of pull request 421 (run `45180089954`) because worker `w-8gb-bl-ok` did not reach `state:connected` within the 15 s deadline of `start_worker`; its host probes alone took 6.3 s. The id was claimed with `agent_bridge.py claim`.
 - 2026-11-23: TEST-41 Implemented (pull request 426, text moved to the archive) and TEST-87 added (`Planned | In`, claimed via `claims/item/TEST-87`): TEST-41 "Done when" is met (`200/200` on Linux in pull requests 363 and 419 and on Windows in pull requests 359 and 420 after the fixes of `09c3accd`, plus macOS in pull request 288); cause not reproduced (pull request 282 CI hit never repeated; pull request 288 diagnostics stay in the probe on the owner's delegation); TEST-87 records the `macos-latest` loopback worker portal `AddrInUse` flake in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` from pull request 419. Index recount: 251 items, 184 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 - 2026-11-24: TEST-92 Implemented (text in the archive): preserved real `RUSTUP_HOME` and `CARGO_HOME` across isolated Python, shell, and Rust E2E harnesses plus `.github/workflows/ci.yml` Wave 2/3 steps (`4252c7bc`) so `rustup` toolchain shims under `RUSTUP_TOOLCHAIN=1.96.0` do not hit 3 s `cargo`/`rustc` probe timeouts when `HOME` is isolated (`0` product or PR #409 files touched); verified full `tests/test_wave2_e2e.py` (`73/73` in `79.564 s`), full `tests/test_wave3_e2e.py` (`63/63` in `88.548 s`), `test_integration.sh` `20/20` worker reg `5.097–6.741 s` (median `5.576 s`) down to `0.726–0.981 s` (median `0.735 s`), and `20/20` medians on `wave2_t1_f1_04` (`10.451 s -> 0.625 s`) and `wave3_t1_3d2_01` (`7.285 s -> 0.611 s`) under 4 busy loops.
+- 2026-11-24: TEST-89 Implemented (pull requests 425, 427 (open), branch `mac/test-89-wave3-connect-guard`): cause is "likely a slow runner; not proven" (local runs set/inherited `RUSTUP_HOME`/`CARGO_HOME` and did not hit CI's `3 s` `cargo`/`rustc` probe timeouts, so `0.4–3.2 s` local connect times do not prove what the CI runner did). Step 2 verified with a 20 s TCP proxy holding worker registration (`15.06 s` `TimeoutError` on `27a910ec`, passed at `20.07 s` with `[timing] w-late-proxy connected after 20.07 s` on `8ccf776f`). Raised `start_worker`, `_wait_until`, and 12 marker/start waits from `15 s` to `120 s` hang guards with `[timing]` prints and master log dump; `tests/test_wave3_e2e.py` (63 tests, ~2 min per run: `115.4–122.4 s`) passed `20/20` (`2,369.8 s` total, max connect `3.19 s`) under 4 busy loops on Apple M5 (`10` cores) at `4b87e64b`.
+- 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.
+- 2026-11-23: TEST-88 Implemented (pull request 424): the case PC ran the Windows loop of "Done when" at `012dc68c`: 20/20 runs of `rusty_grid_worker` and 5/5 of `m3_challenger_2_stress` passed with 0 new console windows and 0 leftover processes (master baseline: 11 new `OpenConsole.exe` in one run). INC-20261123-001 closed.
+- 2026-11-24: ADOPT-3 Implemented (pull request 431, text moved to the archive): added `scripts/install.sh` (bash 3.2, LF) and `scripts/install.ps1` (Windows PowerShell, CRLF, pure ASCII) with `OXIDESWARM_DOWNLOAD_BASE`, `SHA256SUMS` verification, `gh attestation verify` when authenticated (notice/warning + SHA-256 fallback when `gh` is absent or unauthenticated; review fix), docs (`README.md`, `docs/reference.md`, `docs/design/0059-first-users.md`, `CHANGELOG.md`), `Adopt3StaticChecks` / `InstallShTests` / `InstallPs1Tests` in `tests/test_launcher_scripts.py`, `benchmarks/grid/bench_m15_quickstart.py` (with `GH_CONFIG_DIR` preserved for `install.sh` on Unix under isolated `HOME`; review fix) + `test_bench_m15.py` (`4/4`), the macOS quarantine check (`agent-mac-ag` on Apple Silicon M5 Darwin `27.2.0`: `com.apple.provenance` only, no `com.apple.quarantine`), and M15 records across all three systems (Windows `8.551 s`, macOS `8.727 s`, Linux Docker `1.434 s`).
