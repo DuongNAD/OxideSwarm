@@ -1,0 +1,932 @@
+{
+  "benchmark": "ax2-shard-r2-m1",
+  "date_utc": "2026-11-23T23:38:38Z",
+  "plan": {
+    "question_r2": "How much wall time does sharding this repository's workspace --lib unit tests over 3 workers save via today's `submit`?",
+    "question_m1": "Does `oxideswarm shard` finish in <= 0.50x of 1-worker time?",
+    "stop_rule": "R2 savings < 30% triggers guide-only stop rule",
+    "scope": "multi-machine 3-worker lab cluster (macOS arm64 + Windows x86_64 + Linux arm64 Docker on Mac)"
+  },
+  "git": {
+    "commit": "720106d8da69eb5c42bc0e9c0ee4f862e7e72781",
+    "dirty_tree": true
+  },
+  "binary": {
+    "profile": "release",
+    "version": "rusty-grid 0.4.4"
+  },
+  "coordinator_hardware": {
+    "cpu_model": "Apple M5",
+    "cores": 10,
+    "ram_bytes": 34359738368
+  },
+  "coordinator_os": {
+    "system": "Darwin",
+    "release": "27.2.0",
+    "version": "Darwin Kernel Version 27.2.0: Wed Oct 14 23:48:06 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T8142",
+    "machine": "arm64"
+  },
+  "workers": [
+    {
+      "name": "mac-lab-worker",
+      "os": "macos",
+      "arch": "aarch64",
+      "cpu_cores": 10,
+      "ram_mb": 32768,
+      "slots": 9,
+      "iso": "off",
+      "has_workspaces": true,
+      "link": "Link: TCP/LAN"
+    },
+    {
+      "name": "win-case-lab",
+      "os": "windows",
+      "arch": "x86_64",
+      "cpu_cores": 20,
+      "ram_mb": 48941,
+      "slots": 19,
+      "iso": "off",
+      "has_workspaces": true,
+      "link": "Link: TCP/LAN"
+    },
+    {
+      "name": "linux-docker-lab",
+      "os": "linux",
+      "arch": "aarch64",
+      "cpu_cores": 10,
+      "ram_mb": 7934,
+      "slots": 9,
+      "iso": "off",
+      "has_workspaces": true,
+      "link": "Link: TCP/LAN"
+    }
+  ],
+  "network": "LAN TCP (Mac master + Windows case PC + Linux arm64 Docker container on Mac)",
+  "power": [
+    "Now drawing from 'AC Power'",
+    " -InternalBattery-0 (id=36700259)\t100%; charged; 0:00 remaining present: true"
+  ],
+  "load_average_before": [
+    4.5,
+    4.41,
+    4.61
+  ],
+  "load_average_after": [
+    21.84,
+    15.97,
+    13.59
+  ],
+  "python": "3.11.8",
+  "note": "Multi-machine AX-2 R2/M1 evaluation across Mac, Windows case PC, and Linux arm64 Docker worker on Mac",
+  "parameters": {
+    "packages": [
+      "workspace"
+    ],
+    "build_mode": "debug",
+    "baseline_worker": "mac-lab-worker",
+    "r2_workers": [
+      "mac-lab-worker",
+      "win-case-lab",
+      "linux-docker-lab"
+    ],
+    "shard_counts": [
+      3,
+      6
+    ],
+    "runs_per_config": 3,
+    "warmup_runs": 1,
+    "worker_threads": 2,
+    "remote_python": "python3"
+  },
+  "warmup": {
+    "mac-lab-worker": {
+      "wall_s": 136.0897,
+      "arch": "arm64",
+      "cargo_prepare_s": 33.7257,
+      "exec_s": 102.0036,
+      "executed_tests": 1391,
+      "idx": 1,
+      "listed_tests": 1391,
+      "os": "darwin",
+      "target_mode": "shared_temp",
+      "total": 1,
+      "worker_name": "mac-lab-worker"
+    },
+    "win-case-lab": {
+      "wall_s": 141.6471,
+      "arch": "amd64",
+      "cargo_prepare_s": 50.0574,
+      "exec_s": 90.807,
+      "executed_tests": 1347,
+      "idx": 1,
+      "listed_tests": 1347,
+      "os": "windows",
+      "target_mode": "shared_temp",
+      "total": 1,
+      "worker_name": "win-case-lab"
+    },
+    "linux-docker-lab": {
+      "wall_s": 122.359,
+      "arch": "aarch64",
+      "cargo_prepare_s": 49.0313,
+      "exec_s": 73.0159,
+      "executed_tests": 1389,
+      "idx": 1,
+      "listed_tests": 1389,
+      "os": "linux",
+      "target_mode": "shared_temp",
+      "total": 1,
+      "worker_name": "linux-docker-lab"
+    }
+  },
+  "r2_submit": {
+    "by_workers": {
+      "1": {
+        "median": 136.036,
+        "min": 135.1883,
+        "max": 138.643,
+        "runs": 3
+      },
+      "3": {
+        "median": 99.0549,
+        "min": 97.3142,
+        "max": 99.9507,
+        "runs": 3
+      }
+    },
+    "evaluation": {
+      "wall_1w_s": 136.036,
+      "wall_3w_s": 99.0549,
+      "savings_pct": 27.18,
+      "stop_rule_threshold_pct": 30.0,
+      "stop_rule_triggered": true
+    }
+  },
+  "m1_shard": {
+    "by_shards": {
+      "1": {
+        "wall_s": {
+          "median": 137.4924,
+          "min": 134.5033,
+          "max": 138.7468,
+          "runs": 3
+        },
+        "waited_ms": {
+          "median": 137486,
+          "min": 134497,
+          "max": 138740,
+          "runs": 3
+        },
+        "task_time_sum_ms": {
+          "median": 137312,
+          "min": 134333,
+          "max": 138562,
+          "runs": 3
+        },
+        "machines_median": 1
+      },
+      "3": {
+        "wall_s": {
+          "median": 89.3545,
+          "min": 88.0606,
+          "max": 89.3881,
+          "runs": 3
+        },
+        "waited_ms": {
+          "median": 89345,
+          "min": 88052,
+          "max": 89379,
+          "runs": 3
+        },
+        "task_time_sum_ms": {
+          "median": 253353,
+          "min": 252881,
+          "max": 253798,
+          "runs": 3
+        },
+        "machines_median": 3,
+        "per_worker_shards_sample": {
+          "linux-docker-lab": 1,
+          "mac-lab-worker": 1,
+          "win-case-lab": 1
+        }
+      },
+      "6": {
+        "wall_s": {
+          "median": 81.503,
+          "min": 81.2016,
+          "max": 84.3896,
+          "runs": 3
+        },
+        "waited_ms": {
+          "median": 81486,
+          "min": 81186,
+          "max": 84374,
+          "runs": 3
+        },
+        "task_time_sum_ms": {
+          "median": 420086,
+          "min": 416255,
+          "max": 427145,
+          "runs": 3
+        },
+        "machines_median": 3,
+        "per_worker_shards_sample": {
+          "linux-docker-lab": 2,
+          "mac-lab-worker": 1,
+          "win-case-lab": 3
+        }
+      }
+    },
+    "evaluation": {
+      "wall_1w_s": 137.4924,
+      "wall_3w_s": 89.3545,
+      "ratio_3w_to_1w": 0.6499,
+      "target_max_ratio": 0.5,
+      "target_met": false
+    },
+    "evaluations_by_count": {
+      "3": {
+        "wall_1w_s": 137.4924,
+        "wall_3w_s": 89.3545,
+        "ratio_3w_to_1w": 0.6499,
+        "target_max_ratio": 0.5,
+        "target_met": false
+      },
+      "6": {
+        "wall_1w_s": 137.4924,
+        "wall_3w_s": 81.503,
+        "ratio_3w_to_1w": 0.5928,
+        "target_max_ratio": 0.5,
+        "target_met": false
+      }
+    }
+  },
+  "raw": {
+    "r2_submit": {
+      "1": [
+        {
+          "wall_s": 135.1883,
+          "shards": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 32.4007,
+              "exec_s": 102.2726,
+              "executed_tests": 1391,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 1,
+              "worker_name": "mac-lab-worker"
+            }
+          ]
+        },
+        {
+          "wall_s": 136.036,
+          "shards": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 34.1803,
+              "exec_s": 101.3484,
+              "executed_tests": 1391,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 1,
+              "worker_name": "mac-lab-worker"
+            }
+          ]
+        },
+        {
+          "wall_s": 138.643,
+          "shards": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 36.545,
+              "exec_s": 101.5774,
+              "executed_tests": 1391,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 1,
+              "worker_name": "mac-lab-worker"
+            }
+          ]
+        }
+      ],
+      "3": [
+        {
+          "wall_s": 97.3142,
+          "shards": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 50.3964,
+              "exec_s": 46.4053,
+              "executed_tests": 464,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "mac-lab-worker"
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 50.3105,
+              "exec_s": 37.2525,
+              "executed_tests": 449,
+              "idx": 2,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "win-case-lab"
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 50.4135,
+              "exec_s": 17.6549,
+              "executed_tests": 463,
+              "idx": 3,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "linux-docker-lab"
+            }
+          ]
+        },
+        {
+          "wall_s": 99.0549,
+          "shards": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 52.1959,
+              "exec_s": 46.3551,
+              "executed_tests": 464,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "mac-lab-worker"
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 48.541,
+              "exec_s": 35.8278,
+              "executed_tests": 449,
+              "idx": 2,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "win-case-lab"
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 52.405,
+              "exec_s": 17.7646,
+              "executed_tests": 463,
+              "idx": 3,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "linux-docker-lab"
+            }
+          ]
+        },
+        {
+          "wall_s": 99.9507,
+          "shards": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 53.1743,
+              "exec_s": 46.2957,
+              "executed_tests": 464,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "mac-lab-worker"
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.8452,
+              "exec_s": 36.4572,
+              "executed_tests": 449,
+              "idx": 2,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "win-case-lab"
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 50.6566,
+              "exec_s": 17.7526,
+              "executed_tests": 463,
+              "idx": 3,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 3,
+              "worker_name": "linux-docker-lab"
+            }
+          ]
+        }
+      ]
+    },
+    "m1_shard": {
+      "1": [
+        {
+          "wall_s": 134.5033,
+          "status": "completed",
+          "total_shards": 1,
+          "completed_shards": 1,
+          "failed_shards": 0,
+          "machines": 1,
+          "waited_ms": 134497,
+          "task_time_sum_ms": 134333,
+          "per_worker_shards": {
+            "mac-lab-worker": 1
+          },
+          "cargo_summaries": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 32.7954,
+              "exec_s": 101.2366,
+              "executed_tests": 1391,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 1
+            }
+          ]
+        },
+        {
+          "wall_s": 137.4924,
+          "status": "completed",
+          "total_shards": 1,
+          "completed_shards": 1,
+          "failed_shards": 0,
+          "machines": 1,
+          "waited_ms": 137486,
+          "task_time_sum_ms": 137312,
+          "per_worker_shards": {
+            "mac-lab-worker": 1
+          },
+          "cargo_summaries": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 34.7834,
+              "exec_s": 102.2324,
+              "executed_tests": 1391,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 1
+            }
+          ]
+        },
+        {
+          "wall_s": 138.7468,
+          "status": "completed",
+          "total_shards": 1,
+          "completed_shards": 1,
+          "failed_shards": 0,
+          "machines": 1,
+          "waited_ms": 138740,
+          "task_time_sum_ms": 138562,
+          "per_worker_shards": {
+            "mac-lab-worker": 1
+          },
+          "cargo_summaries": [
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 36.6545,
+              "exec_s": 101.6042,
+              "executed_tests": 1391,
+              "idx": 1,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 1
+            }
+          ]
+        }
+      ],
+      "3": [
+        {
+          "wall_s": 89.3881,
+          "status": "completed",
+          "total_shards": 3,
+          "completed_shards": 3,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 89379,
+          "task_time_sum_ms": 253798,
+          "per_worker_shards": {
+            "linux-docker-lab": 1,
+            "mac-lab-worker": 1,
+            "win-case-lab": 1
+          },
+          "cargo_summaries": [
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 50.8247,
+              "exec_s": 37.8098,
+              "executed_tests": 449,
+              "idx": 1,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 3
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 50.7603,
+              "exec_s": 31.4616,
+              "executed_tests": 463,
+              "idx": 2,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 3
+            },
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 51.8296,
+              "exec_s": 30.0755,
+              "executed_tests": 463,
+              "idx": 3,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 3
+            }
+          ]
+        },
+        {
+          "wall_s": 89.3545,
+          "status": "completed",
+          "total_shards": 3,
+          "completed_shards": 3,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 89345,
+          "task_time_sum_ms": 252881,
+          "per_worker_shards": {
+            "linux-docker-lab": 1,
+            "mac-lab-worker": 1,
+            "win-case-lab": 1
+          },
+          "cargo_summaries": [
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 50.031,
+              "exec_s": 38.5261,
+              "executed_tests": 449,
+              "idx": 1,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 3
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 49.7368,
+              "exec_s": 31.7893,
+              "executed_tests": 463,
+              "idx": 2,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 3
+            },
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 51.9554,
+              "exec_s": 29.7534,
+              "executed_tests": 463,
+              "idx": 3,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 3
+            }
+          ]
+        },
+        {
+          "wall_s": 88.0606,
+          "status": "completed",
+          "total_shards": 3,
+          "completed_shards": 3,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 88052,
+          "task_time_sum_ms": 253353,
+          "per_worker_shards": {
+            "linux-docker-lab": 1,
+            "mac-lab-worker": 1,
+            "win-case-lab": 1
+          },
+          "cargo_summaries": [
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.4537,
+              "exec_s": 37.825,
+              "executed_tests": 449,
+              "idx": 1,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 3
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 49.7428,
+              "exec_s": 32.0751,
+              "executed_tests": 463,
+              "idx": 2,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 3
+            },
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 53.0923,
+              "exec_s": 30.0748,
+              "executed_tests": 463,
+              "idx": 3,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 3
+            }
+          ]
+        }
+      ],
+      "6": [
+        {
+          "wall_s": 81.503,
+          "status": "completed",
+          "total_shards": 6,
+          "completed_shards": 6,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 81486,
+          "task_time_sum_ms": 420086,
+          "per_worker_shards": {
+            "linux-docker-lab": 2,
+            "mac-lab-worker": 1,
+            "win-case-lab": 3
+          },
+          "cargo_summaries": [
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 50.0471,
+              "exec_s": 12.8287,
+              "executed_tests": 225,
+              "idx": 1,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 52.8301,
+              "exec_s": 16.6266,
+              "executed_tests": 232,
+              "idx": 2,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 54.163,
+              "exec_s": 11.6808,
+              "executed_tests": 232,
+              "idx": 3,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.8373,
+              "exec_s": 29.8644,
+              "executed_tests": 224,
+              "idx": 4,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.9822,
+              "exec_s": 22.0736,
+              "executed_tests": 224,
+              "idx": 5,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 52.759,
+              "exec_s": 12.6613,
+              "executed_tests": 231,
+              "idx": 6,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 6
+            }
+          ]
+        },
+        {
+          "wall_s": 81.2016,
+          "status": "completed",
+          "total_shards": 6,
+          "completed_shards": 6,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 81186,
+          "task_time_sum_ms": 416255,
+          "per_worker_shards": {
+            "linux-docker-lab": 2,
+            "mac-lab-worker": 1,
+            "win-case-lab": 3
+          },
+          "cargo_summaries": [
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.6678,
+              "exec_s": 12.5939,
+              "executed_tests": 225,
+              "idx": 1,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 51.1884,
+              "exec_s": 16.6124,
+              "executed_tests": 232,
+              "idx": 2,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 54.3054,
+              "exec_s": 11.9843,
+              "executed_tests": 232,
+              "idx": 3,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.7401,
+              "exec_s": 29.797,
+              "executed_tests": 224,
+              "idx": 4,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 49.5973,
+              "exec_s": 21.9265,
+              "executed_tests": 224,
+              "idx": 5,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 51.3069,
+              "exec_s": 12.5462,
+              "executed_tests": 231,
+              "idx": 6,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 6
+            }
+          ]
+        },
+        {
+          "wall_s": 84.3896,
+          "status": "completed",
+          "total_shards": 6,
+          "completed_shards": 6,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 84374,
+          "task_time_sum_ms": 427145,
+          "per_worker_shards": {
+            "linux-docker-lab": 2,
+            "mac-lab-worker": 1,
+            "win-case-lab": 3
+          },
+          "cargo_summaries": [
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 51.8445,
+              "exec_s": 13.2206,
+              "executed_tests": 225,
+              "idx": 1,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 51.6673,
+              "exec_s": 16.6378,
+              "executed_tests": 232,
+              "idx": 2,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "arm64",
+              "cargo_prepare_s": 56.0393,
+              "exec_s": 11.7077,
+              "executed_tests": 232,
+              "idx": 3,
+              "listed_tests": 1391,
+              "os": "darwin",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 51.7506,
+              "exec_s": 31.0547,
+              "executed_tests": 224,
+              "idx": 4,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "amd64",
+              "cargo_prepare_s": 51.5851,
+              "exec_s": 22.7886,
+              "executed_tests": 224,
+              "idx": 5,
+              "listed_tests": 1347,
+              "os": "windows",
+              "target_mode": "shared_temp",
+              "total": 6
+            },
+            {
+              "arch": "aarch64",
+              "cargo_prepare_s": 51.6193,
+              "exec_s": 12.6277,
+              "executed_tests": 231,
+              "idx": 6,
+              "listed_tests": 1389,
+              "os": "linux",
+              "target_mode": "shared_temp",
+              "total": 6
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
