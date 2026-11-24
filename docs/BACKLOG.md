@@ -191,6 +191,7 @@ Recounted on 2026-11-23 after TEST-88 was added as Implemented (pull request 424
 Recounted on 2026-11-24 from the rows with pull request 431: 253 items, 186 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 427: 253 items, 187 Implemented, 19 Partial and 47 Planned; 21 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 433: 254 items, 188 Implemented, 19 Partial and 47 Planned; 21 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows after the batch merge of pull requests 423, 427 to 430, 432 to 435, 437, 438 and 441: 258 items, 194 Implemented, 16 Partial and 48 Planned; 19 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -302,12 +303,12 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Planned | In |  |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Implemented |  | 429 |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
-| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 (open) |
+| TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
 | TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Planned | In | (unlanded claim `TEST-70`) |
 | TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Planned | In |  |
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
-| TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 (open) |
+| TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -655,22 +656,6 @@ The full suite must pass on a clean machine before CI can require it.
   3. If it still stalls after step 1, find the cause (rule 4) before anything else; do not raise the timeouts.
 - **Done when:** The cause is written here, and `test_ax2_shard` and `test_ax1_matrix` pass 50 runs in a row on
   macOS under 6 busy loops with `--test-threads 3`.
-
-### TEST-87: macOS: worker portal loopback test fails when its LAN-side bind finds the port in use
-
-- **Evidence:** `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` failed on
-  `macos-latest` in pull request 419 (run `45129742542`, job `137542373519`, head `116353d0`, docs-only): the
-  panic at `crates/worker/src/client/tests.rs:4155` was `must not bind 0.0.0.0:49623 (binding
-  192.168.64.11:49623 failed: AddrInUse)`. 328 other tests in the binary passed.
-- **Problem:** The test proves the portal is not on `0.0.0.0` by binding `<lan_ip>:<portal port>`. Any other
-  socket on that address and port makes the bind fail, for example a concurrent test's outgoing connection
-  with an ephemeral local port in the same 49152–65535 range. The listener's `local_addr` is already
-  asserted to be `127.0.0.1`, so the LAN-side bind adds only noise.
-- **Do:** Write a failing check first (hold a socket on `<lan_ip>:<port>` before the bind and show the false
-  failure). Then, on `AddrInUse`, connect to `<lan_ip>:<port>` instead: refused, or an answer that is not the
-  portal's `/api/status` body, passes. Only the portal's body fails. Keep the `127.0.0.1` assertion.
-- **Done when:** 50 runs of `cargo test -p rusty_grid_worker --lib client::tests` pass under 4 busy loops
-  on Windows, plus the same run on macOS by `agent-mac`.
 
 ### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
 
