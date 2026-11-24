@@ -1332,6 +1332,12 @@ fn kill_probe_group(pid: u32) {
 #[cfg(windows)]
 pub const WINDOWS_CREATE_SUSPENDED: u32 = 0x0000_0004;
 
+/// Windows creation flag (`CREATE_NO_WINDOW`): a console child gets a console with no window, so
+/// a worker started without a console (a service, a hidden launcher, a test harness) never opens a
+/// visible console window per task or probe; stdout and stderr are pipes either way (design 0108).
+#[cfg(windows)]
+pub const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Windows process error-mode flags that suppress modal hard-error and crash dialogs:
 /// `SEM_FAILCRITICALERRORS` (`0x0001`) | `SEM_NOGPFAULTERRORBOX` (`0x0002`) |
 /// `SEM_NOOPENFILEERRORBOX` (`0x8000`) = `0x8003`.
@@ -1520,7 +1526,7 @@ fn run_command_bounded(
     {
         use std::os::windows::process::CommandExt;
         suppress_windows_error_dialogs();
-        cmd.creation_flags(WINDOWS_CREATE_SUSPENDED);
+        cmd.creation_flags(WINDOWS_CREATE_SUSPENDED | WINDOWS_CREATE_NO_WINDOW);
     }
 
     let mut child = {
@@ -3664,7 +3670,7 @@ Now drawing from 'AC Power'
         };
         let deadline = std::time::Instant::now() + wait_budget;
         loop {
-            sys.refresh_processes();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let alive = sys
                 .process(sysinfo::Pid::from(pid as usize))
                 .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie);

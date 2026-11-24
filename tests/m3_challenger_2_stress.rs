@@ -828,7 +828,7 @@ async fn test_process_tree_containment_grandchild_processes_killed_on_worker_tas
     std::fs::write(
         &gc_script,
         "param([string]$PidFile)\n\
-         $gc1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+         $gc1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -NoNewWindow -PassThru\n\
          [System.IO.File]::AppendAllText($PidFile, \"$($gc1.Id)`n\")\n\
          Start-Sleep -Seconds 300\n",
     )
@@ -838,8 +838,8 @@ async fn test_process_tree_containment_grandchild_processes_killed_on_worker_tas
     std::fs::write(
         &task_script,
         "param([string]$PidFile, [string]$GcScript)\n\
-         $c1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $GcScript, $PidFile -PassThru\n\
-         $c2 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+         $c1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $GcScript, $PidFile -NoNewWindow -PassThru\n\
+         $c2 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -NoNewWindow -PassThru\n\
          [System.IO.File]::AppendAllText($PidFile, \"$($c1.Id)`n$($c2.Id)`n\")\n\
          Start-Sleep -Seconds 300\n",
     )
@@ -943,13 +943,16 @@ async fn test_process_tree_containment_grandchild_processes_killed_on_worker_tas
 #[cfg(windows)]
 #[tokio::test]
 async fn test_process_tree_containment_worker_process_abrupt_kill() {
+    use std::os::windows::process::CommandExt;
     let temp_dir = tempfile::tempdir().expect("temp dir for worker kill test");
     let pid_file = temp_dir.path().join("pids_5b.txt");
     let worker_pid_file = temp_dir.path().join("worker_pid_5b.txt");
 
     // Spawn a child process running this test binary in worker containment mode
     let current_exe = std::env::current_exe().expect("current test exe");
+    // No console window for the helper worker (TEST-88): its tasks inherit its windowless console.
     let mut worker_child = std::process::Command::new(current_exe)
+        .creation_flags(rusty_grid_core::capabilities::WINDOWS_CREATE_NO_WINDOW)
         .arg("--")
         .arg("test_worker_containment_helper_proc")
         .arg("--exact")
@@ -1052,7 +1055,7 @@ async fn test_worker_containment_helper_proc() {
     std::fs::write(
         &gc_script,
         "param([string]$PidFile)\n\
-         $gc1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+         $gc1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -NoNewWindow -PassThru\n\
          [System.IO.File]::AppendAllText($PidFile, \"$($gc1.Id)`n\")\n\
          Start-Sleep -Seconds 300\n",
     )
@@ -1062,8 +1065,8 @@ async fn test_worker_containment_helper_proc() {
     std::fs::write(
         &task_script,
         "param([string]$PidFile, [string]$GcScript)\n\
-         $c1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $GcScript, $PidFile -PassThru\n\
-         $c2 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+         $c1 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File', $GcScript, $PidFile -NoNewWindow -PassThru\n\
+         $c2 = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -NoNewWindow -PassThru\n\
          [System.IO.File]::AppendAllText($PidFile, \"$($c1.Id)`n$($c2.Id)`n\")\n\
          Start-Sleep -Seconds 300\n",
     )
@@ -1103,7 +1106,7 @@ async fn test_process_tree_direct_windows_job_object_fanout() {
         &script,
         "param([string]$PidFile)\n\
          for ($i = 0; $i -lt 5; $i++) {\n\
-             $p = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -PassThru\n\
+             $p = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','Start-Sleep -Seconds 300' -NoNewWindow -PassThru\n\
              [System.IO.File]::AppendAllText($PidFile, \"$($p.Id)`n\")\n\
          }\n\
          Start-Sleep -Seconds 300\n",
