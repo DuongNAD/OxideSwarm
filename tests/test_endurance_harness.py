@@ -15,6 +15,7 @@ import copy
 import datetime
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import random
@@ -22,6 +23,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2795,6 +2797,90 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
             echo_close()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_worker_agent_and_master_dirs_enforce_posix_0700(self):
+        rs = endurance.remote_soak
+        tmp = tempfile.mkdtemp(prefix="ox-remote-soak-perm-")
+        try:
+            fake_bin = os.path.join(tmp, "oxideswarm.exe" if os.name == "nt" else "oxideswarm")
+            with open(fake_bin, "wb") as bf:
+                bf.write(b"dummy")
+            sec_path = os.path.join(tmp, "cluster.secret")
+            with open(sec_path, "w", encoding="utf-8") as sf:
+                sf.write(secrets.token_hex(32) + "\n")
+            if os.name != "nt":
+                os.chmod(sec_path, 0o600)
+
+            real_chmod = os.chmod
+            chmod_modes = {}
+
+            def _record_chmod(path, mode, *args, **kwargs):
+                chmod_modes[os.path.abspath(path)] = mode
+                if os.name != "nt":
+                    real_chmod(path, mode, *args, **kwargs)
+
+            with (
+                mock.patch.object(rs, "_is_posix_host", return_value=True),
+                mock.patch.object(rs.os, "chmod", side_effect=_record_chmod),
+            ):
+                ag = rs.WorkerAgent(
+                    endurance,
+                    binary=fake_bin,
+                    master_addr="127.0.0.1:18088",
+                    control_addr="127.0.0.1:18501",
+                    secret_file=sec_path,
+                    name="win-a",
+                    workspaces=True,
+                    work_dir=os.path.join(tmp, "worker"),
+                )
+                worker_dirs = (
+                    ag.work_root,
+                    ag.home_dir,
+                    ag.ox_home,
+                    ag.tmp_dir,
+                    ag.sandbox_dir,
+                    ag.workspace_dir,
+                )
+                for d in worker_dirs:
+                    self.assertTrue(os.path.isdir(d), f"missing worker dir: {d}")
+                    self.assertEqual(chmod_modes.get(os.path.abspath(d)), 0o700, f"expected 0o700 on {d}")
+                    if os.name != "nt":
+                        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+                cl = self._make_mock_remote_cluster(tmp, fake_bin, sec_path, ["win-a"])
+                cl.state_dir = os.path.join(cl.workdir, "master-state")
+                fake_proc = mock.Mock()
+                fake_proc.pid = 424242
+                fake_proc.poll.return_value = None
+
+                def _fake_spawn(_name, _role, _args, new_group=True):
+                    with open(os.path.join(cl.workdir, "master.port"), "w", encoding="utf-8") as pf:
+                        pf.write("127.0.0.1:18088\n")
+                    with open(os.path.join(cl.workdir, "dash.port"), "w", encoding="utf-8") as df:
+                        df.write("127.0.0.1:18089\n")
+                    return fake_proc, io.StringIO()
+
+                with mock.patch.object(cl, "_spawn_role_proc", side_effect=_fake_spawn):
+                    cl._start_master_locked()
+
+                master_dirs = (
+                    cl.workdir,
+                    cl.state_dir,
+                    cl.blob_dir,
+                    os.path.join(cl.workdir, "home-client"),
+                    os.path.join(cl.workdir, "home-client", "tmp"),
+                    os.path.join(cl.workdir, "home-client", "oxideswarm"),
+                    os.path.join(cl.workdir, "home-secret"),
+                    os.path.join(cl.workdir, "home-secret", "tmp"),
+                    os.path.join(cl.workdir, "home-secret", "oxideswarm"),
+                )
+                for d in master_dirs:
+                    self.assertTrue(os.path.isdir(d), f"missing master dir: {d}")
+                    self.assertEqual(chmod_modes.get(os.path.abspath(d)), 0o700, f"expected 0o700 on {d}")
+                    if os.name != "nt":
+                        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 @unittest.skipUnless(
     os.environ.get("OXIDESWARM_TEST_BIN"),
@@ -2814,8 +2900,18 @@ class RemoteSoakRealBinaryTests(unittest.TestCase):
             work_master = os.path.join(test_root, "work-master")
             work_a = os.path.join(test_root, "work-win-a")
             work_b = os.path.join(test_root, "work-win-b")
-            for d in (os.path.join(home_dir, ".oxideswarm"), tmp_dir, work_master, work_a, work_b):
+            for d in (
+                test_root,
+                home_dir,
+                os.path.join(home_dir, ".oxideswarm"),
+                tmp_dir,
+                work_master,
+                work_a,
+                work_b,
+            ):
                 os.makedirs(d, exist_ok=True)
+                if os.name != "nt":
+                    os.chmod(d, 0o700)
 
             secret_path = os.path.join(test_root, "run.secret")
             secret_text = secrets.token_hex(32)

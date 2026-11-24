@@ -75,6 +75,17 @@ def validate_worker_name(name: str) -> str:
     return name
 
 
+def _is_posix_host() -> bool:
+    return os.name != "nt"
+
+
+def _ensure_private_dir(path: str) -> None:
+    """Create directory and enforce POSIX mode 0o700 so oxideswarm security checks accept it."""
+    os.makedirs(path, exist_ok=True)
+    if _is_posix_host():
+        os.chmod(path, 0o700)
+
+
 def _warn_if_secret_readable_by_others(abs_path: str) -> None:
     """Warn (read-only) when a secret file grants access beyond owner/administrators."""
     if os.name != "nt":
@@ -1272,6 +1283,7 @@ def create_remote_soak_cluster(
                 rate_mbps=None,
                 delay_ms=0.0,
             )
+            _ensure_private_dir(self.workdir)
             token_env = self._build_env(os.path.join(self.workdir, "home-secret"))
             self.dashboard_token = self._resolve_dashboard_token(binary, self._secret_file, token_env)
             self.forbidden_secrets = [
@@ -1302,6 +1314,8 @@ def create_remote_soak_cluster(
 
         def _build_env(self, home: str) -> Dict[str, str]:
             env = super()._build_env(home)
+            for d in (home, os.path.join(home, "tmp"), os.path.join(home, "oxideswarm")):
+                _ensure_private_dir(d)
             env["OXIDESWARM_SECRET_FILE"] = self._secret_file
             return env
 
@@ -1311,8 +1325,8 @@ def create_remote_soak_cluster(
 
         def _start_master_locked(self) -> None:
             assert self.state_dir is not None
-            os.makedirs(self.state_dir, exist_ok=True)
-            os.makedirs(self.blob_dir, exist_ok=True)
+            for d in (self.workdir, self.state_dir, self.blob_dir):
+                _ensure_private_dir(d)
             port_file = os.path.join(self.workdir, "master.port")
             dash_file = os.path.join(self.workdir, "dash.port")
 
@@ -1838,6 +1852,7 @@ class WorkerAgent:
             100 * MIB,
             keep_workdir=self.keep_workdir,
         )
+        _ensure_private_dir(self.work_root)
         # Keep home/oxideswarm and tmp separate sibling directories for Windows SEC-17/SEC-18 DACLs.
         self.home_dir = os.path.join(self.work_root, "home")
         self.ox_home = os.path.join(self.home_dir, ".oxideswarm")
@@ -1846,9 +1861,9 @@ class WorkerAgent:
         self.workspace_dir = os.path.join(self.work_root, "workspaces")
         self.empty_config = os.path.join(self.work_root, "empty.toml")
         for d in (self.home_dir, self.ox_home, self.tmp_dir, self.sandbox_dir):
-            os.makedirs(d, exist_ok=True)
+            _ensure_private_dir(d)
         if self.workspaces:
-            os.makedirs(self.workspace_dir, exist_ok=True)
+            _ensure_private_dir(self.workspace_dir)
         with open(self.empty_config, "w", encoding="utf-8") as f:
             f.write("")
 
