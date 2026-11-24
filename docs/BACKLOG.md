@@ -190,6 +190,7 @@ Recounted on 2026-11-23 from the rows after TEST-41 Implemented (pull request 42
 Recounted on 2026-11-23 after TEST-88 was added as Implemented (pull request 424): 253 items, 185 Implemented, 19 Partial and 49 Planned; 23 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 431: 253 items, 186 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 Recounted on 2026-11-24 from the rows with pull request 427: 253 items, 187 Implemented, 19 Partial and 47 Planned; 21 open items are In and 45 are Out.
+Recounted on 2026-11-24 from the rows after adding TEST-95: 254 items, 187 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -302,6 +303,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Planned | In |  |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 (open) |
+| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -741,6 +743,31 @@ The full suite must pass on a clean machine before CI can require it.
   raised to `120 s`; process-exit, CLI-command and result waits left unchanged. `tests/test_wave3_e2e.py`
   (`63` tests, per-run time ~`2` minutes: `115.4–122.4 s`) passed `20/20` runs (`2,369.8 s` total, max connect
   `3.19 s`) on Apple M5 (`10` logical cores) under `4` Python CPU busy loops at `4b87e64b`.
+
+### TEST-95: CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast`
+
+- **Evidence:** CI run `45272824360` (pull request 432, head `c42bffba`, docs only for `TEST-93`, 2026-11-23
+  22:51 UTC), job `unit tests (ubuntu-latest)` (`138036810990`), step
+  `python3 -B -m unittest tests/test_wave3_e2e.py -v`: `62` of `63` tests passed (`130.746 s`), and
+  `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed at `tests/test_wave3_e2e.py:4756`
+  (now line `4774` on `016f39c4`) with `ValueError: invalid literal for int() with base 10: ''` on
+  `pid = int(pf.read_text(encoding="utf-8").strip())`. Claimed via `agent_bridge.py claim`
+  (`claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`).
+- **Problem:** Helper PID and marker files in `tests/test_wave3_e2e.py` are written non-atomically in place:
+  `install_fake_cargo_nextest` (line `1090`, `(pd / f"shard_{shard_idx}.pid").write_text(...)`),
+  `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` (line `3747`, `echo $$ > ...`), and
+  `install_fake_blender` (`PROBE_PID_FILE` line `1343`, `HANG_PID_FILE` line `1411`, `HANG_MARKER_FILE`
+  line `1420`). When `--fail-fast` tears down remaining shards while a sibling child is creating/truncating
+  or writing `shard_<N>.pid`, the test's reader (`line 4774`, and `line 3767` in `test_t2_ax2_03`) can observe
+  a zero-byte `.pid` file and raise `ValueError`.
+- **Do:** (Code fix and 20-run busy-loop verification wait until after the Stage C `S7` 24-hour soak finishes.)
+  1. Failing check first: demonstrate the empty `shard_*.pid` `ValueError` in `test_t3_03` / `test_t2_ax2_03`.
+  2. Write all `.pid` and marker files via a temporary file in the same directory followed by atomic
+     rename (`os.replace` in `install_fake_cargo_nextest` line `1090` and `install_fake_blender` lines
+     `1343`, `1411`, `1420`; temp file + `mv -f` in `test_t2_ax2_03` line `3747`), so readers (`lines 3764`,
+     `4773`) only see complete `*.pid` files.
+- **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
+  and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
 ## Phase 3: make the documents true
 
@@ -2533,3 +2560,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-23: TEST-88 added and made Partial ([design 0108](design/0108-windows-tasks-without-console-windows.md), incident `INC-20261123-001`): Windows tasks, host probes and test helpers run with `CREATE_NO_WINDOW`, the ping tests start `PING.EXE` directly, and `m3_challenger_2_stress` passes `-NoNewWindow`. The Windows loop of "Done when" runs on the case PC.
 - 2026-11-23: TEST-88 Implemented (pull request 424): the case PC ran the Windows loop of "Done when" at `012dc68c`: 20/20 runs of `rusty_grid_worker` and 5/5 of `m3_challenger_2_stress` passed with 0 new console windows and 0 leftover processes (master baseline: 11 new `OpenConsole.exe` in one run). INC-20261123-001 closed.
 - 2026-11-24: ADOPT-3 Implemented (pull request 431, text moved to the archive): added `scripts/install.sh` (bash 3.2, LF) and `scripts/install.ps1` (Windows PowerShell, CRLF, pure ASCII) with `OXIDESWARM_DOWNLOAD_BASE`, `SHA256SUMS` verification, `gh attestation verify` when authenticated (notice/warning + SHA-256 fallback when `gh` is absent or unauthenticated; review fix), docs (`README.md`, `docs/reference.md`, `docs/design/0059-first-users.md`, `CHANGELOG.md`), `Adopt3StaticChecks` / `InstallShTests` / `InstallPs1Tests` in `tests/test_launcher_scripts.py`, `benchmarks/grid/bench_m15_quickstart.py` (with `GH_CONFIG_DIR` preserved for `install.sh` on Unix under isolated `HOME`; review fix) + `test_bench_m15.py` (`4/4`), the macOS quarantine check (`agent-mac-ag` on Apple Silicon M5 Darwin `27.2.0`: `com.apple.provenance` only, no `com.apple.quarantine`), and M15 records across all three systems (Windows `8.551 s`, macOS `8.727 s`, Linux Docker `1.434 s`).
+- 2026-11-24: TEST-95 added (Planned, In; claim `claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`): in `tests/test_wave3_e2e.py`, `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed in pull request 432 CI (run `45272824360`, job `138036810990`) with `ValueError: invalid literal for int() with base 10: ''` reading an empty `shard_*.pid` written non-atomically under `--fail-fast`; code fix and 20-run loop wait until after Stage C `S7` (Index header recounted: 254 items, 187 Implemented, 19 Partial and 48 Planned; 22 open items are In and 45 are Out).
