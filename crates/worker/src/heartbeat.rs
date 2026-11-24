@@ -179,14 +179,14 @@ fn ensure_telemetry_sampler_started() {
         }
         std::thread::spawn(move || {
             let mut sys = sysinfo::System::new_with_specifics(
-                sysinfo::RefreshKind::new()
-                    .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
-                    .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
+                sysinfo::RefreshKind::nothing()
+                    .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage())
+                    .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
             );
             loop {
-                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
+                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing().with_cpu_usage());
                 sys.refresh_memory();
-                let cpu_usage_pct = sys.global_cpu_info().cpu_usage();
+                let cpu_usage_pct = sys.global_cpu_usage();
                 let ram_available_mb = sys.available_memory() / (1024 * 1024);
                 if let Ok(mut cache) = TELEMETRY_CACHE.lock() {
                     *cache = (cpu_usage_pct, ram_available_mb);

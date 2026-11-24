@@ -376,7 +376,7 @@ time.sleep(60.0)
     );
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for &pid in &pids_cancel {
         assert!(
             sys.process(sysinfo::Pid::from(pid as usize)).is_some(),
@@ -439,7 +439,7 @@ time.sleep(60.0)
     );
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for &pid in &pids_abort {
         assert!(
             sys.process(sysinfo::Pid::from(pid as usize)).is_some(),
@@ -515,7 +515,7 @@ time.sleep(60.0)
     assert_eq!(pids.len(), 2, "Expected 2 processes, found {:?}", pids);
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for &pid in &pids {
         assert!(
             sys.process(sysinfo::Pid::from(pid as usize)).is_some(),
