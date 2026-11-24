@@ -1,7 +1,7 @@
 # 0067: Multi-node model serving evidence, concurrency knee-point admission and usable GPU memory
 
-Status: Draft (research and plan; builds nothing; Q60 to Q63 are open)
-Created: 2026-11-15    Updated: 2026-11-16
+Status: Draft (research and plan; builds nothing; Q60 to Q63 decided on 2026-11-24)
+Created: 2026-11-15    Updated: 2026-11-24
 
 ## Summary
 
@@ -263,8 +263,10 @@ No product code is added by this record.
 
 ## Work items
 
-Sizes follow `BACKLOG.md` (`S`, `M`, `L`). Nothing enters [BACKLOG.md](../BACKLOG.md) until the
-owner decides `Q60` to `Q63`.
+Sizes follow `BACKLOG.md` (`S`, `M`, `L`). The owner decided `Q60` to `Q63` on 2026-11-24. The
+items enter [BACKLOG.md](../BACKLOG.md) with the model phase that
+[ROADMAP.md](../ROADMAP.md) ("Before 0.5.0 has items") describes, which still waits for `Q41`, `Q54`
+and spike `R21`.
 
 | ID | Item | Size | Needs | Files | Done when | Status |
 |---|---|---|---|---|---|---|
@@ -273,15 +275,15 @@ owner decides `Q60` to `Q63`.
 
 ## Decisions for the owner
 
-The right column is a recommended default, not a decision. Once accepted, these join
-[ROADMAP.md](../ROADMAP.md) as `Q60` to `Q63`.
+The owner accepted every recommended default on 2026-11-24. The decisions are also in
+[ROADMAP.md](../ROADMAP.md) ("Decisions for the owner").
 
-| ID | Question | Recommended default |
+| ID | Question | Decision (2026-11-24) |
 |---|---|---|
-| `Q60` | Does `APP-1` ([design 0061](0061-first-application-model-tunnel.md)) expand via spike `R22` to measure `C = 1, 2, 4, 8, 16, 32` (`Throughput vs. interactivity`) before `LLM-9` or `EDU-1` concurrency limits are fixed? | Yes |
-| `Q61` | Should `LLM-6` / `LLM-9` replace raw "fewest open tunnels" placement with active in-flight / knee-point admission and `interactive` (LIVA) vs. `batch` (agents, class) priority bands (`LLM-14`), gated on `R22`? | Yes, after `R22` shows the knee on the owner's hardware |
+| `Q60` | Does `APP-1` ([design 0061](0061-first-application-model-tunnel.md)) expand via spike `R22` to measure `C = 1, 2, 4, 8, 16, 32` (`Throughput vs. interactivity`) before `LLM-9` or `EDU-1` concurrency limits are fixed? | Yes. The first `R22` record of 2026-11-16 is the start; more records follow on each GPU machine that serves a model |
+| `Q61` | Should `LLM-6` / `LLM-9` replace raw "fewest open tunnels" placement with active in-flight / knee-point admission and `interactive` (LIVA) vs. `batch` (agents, class) priority bands (`LLM-14`), gated on `R22`? | Yes. The `R22` record of 2026-11-16 shows the knee on the owner's RTX 5060 Ti. The cap also counts prompt plus answer tokens against the server's pool, because the record shows that a request count alone misses answers cut short |
 | `Q62` | When `FEAT-9b` adds live GPU memory reporting, should workers report OS-usable GPU memory budget (`DXGI Budget - CurrentUsage` on Windows, `recommendedMaxWorkingSetSize` on Metal, safety-capped `NVML free` on Linux) rather than raw physical VRAM? | Yes |
-| `Q63` | For `Q47` ([design 0062](0062-model-weights-into-remote-memory.md)) and `SCALE-3`, should direct worker-to-worker / client-to-worker fast rails (Thunderbolt bridge, direct 2.5G/10G Ethernet) use master-minted Noise/AEAD session tickets with automatic fallback to LAN/QUIC/master? | Yes, after `v0.2.0` and single-hop `LLM-9` work |
+| `Q63` | For `Q47` ([design 0062](0062-model-weights-into-remote-memory.md)) and `SCALE-3`, should direct worker-to-worker / client-to-worker fast rails (Thunderbolt bridge, direct 2.5G/10G Ethernet) use master-minted Noise/AEAD session tickets with automatic fallback to LAN/QUIC/master? | Yes, after single-hop `LLM-9` works. It is a speed-up and is not part of the first `0.5.0` |
 
 ## Status log
 
@@ -303,3 +305,7 @@ The right column is a recommended default, not a decision. Once accepted, these 
   `llamacpp:requests_deferred` stayed 0. So on llama.cpp the `deferred_or_rejected` signal of D1
   does not see this case, and an admission cap must also count prompt plus answer tokens against
   the server's pool. `Q60` to `Q63` stay open.
+- 2026-11-24: The owner accepted the recommended defaults of `Q60` to `Q63`. `Q61` keeps the finding of
+  the `R22` record: admission also counts prompt plus answer tokens. `Q63` no longer names `v0.2.0`
+  (the project is at `0.4.x`); it waits for single-hop `LLM-9`. Nothing is built yet: the model items
+  still wait for `Q41`, `Q54`, spike `R21` and the stability release of `Q80`.

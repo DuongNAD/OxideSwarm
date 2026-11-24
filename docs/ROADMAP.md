@@ -156,7 +156,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | Compatibility spans one protocol version | A peer more than one protocol version behind the master is refused until it is upgraded, and a rollback of the master needs the copy of `--state-dir` taken before the upgrade | By design ([design 0083](design/0083-one-version-window.md)). PROTO-5 keeps a test against the release one protocol back |
 | The Android app does not compile | There is no Android worker app to install; phones join through Termux. The bridge library compiles in CI (AND-5, pull request 240) | AND-1 |
 | GPU work is command tasks, with no user kernel | PyTorch, Blender and CUDA programs run as command tasks, with a guide ([guides/gpu-workloads.md](guides/gpu-workloads.md)), VRAM accounting (FEAT-9a) and a runtime allowlist under isolation (FEAT-3e). The built-in `GpuCompute` task is a benchmark (decision D6). No rule for a GPU inside the Linux sandbox is recorded, and the two-machine GPU run under `--isolation fs` is not recorded | FEAT-9, R20 (Linux) |
-| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only, Q60 to Q63) |
+| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only; Q60 to Q63 decided on 2026-11-24) |
 
 ## Releases
 
@@ -236,8 +236,8 @@ report that design 0067 names.
 
 In order:
 
-1. The owner answers Q60 to Q63 (design 0067), Q54
-   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q41 (design 0061).
+1. The owner answers Q54 ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q41
+   (design 0061). Q60 to Q63 (design 0067) were decided on 2026-11-24 at the recommended defaults.
 2. Spike R21, a reading of what Mesh-LLM already does, has no record. Q54 recommends that no model
    item is built before it has one.
 3. Trial APP-1 (Q40, decided): LIVA on a Mac with the model on another machine. No trial has run.
@@ -679,8 +679,8 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q1
 right column is a recommended default, not a decision, and no work depends on it until the owner
 answers.
 
-Q60 to Q63 are open in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and join
-this table once the owner answers them. Q64 to Q79 are decided and recorded where they were asked:
+Q60 to Q63 were asked in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and
+decided on 2026-11-24; they are in this table. Q64 to Q79 are decided and recorded where they were asked:
 Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train.md), Q68 to Q72 in
 [design 0082](design/0082-task-extension-slot.md) and Q73 to Q79 in
 [design 0083](design/0083-one-version-window.md).
@@ -745,6 +745,10 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Yes, decided by the owner on 2026-11-19: the 24-hour soak runs on the owner's three machines, now (apart from the trial cluster) |
 | Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Decided by the owner on 2026-11-19: decide from the T5 and T9 records over a relay; nothing changes before them |
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Decided by the owner on 2026-11-19: 8 GiB first; add a model's size when design 0062 names one |
+| Q60 | Does trial APP-1 grow with spike R22, which measures throughput against the number of concurrent requests (1 to 32), before the concurrency limits of LLM-9 or EDU-1 are fixed (design 0067)? | Yes, decided by the owner on 2026-11-24. The R22 record of 2026-11-16 is the first; each GPU machine that serves a model gets one |
+| Q61 | Do LLM-6 and LLM-9 place requests by the requests in flight and the measured knee point instead of the fewest open tunnels, with an `interactive` band (LIVA) ahead of a `batch` band (agents, a class) (LLM-14, design 0067)? | Yes, decided by the owner on 2026-11-24. The cap also counts prompt plus answer tokens against the server's pool, because the R22 record shows answers cut short with no deferred request |
+| Q62 | When FEAT-9b reports live GPU memory, does a worker report the memory the OS lets it use (DXGI budget minus usage on Windows, `recommendedMaxWorkingSetSize` on Metal, NVML free with a safety margin on Linux) rather than the physical VRAM (design 0067)? | Yes, decided by the owner on 2026-11-24 |
+| Q63 | Do direct fast links between machines (Thunderbolt bridge, direct 2.5G/10G Ethernet) carry worker-to-worker and client-to-worker data with session tickets minted by the master and a fallback to LAN, QUIC or the master (Q47, SCALE-3, design 0067)? | Yes, decided by the owner on 2026-11-24, after single-hop LLM-9 works; not part of the first 0.5.0 |
 | Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
 | Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are Phase 13 of [BACKLOG.md](BACKLOG.md) |
