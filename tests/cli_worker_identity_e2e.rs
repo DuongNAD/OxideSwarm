@@ -20,8 +20,31 @@ use uuid::Uuid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
 
+fn preserve_toolchain_env(cmd: &mut Command) {
+    let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".rustup"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", p);
+    }
+    if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".cargo"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("CARGO_HOME", p);
+    }
+}
+
 fn cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
+    preserve_toolchain_env(&mut cmd);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env_remove("OXIDESWARM_HOME")

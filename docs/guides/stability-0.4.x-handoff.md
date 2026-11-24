@@ -177,7 +177,7 @@ FILES: `crates/worker/tests/test_feat3_os_isolation.rs` (`mod windows`, in parti
 in `docs/BACKLOG.md` (its Partial text and the 2026-11-20 status log line).
 
 DO:
-1. With at least 6 GB free, run `RUSTY_GRID_REQUIRE_APPCONTAINER=1 cargo test -p rusty_grid_worker --locked`
+1. With at least 6 GB free, run `$env:RUSTY_GRID_REQUIRE_APPCONTAINER = "1"; cargo test -p rusty_grid_worker --locked`
    (the whole crate, as in the failing run) 20 times under 6 busy loops, from a non-elevated shell.
 2. Record pass/fail per run and the durations of the five hardened tests. For a failure, keep
    `format_result_diag` output and the test log.
@@ -306,7 +306,7 @@ with a temporary `USERPROFILE`/`HOME`, and stop them by PID. Record each command
 5. MESH-2: `cargo build -p agent_mesh`, run the hub and two `scripts/agent_node.py` nodes, send a
    file over 1 MiB (chunked) and one over `--inbox-max-mb` (expect `ERR_INBOX_FULL`).
 
-For every defect: claim an item id (`python3 scripts/agent_bridge.py claim item --title "..."`; if the
+For every defect: claim an item id (`python3 scripts/agent_bridge.py claim item --prefix TEST --title "..."`; if the
 hub times out, take the next free number after checking `docs/BACKLOG.md` and `gh pr list --state all`,
 and say so in the pull request), write a test that fails without the fix, and fix it only if the fix
 is under about 100 lines and changes no wire format; otherwise leave the item Planned with the test
@@ -349,7 +349,7 @@ DO:
 5. Kill the GPU worker while a GEMM task runs: the task is requeued and never runs on the CPU worker
    (a real-GPU task never falls back to the CPU).
 
-Record it under a new TEST item (claim the id with `python3 scripts/agent_bridge.py claim item --title
+Record it under a new TEST item (claim the id with `python3 scripts/agent_bridge.py claim item --prefix TEST --title
 "Real GPU stability record on Windows"`, same fallback as S8). A failure gets its own item and a
 failing test.
 
