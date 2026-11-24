@@ -33,10 +33,11 @@ pub fn run_fast_check(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "fast");
 
-    let cmd_res = Command::new("cargo")
-        .args(["check", "--workspace"])
-        .current_dir(workspace_root)
-        .output();
+    let cmd_res = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["check", "--workspace"])
+            .current_dir(workspace_root),
+    );
 
     res.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -594,11 +595,11 @@ pub async fn launch_local_dev_cluster_with_ports(
         if fallback_bin.exists() {
             target_bin = fallback_bin;
         } else {
-            match Command::new("cargo")
-                .args(["build", "--bin", "rusty-grid"])
-                .current_dir(&fallback_root)
-                .output()
-            {
+            match rusty_grid_core::process_spawn::output_std(
+                Command::new("cargo")
+                    .args(["build", "--bin", "rusty-grid"])
+                    .current_dir(&fallback_root),
+            ) {
                 Ok(out) if out.status.success() => {
                     if fallback_bin.exists() {
                         target_bin = fallback_bin;
@@ -661,12 +662,13 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
     let master_log = master_log_path(workspace_root);
     let (master_out, master_err) = master_log_stdio(&master_log);
-    let master_res = master_cmd
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(master_out)
-        .stderr(master_err)
-        .spawn();
+    let master_res = rusty_grid_core::process_spawn::spawn_std(
+        master_cmd
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(master_out)
+            .stderr(master_err),
+    );
 
     let mut master_child = match master_res {
         Ok(child) => {
@@ -858,12 +860,13 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--no-portal",
         ]);
     }
-    let w1_res = w1_cmd
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let w1_res = rusty_grid_core::process_spawn::spawn_std(
+        w1_cmd
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 
     let mut w1_child = match w1_res {
         Ok(child) => {
@@ -962,12 +965,13 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--no-portal",
         ]);
     }
-    let w2_res = w2_cmd
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let w2_res = rusty_grid_core::process_spawn::spawn_std(
+        w2_cmd
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 
     let mut w2_child = match w2_res {
         Ok(child) => {
@@ -1224,11 +1228,11 @@ fn signal_verified_process(sys: &System, pid: u32) -> bool {
     #[cfg(unix)]
     {
         let _ = sys;
-        Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        rusty_grid_core::process_spawn::output_std(
+            Command::new("kill").args(["-TERM", &pid.to_string()]),
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
     }
     #[cfg(windows)]
     {
@@ -1240,10 +1244,12 @@ fn signal_verified_process(sys: &System, pid: u32) -> bool {
 
 #[cfg(unix)]
 fn is_unix_process_zombie_or_gone(pid: u32) -> bool {
-    match Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-    {
+    match rusty_grid_core::process_spawn::output_std(Command::new("ps").args([
+        "-o",
+        "stat=",
+        "-p",
+        &pid.to_string(),
+    ])) {
         Ok(out) => {
             if !out.status.success() {
                 return true;
