@@ -422,7 +422,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Partial | In | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
-| AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
+| AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056), (draft design 0109) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Partial | In | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
@@ -1536,6 +1536,11 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A client sees the first output line while the task runs. An MCP client polls a
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
+- **Note (2026-11-24, `E-M4` draft):** [Design 0109](design/0109-ax3-live-output-and-mcp-tasks.md) specifies
+  the wire variants, twin mirror enums, `ProtocolCapabilities::LIVE_OUTPUT`, protocol bump and Design `0076`
+  release-train rule, bounded worker/master buffers preserving Design `0022` head/tail capture, CLI `logs` /
+  `--follow`, and MCP `2026-07-28` + `2024-11-05` compatibility (**Q55** open; stays `Planned` with no code
+  merge in `0.4.x`).
 
 ### BUG-36: `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout
 
