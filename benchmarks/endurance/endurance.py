@@ -2115,13 +2115,20 @@ class BackgroundSampler:
 # ---------------------------------------------------------------- isolated cluster management
 
 
+def _ensure_private_dir(path: str) -> None:
+    """Create directory and enforce POSIX mode 0o700 so oxideswarm security checks accept it."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if not IS_WINDOWS:
+        os.chmod(path, 0o700)
+
+
 def _isolated_process_env(home: str, empty_config: str) -> Dict[str, str]:
     """Isolated process environment with private HOME/OXIDESWARM_HOME while preserving Rust toolchains."""
-    os.makedirs(home, exist_ok=True)
+    _ensure_private_dir(home)
     tmp_dir = os.path.join(home, "tmp")
     ox_home = os.path.join(home, "oxideswarm")
-    os.makedirs(tmp_dir, exist_ok=True)
-    os.makedirs(ox_home, exist_ok=True)
+    _ensure_private_dir(tmp_dir)
+    _ensure_private_dir(ox_home)
     env = {
         k: v
         for k, v in os.environ.items()
@@ -2167,7 +2174,7 @@ class EnduranceCluster:
     ) -> None:
         self.binary = binary
         self.workdir = os.path.abspath(workdir)
-        os.makedirs(self.workdir, exist_ok=True)
+        _ensure_private_dir(self.workdir)
         self.n_workers = int(workers)
         self.blob_store_mb = blob_store_mb
         self.blob_cache_mb = blob_cache_mb
@@ -2270,7 +2277,7 @@ class EnduranceCluster:
             worker_target = self.worker_via_proxy.bound_addr
 
         for i in range(self.n_workers):
-            os.makedirs(self.sandbox_dirs[i], exist_ok=True)
+            _ensure_private_dir(self.sandbox_dirs[i])
             wargs = [
                 "worker",
                 "--master",
@@ -2485,7 +2492,7 @@ class RemoteEnduranceCluster:
     ) -> None:
         self.binary = binary
         self.workdir = os.path.abspath(workdir)
-        os.makedirs(self.workdir, exist_ok=True)
+        _ensure_private_dir(self.workdir)
         self.master_addr = str(master_addr).strip()
         self.master_host, self.master_port = _parse_host_port(self.master_addr)
         self.secret_file = os.path.abspath(secret_file) if secret_file else None
@@ -3173,8 +3180,8 @@ class SoakCluster(EnduranceCluster):
 
     def _start_master_locked(self) -> None:
         assert self.state_dir is not None
-        os.makedirs(self.state_dir, exist_ok=True)
-        os.makedirs(self.blob_dir, exist_ok=True)
+        _ensure_private_dir(self.state_dir)
+        _ensure_private_dir(self.blob_dir)
         port_file = os.path.join(self.workdir, "master.port")
         dash_file = os.path.join(self.workdir, "dash.port")
         for fp in (port_file, dash_file):
@@ -3242,7 +3249,7 @@ class SoakCluster(EnduranceCluster):
         raise RuntimeError("master did not publish its port within 30 s")
 
     def _start_worker_locked(self, idx: int) -> None:
-        os.makedirs(self.sandbox_dirs[idx], exist_ok=True)
+        _ensure_private_dir(self.sandbox_dirs[idx])
         target_addr = self.proxies[idx].bound_addr if idx < len(self.proxies) else self.current_master_addr()
         args = [
             "worker",
@@ -3260,7 +3267,7 @@ class SoakCluster(EnduranceCluster):
             str(int(self.blob_cache_mb or 2048)),
         ]
         if self.workspaces:
-            os.makedirs(self.workspace_dirs[idx], exist_ok=True)
+            _ensure_private_dir(self.workspace_dirs[idx])
             args += ["--workspaces", "--workspace-root", self.workspace_dirs[idx]]
         gen = self._worker_gen[idx]
         self._worker_gen[idx] += 1
@@ -3685,7 +3692,7 @@ class RemoteEnduranceCluster:
     ) -> None:
         self.binary = binary
         self.workdir = os.path.abspath(workdir)
-        os.makedirs(self.workdir, exist_ok=True)
+        _ensure_private_dir(self.workdir)
         self.master_addr = str(master_addr).strip()
         self.master_host, self.master_port = _parse_host_port(self.master_addr)
         self.secret_file = os.path.abspath(secret_file) if secret_file else None

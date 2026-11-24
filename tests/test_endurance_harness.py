@@ -20,6 +20,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -925,6 +926,41 @@ class SoakHarnessTests(unittest.TestCase):
                 min_created_epoch=1000.0,
             )
             self.assertEqual([x["pid"] for x in win_mode_posix_wd], [8001, 8002, 8004])
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits")
+    def test_soak_cluster_creates_0700_dirs_under_0022_umask(self):
+        old_umask = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory(prefix="ox_t90_") as td:
+                workdir = os.path.join(td, "cluster")
+                fake_proc = mock.MagicMock()
+                fake_proc.pid = 424242
+                fake_proc.poll.return_value = None
+                cluster = endurance.SoakCluster(
+                    "/usr/bin/true",
+                    workdir,
+                    workers=2,
+                    workspaces=True,
+                )
+                os.makedirs(cluster.workspace_dirs[1], mode=0o755, exist_ok=True)
+                os.chmod(cluster.workspace_dirs[1], 0o755)
+                with (
+                    mock.patch.object(cluster, "current_master_addr", return_value="127.0.0.1:8088"),
+                    mock.patch.object(cluster, "_spawn_role_proc", return_value=(fake_proc, mock.MagicMock())),
+                ):
+                    cluster._start_worker_locked(0)
+                    cluster._start_worker_locked(1)
+                for path in (
+                    cluster.workdir,
+                    cluster.sandbox_dirs[0],
+                    cluster.workspace_dirs[0],
+                    cluster.sandbox_dirs[1],
+                    cluster.workspace_dirs[1],
+                ):
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                    self.assertEqual(mode, 0o700, "expected 0o700 on %s, got %s" % (path, oct(mode)))
+        finally:
+            os.umask(old_umask)
 
 
 class EnduranceCiWorkflowTests(unittest.TestCase):
