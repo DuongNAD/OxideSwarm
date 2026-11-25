@@ -269,6 +269,15 @@ The right column records the owner's decisions of 2026-11-19, listed in
   `29.2 -> 40.3 MiB` [gen 1]; bounded idle stores and mid-run worker cache `<= 2,125.0 MiB` within pinned headroom;
   fault-excluded clean probe p99 `130.85 -> 146.51 ms` [`14`/`16` samples, ratio `1.1197`]; `0` leftover PIDs
   and `0` leftover task process trees; 24-hour 3-machine step 2 awaits an owner date).
+- 2026-11-19: TEST-25 remote-worker mode added (pull request 395, D4.3): added
+  `benchmarks/endurance/remote_soak.py`, `endurance.py soak --master-only`, and `worker-agent` with
+  out-of-band `--secret-file` (`load_file`-compatible hex parsing + permission warnings) and hardened
+  mutual HMAC-SHA256 control authentication (300 s timestamp + nonce replay check, `req_nonce` + `run_id`
+  response binding, `cmd_id` dedupe, `30 s` timeout + `8`-slot `503` cap, `1 MiB` reply cap,
+  `--orphan-timeout 15m`, 4-op allowlist, settings & `instance_id` validation), per-worker loopback
+  `ThrottleProxy`, master-clock-aligned remote sample/disk/clean-stop merging, `state:busy` connectivity
+  handling, `QueueFull` backoff, `README.md` D4.3 commands, and unit + loopback tests in
+  `tests/test_endurance_harness.py` (`TEST-25` stays Partial until the 24-hour soak record lands).
 - 2026-11-19: TEST-26 Partial (pull request 382, D4.2): added scheduled (`cron: "17 3 * * 1"`)
   and `workflow_dispatch` job `endurance` on `ubuntu-latest` to `.github/workflows/ci.yml` (never on
   pull requests, not a required check; pinned action commits) running `transfer` (`T1` `1 GiB`, `T2`
