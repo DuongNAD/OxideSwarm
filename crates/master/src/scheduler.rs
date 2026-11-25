@@ -9101,4 +9101,81 @@ mod tests {
         assert_eq!(report.assignments[0].worker_id, w_healthy.worker_id);
         assert!(report.skipped.is_empty());
     }
+
+    #[test]
+    fn test_bug37_old_doctor_c5_ram_1024_queued_under_low_ram_while_c3_c4_and_submit_run() {
+        let mut w = make_worker("m5-repro", 10, 32_768, true, false);
+        w.capabilities.tags = vec!["os:macos".into(), "arch:aarch64".into(), "iso:fs".into()];
+        // Simulate sysinfo 0.30.13 on macOS subtracting compressor_page_count into the 512..1023 MiB band.
+        w.ram_available_mb = 800;
+
+        let pin_id = Placement {
+            worker: Some(w.worker_id.to_string()),
+            ..Placement::default()
+        };
+        let pin_name = Placement {
+            worker: Some(w.capabilities.name.clone()),
+            ..Placement::default()
+        };
+
+        let old_c3 = Task::new(
+            TaskSpec::builtin_test("hash_compute", 10_000),
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        )
+        .with_placement(&pin_id);
+        let old_c4 = Task::new(
+            TaskSpec::command("sh", vec!["-c".into(), "echo ok".into()]),
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        )
+        .with_placement(&pin_id);
+        let old_c5 = Task::new(
+            TaskSpec::gpu_compute_with_params("matrix_multiply", vec![1, 2, 3, 4], 16, 512),
+            TaskRequirements::gpu(60).with_max_retries(0),
+        )
+        .with_placement(&pin_id);
+
+        let mut submit_gpu_req = TaskRequirements::gpu(60);
+        submit_gpu_req.ram_mb = 0;
+        let submit_gpu = Task::new(
+            TaskSpec::gpu_compute_with_params("matrix_multiply", vec![1, 2, 3, 4], 16, 2048),
+            submit_gpu_req.clone(),
+        )
+        .with_placement(&pin_name);
+
+        let fixed_c5 = Task::new(
+            TaskSpec::gpu_compute_with_params("matrix_multiply", vec![1, 2, 3, 4], 16, 512),
+            submit_gpu_req.with_max_retries(0),
+        )
+        .with_placement(&pin_id);
+
+        let cfg = SchedulerConfig::default();
+        let workers = std::slice::from_ref(&w);
+
+        let r_c3 = WorkloadScheduler::matchmake(&cfg, &[old_c3], workers);
+        assert_eq!(r_c3.assignments.len(), 1);
+        assert!(r_c3.skipped.is_empty());
+
+        let r_c4 = WorkloadScheduler::matchmake(&cfg, &[old_c4], workers);
+        assert_eq!(r_c4.assignments.len(), 1);
+        assert!(r_c4.skipped.is_empty());
+
+        let r_old_c5 = WorkloadScheduler::matchmake(&cfg, std::slice::from_ref(&old_c5), workers);
+        assert!(r_old_c5.assignments.is_empty());
+        assert_eq!(r_old_c5.skipped.len(), 1);
+
+        let r_submit = WorkloadScheduler::matchmake(&cfg, &[submit_gpu], workers);
+        assert_eq!(r_submit.assignments.len(), 1);
+        assert!(r_submit.skipped.is_empty());
+
+        let r_fixed_c5 = WorkloadScheduler::matchmake(&cfg, &[fixed_c5], workers);
+        assert_eq!(r_fixed_c5.assignments.len(), 1);
+        assert!(r_fixed_c5.skipped.is_empty());
+
+        // With sysinfo 0.38.4 (PR #439) reporting ~20 GiB free, even old C5 schedules immediately.
+        let mut w_fixed_sysinfo = w;
+        w_fixed_sysinfo.ram_available_mb = 20_000;
+        let r_recovered = WorkloadScheduler::matchmake(&cfg, &[old_c5], &[w_fixed_sysinfo]);
+        assert_eq!(r_recovered.assignments.len(), 1);
+        assert!(r_recovered.skipped.is_empty());
+    }
 }

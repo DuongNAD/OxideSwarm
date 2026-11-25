@@ -203,6 +203,7 @@ Recounted on 2026-11-24 from the rows with pull request 450: 287 items, 197 Impl
 Recounted on 2026-11-24 from the rows with pull request 447: 287 items, 197 Implemented, 21 Partial and 69 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 448: 287 items, 197 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 453: 288 items, 198 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 452: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -449,6 +450,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
+| BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
@@ -1681,6 +1683,42 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   fails without the change: more shards than slots, each well inside `--timeout-secs`, the run longer than it.
 - **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
   queue time, and that test passes.
+
+### BUG-37: `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`)
+
+- **Evidence:** On 2026-11-24 21:45 UTC, `oxideswarm doctor` of release `0.4.3` reported
+  `FAIL C5 GPU probe ... no result within 60s (last state Queued)` twice in a row against a `0.4.4`
+  Apple M5 `--isolation fs` GPU worker and `0.4.3` master, while
+  `submit --worker <w> --type gpu --gpu --matrix-dim 2048 --wait` gave `VERIFIED_OK` and `0.4.4 doctor`
+  later passed C5. Claimed via `claims/item/BUG-37__mac-ag__20261124T220733857026Z__aaad783f.json`.
+  Inspection of `v0.4.3` (`1c664273`) vs `v0.4.4` (`e7aca4c7`) shows zero code diff in
+  `crates/cli/src/doctor.rs`, `crates/master/src/`, `Cargo.lock` `sysinfo 0.30.13`, or non-test
+  `crates/core/src/{task,placement,capabilities,protocol}.rs`; `TaskView::required_features` is
+  `ProtocolCapabilities::empty()` for C3, C4, C5, and `submit --gpu`, and `Placement` sets only `worker`.
+  Loopback tests with SHA-256-verified `v0.4.3` and `v0.4.4` `aarch64-apple-darwin` release archives on
+  Apple M5 (`32,768 MiB` RAM) passed C5 in `4–14 ms` across `0.4.3-cpu/gpu` and `0.4.4-cpu/gpu`
+  (Scenario A `0.4.3-gpu` master, Scenario B1 `0.4.3-cpu` master, Scenario B2 `0.4.4-cpu --simulate-gpu`
+  worker `41 ms`; `submit --matrix-dim 2048 --wait` `127 ms`, `VERIFIED_OK`), but `/api/workers` in
+  Scenario B1 revealed `"ram_available_mb": 2130` out of `32768` (`vm_stat` `547,571` compressor pages,
+  `memory_pressure` `61%` system-wide free). In `sysinfo 0.30.13` (`src/unix/apple/system.rs`), macOS
+  `available_memory()` computes `(free + inactive + purgeable - compressor_page_count) * page_size`,
+  so compressed RAM drags reported `ram_available_mb` into `~0–2 GiB` (already fixed on `master` in PR `#439`
+  `8570000f` via `sysinfo 0.38.4`). Meanwhile `doctor::probe_task` assigns C3/C4 `TaskRequirements::generic`
+  (`ram_mb: 512`) and C5 `TaskRequirements::gpu` (`ram_mb: 1024`), whereas `SubmitArgs::ram_mb` defaults to
+  `0`. Whenever `sysinfo 0.30.13` reports `512..=1023 MiB` available (or `unstarted_ram_mb` drops headroom
+  `< 1024`), `scheduler.rs::is_seat_ram_short` allows C3/C4 (`512`) and `submit` (`0`, bypassed) while keeping
+  C5 (`1024`) `Queued` (`TaskStatusInfo` hides `ScheduleSkipReason`). (Note: `heavy: true` mobile thermal
+  gates also distinguish C5 from C3/C4, though they apply equally to `submit --type gpu` unless cleared.)
+- **Problem:** A `512x512` diagnostic GPU probe (~3 MiB) demands `ram_mb: 1024`, unlike `submit --type gpu`
+  (`0`), causing C5 to stall in `Queued` whenever a `0.4.3`/`0.4.4` macOS worker's compressed memory pushes
+  `sysinfo 0.30.13`'s `ram_available_mb` below `1024 MiB`.
+- **Do:** Set `ram_mb = 0` on lightweight `oxideswarm doctor` probe tasks (`probe_task`, `throughput_task`,
+  and `spread_check`) to match `submit`'s default, mention available RAM in C3–C5 timeout hints, and add
+  regression tests in `doctor.rs` (`test_bug37_doctor_probes_use_zero_ram_floor_like_submit`,
+  failing-first at `512`) and `scheduler.rs` (`test_bug37_old_doctor_c5_ram_1024_queued_under_low_ram_while_c3_c4_and_submit_run`).
+- **Done when:** Both regression tests, `doctor::tests`, `fmt`, and single-crate `clippy` pass; the PR records
+  the `v0.4.3`/`v0.4.4` verification and `sysinfo 0.30.13` root cause.
+- **Status (2026-11-24):** Implemented (`mac/bug-37-doctor-c5-gpu-queued`).
 
 ### BUG-38: Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt
 
@@ -3176,4 +3214,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-98 Implemented (`win2/test-98-revoke-worker-scope`, claim `claims/item/TEST-98__win-2__20261124T172506156991Z__f7dbab9d.json`, text moved to `docs/BACKLOG-ARCHIVE.md`): added `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT` filtering in `windows/revoke-isolation-acls.ps1`, scoped `ps_env` plus added a positive scoped-worker detection test in `tests/test_launcher_scripts.py`, and verified `20/20` sequential runs on Windows alongside live Stage C `S7` (`96` tests / `62` skipped / `0` failures per run; `total 3,452.253 s`, median `168.249 s`, `minRAM 4.523 GiB`).
 - 2026-11-24: TEST-96 Partial (`mac/test-96-mesh-multichunk-ack-guard`, `loop after S7`): audited sender `send_envelope`, hub `Outbox::push` / `InflightDataTracker`, and consumer `DataConsumer` / `ChunkReassembler` / `persist_payload_atomic` end to end and confirmed root cause `(a)` (starved CI runner + `spawn_blocking` `file.sync_all()` `fsync` in part 3 delaying `DeliveryAck(data_received_verified)` past `5 s`, not lost/evicted ACKs `(b)` which fail immediately with `RecvError` or `DeliveryNack`); replaced all `3 s` / `5 s` wall-clock windows in `crates/agent_mesh/src/client.rs::test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and `[timing]` prints; stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-24: TEST-93 Partial (`win/test-93-quic-heartbeat-structural`): audited all 1,098 lines of `tests/m2_challenger_1_stress.rs` (line 472 `avg_latency < 50 ms` was the sole Category 1 wall-clock upper bound), replaced it in `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` with a structural QUIC `STREAM_DATA` flow-control backpressure (`64 KiB` stream receive window, `16 KiB` chunks, paused server sink) + in-order `HeartbeatAck` verification under a `60 s` hang guard and `[timing]` printout, and verified `10/10` sequential Windows passes (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress`, no busy loops during Stage C `S7`, `12` passed/`0` failed per run; wall `2.250–3.469 s`, median `2.821 s`, total `27.453 s`; `avg_latency` `677.343–787.493 µs`, `max_latency` `6.8813–8.1431 ms`); `fmt` and `-j 4` `clippy` clean (`0` warnings); stays Partial pending `20/20` loaded runs (`loop after S7`).
+- 2026-11-24: BUG-37 Implemented (`mac/bug-37-doctor-c5-gpu-queued`, claim `claims/item/BUG-37__mac-ag__20261124T220733857026Z__aaad783f.json`): reproduced/audited `v0.4.3` vs `v0.4.4` macOS releases (zero diff in `doctor.rs`/master/core; Scenario A/B1/B2 passed C5 `4–41 ms` at `ram_available_mb=2130`, exposing `sysinfo 0.30.13` subtracting `547,571` macOS compressor pages from `free + inactive + purgeable`, fixed on `master` by PR `#439` `sysinfo 0.38.4`); proved `doctor`'s `TaskRequirements::gpu` (`ram_mb: 1024`) stalls C5 in `is_seat_ram_short` whenever `512 <= ram_available_mb < 1024` while C3/C4 (`512`) and `submit --type gpu` (`0`) run; set `ram_mb = 0` on `doctor` probes in `crates/cli/src/doctor.rs` and added regression tests in `doctor.rs` (failing-first at `512`) and `scheduler.rs`.
 - 2026-11-24: BUG-38 Implemented (pull request 453, branch `win/bug-38-usb-kit-windows`): fixed PowerShell `${InstallRoot}?` variable interpolation in `packaging/usb/uninstall.ps1:140` so interactive uninstall renders the full install path, and hardened `packaging/usb/install.ps1` `-Update` to collect and deduplicate stopped worker PIDs (`run\worker.pid` and `Win32_Process`), poll `Get-Process -Id` every `250 ms` up to `OXIDESWARM_USB_STOP_WAIT_MS` (default `15000 ms`) before removing `run\worker.pid`, and retry binary replacement (`Copy-Item`) every `250 ms` up to `OXIDESWARM_USB_COPY_WAIT_MS` (default `15000 ms`) on transient Windows sharing/user-mapped-section locks; added static and live Windows ConPTY + lock-retry regression tests (`test_windows_usb_bug38_static_prompt_and_update_wait` and `test_windows_usb_bug38_uninstall_prompt_and_update_retry_live`) in `tests/test_launcher_scripts.py` (with `tests/test_m1_challenger_hygiene.py` and the `test_windows_usb` suite passing on Windows 11).
