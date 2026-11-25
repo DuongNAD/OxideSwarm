@@ -325,6 +325,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Partial | In |  |
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
+| TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -894,6 +895,39 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** the root cause is written here (done), the test has no short wall-clock window (done), and
   `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
   loop runs under load on Linux (`loop after S7`).
+
+### TEST-99: Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs
+
+- **Evidence:** Discovered during `E-D2` on Windows 11 x86_64 at clean `origin/master` `d88083f2` (claim
+  `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, report Hub
+  `test_runs/win-2_e-d2_2026-11-25.md`). Both the isolated `E-D2` harness (`45/45` completed runs of
+  `cargo test --locked -p rusty_grid_master --lib`, `428 passed; 8 failed` per run before owner order stopped
+  the loop) and a plain developer environment run (no `HOME`/`USERPROFILE`/`TEMP` override, no busy loops) fail
+  deterministically with `Config("members directory '...' is accessible by other accounts (...)")` in these 8 tests:
+  1. `registry::tests::test_release_non_live_worker_id_flushes_outside_registry_lock` (`crates/master/src/registry.rs:3323`)
+  2. `server::auth_and_member_tests::test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush` (`crates/master/src/server/auth_and_member_tests.rs:1112`)
+  3. `server::auth_and_member_tests::test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_and_item7_prune` (`crates/master/src/server/auth_and_member_tests.rs:651`)
+  4. `server::members::non_member_claim_tests::revoke_prunes_claims_of_earlier_removed_members` (`crates/master/src/members.rs:4891`)
+  5. `server::members::tests::admin_invite_rule_revoked_keys_role_merge_and_id_only_resolution` (`crates/master/src/members.rs:3355`)
+  6. `server::members::tests::claim_worker_id_evicting_drops_oldest_non_live_claims_and_caps_live_claims_at_64` (`crates/master/src/members.rs:3506`)
+  7. `server::members::tests::test_r5_role_upgrade_rollback_concurrent_approval_and_failed_write_consistency` (`crates/master/src/members.rs:4262`)
+  8. `server::members::tests::test_r6_m1_release_worker_write_error_s1_dirty_retry_and_nit2_double_fault` (`crates/master/src/members.rs:4613`)
+- **Problem:** On Windows, `check_members_file_permissions` (`crates/master/src/members.rs:562-597`) checks the
+  DACL of `path.parent()` (`members directory`) via `open_grants` and rejects any existing directory that grants
+  read or write access to another account. These 8 tests pass `tempfile::tempdir().path()` directly as the
+  members directory; on Windows hosts whose `%TEMP%` or `%LOCALAPPDATA%` has foreign read/write ACEs (unlike
+  `windows-latest` CI runners), `tempfile::tempdir()` inherits those ACEs and `MemberStore::load_from_dir`
+  refuses to load it. Other `members` tests pass a non-existent child directory (such as `dir.path().join("members")`)
+  so `write_members_file_atomic` (`crates/master/src/members.rs:608`) creates it via `create_private_dir_all` with
+  a protected DACL.
+- **Do:**
+  1. Update the 8 tests to create their `MemberStore` inside a private subdirectory (e.g. `dir.path().join("members")`
+     or `create_private_dir_all`) rather than the raw `tempfile::tempdir()` root, keeping dedicated negative
+     tests that intentionally test open-directory refusal separate.
+  2. Verify `cargo test --locked -p rusty_grid_master --lib` passes on both Windows hosts with foreign `%TEMP%` ACEs
+     and CI.
+- **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
+  --lib` passes `436/436` locally) and CI stays green.
 
 ## Phase 3: make the documents true
 
@@ -3218,3 +3252,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: BUG-37 Implemented (`mac/bug-37-doctor-c5-gpu-queued`, claim `claims/item/BUG-37__mac-ag__20261124T220733857026Z__aaad783f.json`): reproduced/audited `v0.4.3` vs `v0.4.4` macOS releases (zero diff in `doctor.rs`/master/core; Scenario A/B1/B2 passed C5 `4–41 ms` at `ram_available_mb=2130`, exposing `sysinfo 0.30.13` subtracting `547,571` macOS compressor pages from `free + inactive + purgeable`, fixed on `master` by PR `#439` `sysinfo 0.38.4`); proved `doctor`'s `TaskRequirements::gpu` (`ram_mb: 1024`) stalls C5 in `is_seat_ram_short` whenever `512 <= ram_available_mb < 1024` while C3/C4 (`512`) and `submit --type gpu` (`0`) run; set `ram_mb = 0` on `doctor` probes in `crates/cli/src/doctor.rs` and added regression tests in `doctor.rs` (failing-first at `512`) and `scheduler.rs`.
 - 2026-11-24: BUG-38 Implemented (pull request 453, branch `win/bug-38-usb-kit-windows`): fixed PowerShell `${InstallRoot}?` variable interpolation in `packaging/usb/uninstall.ps1:140` so interactive uninstall renders the full install path, and hardened `packaging/usb/install.ps1` `-Update` to collect and deduplicate stopped worker PIDs (`run\worker.pid` and `Win32_Process`), poll `Get-Process -Id` every `250 ms` up to `OXIDESWARM_USB_STOP_WAIT_MS` (default `15000 ms`) before removing `run\worker.pid`, and retry binary replacement (`Copy-Item`) every `250 ms` up to `OXIDESWARM_USB_COPY_WAIT_MS` (default `15000 ms`) on transient Windows sharing/user-mapped-section locks; added static and live Windows ConPTY + lock-retry regression tests (`test_windows_usb_bug38_static_prompt_and_update_wait` and `test_windows_usb_bug38_uninstall_prompt_and_update_retry_live`) in `tests/test_launcher_scripts.py` (with `tests/test_m1_challenger_hygiene.py` and the `test_windows_usb` suite passing on Windows 11).
 - 2026-11-25: TEST-93 Partial (`win/test-93-windows-loop`): verified `20/20` sequential loaded Windows passes on clean `origin/master` `d88083f2` (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` per run (`wall 1.891–3.922 s`, `median 3.312 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency 679.700 µs–1.65159 ms`, `max_latency 7.5054–16.1910 ms`); stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
+- 2026-11-25: TEST-99 added (Planned, In; claim `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, `win2/test-99-master-members-tempdir-acl`): `8` `rusty_grid_master` `members`/`registry` unit tests fail deterministically (`428 passed; 8 failed`) in both plain developer env and isolated `E-D2` harness on Windows 11 (`d88083f2`) because they pass `tempfile::tempdir().path()` directly to `MemberStore::load_from_dir` when `%TEMP%` has foreign ACEs instead of a private subdirectory created via `create_private_dir_all`.
