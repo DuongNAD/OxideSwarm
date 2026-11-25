@@ -21,6 +21,8 @@ before adding or changing a document.
 | [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md) | Prompts for coding agents: the remaining work of the 0.4.x stability milestone (Q80), one self-contained prompt per item (TEST-85, BUG-35, TEST-41, TEST-69, the CI streak, TEST-24, TEST-25) | Owner, coding agents |
 | [fuzz/README.md](../fuzz/README.md) | Runbook: the `cargo fuzz` targets for the frame reader, the server handshake and `TreeManifest::decode` (`LV-1`), the encrypted record layer, join tokens and invites, the master's journal and snapshot readers, and the JSON-RPC reader of `oxideswarm mcp` (`LV-18`), how to run them, the one-hour and five-minute records, open targets | Contributors, coding agents |
 | [SECURITY.md](SECURITY.md) | Threat model, cluster secret, ports, tokens, who runs tasks | Users, reviewers |
+| [GOVERNANCE.md](../GOVERNANCE.md) | Project roles, decision-making, maintainer path, and planned neutral stewardship (`LV-14`) | Contributors |
+| [CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) | Contributor Covenant 2.1 community standards and private reporting route (`LV-14`) | Contributors |
 | [DEPLOYMENT.md](../DEPLOYMENT.md) | Agent Mesh deployment and operations (not the compute grid) | Users |
 | [PROJECT.md](../PROJECT.md) | Architecture, workspace layout, feature inventory, and a link to the roadmap | Contributors |
 | [CLAUDE.md](../CLAUDE.md) | Build and test commands, architecture map for coding agents | Coding agents |

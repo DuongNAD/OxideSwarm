@@ -157,11 +157,13 @@ The full list is in [docs/reference.md](docs/reference.md#status-and-limits), th
 - [docs/SECURITY.md](docs/SECURITY.md): threat model, cluster secret, ports, who runs tasks
 - [CHANGELOG.md](CHANGELOG.md) and [docs/ROADMAP.md](docs/ROADMAP.md)
 
+## How this project is built
+
+Coding agents implement and review the code and tests; the project owner sets direction, decides open design questions, and reviews and approves every pull request and release (see [GOVERNANCE.md](GOVERNANCE.md)).
+
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. A change to behaviour, a CLI flag, an environment
-variable or the wire format comes with a design record in [docs/design/](docs/design/) and an update
-of [docs/reference.md](docs/reference.md), in the same pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md), [GOVERNANCE.md](GOVERNANCE.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) first. A change to behaviour, a CLI flag, an environment variable or the wire format comes with a design record in [docs/design/](docs/design/) and an update of [docs/reference.md](docs/reference.md), in the same pull request.
 
 ## How to cite
 
