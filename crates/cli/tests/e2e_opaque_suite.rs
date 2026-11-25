@@ -2987,7 +2987,17 @@ fn s5a_release_readiness_hygiene_and_skew_baseline_e2e() {
 #[test]
 fn s5b_release_readiness_m2_citation_and_skew_pin_e2e() {
     let cff = fs::read_to_string(root().join("CITATION.cff")).unwrap();
-    assert!(cff.contains("cff-version: 1.2.0") && cff.contains("0.4.4"));
+    let cargo = fs::read_to_string(root().join("Cargo.toml")).unwrap();
+    let version = cargo
+        .split("[workspace.package]")
+        .nth(1)
+        .and_then(|sec| sec.lines().find(|l| l.trim_start().starts_with("version")))
+        .and_then(|l| l.split('"').nth(1))
+        .expect("[workspace.package] version in Cargo.toml");
+    assert!(
+        cff.contains("cff-version: 1.2.0") && cff.contains(&format!("version: \"{version}\"")),
+        "CITATION.cff must name the workspace version {version}"
+    );
     let ci = fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains("v0.3.0") && ci.contains("release-skew"));
 }
