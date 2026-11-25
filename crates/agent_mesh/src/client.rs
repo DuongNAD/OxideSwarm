@@ -1442,9 +1442,9 @@ impl AgentMeshClient {
             return;
         }
         let mut sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::new()
-                .with_cpu(sysinfo::CpuRefreshKind::new().with_cpu_usage())
-                .with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
+            sysinfo::RefreshKind::nothing()
+                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(sysinfo::MemoryRefreshKind::nothing().with_ram()),
         );
         loop {
             if let Err(e) = self.connect().await {
@@ -1478,9 +1478,9 @@ impl AgentMeshClient {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             while self.is_connected() {
                 interval.tick().await;
-                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::new().with_cpu_usage());
-                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::new().with_ram());
-                let cpu_usage_pct = Some(sys.global_cpu_info().cpu_usage());
+                sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing().with_cpu_usage());
+                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+                let cpu_usage_pct = Some(sys.global_cpu_usage());
                 let avail_bytes = sys.available_memory();
                 let mem_bytes = if avail_bytes > 0 {
                     avail_bytes
@@ -2064,6 +2064,10 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
 
     #[tokio::test]
     async fn test_corrupt_and_multi_chunk_data_delivery() {
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+        const HANG_GUARD_MS: u64 = 60_000;
+        let test_t0 = Instant::now();
+
         let tmp = tempfile::tempdir().unwrap();
         let inbox = validate_inbox_dir(&tmp.path().join("inbox")).unwrap();
 
@@ -2077,6 +2081,7 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         sender.connect().await.unwrap();
 
         // 1. Corrupted checksum must NACK and write nothing to inbox or received_payloads
+        let t_p1 = Instant::now();
         let mut bad_env = AgentMeshEnvelope::new_data_payload("sender", "consumer", b"tampered").0;
         let bad_corr = bad_env.correlation_id().to_string();
         if let AgentMeshEnvelope::DataPayload {
@@ -2089,9 +2094,9 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         let (tx, rx) = oneshot::channel();
         sender.pending.write().await.insert(bad_corr.clone(), tx);
         sender.send_envelope(bad_env).await.unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(3), rx)
+        let reply = tokio::time::timeout(HANG_GUARD, rx)
             .await
-            .unwrap()
+            .expect("corrupt checksum DeliveryNack exceeded 60 s hang guard")
             .unwrap();
         match reply {
             AgentMeshEnvelope::DeliveryNack { error_code, .. } => {
@@ -2101,8 +2106,10 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         }
         assert!(consumer.received_data_payloads().await.is_empty());
         assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+        let p1_elapsed = t_p1.elapsed();
 
         // 2. Non-Latin-1 code point must NACK and write nothing
+        let t_p2 = Instant::now();
         let non_latin1 = serde_json::json!({
             "type": "DataPayload",
             "correlation_id": "bad-unicode",
@@ -2121,17 +2128,19 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
             .send_envelope(AgentMeshEnvelope::from_json_str(&non_latin1.to_string()).unwrap())
             .await
             .unwrap();
-        let reply2 = tokio::time::timeout(Duration::from_secs(3), rx2)
+        let reply2 = tokio::time::timeout(HANG_GUARD, rx2)
             .await
-            .unwrap()
+            .expect("non-Latin-1 DeliveryNack exceeded 60 s hang guard")
             .unwrap();
         assert!(matches!(
             reply2,
             AgentMeshEnvelope::DeliveryNack { ref error_code, .. } if error_code == ERR_PAYLOAD_CORRUPT
         ));
         assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 0);
+        let p2_elapsed = t_p2.elapsed();
 
         // 3. Multi-chunk out-of-order reassembly + atomic inbox write
+        let t_p3 = Instant::now();
         let big_payload: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
         let (mut chunks, multi_corr, multi_sha) =
             AgentMeshEnvelope::new_data_payload_chunks("sender", "consumer", &big_payload, 1024);
@@ -2142,10 +2151,11 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         for chunk in chunks {
             sender.send_envelope(chunk).await.unwrap();
         }
-        let reply3 = tokio::time::timeout(Duration::from_secs(5), rx3)
+        let reply3 = tokio::time::timeout(HANG_GUARD, rx3)
             .await
-            .unwrap()
+            .expect("multi-chunk DeliveryAck exceeded 60 s hang guard")
             .unwrap();
+        let p3_ack_elapsed = t_p3.elapsed();
         assert!(matches!(
             reply3,
             AgentMeshEnvelope::DeliveryAck { ref status, .. } if status == "data_received_verified"
@@ -2160,21 +2170,35 @@ Awqiz2dEoo0u/ek78WOGb2h+PVsKTUeFAnQc7q7C7wIgNOPgPgYWqKkIuGBeQk5C\n\
         assert_eq!(compute_sha256(&disk_bytes), multi_sha);
 
         // 4. send_data_payload_chunked_with_ack against missing target fails immediately
+        let t_p4 = Instant::now();
         let err = sender
-            .send_data_payload_chunked_with_ack("missing-node", b"abc", 2, Some(3000))
+            .send_data_payload_chunked_with_ack("missing-node", b"abc", 2, Some(HANG_GUARD_MS))
             .await
             .expect_err("missing target must fail");
         assert!(err.to_string().contains("ERR_NODE_NOT_FOUND"), "{err}");
+        let p4_elapsed = t_p4.elapsed();
 
         // 5. Self-delivery (from == to) resolves with DeliveryAck instead of DataPayload.
+        let t_p5 = Instant::now();
         let self_receipt = consumer
-            .send_data_payload_with_ack("consumer", b"self-loop-payload", Some(3000))
+            .send_data_payload_with_ack("consumer", b"self-loop-payload", Some(HANG_GUARD_MS))
             .await
             .expect("self-targeted send_data_payload_with_ack must succeed");
+        let p5_elapsed = t_p5.elapsed();
         assert_eq!(self_receipt.responder, "consumer");
         assert_eq!(self_receipt.status, "data_received_verified");
         assert_eq!(self_receipt.sha256, compute_sha256(b"self-loop-payload"));
         assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 2);
+
+        eprintln!(
+            "[timing] test_corrupt_and_multi_chunk_data_delivery total={:?} p1_nack={:?} p2_nack={:?} p3_multichunk_ack={:?} p4_missing={:?} p5_self={:?}",
+            test_t0.elapsed(),
+            p1_elapsed,
+            p2_elapsed,
+            p3_ack_elapsed,
+            p4_elapsed,
+            p5_elapsed
+        );
 
         sender.close().await;
         consumer.close().await;

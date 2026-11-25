@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 fn alive(pid: u32) -> bool {
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     sys.process(sysinfo::Pid::from(pid as usize))
         .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
 }

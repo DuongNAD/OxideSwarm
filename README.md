@@ -36,27 +36,50 @@ local runs ([record](benchmarks/sweep/results/2026-11-18-w1-two-machines-lan.jso
 
 ## Install
 
-Download the archive for your system and `SHA256SUMS` from the
-[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.4`).
-Check both, unpack, and put the folder on your `PATH`:
+Install the pinned release (`v0.4.5`) for your user with the two-step installer (no `sudo`, no
+background service, verifies `SHA256SUMS` before unpacking and `gh attestation verify` when `gh`
+is installed and authenticated; warns and continues after `SHA256SUMS` if `gh` is not logged in):
+
+```bash
+# macOS / Linux (writes to ~/.local/bin by default; --dir <DIR> changes it)
+curl -fsSLO https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.sh
+bash install.sh
+```
+
+```powershell
+# Windows (writes to %LOCALAPPDATA%\OxideSwarm\bin by default; --dir <DIR> changes it)
+Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Both scripts support `--version <VERSION>`, `--dir <DIR>`, `--gpu` (for the `-gpu` wgpu archive),
+and `--dry-run` (Windows also accepts `-Version`, `-Dir`, `-Gpu`, `-DryRun`). Set
+`OXIDESWARM_DOWNLOAD_BASE` to override the release download base URL for mirrors or tests.
+
+Or download the archive for your system and `SHA256SUMS` by hand from the
+[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.5`),
+check both, unpack, and put the folder on your `PATH`:
 
 ```bash
 # macOS / Linux (on Linux: sha256sum -c SHA256SUMS --ignore-missing)
 shasum -a 256 -c SHA256SUMS --ignore-missing
-gh attestation verify oxideswarm-0.4.4-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm
-tar -xzf oxideswarm-0.4.4-aarch64-apple-darwin.tar.gz
+gh attestation verify oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm
+tar -xzf oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz
 ```
 
 ```powershell
 # Windows: compare the hash with its line in SHA256SUMS
-(Get-FileHash .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-gh attestation verify .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
-Expand-Archive .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
+Expand-Archive .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 ```
 
-The binaries are not signed. On macOS, remove the quarantine flag before the first start:
-`xattr -dr com.apple.quarantine oxideswarm-0.4.4-aarch64-apple-darwin`. Targets, the `-gpu` archives,
-what the attestation proves and the service installers: [docs/reference.md](docs/reference.md#install).
+The binaries are not signed. On macOS, a browser download carries a quarantine flag that must be
+removed before the first start: `xattr -dr com.apple.quarantine oxideswarm-0.4.5-aarch64-apple-darwin`
+(browser downloads only — verified on macOS Darwin `27.2.0` that binaries fetched via `scripts/install.sh`
+and `curl` carry no `com.apple.quarantine` attribute).
+Targets, the `-gpu` archives, what the attestation proves and the service installers:
+[docs/reference.md](docs/reference.md#install).
 
 Build from source (Rust 1.91 or newer; add `--features gpu-wgpu` for hardware GPU detection and the built-in `GpuCompute` benchmark):
 
@@ -134,11 +157,13 @@ The full list is in [docs/reference.md](docs/reference.md#status-and-limits), th
 - [docs/SECURITY.md](docs/SECURITY.md): threat model, cluster secret, ports, who runs tasks
 - [CHANGELOG.md](CHANGELOG.md) and [docs/ROADMAP.md](docs/ROADMAP.md)
 
+## How this project is built
+
+Coding agents implement and review the code and tests; the project owner sets direction, decides open design questions, and reviews and approves every pull request and release (see [GOVERNANCE.md](GOVERNANCE.md)).
+
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. A change to behaviour, a CLI flag, an environment
-variable or the wire format comes with a design record in [docs/design/](docs/design/) and an update
-of [docs/reference.md](docs/reference.md), in the same pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md), [GOVERNANCE.md](GOVERNANCE.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) first. A change to behaviour, a CLI flag, an environment variable or the wire format comes with a design record in [docs/design/](docs/design/) and an update of [docs/reference.md](docs/reference.md), in the same pull request.
 
 ## How to cite
 
