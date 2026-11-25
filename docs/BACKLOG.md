@@ -202,6 +202,7 @@ Recounted on 2026-11-24 from the rows with pull request 451: 286 items, 196 Impl
 Recounted on 2026-11-24 from the rows with pull request 450: 287 items, 197 Implemented, 20 Partial and 70 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 447: 287 items, 197 Implemented, 21 Partial and 69 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 448: 287 items, 197 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 453: 288 items, 198 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -448,6 +449,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
+| BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -1679,6 +1681,41 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   fails without the change: more shards than slots, each well inside `--timeout-secs`, the run longer than it.
 - **Done when:** A run whose every task finishes inside `--timeout-secs` never reports `timed_out` because of
   queue time, and that test passes.
+
+### BUG-38: Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt
+
+- **Status (2026-11-24):** Implemented (win/bug-38-usb-kit-windows). Fixed `${InstallRoot}?` interpolation in `packaging/usb/uninstall.ps1:140` and added bounded worker-exit polling plus `Copy-Item` retry on transient sharing/user-mapped-section locks in `packaging/usb/install.ps1` (`OXIDESWARM_USB_STOP_WAIT_MS` / `OXIDESWARM_USB_COPY_WAIT_MS`), with static and live Windows regression tests in `tests/test_launcher_scripts.py`.
+
+- **Evidence:** Live Windows 11 Pro x86_64 check of the released `v0.4.4` USB kit (`packaging/usb/install.ps1:931-955`,
+  `packaging/usb/uninstall.ps1:140`; both byte-identical on `origin/master` `77553214`) against a throwaway loopback
+  `v0.4.4` master (`127.0.0.1:19500`, `OXIDESWARM_USB_POINTER_KEY` isolated; recorded in Hub
+  `test_runs/win_usb_kit_044_2026-11-25.md`).
+  - Fresh `Install OxideSwarm.cmd -Slots 1`, `doctor` (`8 passed, 0 warnings, 0 failed, 1 skipped` on `C5`),
+    `submit --wait --command cmd -- /c ver` (`Exit Code: 0`, `13 ms`), and `Uninstall OxideSwarm.cmd` all pass.
+  - `Update OxideSwarm.cmd` (`install.ps1 -Update`) failed 2/2 times with `rc=1`:
+    1. `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The requested operation cannot be performed on a file with a user-mapped section open.`
+    2. `stopping the worker started earlier (PID 29324)` -> `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The process cannot access the file '%LOCALAPPDATA%\OxideSwarm-USB\bin\oxideswarm.exe' because it is being used by another process.`
+  - `Uninstall OxideSwarm.cmd` (`packaging/usb/uninstall.ps1:140`) printed `"Remove the OxideSwarm install in  [y/N]:"`
+    with the install path omitted.
+- **Problem:**
+  1. `packaging/usb/install.ps1:931-955` calls `Stop-Process -Id ([int]$old) -Force` + a fixed `Start-Sleep -Seconds 2`,
+     deletes `run\worker.pid`, and immediately runs a single-shot `Copy-Item $f (Join-Path $Bin $b) -Force`. On Windows
+     before the exited worker's memory-mapped executable section closes (or transient lock clears), `Copy-Item` throws
+     and aborts `-Update` without restarting the worker (`doctor` fails with `0 connected`).
+  2. `packaging/usb/uninstall.ps1:140` writes `"Remove the OxideSwarm install in $InstallRoot? [y/N]"`. Because `?` is
+     a valid identifier character in PowerShell, `"$InstallRoot?"` resolves to unset `$InstallRoot?` (`$null`), hiding the
+     target folder path from the confirmation prompt.
+- **Do:**
+  1. Wait for stopped worker PIDs to exit (polling `Get-Process` up to ~10 s, matching `uninstall.ps1:174-179`) and
+     retry/stage binary replacement in `packaging/usb/install.ps1` with a short backoff when Windows reports a transient
+     sharing/user-mapped section lock on `oxideswarm.exe` / `rusty-grid.exe` / `ox-mode.exe` (and on failure avoid
+     leaving a silently dead worker or document the retry cleanly).
+  2. Fix `packaging/usb/uninstall.ps1:140` to `${InstallRoot}?`.
+  3. Add unit/regression coverage in `tests/test_launcher_scripts.py` verifying `$InstallRoot` renders before `?` in
+     the uninstall prompt and verifying update wait/retry behavior on Windows.
+- **Done when:** `Update OxideSwarm.cmd` succeeds repeatedly against an active Windows worker, `Uninstall OxideSwarm.cmd`
+  prints the full install folder before `? [y/N]`, and the launcher test suite passes on Windows (`install.ps1` /
+  `uninstall.ps1`).
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -3139,3 +3176,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-98 Implemented (`win2/test-98-revoke-worker-scope`, claim `claims/item/TEST-98__win-2__20261124T172506156991Z__f7dbab9d.json`, text moved to `docs/BACKLOG-ARCHIVE.md`): added `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT` filtering in `windows/revoke-isolation-acls.ps1`, scoped `ps_env` plus added a positive scoped-worker detection test in `tests/test_launcher_scripts.py`, and verified `20/20` sequential runs on Windows alongside live Stage C `S7` (`96` tests / `62` skipped / `0` failures per run; `total 3,452.253 s`, median `168.249 s`, `minRAM 4.523 GiB`).
 - 2026-11-24: TEST-96 Partial (`mac/test-96-mesh-multichunk-ack-guard`, `loop after S7`): audited sender `send_envelope`, hub `Outbox::push` / `InflightDataTracker`, and consumer `DataConsumer` / `ChunkReassembler` / `persist_payload_atomic` end to end and confirmed root cause `(a)` (starved CI runner + `spawn_blocking` `file.sync_all()` `fsync` in part 3 delaying `DeliveryAck(data_received_verified)` past `5 s`, not lost/evicted ACKs `(b)` which fail immediately with `RecvError` or `DeliveryNack`); replaced all `3 s` / `5 s` wall-clock windows in `crates/agent_mesh/src/client.rs::test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and `[timing]` prints; stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-24: TEST-93 Partial (`win/test-93-quic-heartbeat-structural`): audited all 1,098 lines of `tests/m2_challenger_1_stress.rs` (line 472 `avg_latency < 50 ms` was the sole Category 1 wall-clock upper bound), replaced it in `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` with a structural QUIC `STREAM_DATA` flow-control backpressure (`64 KiB` stream receive window, `16 KiB` chunks, paused server sink) + in-order `HeartbeatAck` verification under a `60 s` hang guard and `[timing]` printout, and verified `10/10` sequential Windows passes (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress`, no busy loops during Stage C `S7`, `12` passed/`0` failed per run; wall `2.250–3.469 s`, median `2.821 s`, total `27.453 s`; `avg_latency` `677.343–787.493 µs`, `max_latency` `6.8813–8.1431 ms`); `fmt` and `-j 4` `clippy` clean (`0` warnings); stays Partial pending `20/20` loaded runs (`loop after S7`).
+- 2026-11-24: BUG-38 Implemented (pull request 453, branch `win/bug-38-usb-kit-windows`): fixed PowerShell `${InstallRoot}?` variable interpolation in `packaging/usb/uninstall.ps1:140` so interactive uninstall renders the full install path, and hardened `packaging/usb/install.ps1` `-Update` to collect and deduplicate stopped worker PIDs (`run\worker.pid` and `Win32_Process`), poll `Get-Process -Id` every `250 ms` up to `OXIDESWARM_USB_STOP_WAIT_MS` (default `15000 ms`) before removing `run\worker.pid`, and retry binary replacement (`Copy-Item`) every `250 ms` up to `OXIDESWARM_USB_COPY_WAIT_MS` (default `15000 ms`) on transient Windows sharing/user-mapped-section locks; added static and live Windows ConPTY + lock-retry regression tests (`test_windows_usb_bug38_static_prompt_and_update_wait` and `test_windows_usb_bug38_uninstall_prompt_and_update_retry_live`) in `tests/test_launcher_scripts.py` (with `tests/test_m1_challenger_hygiene.py` and the `test_windows_usb` suite passing on Windows 11).
