@@ -205,6 +205,11 @@ Recounted on 2026-11-24 from the rows with pull request 448: 287 items, 197 Impl
 Recounted on 2026-11-24 from the rows with pull request 453: 288 items, 198 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 452: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 455: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 456: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 458: 290 items, 199 Implemented, 22 Partial and 69 Planned; 22 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 459: 291 items, 199 Implemented, 22 Partial and 70 Planned; 23 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 460: 291 items, 199 Implemented, 22 Partial and 70 Planned; 23 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 457: 291 items, 200 Implemented, 21 Partial and 70 Planned; 22 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -326,6 +331,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Implemented |  | 449, 455 |
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
+| TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -453,6 +459,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
+| BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -649,6 +656,38 @@ The full suite must pass on a clean machine before CI can require it.
   - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
   - Check 5 (Clean stop): `passed` (`0` leftover soak/cluster/keep-awake processes, work dir removed).
   Stays `Partial` pending the full 24-hour 3-machine (Mac master + two Windows workers) run.
+- **Update (2026-11-25, 17h48m 3-machine LAN TCP soak record, branch `mac/test-25-s7-3machine-record`):**
+  Ran Stage C `S7` (`endurance.py soak --master-only --link lan-tcp --duration 24h --fault-scale 1.0
+  --load-scale 1.0 --slots 2 --workspaces --max-queue-size 64`, `rusty-grid 0.4.4` release on PR `#395`
+  `d8cf052e`) across Mac Apple M5 master (`07:48:45Z` start) + Windows case PC `win-case` (`07:49:54Z`
+  registered) + Windows Dell `win-dell` (`07:50:00Z` registered) from `2026-11-24T07:49:50Z` to
+  `2026-11-25T01:38:43Z` (`64,133 s` / `17.81 h` / `17 h 48 m`). `win-dell` departed cleanly on schedule at
+  `2026-11-24T21:30:33Z` (`13 h 40 m`), and `win-case` stopped at `2026-11-25T01:38:43Z` (`17 h 48 m`)
+  when the Windows Antigravity host server restarted (Windows OS did not reboot; not an OxideSwarm fault);
+  owner ended `S7` (`SIGINT` `03:05:43Z`, master `SIGTERM` `03:07:21Z`, harness exited `03:09:06Z` with
+  `KeyboardInterrupt` / `aborted_base=True`, emitting no `s7_24h_record.json`), and the `0`-worker tail
+  (`01:38:43Z`–`03:07:21Z`, `master-9.log` with `0` results and `0` `ERROR`s) is excluded from the measured
+  run. Committed sanitized record
+  `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json`:
+  - Check 1 (Accounting): `49,355` unique master-logged task results across `master-0..8.log` (`48,290` `0`,
+    `1,065` `130`, `0` `124` watchdog timeouts; `0` duplicates; `win-case` `38,951` ok / `839` cancelled across
+    `28` logs; `win-dell` `9,339` ok / `226` cancelled across `21` logs), `123` failover sweeps (`win-case` `76`,
+    `win-dell` `47`, `0` reaper/superseded failovers), `74` orphan requeue events (`134` tasks), `0` queue
+    record errors, `0` log-level `ERROR` or panics across master or `49` worker logs; pre-restart `01:48:24Z`
+    `/api/tasks` window (`10,029` tasks: `9,783` completed, `217` cancelled, `29` queued post-disconnect,
+    `6` retries / `6` failovers); client-side `TaskLedger` SHA-256 verification `not_evaluated_due_to_early_stop`.
+  - Check 2 (Resource plateau): `not_evaluated_due_to_early_stop` (continuous `60 s` `BackgroundSampler` lost
+    on `KeyboardInterrupt`); observational series stayed flat: Mac master `53.52 MiB` RSS / `35` FDs at
+    `01:48:24Z` (`+17h58m`), `win-dell` `oxideswarm.exe` `25.5–26.8 MB` across H1–H13 (`4.04–5.18 GiB` free
+    RAM, `C:` `52.59–57.49 GB`), `win-case` `C:` `42.68 -> 38.12 -> 37.52 GiB` (`0` errors).
+  - Check 3 (Disk & journal): `master-blobs` `4,249,880,320 B` (`01:48:24Z`) and `4,255,124,429 B` idle
+    (`<= 4 GiB` cap, `5,689` LRU eviction events / `9,542` blobs, `0` `.part`/`.tmp` leftovers); `journal.bin`
+    compacted on shutdown from `1,123,749 B` (`01:48:24Z`) to `24 B` (`snapshot.bin` `12,707,196 B`, `256`
+    `cold_results` dirs); remote worker idle snapshots `not_evaluated_due_to_early_stop`.
+  - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
+  - Check 5 (Clean stop): `passed` (`0` leftover processes on Mac or Windows workers; Mac workdir preserved
+    outside `/tmp` locally).
+  Stays `Partial | In` pending a full uninterrupted `24 h` 3-machine run.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -868,6 +907,39 @@ The full suite must pass on a clean machine before CI can require it.
   3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`. Remaining: `20/20` runs under busy loops (`loop after S7`).
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
+
+### TEST-99: Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs
+
+- **Evidence:** Discovered during `E-D2` on Windows 11 x86_64 at clean `origin/master` `d88083f2` (claim
+  `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, report Hub
+  `test_runs/win-2_e-d2_2026-11-25.md`). Both the isolated `E-D2` harness (`45/45` completed runs of
+  `cargo test --locked -p rusty_grid_master --lib`, `428 passed; 8 failed` per run before owner order stopped
+  the loop) and a plain developer environment run (no `HOME`/`USERPROFILE`/`TEMP` override, no busy loops) fail
+  deterministically with `Config("members directory '...' is accessible by other accounts (...)")` in these 8 tests:
+  1. `registry::tests::test_release_non_live_worker_id_flushes_outside_registry_lock` (`crates/master/src/registry.rs:3323`)
+  2. `server::auth_and_member_tests::test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush` (`crates/master/src/server/auth_and_member_tests.rs:1112`)
+  3. `server::auth_and_member_tests::test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_and_item7_prune` (`crates/master/src/server/auth_and_member_tests.rs:651`)
+  4. `server::members::non_member_claim_tests::revoke_prunes_claims_of_earlier_removed_members` (`crates/master/src/members.rs:4891`)
+  5. `server::members::tests::admin_invite_rule_revoked_keys_role_merge_and_id_only_resolution` (`crates/master/src/members.rs:3355`)
+  6. `server::members::tests::claim_worker_id_evicting_drops_oldest_non_live_claims_and_caps_live_claims_at_64` (`crates/master/src/members.rs:3506`)
+  7. `server::members::tests::test_r5_role_upgrade_rollback_concurrent_approval_and_failed_write_consistency` (`crates/master/src/members.rs:4262`)
+  8. `server::members::tests::test_r6_m1_release_worker_write_error_s1_dirty_retry_and_nit2_double_fault` (`crates/master/src/members.rs:4613`)
+- **Problem:** On Windows, `check_members_file_permissions` (`crates/master/src/members.rs:562-597`) checks the
+  DACL of `path.parent()` (`members directory`) via `open_grants` and rejects any existing directory that grants
+  read or write access to another account. These 8 tests pass `tempfile::tempdir().path()` directly as the
+  members directory; on Windows hosts whose `%TEMP%` or `%LOCALAPPDATA%` has foreign read/write ACEs (unlike
+  `windows-latest` CI runners), `tempfile::tempdir()` inherits those ACEs and `MemberStore::load_from_dir`
+  refuses to load it. Other `members` tests pass a non-existent child directory (such as `dir.path().join("members")`)
+  so `write_members_file_atomic` (`crates/master/src/members.rs:608`) creates it via `create_private_dir_all` with
+  a protected DACL.
+- **Do:**
+  1. Update the 8 tests to create their `MemberStore` inside a private subdirectory (e.g. `dir.path().join("members")`
+     or `create_private_dir_all`) rather than the raw `tempfile::tempdir()` root, keeping dedicated negative
+     tests that intentionally test open-directory refusal separate.
+  2. Verify `cargo test --locked -p rusty_grid_master --lib` passes on both Windows hosts with foreign `%TEMP%` ACEs
+     and CI.
+- **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
+  --lib` passes `436/436` locally) and CI stays green.
 
 ## Phase 3: make the documents true
 
@@ -1698,6 +1770,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 ### BUG-38: Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt
 
 - **Status (2026-11-24):** Implemented (win/bug-38-usb-kit-windows). Fixed `${InstallRoot}?` interpolation in `packaging/usb/uninstall.ps1:140` and added bounded worker-exit polling plus `Copy-Item` retry on transient sharing/user-mapped-section locks in `packaging/usb/install.ps1` (`OXIDESWARM_USB_STOP_WAIT_MS` / `OXIDESWARM_USB_COPY_WAIT_MS`), with static and live Windows regression tests in `tests/test_launcher_scripts.py`.
+- **Live verification (2026-11-25):** Verified `origin/master` (`d88083f2`) kit scripts over a running `v0.4.4` (`e7aca4c7`) USB-kit worker (`-Slots 1`, CPU, throwaway loopback master) in ConPTY (Drive `test_runs/win_bug38_live_2026-11-25.md`): `3/3` consecutive `Update OxideSwarm.cmd` runs passed (`Updated. Worker ... runs rusty-grid 0.4.4`, `0` lock errors, `doctor` `8/8` non-GPU checks after each), `Uninstall OxideSwarm.cmd` printed the full install path before `? [y/N]`, and post-uninstall left zero processes, folder, ACL grants, or HKCU pointer entries.
 
 - **Evidence:** Live Windows 11 Pro x86_64 check of the released `v0.4.4` USB kit (`packaging/usb/install.ps1:931-955`,
   `packaging/usb/uninstall.ps1:140`; both byte-identical on `origin/master` `77553214`) against a throwaway loopback
@@ -1729,6 +1802,39 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** `Update OxideSwarm.cmd` succeeds repeatedly against an active Windows worker, `Uninstall OxideSwarm.cmd`
   prints the full install folder before `? [y/N]`, and the launcher test suite passes on Windows (`install.ps1` /
   `uninstall.ps1`).
+
+### BUG-39: Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID
+
+- **Evidence:** Discovered during `E-D2` on Windows 11 x86_64 at clean `origin/master` `d88083f2` (claim
+  `claims/item/BUG-39__win__20261125T031711167999Z__aa5175b1.json`, report Hub
+  `test_runs/win-2_e-d2_2026-11-25.md`). Both the isolated `E-D2` harness (`50/50` runs of
+  `cargo test --locked -p rusty_grid_core --lib`, `307 passed; 2 failed`) and a plain developer environment run
+  (`%TEMP%`, no `HOME`/`USERPROFILE`/`TEMP` override, no busy loops) fail deterministically in
+  `private_file::windows_tests::icacls_printed_remedies_remove_both_inherited_and_explicit_foreign_grants` at
+  `crates/core/src/private_file.rs:2135` with:
+  `dir remedy failed: stdout=Successfully processed 0 files; Failed processing 0 files` (`stderr=`).
+  Reproduced directly with `icacls.exe`: when `%TEMP%` or `%LOCALAPPDATA%` carries an inherited unresolvable
+  SID (`S-1-5-21-<domain>-<rid>:(I)(OI)(CI)(RX)` or `(OI)(CI)(M)`), running `icacls <path> /inheritance:r
+  /grant:r ... /remove:g "*S-1-5-21-<domain>-<rid>" ...` exits `1332` (`ERROR_NONE_MAPPED`) and modifies `0`
+  files; running `icacls <path> /remove:g` or `/remove` on an explicit unresolvable SID also exits `1332`,
+  whereas omitting inherited-only unresolvable SIDs (removed by `/inheritance:r`) or running `icacls <path> /reset`
+  before `/inheritance:r /grant:r` exits `0`.
+- **Problem:** `crates/core/src/private_file.rs` (`icacls_private_file_command`, `icacls_private_dir_command`, and
+  `append_icacls_remove_args`, lines `265–299`) appends `/remove:g "*<sid>"` for every offending SID regardless of
+  whether the SID is inherited-only (`INHERITED_ACE` `0x10`) or unresolvable via `LookupAccountSidW`. On a Windows
+  machine whose `%TEMP%`, `%LOCALAPPDATA%`, or profile directory contains a leftover/unresolvable SID from a
+  deleted local/domain account or container, the printed `icacls` remedy fails with `ERROR_NONE_MAPPED` (`1332`)
+  and leaves the file or directory unprotected (`packaging/usb/install.ps1:613` `Get-SandboxBaseFix` has the same
+  `/remove:g "*<sid>"` pattern for explicit holders).
+- **Do:**
+  1. Write a failing-first test in `crates/core/src/private_file.rs` covering an inherited unresolvable/foreign SID
+     and an explicit unresolvable SID (without requiring an unresolvable SID on the host).
+  2. Fix the printed remedy builder (`private_file.rs`: omit inherited-only ACEs from `/remove:g` since
+     `/inheritance:r` already strips them, and handle unresolvable explicit SIDs via `/reset` or safe Win32/SDDL
+     remediation; check `packaging/usb/install.ps1:613` and existing unit tests).
+- **Done when:** the new regression test fails before the fix and passes after, `cargo test --locked -p
+  rusty_grid_core --lib` and `cargo test --locked -p rusty_grid_worker --lib sandbox::tests` pass on Windows hosts
+  with inherited/unresolvable SIDs as well as CI, and `cargo fmt` + `clippy` pass with 0 warnings.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -3191,6 +3297,10 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-93 Partial (`win/test-93-quic-heartbeat-structural`): audited all 1,098 lines of `tests/m2_challenger_1_stress.rs` (line 472 `avg_latency < 50 ms` was the sole Category 1 wall-clock upper bound), replaced it in `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` with a structural QUIC `STREAM_DATA` flow-control backpressure (`64 KiB` stream receive window, `16 KiB` chunks, paused server sink) + in-order `HeartbeatAck` verification under a `60 s` hang guard and `[timing]` printout, and verified `10/10` sequential Windows passes (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress`, no busy loops during Stage C `S7`, `12` passed/`0` failed per run; wall `2.250–3.469 s`, median `2.821 s`, total `27.453 s`; `avg_latency` `677.343–787.493 µs`, `max_latency` `6.8813–8.1431 ms`); `fmt` and `-j 4` `clippy` clean (`0` warnings); stays Partial pending `20/20` loaded runs (`loop after S7`).
 - 2026-11-24: BUG-37 Implemented (`mac/bug-37-doctor-c5-gpu-queued`, claim `claims/item/BUG-37__mac-ag__20261124T220733857026Z__aaad783f.json`): reproduced/audited `v0.4.3` vs `v0.4.4` macOS releases (zero diff in `doctor.rs`/master/core; Scenario A/B1/B2 passed C5 `4–41 ms` at `ram_available_mb=2130`, exposing `sysinfo 0.30.13` subtracting `547,571` macOS compressor pages from `free + inactive + purgeable`, fixed on `master` by PR `#439` `sysinfo 0.38.4`); proved `doctor`'s `TaskRequirements::gpu` (`ram_mb: 1024`) stalls C5 in `is_seat_ram_short` whenever `512 <= ram_available_mb < 1024` while C3/C4 (`512`) and `submit --type gpu` (`0`) run; set `ram_mb = 0` on `doctor` probes in `crates/cli/src/doctor.rs` and added regression tests in `doctor.rs` (failing-first at `512`) and `scheduler.rs`.
 - 2026-11-24: BUG-38 Implemented (pull request 453, branch `win/bug-38-usb-kit-windows`): fixed PowerShell `${InstallRoot}?` variable interpolation in `packaging/usb/uninstall.ps1:140` so interactive uninstall renders the full install path, and hardened `packaging/usb/install.ps1` `-Update` to collect and deduplicate stopped worker PIDs (`run\worker.pid` and `Win32_Process`), poll `Get-Process -Id` every `250 ms` up to `OXIDESWARM_USB_STOP_WAIT_MS` (default `15000 ms`) before removing `run\worker.pid`, and retry binary replacement (`Copy-Item`) every `250 ms` up to `OXIDESWARM_USB_COPY_WAIT_MS` (default `15000 ms`) on transient Windows sharing/user-mapped-section locks; added static and live Windows ConPTY + lock-retry regression tests (`test_windows_usb_bug38_static_prompt_and_update_wait` and `test_windows_usb_bug38_uninstall_prompt_and_update_retry_live`) in `tests/test_launcher_scripts.py` (with `tests/test_m1_challenger_hygiene.py` and the `test_windows_usb` suite passing on Windows 11).
+- 2026-11-25: BUG-38 live-verified (`win/bug-38-live-check`, Drive `test_runs/win_bug38_live_2026-11-25.md`): installed `v0.4.4` (`e7aca4c7`) Kit A (`-Slots 1`, GPU `n`, throwaway loopback master) in ConPTY, verified `doctor` + `submit cmd /c ver`, then ran `origin/master` (`d88083f2`) Kit B `Update OxideSwarm.cmd` `3/3` times consecutively over the running worker (`Updated. Worker ... runs rusty-grid 0.4.4`, `0` lock errors, `doctor` passing after each), confirmed Kit B `Uninstall OxideSwarm.cmd` prints the full install path before `? [y/N]`, verified zero leftovers (process, folder, ACL grants, HKCU pointer), and removed throwaway master and kits.
 - 2026-11-25: TEST-96 Partial (`win2/test-96-windows-loop`): verified `200/200` sequential passes on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) under `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` `25.819–292.559 ms`, median `45.050 ms`; `p3_multichunk_ack` `5.806–255.009 ms`, median `10.364 ms`; min free RAM `5.891 GiB`); stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-25: TEST-93 Partial (`win/test-93-windows-loop`): verified `20/20` sequential loaded Windows passes on clean `origin/master` `d88083f2` (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` per run (`wall 1.891–3.922 s`, `median 3.312 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency 679.700 µs–1.65159 ms`, `max_latency 7.5054–16.1910 ms`); stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
 - 2026-11-25: TEST-96 Implemented (`win/test-96-linux-loop`, text moved to `docs/BACKLOG-ARCHIVE.md`): verified `200/200` sequential loaded Linux passes on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` inside Docker `rust:1.96` (`rustc 1.96.1`, kernel `6.6.87.2-microsoft-standard-WSL2 x86_64`, `20` logical cores, `cargo test --locked -j 4 -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture`) alongside `1` `python3` `hashlib.sha256(4096B)` CPU busy loop (`wall` total `119.722 s`, min `0.440 s`, median `0.611 s`, max `0.788 s`; test `[timing]` `total 89.504–109.412 ms` median `93.208 ms`, `p3_multichunk_ack 42.672–47.266 ms` median `43.601 ms`; `agent-win-2` also verified `200/200` on Windows in PR #455); all `Do` and `Done when` steps are met.
+- 2026-11-25: TEST-25 Partial (3-machine Stage C `S7` `lan-tcp` soak stopped at `17.81 h` / `17 h 48 m`, branch `mac/test-25-s7-3machine-record`): Mac M5 master + `win-case` + `win-dell` on PR `#395` `d8cf052e` (`win-dell` planned leave `21:30:33Z`, `win-case` stopped `01:38:43Z` on Antigravity host restart, not a product fault; `0`-worker tail `01:38:43Z`–`03:07:21Z` excluded); committed `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json` (`49,355` unique results across `master-0..8.log` with `48,290` `0`, `1,065` `130`, `0` `124` timeouts, `0` duplicates, `0` `ERROR`/panics across master or `49` worker logs, `master-blobs` `<= 4 GiB` with `5,689` eviction events, `journal.bin` `1,123,749 -> 24 B`, `0` leftover processes); stays `Partial | In` pending a full `24 h` 3-machine run.
+- 2026-11-25: TEST-99 added (Planned, In; claim `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, `win2/test-99-master-members-tempdir-acl`): `8` `rusty_grid_master` `members`/`registry` unit tests fail deterministically (`428 passed; 8 failed`) in both plain developer env and isolated `E-D2` harness on Windows 11 (`d88083f2`) because they pass `tempfile::tempdir().path()` directly to `MemberStore::load_from_dir` when `%TEMP%` has foreign ACEs instead of a private subdirectory created via `create_private_dir_all`.
+- 2026-11-25: BUG-39 added (Planned, In; claim `claims/item/BUG-39__win__20261125T031711167999Z__aa5175b1.json`, `win2/bug-39-icacls-unresolvable-sid`): `private_file::windows_tests::icacls_printed_remedies_remove_both_inherited_and_explicit_foreign_grants` (`crates/core/src/private_file.rs:2135`) fails deterministically in both plain developer env and isolated `E-D2` harness (`50/50`) on Windows 11 (`d88083f2`) because `icacls /remove:g "*<sid>"` exits `1332` (`ERROR_NONE_MAPPED`) when the DACL carries an unresolvable SID.
