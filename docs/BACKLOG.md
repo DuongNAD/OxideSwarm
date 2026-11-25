@@ -648,6 +648,38 @@ The full suite must pass on a clean machine before CI can require it.
   - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
   - Check 5 (Clean stop): `passed` (`0` leftover soak/cluster/keep-awake processes, work dir removed).
   Stays `Partial` pending the full 24-hour 3-machine (Mac master + two Windows workers) run.
+- **Update (2026-11-25, 17h48m 3-machine LAN TCP soak record, branch `mac/test-25-s7-3machine-record`):**
+  Ran Stage C `S7` (`endurance.py soak --master-only --link lan-tcp --duration 24h --fault-scale 1.0
+  --load-scale 1.0 --slots 2 --workspaces --max-queue-size 64`, `rusty-grid 0.4.4` release on PR `#395`
+  `d8cf052e`) across Mac Apple M5 master (`07:48:45Z` start) + Windows case PC `win-case` (`07:49:54Z`
+  registered) + Windows Dell `win-dell` (`07:50:00Z` registered) from `2026-11-24T07:49:50Z` to
+  `2026-11-25T01:38:43Z` (`64,133 s` / `17.81 h` / `17 h 48 m`). `win-dell` departed cleanly on schedule at
+  `2026-11-24T21:30:33Z` (`13 h 40 m`), and `win-case` stopped at `2026-11-25T01:38:43Z` (`17 h 48 m`)
+  when the Windows Antigravity host server restarted (Windows OS did not reboot; not an OxideSwarm fault);
+  owner ended `S7` (`SIGINT` `03:05:43Z`, master `SIGTERM` `03:07:21Z`, harness exited `03:09:06Z` with
+  `KeyboardInterrupt` / `aborted_base=True`, emitting no `s7_24h_record.json`), and the `0`-worker tail
+  (`01:38:43Z`–`03:07:21Z`, `master-9.log` with `0` results and `0` `ERROR`s) is excluded from the measured
+  run. Committed sanitized record
+  `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json`:
+  - Check 1 (Accounting): `49,355` unique master-logged task results across `master-0..8.log` (`48,290` `0`,
+    `1,065` `130`, `0` `124` watchdog timeouts; `0` duplicates; `win-case` `38,951` ok / `839` cancelled across
+    `28` logs; `win-dell` `9,339` ok / `226` cancelled across `21` logs), `123` failover sweeps (`win-case` `76`,
+    `win-dell` `47`, `0` reaper/superseded failovers), `74` orphan requeue events (`134` tasks), `0` queue
+    record errors, `0` log-level `ERROR` or panics across master or `49` worker logs; pre-restart `01:48:24Z`
+    `/api/tasks` window (`10,029` tasks: `9,783` completed, `217` cancelled, `29` queued post-disconnect,
+    `6` retries / `6` failovers); client-side `TaskLedger` SHA-256 verification `not_evaluated_due_to_early_stop`.
+  - Check 2 (Resource plateau): `not_evaluated_due_to_early_stop` (continuous `60 s` `BackgroundSampler` lost
+    on `KeyboardInterrupt`); observational series stayed flat: Mac master `53.52 MiB` RSS / `35` FDs at
+    `01:48:24Z` (`+17h58m`), `win-dell` `oxideswarm.exe` `25.5–26.8 MB` across H1–H13 (`4.04–5.18 GiB` free
+    RAM, `C:` `52.59–57.49 GB`), `win-case` `C:` `42.68 -> 38.12 -> 37.52 GiB` (`0` errors).
+  - Check 3 (Disk & journal): `master-blobs` `4,249,880,320 B` (`01:48:24Z`) and `4,255,124,429 B` idle
+    (`<= 4 GiB` cap, `5,689` LRU eviction events / `9,542` blobs, `0` `.part`/`.tmp` leftovers); `journal.bin`
+    compacted on shutdown from `1,123,749 B` (`01:48:24Z`) to `24 B` (`snapshot.bin` `12,707,196 B`, `256`
+    `cold_results` dirs); remote worker idle snapshots `not_evaluated_due_to_early_stop`.
+  - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
+  - Check 5 (Clean stop): `passed` (`0` leftover processes on Mac or Windows workers; Mac workdir preserved
+    outside `/tmp` locally).
+  Stays `Partial | In` pending a full uninterrupted `24 h` 3-machine run.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -3218,3 +3250,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: BUG-37 Implemented (`mac/bug-37-doctor-c5-gpu-queued`, claim `claims/item/BUG-37__mac-ag__20261124T220733857026Z__aaad783f.json`): reproduced/audited `v0.4.3` vs `v0.4.4` macOS releases (zero diff in `doctor.rs`/master/core; Scenario A/B1/B2 passed C5 `4–41 ms` at `ram_available_mb=2130`, exposing `sysinfo 0.30.13` subtracting `547,571` macOS compressor pages from `free + inactive + purgeable`, fixed on `master` by PR `#439` `sysinfo 0.38.4`); proved `doctor`'s `TaskRequirements::gpu` (`ram_mb: 1024`) stalls C5 in `is_seat_ram_short` whenever `512 <= ram_available_mb < 1024` while C3/C4 (`512`) and `submit --type gpu` (`0`) run; set `ram_mb = 0` on `doctor` probes in `crates/cli/src/doctor.rs` and added regression tests in `doctor.rs` (failing-first at `512`) and `scheduler.rs`.
 - 2026-11-24: BUG-38 Implemented (pull request 453, branch `win/bug-38-usb-kit-windows`): fixed PowerShell `${InstallRoot}?` variable interpolation in `packaging/usb/uninstall.ps1:140` so interactive uninstall renders the full install path, and hardened `packaging/usb/install.ps1` `-Update` to collect and deduplicate stopped worker PIDs (`run\worker.pid` and `Win32_Process`), poll `Get-Process -Id` every `250 ms` up to `OXIDESWARM_USB_STOP_WAIT_MS` (default `15000 ms`) before removing `run\worker.pid`, and retry binary replacement (`Copy-Item`) every `250 ms` up to `OXIDESWARM_USB_COPY_WAIT_MS` (default `15000 ms`) on transient Windows sharing/user-mapped-section locks; added static and live Windows ConPTY + lock-retry regression tests (`test_windows_usb_bug38_static_prompt_and_update_wait` and `test_windows_usb_bug38_uninstall_prompt_and_update_retry_live`) in `tests/test_launcher_scripts.py` (with `tests/test_m1_challenger_hygiene.py` and the `test_windows_usb` suite passing on Windows 11).
 - 2026-11-25: TEST-93 Partial (`win/test-93-windows-loop`): verified `20/20` sequential loaded Windows passes on clean `origin/master` `d88083f2` (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` per run (`wall 1.891–3.922 s`, `median 3.312 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency 679.700 µs–1.65159 ms`, `max_latency 7.5054–16.1910 ms`); stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
+- 2026-11-25: TEST-25 Partial (3-machine Stage C `S7` `lan-tcp` soak stopped at `17.81 h` / `17 h 48 m`, branch `mac/test-25-s7-3machine-record`): Mac M5 master + `win-case` + `win-dell` on PR `#395` `d8cf052e` (`win-dell` planned leave `21:30:33Z`, `win-case` stopped `01:38:43Z` on Antigravity host restart, not a product fault; `0`-worker tail `01:38:43Z`–`03:07:21Z` excluded); committed `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json` (`49,355` unique results across `master-0..8.log` with `48,290` `0`, `1,065` `130`, `0` `124` timeouts, `0` duplicates, `0` `ERROR`/panics across master or `49` worker logs, `master-blobs` `<= 4 GiB` with `5,689` eviction events, `journal.bin` `1,123,749 -> 24 B`, `0` leftover processes); stays `Partial | In` pending a full `24 h` 3-machine run.

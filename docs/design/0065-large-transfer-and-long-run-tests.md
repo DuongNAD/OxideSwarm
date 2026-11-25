@@ -1,7 +1,7 @@
 # 0065: Tests for large transfers and long runs
 
 Status: Partial (TEST-24 and TEST-25 step 1 harnesses + Windows loopback records, PR 374 and PR 381; Q57–Q59 decided by owner 2026-11-19)
-Created: 2026-11-14    Updated: 2026-11-19
+Created: 2026-11-14    Updated: 2026-11-25
 
 ## Summary
 
@@ -287,3 +287,17 @@ The right column records the owner's decisions of 2026-11-19, listed in
   `journal.bin` compaction (`2,104,993 -> 54,043 B`), and `0` leftover processes; in-memory ledger SHA-256,
   60 s `BackgroundSampler` means, `probe_samples` p99, and `fault_events_log` marked
   `not_evaluated_due_to_early_stop`. Stays Partial pending the 3-machine run.
+- 2026-11-25: TEST-25 Partial (3-machine Stage C `S7` `lan-tcp` soak stopped at `17.81 h` / `17 h 48 m`,
+  branch `mac/test-25-s7-3machine-record`): Mac Apple M5 master + `win-case` + `win-dell` on PR `#395`
+  `d8cf052e` (`rusty-grid 0.4.4`, `--slots 2`, `--workspaces`, `max_queue_size=64`); `win-dell` departed
+  cleanly on schedule at `2026-11-24T21:30:33Z` (`13 h 40 m`) and `win-case` stopped at
+  `2026-11-25T01:38:43Z` (`17 h 48 m`) when its Windows Antigravity host restarted (not a product fault),
+  with the `0`-worker tail (`01:38:43Z`–`03:07:21Z`) excluded from the measured run. Committed sanitized
+  record `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json`:
+  `49,355` unique master-logged results across `master-0..8.log` (`48,290` `0`, `1,065` `130`, `0` `124`
+  watchdog timeouts, `0` duplicates, `0` `ERROR`/panics across master or `49` worker logs; `123` failover
+  sweeps, `74` orphan requeue events / `134` tasks), `master-blobs` `4,255,124,429 B` (`<= 4 GiB`, `5,689`
+  eviction events / `9,542` blobs, `0` `.part`/`.tmp` leftovers), `journal.bin` compacted `1,123,749 -> 24 B`,
+  Mac master RSS `53.52 MiB` / `35` FDs (`01:48:24Z`), `win-dell` `oxideswarm.exe` RSS `25.5–26.8 MB` across
+  H1–H13, and `0` leftover processes (`5_clean_stop` passed). Stays Partial pending a full `24 h`
+  3-machine run.
