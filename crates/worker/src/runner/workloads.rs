@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU32;
+#[cfg(feature = "3d")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -26,6 +28,9 @@ use crate::workspace::WorkspaceError;
 #[cfg(feature = "3d")]
 use super::capture::read_output_file;
 use super::capture::{append_note, cancellation, check_cancelled_now};
+use super::checkpoint::{
+    capture_tx_for_isolation, ProcessCheckpointCtx, PROCESS_CHECKPOINT_DIR_NAME,
+};
 #[cfg(not(windows))]
 use super::supervise::resolve_default_shell;
 #[cfg(windows)]
@@ -59,10 +64,13 @@ pub(crate) fn base_refusal(
 
 impl TaskRunner {
     /// Executes a `Command` or `ShellScript` task inside a persistent named workspace (`design 0039`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_workspace_workload(
         &self,
         task: &Task,
         ws: &WorkspaceRef,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
@@ -309,8 +317,29 @@ impl TaskRunner {
             task_env: ws_task_env,
         };
 
+        let cp_dir = tmp_dir.join(PROCESS_CHECKPOINT_DIR_NAME);
+        let cp_owned = checkpoint.cloned();
+        let cp_task_id = task.id;
+        let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_tx = capture_tx_for_isolation(checkpoint_tx, self.config.isolation);
+        let cp_ctx = match tokio::task::spawn_blocking(move || {
+            ProcessCheckpointCtx::prepare_and_restore(
+                cp_task_id,
+                cp_dir,
+                cp_owned.as_ref(),
+                cp_tx,
+                cp_poll,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(e)) => return fail(e),
+            Err(e) => return fail(format!("checkpoint preparation panicked: {e}")),
+        };
+
         let result = self
-            .execute_process_supervised_with_workspace(
+            .execute_process_supervised_with_checkpoint(
                 task.id,
                 &tree_dir,
                 &program,
@@ -323,6 +352,7 @@ impl TaskRunner {
                 cancel_rx,
                 start_time,
                 Some(ws_ctx),
+                Some(cp_ctx),
             )
             .await;
 
@@ -374,6 +404,8 @@ impl TaskRunner {
         env: &HashMap<String, String>,
         working_dir: Option<&PathBuf>,
         stdin: Option<&[u8]>,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
@@ -458,8 +490,51 @@ impl TaskRunner {
             sandbox.path().to_path_buf()
         };
 
+        let cp_dir = sandbox.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        let cp_owned = checkpoint.cloned();
+        let cp_task_id = task.id;
+        let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_tx = capture_tx_for_isolation(checkpoint_tx, self.config.isolation);
+        let cp_ctx = match tokio::task::spawn_blocking(move || {
+            ProcessCheckpointCtx::prepare_and_restore(
+                cp_task_id,
+                cp_dir,
+                cp_owned.as_ref(),
+                cp_tx,
+                cp_poll,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(e)) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Failed to initialize checkpoint directory: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint directory error: {e}")),
+                );
+            }
+            Err(e) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Checkpoint preparation panicked: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint preparation panicked: {e}")),
+                );
+            }
+        };
+
         let result = self
-            .execute_process_supervised(
+            .execute_process_supervised_with_checkpoint(
                 task.id,
                 sandbox.path(),
                 program,
@@ -471,6 +546,8 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
+                Some(cp_ctx),
             )
             .await;
 
@@ -491,6 +568,8 @@ impl TaskRunner {
         script: &str,
         interpreter: Option<&str>,
         env: &HashMap<String, String>,
+        checkpoint: Option<&CheckpointData>,
+        checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
         child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
@@ -612,8 +691,51 @@ impl TaskRunner {
             )
         };
 
+        let cp_dir = sandbox.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        let cp_owned = checkpoint.cloned();
+        let cp_task_id = task.id;
+        let cp_poll = self.config.checkpoint_poll_interval;
+        let cp_tx = capture_tx_for_isolation(checkpoint_tx, self.config.isolation);
+        let cp_ctx = match tokio::task::spawn_blocking(move || {
+            ProcessCheckpointCtx::prepare_and_restore(
+                cp_task_id,
+                cp_dir,
+                cp_owned.as_ref(),
+                cp_tx,
+                cp_poll,
+            )
+        })
+        .await
+        {
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(e)) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Failed to initialize checkpoint directory: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint directory error: {e}")),
+                );
+            }
+            Err(e) => {
+                let _ = sandbox.destroy().await;
+                return TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    "",
+                    format!("Checkpoint preparation panicked: {e}"),
+                    start_time.elapsed().as_millis() as u64,
+                    Some(format!("Checkpoint preparation panicked: {e}")),
+                );
+            }
+        };
+
         let result = self
-            .execute_process_supervised(
+            .execute_process_supervised_with_checkpoint(
                 task.id,
                 sandbox.path(),
                 &prog,
@@ -625,6 +747,8 @@ impl TaskRunner {
                 child_pid,
                 cancel_rx,
                 start_time,
+                None,
+                Some(cp_ctx),
             )
             .await;
 
@@ -1058,7 +1182,14 @@ impl TaskRunner {
         if engine == Engine3D::Sdf || engine == Engine3D::Auto {
             info!(task_id = %task.id, "Executing Tier 0 Procedural SDF engine");
             return self
-                .execute_tier0_sdf(task, spec, checkpoint_tx.clone(), start_time)
+                .execute_tier0_sdf(
+                    task,
+                    spec,
+                    checkpoint_tx.clone(),
+                    timeout,
+                    cancel_rx,
+                    start_time,
+                )
                 .await;
         }
 
@@ -1290,6 +1421,12 @@ impl TaskRunner {
         res
     }
 
+    /// Raises the cooperative stop flag when dropped (cancel, timeout, or future abort).
+    #[cfg(feature = "3d")]
+    fn make_stop_guard(stop: Arc<AtomicBool>) -> WorkloadStopOnDrop {
+        WorkloadStopOnDrop(stop)
+    }
+
     /// Direct Tier 0 Procedural Signed Distance Function mesh generator (< 50 ms)
     /// with incremental milestone progress checkpoints (25%, 50%, 75%, 100%).
     #[cfg(feature = "3d")]
@@ -1298,9 +1435,29 @@ impl TaskRunner {
         task: &Task,
         spec: &rusty_grid_core::task::Generative3DSpec,
         checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
+        timeout: Duration,
+        mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
         let task_id = task.id;
+
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            let err_msg = if reason.starts_with("Cancelled:") {
+                reason
+            } else {
+                format!("Cancelled: {reason}")
+            };
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_CANCELLED,
+                Bytes::new(),
+                Bytes::new(),
+                elapsed,
+                Some(err_msg),
+            );
+        }
 
         // Reject image input on SDF tier
         if spec.image_data.is_some() {
@@ -1319,73 +1476,128 @@ impl TaskRunner {
         }
 
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
-        let spec_clone = spec.clone();
-
-        let compute_handle = tokio::task::spawn_blocking(move || {
-            crate::gen3d::generate_procedural_3d_with_progress(&spec_clone, |frac, stage, msg| {
-                let _ = prog_tx.send((frac, stage, msg));
-            })
+        let tx_forward = checkpoint_tx.clone();
+        let forward_handle = tokio::spawn(async move {
+            let mut seq = 1u64;
+            while let Some((frac, stage, msg)) = prog_rx.recv().await {
+                if let Some(ref tx) = tx_forward {
+                    let delta = serde_json::json!({
+                        "progress": frac,
+                        "stage": stage,
+                        "message": msg,
+                    });
+                    let _ = tx
+                        .send(WorkerMessage::Checkpoint {
+                            task_id,
+                            sequence: seq,
+                            delta_state: Bytes::from(delta.to_string().into_bytes()),
+                        })
+                        .await;
+                    seq += 1;
+                }
+            }
         });
 
-        let mut seq = 1u64;
-        while let Some((frac, stage, msg)) = prog_rx.recv().await {
-            if let Some(ref tx) = checkpoint_tx {
-                let delta = serde_json::json!({
-                    "progress": frac,
-                    "stage": stage,
-                    "message": msg,
-                });
-                let _ = tx
-                    .send(WorkerMessage::Checkpoint {
-                        task_id,
-                        sequence: seq,
-                        delta_state: Bytes::from(delta.to_string().into_bytes()),
-                    })
-                    .await;
-                seq += 1;
-            }
-        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop_on_exit = Self::make_stop_guard(Arc::clone(&stop));
+        let stop_clone = Arc::clone(&stop);
+        let spec_clone = spec.clone();
 
-        match compute_handle.await {
-            Ok(Ok((glb_bytes, stats))) => {
+        let mut compute_handle = tokio::task::spawn_blocking(move || {
+            crate::gen3d::generate_procedural_3d_cancellable(
+                &spec_clone,
+                move |frac, stage, msg| {
+                    let _ = prog_tx.send((frac, stage, msg));
+                },
+                &|| stop_clone.load(Ordering::Relaxed),
+            )
+        });
+
+        tokio::select! {
+            biased;
+
+            reason = cancellation(&mut cancel_rx) => {
+                stop.store(true, Ordering::Release);
+                forward_handle.abort();
+                let _ = tokio::time::timeout(Duration::from_millis(200), &mut compute_handle).await;
                 let elapsed = start_time.elapsed().as_millis() as u64;
-                let mut res = TaskResult::success(
-                    self.worker_id,
-                    task_id,
-                    Bytes::from(format!(
-                        "Tier 0 procedural SDF mesh generated: {} vertices, {} triangles in {} ms\n",
-                        stats.vertex_count, stats.triangle_count, stats.execution_time_ms
-                    )),
-                    elapsed,
-                    false,
-                );
-                res = res.with_asset_bytes(Bytes::from(glb_bytes));
-                res = res.with_device_name("Procedural-SDF-PureRust");
-                res
-            }
-            Ok(Err(e)) => {
-                let elapsed = start_time.elapsed().as_millis() as u64;
+                let err_msg = if reason.starts_with("Cancelled:") {
+                    reason
+                } else {
+                    format!("Cancelled: {reason}")
+                };
                 TaskResult::failure(
                     self.worker_id,
                     task_id,
-                    EXIT_CODE_GENERAL_ERROR,
+                    EXIT_CODE_CANCELLED,
                     Bytes::new(),
-                    format!("Procedural SDF generation error: {e}"),
+                    Bytes::new(),
                     elapsed,
-                    Some(format!("SDF error: {e}")),
+                    Some(err_msg),
                 )
             }
-            Err(e) => {
+
+            _ = tokio::time::sleep(timeout) => {
+                stop.store(true, Ordering::Release);
+                forward_handle.abort();
+                let _ = tokio::time::timeout(Duration::from_millis(200), &mut compute_handle).await;
                 let elapsed = start_time.elapsed().as_millis() as u64;
+                let msg = format!("Task timed out after {}s", timeout.as_secs());
                 TaskResult::failure(
                     self.worker_id,
                     task_id,
-                    EXIT_CODE_GENERAL_ERROR,
+                    EXIT_CODE_TIMEOUT,
                     Bytes::new(),
-                    format!("Compute join error: {e}"),
+                    Bytes::from(msg.clone()),
                     elapsed,
-                    Some(format!("Join error: {e}")),
+                    Some(msg),
                 )
+            }
+
+            joined = &mut compute_handle => {
+                let _ = forward_handle.await;
+                match joined {
+                    Ok(Ok((glb_bytes, stats))) => {
+                        let elapsed = start_time.elapsed().as_millis() as u64;
+                        let mut res = TaskResult::success(
+                            self.worker_id,
+                            task_id,
+                            Bytes::from(format!(
+                                "Tier 0 procedural SDF mesh generated: {} vertices, {} triangles in {} ms\n",
+                                stats.vertex_count, stats.triangle_count, stats.execution_time_ms
+                            )),
+                            elapsed,
+                            false,
+                        );
+                        res = res.with_asset_bytes(Bytes::from(glb_bytes));
+                        res = res.with_device_name("Procedural-SDF-PureRust");
+                        res
+                    }
+                    Ok(Err(e)) => {
+                        let elapsed = start_time.elapsed().as_millis() as u64;
+                        TaskResult::failure(
+                            self.worker_id,
+                            task_id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            Bytes::new(),
+                            format!("Procedural SDF generation error: {e}"),
+                            elapsed,
+                            Some(format!("SDF error: {e}")),
+                        )
+                    }
+                    Err(e) => {
+                        let elapsed = start_time.elapsed().as_millis() as u64;
+                        TaskResult::failure(
+                            self.worker_id,
+                            task_id,
+                            EXIT_CODE_GENERAL_ERROR,
+                            Bytes::new(),
+                            format!("Compute join error: {e}"),
+                            elapsed,
+                            Some(format!("Join error: {e}")),
+                        )
+                    }
+                }
             }
         }
     }
@@ -1401,11 +1613,29 @@ impl TaskRunner {
         _checkpoint: Option<&CheckpointData>,
         checkpoint_tx: Option<mpsc::Sender<WorkerMessage>>,
         timeout: Duration,
-        _child_pid: Option<Arc<AtomicU32>>,
+        child_pid: Option<Arc<AtomicU32>>,
         mut cancel_rx: Option<oneshot::Receiver<String>>,
         start_time: Instant,
     ) -> TaskResult {
         let task_id = task.id;
+        if let Some(reason) = check_cancelled_now(&mut cancel_rx) {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            let err_msg = if reason.starts_with("Cancelled:") {
+                reason
+            } else {
+                format!("Cancelled: {reason}")
+            };
+            return TaskResult::failure(
+                self.worker_id,
+                task_id,
+                EXIT_CODE_CANCELLED,
+                Bytes::new(),
+                Bytes::new(),
+                elapsed,
+                Some(err_msg),
+            );
+        }
+
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
         let tx_forward = checkpoint_tx.clone();
 
@@ -1431,69 +1661,48 @@ impl TaskRunner {
             }
         });
 
-        let compute_fut =
-            crate::autorig::auto_rig_mesh_async(self, task_id, spec, move |frac, stage, msg| {
+        let result = crate::autorig::auto_rig_mesh_async_supervised(
+            self,
+            task_id,
+            spec,
+            timeout,
+            child_pid,
+            cancel_rx,
+            start_time,
+            move |frac, stage, msg| {
                 let _ = prog_tx.send((frac, stage, msg.to_string()));
-            });
+            },
+        )
+        .await;
 
-        tokio::select! {
-            result = tokio::time::timeout(timeout, compute_fut) => {
+        match result {
+            Ok(outcome) => {
                 let _ = forward_handle.await;
-                match result {
-                    Ok(Ok(glb_bytes)) => {
-                        let elapsed = start_time.elapsed().as_millis() as u64;
-                        let mut res = TaskResult::success(
-                            self.worker_id,
-                            task.id,
-                            Bytes::from(format!(
-                                "Auto-rigging completed successfully: {} bytes .glb generated in {} ms\n",
-                                glb_bytes.len(),
-                                elapsed
-                            )),
-                            elapsed,
-                            false,
-                        );
-                        res = res.with_asset_bytes(Bytes::from(glb_bytes));
-                        res = res.with_device_name("OxideSwarm-AutoRig-Engine");
-                        res
-                    }
-                    Ok(Err(e)) => {
-                        let elapsed = start_time.elapsed().as_millis() as u64;
-                        TaskResult::failure(
-                            self.worker_id,
-                            task.id,
-                            EXIT_CODE_GENERAL_ERROR,
-                            Bytes::new(),
-                            Bytes::from(format!("Auto-rigging execution error: {e}")),
-                            elapsed,
-                            Some(format!("Auto-rig error: {e}")),
-                        )
-                    }
-                    Err(_) => {
-                        let elapsed = start_time.elapsed().as_millis() as u64;
-                        TaskResult::failure(
-                            self.worker_id,
-                            task.id,
-                            EXIT_CODE_TIMEOUT,
-                            Bytes::new(),
-                            Bytes::from(format!("Auto-rigging task timed out after {}s", timeout.as_secs())),
-                            elapsed,
-                            Some("Task timed out".to_string()),
-                        )
-                    }
-                }
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                let mut res = TaskResult::success(
+                    self.worker_id,
+                    task.id,
+                    Bytes::from(format!(
+                        "Auto-rigging completed successfully (provider: {}): {} bytes .glb generated in {} ms\n",
+                        outcome.provider.as_str(),
+                        outcome.glb_bytes.len(),
+                        elapsed
+                    )),
+                    elapsed,
+                    false,
+                );
+                res = res.with_asset_bytes(Bytes::from(outcome.glb_bytes));
+                res = res.with_device_name(outcome.provider.device_name());
+                res
             }
-
-            cancel_msg = async {
-                if let Some(ref mut rx) = cancel_rx {
-                    rx.await.ok()
-                } else {
-                    std::future::pending().await
-                }
-            } => {
+            Err(crate::autorig::WorkerError::Cancelled(reason)) => {
                 forward_handle.abort();
                 let elapsed = start_time.elapsed().as_millis() as u64;
-                let reason = cancel_msg.unwrap_or_else(|| "Task cancelled by master".to_string());
+                let err_msg = if reason.starts_with("Cancelled:") {
+                    reason
+                } else {
+                    format!("Cancelled: {reason}")
+                };
                 TaskResult::failure(
                     self.worker_id,
                     task.id,
@@ -1501,9 +1710,45 @@ impl TaskRunner {
                     Bytes::new(),
                     Bytes::new(),
                     elapsed,
-                    Some(format!("Cancelled: {reason}")),
+                    Some(err_msg),
+                )
+            }
+            Err(crate::autorig::WorkerError::TimedOut(msg)) => {
+                forward_handle.abort();
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_TIMEOUT,
+                    Bytes::new(),
+                    Bytes::from(msg.clone()),
+                    elapsed,
+                    Some(msg),
+                )
+            }
+            Err(e) => {
+                let _ = forward_handle.await;
+                let elapsed = start_time.elapsed().as_millis() as u64;
+                TaskResult::failure(
+                    self.worker_id,
+                    task.id,
+                    EXIT_CODE_GENERAL_ERROR,
+                    Bytes::new(),
+                    Bytes::from(format!("Auto-rigging execution error: {e}")),
+                    elapsed,
+                    Some(format!("Auto-rig error: {e}")),
                 )
             }
         }
+    }
+}
+
+#[cfg(feature = "3d")]
+struct WorkloadStopOnDrop(Arc<AtomicBool>);
+
+#[cfg(feature = "3d")]
+impl Drop for WorkloadStopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }

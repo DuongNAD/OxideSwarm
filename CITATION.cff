@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+title: "OxideSwarm"
+abstract: "A zero-broker distributed compute grid and cross-platform agent mesh written in Rust that turns machines you own into a compute grid for builds, tests, and coding agents."
+authors:
+  - name: "The OxideSwarm Authors"
+version: "0.4.5"
+date-released: "2026-11-25"
+license:
+  - MIT
+  - Apache-2.0
+repository-code: "https://github.com/DuongNAD/OxideSwarm"
+keywords:
+  - distributed-computing
+  - rust
+  - compute-grid
+  - p2p
+  - mcp
+  - coding-agents

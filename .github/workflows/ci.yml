@@ -155,6 +155,49 @@ jobs:
         run: cargo build -p agent_mesh --locked
       - name: run Rust hub + Python agent interop suites
         run: python tests/test_agent_mesh_rust_hub_cross_interop.py
+      - name: build CLI and agent mesh binaries for Wave 2 E2E tests
+        if: matrix.os != 'windows-latest'
+        run: cargo build -p rusty_grid_cli -p agent_mesh --locked
+      - name: run Wave 2 E2E tests
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPISO="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/oxs_e2e.XXXXXX")"
+          trap 'rm -rf "$TMPISO"' EXIT
+          chmod 700 "$TMPISO"
+          mkdir -p "$TMPISO/bin" "$TMPISO/home" "$TMPISO/tmp"
+          printf '#!/bin/sh\necho "Now drawing from '\''AC Power'\''"\nexit 0\n' > "$TMPISO/bin/pmset"
+          chmod 755 "$TMPISO/bin/pmset"
+          REAL_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          REAL_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTUP_HOME="$REAL_RUSTUP_HOME" CARGO_HOME="$REAL_CARGO_HOME" \
+            HOME="$TMPISO/home" USERPROFILE="$TMPISO/home" TMPDIR="$TMPISO/tmp" PATH="$TMPISO/bin:$PATH" \
+            RUSTY_GRID_NO_BATTERY=1 OXIDESWARM_PROFILE=debug \
+            python3 -m unittest tests/test_wave2_e2e.py -v
+      - name: build CLI (--features 3d) and agent mesh binaries for Wave 3 E2E tests
+        if: matrix.os != 'windows-latest'
+        run: |
+          cargo build -p rusty_grid_cli --bin oxideswarm --features 3d --locked
+          cargo build -p agent_mesh --bin agent-mesh --locked
+      - name: run Wave 3 E2E tests
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPISO="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/oxs_e2e.XXXXXX")"
+          trap 'rm -rf "$TMPISO"' EXIT
+          chmod 700 "$TMPISO"
+          mkdir -p "$TMPISO/bin" "$TMPISO/home" "$TMPISO/tmp"
+          printf '#!/bin/sh\necho "Now drawing from '\''AC Power'\''"\nexit 0\n' > "$TMPISO/bin/pmset"
+          chmod 755 "$TMPISO/bin/pmset"
+          REAL_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          REAL_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          RUSTUP_HOME="$REAL_RUSTUP_HOME" CARGO_HOME="$REAL_CARGO_HOME" \
+            HOME="$TMPISO/home" USERPROFILE="$TMPISO/home" TMPDIR="$TMPISO/tmp" PATH="$TMPISO/bin:$PATH" \
+            RUSTY_GRID_NO_BATTERY=1 RUSTY_GRID_DISABLE_DISCOVERY=1 RUSTY_GRID_P2P_MINIMAL=1 \
+            OXIDESWARM_PROFILE=debug OXIDESWARM_E2E_TIER=all PYTHONDONTWRITEBYTECODE=1 \
+            python3 -B -m unittest tests/test_wave3_e2e.py -v
 
   workspace-test:
     # Full Cargo workspace test suite (`tests/` and `crates/*/tests/` included).
@@ -307,6 +350,7 @@ jobs:
       - run: python tests/test_m1_challenger_hygiene.py
       - run: python tests/test_release_skew.py
       - run: python tests/test_bench_grid.py
+      - run: python -B benchmarks/grid/test_bench_shard.py
       - run: python tests/test_scale_harness.py
       - run: python tests/test_bench_sweep.py
       - run: python tests/test_campaign_driver.py
@@ -316,14 +360,19 @@ jobs:
         run: python tests/run_mesh_simulation_tests.py
 
   release-skew:
-    # PROTO-2, design 0076 D2: the newest release and the pull request's build, in three pairs on loopback.
-    # The expected verdict of each pair follows from the two builds' protocol constants and the one-version
-    # window (design 0083); a pair that differs from it fails, as does a refusal that prints no version error.
-    # Not a required check.
+    # PROTO-2 (design 0076 D2) & PROTO-5 (design 0083): test both the newest release and the pinned
+    # release one protocol back (PREVIOUS_PROTOCOL_RELEASE) against the pull request's build, in three
+    # pairs on loopback. The expected verdict of each pair follows from the two builds' protocol
+    # constants and the one-version window (design 0083); a pair that differs from it fails, as does
+    # a refusal that prints no version error. Not a required check.
     name: release skew (ubuntu-latest)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # PROTO-5 (design 0083): pinned release one protocol back (protocol 9 while CURRENT=10, MIN=9).
+      # Move this pin at each wire change.
+      PREVIOUS_PROTOCOL_RELEASE: v0.3.0
     permissions:
       contents: read
     steps:
@@ -337,33 +386,43 @@ jobs:
         with:
           python-version: '3.12'
       - run: cargo build --locked --bin oxideswarm
-      - name: download the newest release and run the skew script
+      - name: download releases and run the skew script
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
-          if [ -z "$tag" ]; then
+          latest_tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -z "$latest_tag" ]; then
             echo "::notice::No release exists yet, so there is nothing to run against the pull request's build."
             echo "### Release skew" >> "$GITHUB_STEP_SUMMARY"
             echo "No release exists yet." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          ver="${tag#v}"
-          name="oxideswarm-${ver}-x86_64-unknown-linux-gnu"
-          dl="$RUNNER_TEMP/release-dl"
-          out="$RUNNER_TEMP/release-bin"
-          mkdir -p "$dl" "$out"
-          gh release download "$tag" -p "${name}.tar.gz" -p SHA256SUMS -D "$dl"
-          (cd "$dl" && grep -F "  ${name}.tar.gz" SHA256SUMS | sha256sum -c -)
-          tar -xzf "$dl/${name}.tar.gz" -C "$out"
-          # The release's protocol constants give the expected verdict of each pair (design 0083).
-          gh api -H "Accept: application/vnd.github.raw" \
-            "repos/${GH_REPO}/contents/crates/core/src/protocol.rs?ref=${tag}" > "$dl/protocol.rs"
-          echo "Release ${tag} against the pull request build"
-          python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm \
-            --release-protocol-rs "$dl/protocol.rs"
+          tags=("$latest_tag")
+          if [ -n "${PREVIOUS_PROTOCOL_RELEASE:-}" ] && [ "${PREVIOUS_PROTOCOL_RELEASE}" != "${latest_tag}" ]; then
+            tags+=("${PREVIOUS_PROTOCOL_RELEASE}")
+          fi
+          overall_rc=0
+          for tag in "${tags[@]}"; do
+            ver="${tag#v}"
+            name="oxideswarm-${ver}-x86_64-unknown-linux-gnu"
+            dl="$RUNNER_TEMP/release-dl/${tag}"
+            out="$RUNNER_TEMP/release-bin/${tag}"
+            mkdir -p "$dl" "$out"
+            gh release download "$tag" -p "${name}.tar.gz" -p SHA256SUMS -D "$dl"
+            (cd "$dl" && grep -F "  ${name}.tar.gz" SHA256SUMS | sha256sum -c -)
+            tar -xzf "$dl/${name}.tar.gz" -C "$out"
+            # The release's protocol constants give the expected verdict of each pair (design 0083).
+            gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${GH_REPO}/contents/crates/core/src/protocol.rs?ref=${tag}" > "$dl/protocol.rs"
+            echo "Release ${tag} against the pull request build"
+            if ! python3 -I scripts/release_skew.py "$out/${name}/oxideswarm" target/debug/oxideswarm \
+              --release-protocol-rs "$dl/protocol.rs" --release-tag "$tag"; then
+              overall_rc=1
+            fi
+          done
+          exit "$overall_rc"
 
   audit:
     name: cargo audit

@@ -565,26 +565,27 @@ async fn test_cli_deeply_nested_output_directory_creation() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // 3. Submit 3D task with deeply nested output path via spawned CLI binary
-    let output = cli_command(temp_home.path())
-        .arg("submit")
-        .arg("--master")
-        .arg(master_addr.to_string())
-        .arg("--type")
-        .arg("3d")
-        .arg("--prompt")
-        .arg("an obsidian monolith")
-        .arg("--quality")
-        .arg("fast")
-        .arg("--engine")
-        .arg("sdf")
-        .arg("--export-texture")
-        .arg("--wait")
-        .arg("--json")
-        .arg("-o")
-        .arg(&deeply_nested_out)
-        .output()
-        .await
-        .expect("spawn submit command");
+    let output = rusty_grid_core::process_spawn::output_tokio(
+        cli_command(temp_home.path())
+            .arg("submit")
+            .arg("--master")
+            .arg(master_addr.to_string())
+            .arg("--type")
+            .arg("3d")
+            .arg("--prompt")
+            .arg("an obsidian monolith")
+            .arg("--quality")
+            .arg("fast")
+            .arg("--engine")
+            .arg("sdf")
+            .arg("--export-texture")
+            .arg("--wait")
+            .arg("--json")
+            .arg("-o")
+            .arg(&deeply_nested_out),
+    )
+    .await
+    .expect("spawn submit command");
 
     assert!(
         output.status.success(),

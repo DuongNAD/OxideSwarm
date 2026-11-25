@@ -12,7 +12,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 authors = ["The OxideSwarm Authors"]
 license = "MIT OR Apache-2.0"
@@ -63,7 +63,7 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "1.2"
 
 # System monitoring
-sysinfo = "0.30"
+sysinfo = "0.38.4"
 
 # Embedded P2P NAT Traversal
 iroh = { version = "1.2", default-features = false, features = ["tls-ring", "portmapper"] }

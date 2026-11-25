@@ -1,0 +1,111 @@
+{
+  "benchmark": "ADOPT-3 M15 scripted Quick start from empty HOME",
+  "measure": "M15",
+  "date_utc": "2026-11-23T21:33:26Z",
+  "git": {
+    "commit": "2738cc005b1d9dd15653eb7af4e2721150235596",
+    "dirty_tree": false
+  },
+  "release_version": "0.4.4",
+  "target": "x86_64-unknown-linux-gnu",
+  "local_archive_http": true,
+  "attestation_checked": false,
+  "installed_binary_version": "rusty-grid 0.4.4",
+  "hardware": {
+    "cpu_model": "VirtualApple @ 2.50GHz",
+    "cores": 10,
+    "ram_bytes": 8319504384
+  },
+  "os": {
+    "system": "Linux",
+    "release": "7.0.14-linuxkit",
+    "version": "#1 SMP PREEMPT Fri Oct 16 11:55:50 UTC 2026",
+    "machine": "x86_64"
+  },
+  "network": "loopback (127.0.0.1), single machine",
+  "power": "no battery found",
+  "load_average_before": [
+    0.12,
+    0.08,
+    0.03
+  ],
+  "load_average_after": [
+    0.11,
+    0.08,
+    0.03
+  ],
+  "python": "3.13.5",
+  "note": "Docker rust:1.96 linux/amd64 on Apple M5 host (Rosetta/emulation), no gh CLI installed (SHA256SUMS verified)",
+  "summary": {
+    "install_s": {
+      "median": 0.808,
+      "min": 0.794,
+      "max": 0.816,
+      "runs": 3
+    },
+    "master_ready_s": {
+      "median": 0.112,
+      "min": 0.105,
+      "max": 0.112,
+      "runs": 3
+    },
+    "worker_ready_s": {
+      "median": 0.416,
+      "min": 0.406,
+      "max": 0.418,
+      "runs": 3
+    },
+    "first_submit_s": {
+      "median": 0.098,
+      "min": 0.097,
+      "max": 0.099,
+      "runs": 3
+    },
+    "total_s": {
+      "median": 1.434,
+      "min": 1.412,
+      "max": 1.445,
+      "runs": 3
+    },
+    "all_attestation_checked": false,
+    "all_succeeded": true
+  },
+  "runs": [
+    {
+      "run": 1,
+      "install_s": 0.816,
+      "master_ready_s": 0.112,
+      "worker_ready_s": 0.416,
+      "first_submit_s": 0.098,
+      "total_s": 1.445,
+      "attestation_checked": false,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 270,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    },
+    {
+      "run": 2,
+      "install_s": 0.794,
+      "master_ready_s": 0.112,
+      "worker_ready_s": 0.406,
+      "first_submit_s": 0.097,
+      "total_s": 1.412,
+      "attestation_checked": false,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 270,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    },
+    {
+      "run": 3,
+      "install_s": 0.808,
+      "master_ready_s": 0.105,
+      "worker_ready_s": 0.418,
+      "first_submit_s": 0.099,
+      "total_s": 1.434,
+      "attestation_checked": false,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 270,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    }
+  ]
+}

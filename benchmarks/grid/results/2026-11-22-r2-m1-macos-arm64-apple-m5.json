@@ -1,0 +1,282 @@
+{
+  "benchmark": "ax2-shard-r2-m1",
+  "date_utc": "2026-11-22T03:55:25Z",
+  "plan": {
+    "question_r2": "How much wall time does sharding this repository's unit tests over 3 workers save via today's `submit`?",
+    "question_m1": "Does `oxideswarm shard --count 3` finish in <= 0.50x of 1-worker time?",
+    "stop_rule": "R2 savings < 30% triggers guide-only stop rule",
+    "scope": "single-host loopback (127.0.0.1); NOT 3 physical machines"
+  },
+  "git": {
+    "commit": "c1b179e6005f4d663da30754472e868c846eeacb",
+    "dirty_tree": true
+  },
+  "binary": {
+    "profile": "release",
+    "version": "rusty-grid 0.4.4"
+  },
+  "hardware": {
+    "cpu_model": "Apple M5",
+    "cores": 10,
+    "ram_bytes": 34359738368
+  },
+  "os": {
+    "system": "Darwin",
+    "release": "27.2.0",
+    "version": "Darwin Kernel Version 27.2.0: Wed Oct 14 23:48:06 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T8142",
+    "machine": "arm64"
+  },
+  "network": "single-host loopback (127.0.0.1); NOT 3 physical machines",
+  "power": [
+    "Now drawing from 'AC Power'",
+    " -InternalBattery-0 (id=36700259)\t100%; charged; 0:00 remaining present: true"
+  ],
+  "load_average_before": [
+    7.44,
+    14.24,
+    12.48
+  ],
+  "load_average_after": [
+    2.95,
+    6.65,
+    9.88
+  ],
+  "python": "3.11.8",
+  "note": "Single-host loopback R2/M1 evaluation across 1..3 local workers sharing host CPU cores",
+  "parameters": {
+    "packages": [
+      "rusty_grid_core",
+      "rusty_grid_master"
+    ],
+    "test_count": 725,
+    "worker_counts": [
+      1,
+      2,
+      3
+    ],
+    "runs_per_worker_count": 3,
+    "warmup_runs": 1,
+    "worker_threads": 2,
+    "quick": false
+  },
+  "r2_submit": {
+    "by_workers": {
+      "1": {
+        "median": 56.0518,
+        "min": 54.7751,
+        "max": 68.1796,
+        "runs": 3
+      },
+      "2": {
+        "median": 37.469,
+        "min": 34.3722,
+        "max": 37.5403,
+        "runs": 3
+      },
+      "3": {
+        "median": 27.3183,
+        "min": 25.1812,
+        "max": 27.8366,
+        "runs": 3
+      }
+    },
+    "evaluation": {
+      "wall_1w_s": 56.0518,
+      "wall_3w_s": 27.3183,
+      "savings_pct": 51.26,
+      "stop_rule_threshold_pct": 30.0,
+      "stop_rule_triggered": false
+    }
+  },
+  "m1_shard": {
+    "by_workers": {
+      "1": {
+        "wall_s": {
+          "median": 54.8547,
+          "min": 52.4554,
+          "max": 65.2391,
+          "runs": 3
+        },
+        "waited_ms": {
+          "median": 54846,
+          "min": 52446,
+          "max": 65228,
+          "runs": 3
+        },
+        "task_time_sum_ms": {
+          "median": 54843,
+          "min": 52443,
+          "max": 55452,
+          "runs": 3
+        },
+        "machines_median": 1
+      },
+      "2": {
+        "wall_s": {
+          "median": 34.3575,
+          "min": 34.177,
+          "max": 36.0096,
+          "runs": 3
+        },
+        "waited_ms": {
+          "median": 34351,
+          "min": 34169,
+          "max": 36000,
+          "runs": 3
+        },
+        "task_time_sum_ms": {
+          "median": 62004,
+          "min": 61319,
+          "max": 64629,
+          "runs": 3
+        },
+        "machines_median": 2
+      },
+      "3": {
+        "wall_s": {
+          "median": 27.7609,
+          "min": 25.5403,
+          "max": 28.114,
+          "runs": 3
+        },
+        "waited_ms": {
+          "median": 27754,
+          "min": 25534,
+          "max": 28107,
+          "runs": 3
+        },
+        "task_time_sum_ms": {
+          "median": 70305,
+          "min": 61880,
+          "max": 70959,
+          "runs": 3
+        },
+        "machines_median": 3
+      }
+    },
+    "evaluation": {
+      "wall_1w_s": 54.8547,
+      "wall_3w_s": 27.7609,
+      "ratio_3w_to_1w": 0.5061,
+      "target_max_ratio": 0.5,
+      "target_met": false
+    }
+  },
+  "raw": {
+    "r2_submit": {
+      "1": [
+        54.7751,
+        68.1796,
+        56.0518
+      ],
+      "2": [
+        34.3722,
+        37.5403,
+        37.469
+      ],
+      "3": [
+        27.8366,
+        27.3183,
+        25.1812
+      ]
+    },
+    "m1_shard": {
+      "1": [
+        {
+          "wall_s": 65.2391,
+          "status": "completed",
+          "total_shards": 1,
+          "completed_shards": 1,
+          "failed_shards": 0,
+          "machines": 1,
+          "waited_ms": 65228,
+          "task_time_sum_ms": 55452
+        },
+        {
+          "wall_s": 54.8547,
+          "status": "completed",
+          "total_shards": 1,
+          "completed_shards": 1,
+          "failed_shards": 0,
+          "machines": 1,
+          "waited_ms": 54846,
+          "task_time_sum_ms": 54843
+        },
+        {
+          "wall_s": 52.4554,
+          "status": "completed",
+          "total_shards": 1,
+          "completed_shards": 1,
+          "failed_shards": 0,
+          "machines": 1,
+          "waited_ms": 52446,
+          "task_time_sum_ms": 52443
+        }
+      ],
+      "2": [
+        {
+          "wall_s": 34.177,
+          "status": "completed",
+          "total_shards": 2,
+          "completed_shards": 2,
+          "failed_shards": 0,
+          "machines": 2,
+          "waited_ms": 34169,
+          "task_time_sum_ms": 61319
+        },
+        {
+          "wall_s": 34.3575,
+          "status": "completed",
+          "total_shards": 2,
+          "completed_shards": 2,
+          "failed_shards": 0,
+          "machines": 2,
+          "waited_ms": 34351,
+          "task_time_sum_ms": 62004
+        },
+        {
+          "wall_s": 36.0096,
+          "status": "completed",
+          "total_shards": 2,
+          "completed_shards": 2,
+          "failed_shards": 0,
+          "machines": 2,
+          "waited_ms": 36000,
+          "task_time_sum_ms": 64629
+        }
+      ],
+      "3": [
+        {
+          "wall_s": 25.5403,
+          "status": "completed",
+          "total_shards": 3,
+          "completed_shards": 3,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 25534,
+          "task_time_sum_ms": 61880
+        },
+        {
+          "wall_s": 28.114,
+          "status": "completed",
+          "total_shards": 3,
+          "completed_shards": 3,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 28107,
+          "task_time_sum_ms": 70959
+        },
+        {
+          "wall_s": 27.7609,
+          "status": "completed",
+          "total_shards": 3,
+          "completed_shards": 3,
+          "failed_shards": 0,
+          "machines": 3,
+          "waited_ms": 27754,
+          "task_time_sum_ms": 70305
+        }
+      ]
+    }
+  }
+}

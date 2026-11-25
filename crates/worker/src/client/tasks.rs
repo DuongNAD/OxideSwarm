@@ -711,19 +711,36 @@ impl WorkerClient {
             let checkpoint_tx = negotiated
                 .contains(ProtocolCapabilities::CHECKPOINT_DELTA)
                 .then_some(cp_tx);
-            let forward_checkpoint = |cp_msg: WorkerMessage| {
-                let mut sent = false;
-                if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
-                    if tx.try_send(cp_msg.clone()).is_ok() {
-                        sent = true;
+            let forward_checkpoint = |cp_msg: WorkerMessage, is_final: bool| {
+                let session_data_tx = &session_data_tx;
+                let outbound_tx = &outbound_tx;
+                let resume_window_active = &resume_window_active;
+                let pending_resume_outbox = &pending_resume_outbox;
+                async move {
+                    let mut sent = false;
+                    if let Some(tx) = current_tx(session_data_tx, outbound_tx) {
+                        match tx.try_send(cp_msg.clone()) {
+                            Ok(()) => sent = true,
+                            Err(mpsc::error::TrySendError::Full(msg))
+                                if is_final && !resume_window_active.load(Ordering::Acquire) =>
+                            {
+                                if tokio::time::timeout(Duration::from_millis(200), tx.send(msg))
+                                    .await
+                                    .is_ok_and(|r| r.is_ok())
+                                {
+                                    sent = true;
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
-                }
-                if !sent && resume_window_active.load(Ordering::Acquire) {
-                    let mut outbox = pending_resume_outbox
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if !outbox.cancelled.contains(&task_id) {
-                        outbox.checkpoints.insert(task_id, cp_msg);
+                    if !sent && resume_window_active.load(Ordering::Acquire) {
+                        let mut outbox = pending_resume_outbox
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if !outbox.cancelled.contains(&task_id) {
+                            outbox.checkpoints.insert(task_id, cp_msg);
+                        }
                     }
                 }
             };
@@ -743,7 +760,7 @@ impl WorkerClient {
                     tokio::select! {
                         res = &mut exec_fut => break res,
                         Some(cp_msg) = cp_rx.recv() => {
-                            forward_checkpoint(cp_msg);
+                            forward_checkpoint(cp_msg, false).await;
                         }
                         reason = cancellation(&mut cancel_slot) => {
                             if let Some(tx) = exec_cancel_tx.take() {
@@ -759,7 +776,7 @@ impl WorkerClient {
                 }
             };
             while let Ok(cp_msg) = cp_rx.try_recv() {
-                forward_checkpoint(cp_msg);
+                forward_checkpoint(cp_msg, true).await;
             }
 
             // Output files reach the Master's blob store before the result that names them.
@@ -1067,6 +1084,36 @@ impl WorkerClient {
                     warn!("A cancelled task did not stop within the drain timeout; aborting it");
                     join.abort();
                 }
+            }
+        }
+        count
+    }
+
+    /// Gracefully stops active tasks on worker shutdown within `drain_timeout` so process tasks
+    /// can emit final checkpoints before `Disconnecting` is sent. Returns `0` immediately when idle.
+    pub(super) async fn drain_active_tasks_for_shutdown(&self, drain_timeout: Duration) -> usize {
+        let handles: Vec<TaskExecutionHandle> = {
+            let mut lock = self.active_task_table.write().await;
+            lock.drain().map(|(_, handle)| handle).collect()
+        };
+        if handles.is_empty() {
+            return 0;
+        }
+        let count = handles.len();
+        info!(
+            worker_id = %self.worker_id,
+            tasks = count,
+            "Draining active tasks for final checkpoint flush before worker disconnect"
+        );
+        let joins: Vec<JoinHandle<()>> = handles
+            .into_iter()
+            .filter_map(|handle| Self::begin_stop(handle, "Graceful worker checkpoint drain"))
+            .collect();
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        for mut join in joins {
+            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
+                warn!("Active task did not finish checkpoint drain within timeout; aborting it");
+                join.abort();
             }
         }
         count

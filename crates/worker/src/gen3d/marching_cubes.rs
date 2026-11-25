@@ -26,6 +26,18 @@ pub const EDGE_CORNERS: [(usize, usize); 12] = [
 
 /// Extracts an isosurface mesh from an SDF preset at the given grid resolution.
 pub fn extract_isosurface(preset: &SdfPreset, resolution: usize) -> Result<RawMesh, String> {
+    extract_isosurface_cancellable(preset, resolution, &|| false)
+}
+
+/// Extracts an isosurface mesh with cooperative cancellation checks per slice.
+pub fn extract_isosurface_cancellable(
+    preset: &SdfPreset,
+    resolution: usize,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<RawMesh, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
     let (min_b, max_b) = preset.bounds();
 
     let nx = resolution;
@@ -46,6 +58,9 @@ pub fn extract_isosurface(preset: &SdfPreset, resolution: usize) -> Result<RawMe
     // 1. Pre-sample grid scalar field in flat buffer
     let mut grid_vals = Vec::with_capacity(total_corners);
     for k in 0..corners_z {
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let z = min_b.z + (k as f32) * dz;
         for j in 0..corners_y {
             let y = min_b.y + (j as f32) * dy;
@@ -91,6 +106,9 @@ pub fn extract_isosurface(preset: &SdfPreset, resolution: usize) -> Result<RawMe
 
     // 3. March over each cubic cell
     for k in 0..nz {
+        if should_stop() {
+            return Err("Cancelled".to_string());
+        }
         for j in 0..ny {
             for i in 0..nx {
                 // Fetch 8 corner values

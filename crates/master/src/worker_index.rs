@@ -159,11 +159,20 @@ const KNOWN_FEATURES: ProtocolCapabilities = ProtocolCapabilities(
         | ProtocolCapabilities::TREE_V2.0,
 );
 
+/// Capability and feature requirements passed into worker bitset filtering (`3D-2`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CapRequirements {
+    pub(crate) requires_gpu: bool,
+    pub(crate) requires_blender: bool,
+    pub(crate) required_features: ProtocolCapabilities,
+}
+
 /// Attribute bitset index over any slice of `WorkerInfo`.
 pub(crate) struct WorkerAttrIndex {
     all: BitSet,
     connected: BitSet,
     gpu: BitSet,
+    blender: BitSet,
     by_os: HashMap<String, BitSet>,
     by_arch: HashMap<String, BitSet>,
     by_worker_id: HashMap<Uuid, BitSet>,
@@ -186,6 +195,7 @@ impl WorkerAttrIndex {
         let all = BitSet::filled(len);
         let mut connected = BitSet::new(len);
         let mut gpu = BitSet::new(len);
+        let mut blender = BitSet::new(len);
         let mut by_os: HashMap<String, BitSet> = HashMap::new();
         let mut by_arch: HashMap<String, BitSet> = HashMap::new();
         let mut by_worker_id: HashMap<Uuid, BitSet> = HashMap::with_capacity(len);
@@ -211,6 +221,9 @@ impl WorkerAttrIndex {
             }
             if worker.capabilities.can_execute_gpu() {
                 gpu.set(idx);
+            }
+            if worker.capabilities.has_blender {
+                blender.set(idx);
             }
             by_worker_id
                 .entry(worker.worker_id)
@@ -291,6 +304,7 @@ impl WorkerAttrIndex {
             all,
             connected,
             gpu,
+            blender,
             by_os,
             by_arch,
             by_worker_id,
@@ -397,50 +411,71 @@ impl WorkerAttrIndex {
         true
     }
 
-    /// Narrows `mask` in place by GPU & protocol features; returns `false` if empty.
-    pub(crate) fn apply_caps_and_features(
-        &self,
-        mask: &mut BitSet,
-        requires_gpu: bool,
-        required_features: ProtocolCapabilities,
-    ) -> bool {
-        if requires_gpu {
+    /// Narrows `mask` in place by GPU, Blender, & protocol features; returns `false` if empty.
+    pub(crate) fn apply_caps_and_features(&self, mask: &mut BitSet, caps: CapRequirements) -> bool {
+        if caps.requires_gpu {
             mask.and_assign(&self.gpu);
             if mask.is_empty() {
                 return false;
             }
         }
-        if required_features.contains(ProtocolCapabilities::FILE_STAGING) {
+        if caps.requires_blender {
+            mask.and_assign(&self.blender);
+            if mask.is_empty() {
+                return false;
+            }
+        }
+        if caps
+            .required_features
+            .contains(ProtocolCapabilities::FILE_STAGING)
+        {
             mask.and_assign(&self.feat_file_staging);
             if mask.is_empty() {
                 return false;
             }
         }
-        if required_features.contains(ProtocolCapabilities::BLOB_TRANSFER) {
+        if caps
+            .required_features
+            .contains(ProtocolCapabilities::BLOB_TRANSFER)
+        {
             mask.and_assign(&self.feat_blob_transfer);
             if mask.is_empty() {
                 return false;
             }
         }
-        if required_features.contains(ProtocolCapabilities::THREE_D) {
+        if caps
+            .required_features
+            .contains(ProtocolCapabilities::THREE_D)
+        {
             mask.and_assign(&self.feat_three_d);
             if mask.is_empty() {
                 return false;
             }
         }
-        if required_features.contains(ProtocolCapabilities::WORKSPACES) {
+        if caps
+            .required_features
+            .contains(ProtocolCapabilities::WORKSPACES)
+        {
             mask.and_assign(&self.feat_workspaces);
             if mask.is_empty() {
                 return false;
             }
         }
-        if required_features.contains(ProtocolCapabilities::TREE_V2) {
+        if caps
+            .required_features
+            .contains(ProtocolCapabilities::TREE_V2)
+        {
             mask.and_assign(&self.feat_tree_v2);
             if mask.is_empty() {
                 return false;
             }
         }
         true
+    }
+
+    #[inline]
+    pub(crate) fn any_has_blender(&self) -> bool {
+        !self.blender.is_empty()
     }
 
     #[inline]
@@ -452,23 +487,33 @@ impl WorkerAttrIndex {
         self.apply_placement(&mut mask, placement)
     }
 
-    /// Returns whether any indexed GPU worker satisfies `requirements` and `placement`.
+    /// Returns whether any indexed GPU worker satisfies `requirements`, `req_vram`,
+    /// `requires_blender`, and `placement`.
     #[inline]
     pub(crate) fn any_gpu_fits(
         &self,
         workers: &[WorkerInfo],
         requirements: &TaskRequirements,
+        req_vram: u64,
+        requires_blender: bool,
         placement: &Placement,
     ) -> bool {
         if self.gpu.is_empty() {
             return false;
         }
         let mut mask = self.gpu.clone();
+        if requires_blender {
+            mask.and_assign(&self.blender);
+            if mask.is_empty() {
+                return false;
+            }
+        }
         if !placement.is_empty() && !self.apply_placement(&mut mask, placement) {
             return false;
         }
-        mask.iter_ones()
-            .any(|idx| statically_fits_caps(requirements, &workers[idx].capabilities))
+        mask.iter_ones().any(|idx| {
+            statically_fits_caps_with_vram(requirements, req_vram, &workers[idx].capabilities)
+        })
     }
 
     #[inline]
@@ -481,7 +526,12 @@ impl WorkerAttrIndex {
             return !workers.is_empty();
         }
         let mut mask = self.all.clone();
-        if !self.apply_caps_and_features(&mut mask, false, required_features) {
+        let caps = CapRequirements {
+            requires_gpu: false,
+            requires_blender: false,
+            required_features,
+        };
+        if !self.apply_caps_and_features(&mut mask, caps) {
             return false;
         }
         if (required_features.0 & !KNOWN_FEATURES.0) == 0 {
@@ -600,13 +650,12 @@ impl WorkerIndex {
     }
 
     /// Computes a mask of seats eligible for `found` (connected, not host-busy, not reserved,
-    /// remaining slots > 0, satisfying placement, GPU, required features, mobile/environmental
+    /// remaining slots > 0, satisfying placement, GPU/Blender/required features, mobile/environmental
     /// constraints, and not in `avoided`).
     pub(crate) fn free_candidate_mask(
         &self,
         placement: &Placement,
-        requires_gpu: bool,
-        required_features: ProtocolCapabilities,
+        caps: CapRequirements,
         cpu_cores: usize,
         heavy: bool,
         avoided: &[Uuid],
@@ -620,10 +669,7 @@ impl WorkerIndex {
         if mask.is_empty() {
             return None;
         }
-        if !self
-            .attrs
-            .apply_caps_and_features(&mut mask, requires_gpu, required_features)
-        {
+        if !self.attrs.apply_caps_and_features(&mut mask, caps) {
             return None;
         }
         if !placement.is_empty() && !self.attrs.apply_placement(&mut mask, placement) {
@@ -639,13 +685,12 @@ impl WorkerIndex {
     }
 
     /// Computes a mask of unblocked seats (connected, not host-busy, not reserved) matching
-    /// static placement, GPU, required features, mobile rules, and `!avoided`, regardless of
-    /// whether slots are currently free.
+    /// static placement, GPU/Blender/required features, mobile rules, and `!avoided`, regardless
+    /// of whether slots are currently free.
     pub(crate) fn unblocked_static_mask(
         &self,
         placement: &Placement,
-        requires_gpu: bool,
-        required_features: ProtocolCapabilities,
+        caps: CapRequirements,
         cpu_cores: usize,
         heavy: bool,
         avoided: &[Uuid],
@@ -659,10 +704,7 @@ impl WorkerIndex {
         if mask.is_empty() {
             return None;
         }
-        if !self
-            .attrs
-            .apply_caps_and_features(&mut mask, requires_gpu, required_features)
-        {
+        if !self.attrs.apply_caps_and_features(&mut mask, caps) {
             return None;
         }
         if !placement.is_empty() && !self.attrs.apply_placement(&mut mask, placement) {
@@ -678,12 +720,11 @@ impl WorkerIndex {
     }
 
     /// Computes a mask for all connected seats permitted into `matching` (`!(host_busy && load==0)`)
-    /// matching static placement, GPU, required features, mobile rules, and `!avoided`.
+    /// matching static placement, GPU/Blender/required features, mobile rules, and `!avoided`.
     pub(crate) fn matching_static_mask(
         &self,
         placement: &Placement,
-        requires_gpu: bool,
-        required_features: ProtocolCapabilities,
+        caps: CapRequirements,
         cpu_cores: usize,
         heavy: bool,
         avoided: &[Uuid],
@@ -697,10 +738,7 @@ impl WorkerIndex {
         if mask.is_empty() {
             return None;
         }
-        if !self
-            .attrs
-            .apply_caps_and_features(&mut mask, requires_gpu, required_features)
-        {
+        if !self.attrs.apply_caps_and_features(&mut mask, caps) {
             return None;
         }
         if !placement.is_empty() && !self.attrs.apply_placement(&mut mask, placement) {
@@ -730,6 +768,11 @@ impl RegisteredIndex {
     }
 
     #[inline]
+    pub(crate) fn any_has_blender(&self) -> bool {
+        self.attrs.any_has_blender()
+    }
+
+    #[inline]
     pub(crate) fn any_has_features(
         &self,
         registered: &[WorkerInfo],
@@ -743,24 +786,21 @@ impl RegisteredIndex {
         self.attrs.any_matches_placement(placement)
     }
 
-    /// Returns whether at least one registered worker satisfies `requirements`, `placement`,
-    /// `requires_gpu`, and `required_features`.
+    /// Returns whether at least one registered worker satisfies `requirements`, `req_vram`,
+    /// `placement`, and `caps`.
     pub(crate) fn any_fits_all(
         &self,
         registered: &[WorkerInfo],
         requirements: &TaskRequirements,
+        req_vram: u64,
         placement: &Placement,
-        requires_gpu: bool,
-        required_features: ProtocolCapabilities,
+        caps: CapRequirements,
     ) -> bool {
         if registered.is_empty() {
             return false;
         }
         let mut mask = self.attrs.all.clone();
-        if !self
-            .attrs
-            .apply_caps_and_features(&mut mask, requires_gpu, required_features)
-        {
+        if !self.attrs.apply_caps_and_features(&mut mask, caps) {
             return false;
         }
         if !placement.is_empty() && !self.attrs.apply_placement(&mut mask, placement) {
@@ -768,18 +808,27 @@ impl RegisteredIndex {
         }
         mask.iter_ones().any(|idx| {
             let w = &registered[idx];
-            statically_fits_caps(requirements, &w.capabilities)
-                && w.features.contains(required_features)
+            statically_fits_caps_with_vram(requirements, req_vram, &w.capabilities)
+                && w.features.contains(caps.required_features)
         })
     }
 }
 
 #[inline]
-fn statically_fits_caps(req: &TaskRequirements, caps: &WorkerCapabilities) -> bool {
-    let req_vram = req.effective_vram_mb();
+pub(crate) fn statically_fits_caps_with_vram(
+    req: &TaskRequirements,
+    req_vram: u64,
+    caps: &WorkerCapabilities,
+) -> bool {
     (req.cpu_cores == 0 || caps.cpu_cores >= req.cpu_cores)
         && (req.ram_mb == 0 || caps.ram_mb >= req.ram_mb)
         && (req_vram == 0 || caps.vram_mb.is_some_and(|v| v >= req_vram))
+}
+
+#[cfg(test)]
+#[inline]
+fn statically_fits_caps(req: &TaskRequirements, caps: &WorkerCapabilities) -> bool {
+    statically_fits_caps_with_vram(req, req.effective_vram_mb(), caps)
 }
 
 #[cfg(test)]
@@ -935,8 +984,13 @@ mod tests {
                         })
                         .map(|(i, _)| i)
                         .collect();
+                    let caps = CapRequirements {
+                        requires_gpu: gpu,
+                        requires_blender: false,
+                        required_features: feat,
+                    };
                     let actual: Vec<usize> = index
-                        .free_candidate_mask(p, gpu, feat, 1, false, &[])
+                        .free_candidate_mask(p, caps, 1, false, &[])
                         .map_or_else(Vec::new, |m| m.iter_ones().collect());
                     assert_eq!(actual, expected, "mismatch for {p} gpu={gpu} feat={feat:?}");
                 }
@@ -992,8 +1046,11 @@ mod tests {
         let tree_v2_only: Vec<usize> = index
             .free_candidate_mask(
                 &Placement::default(),
-                false,
-                ProtocolCapabilities::TREE_V2,
+                CapRequirements {
+                    requires_gpu: false,
+                    requires_blender: false,
+                    required_features: ProtocolCapabilities::TREE_V2,
+                },
                 1,
                 false,
                 &[],
@@ -1004,8 +1061,12 @@ mod tests {
         let ws_plus_v2: Vec<usize> = index
             .free_candidate_mask(
                 &Placement::default(),
-                false,
-                ProtocolCapabilities::WORKSPACES | ProtocolCapabilities::TREE_V2,
+                CapRequirements {
+                    requires_gpu: false,
+                    requires_blender: false,
+                    required_features: ProtocolCapabilities::WORKSPACES
+                        | ProtocolCapabilities::TREE_V2,
+                },
                 1,
                 false,
                 &[],

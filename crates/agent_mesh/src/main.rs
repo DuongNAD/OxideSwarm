@@ -5,10 +5,15 @@
 
 #![forbid(unsafe_code)]
 
-use agent_mesh::{AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, HubConfig};
+use agent_mesh::{
+    AgentGridBridge, AgentMeshClient, AgentMeshEnvelope, AgentMeshHub, GridBackend, HubConfig,
+    RemoteMasterBackend, RemoteMasterConfig, DEFAULT_RPC_TIMEOUT,
+};
 use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::{Parser, Subcommand};
 use rusty_grid_core::cluster_auth::ClusterSecret;
+use rusty_grid_core::error::GridError;
+use rusty_grid_core::noise_auth::{default_node_key_path, NodeKeypair, PublicKey};
 use rusty_grid_master::server::{MasterServer, ServerConfig};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -55,9 +60,37 @@ pub enum Commands {
         #[arg(long, env = "OXIDE_GRID_MASTER", num_args = 0..=1, default_missing_value = "127.0.0.1:0")]
         grid_master: Option<String>,
 
+        /// Connect the hub's AgentGridBridge to an already-running OxideSwarm Master
+        /// (e.g. 127.0.0.1:8088, auto, or a P2P ticket). Conflicts with --grid-master.
+        #[arg(
+            long,
+            env = "OXIDE_GRID_CONNECT",
+            conflicts_with = "grid_master",
+            value_name = "HOST:PORT"
+        )]
+        grid_connect: Option<String>,
+
         /// Shared cluster secret for Master Grid authentication (hex string or path to secret file)
         #[arg(long, env = "OXIDESWARM_SECRET", hide_env_values = true)]
         secret: Option<String>,
+
+        /// Path to file holding the shared cluster secret (hex); falls back to
+        /// OXIDESWARM_SECRET_FILE and ~/.oxideswarm/cluster.secret.
+        #[arg(
+            long,
+            env = "OXIDESWARM_SECRET_FILE",
+            value_name = "PATH",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        secret_file: Option<PathBuf>,
+
+        /// Pinned Master OXS-AUTH v3 X25519 public key (64 hex chars).
+        #[arg(long, env = "RUSTY_GRID_MASTER_KEY", value_name = "HEX")]
+        master_key: Option<String>,
+
+        /// Custom iroh relay URL (https://...) for P2P --grid-connect targets.
+        #[arg(long, env = "RUSTY_GRID_RELAY_URL", value_name = "URL")]
+        relay_url: Option<String>,
 
         /// Maximum megabytes of active (non-terminal) task payloads held in the embedded Master
         /// Grid queue (`--grid-master`; default 256).
@@ -96,6 +129,31 @@ pub enum Commands {
         /// Disable shell command execution (refuse shell_exec)
         #[arg(long)]
         no_shell: bool,
+
+        /// Directory where verified incoming DataPayload bytes are persisted atomically
+        #[arg(
+            long,
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        inbox_dir: Option<PathBuf>,
+
+        /// Most MiB the files in --inbox-dir may hold; a payload that does not fit is refused
+        /// with DeliveryNack(ERR_INBOX_FULL)
+        #[arg(
+            long,
+            default_value_t = agent_mesh::DEFAULT_INBOX_MAX_BYTES / (1024 * 1024),
+            value_parser = clap::value_parser!(u64).range(1..=(u64::MAX / (1024 * 1024)))
+        )]
+        inbox_max_mb: u64,
+
+        /// Most files --inbox-dir may hold; past it payloads are refused with
+        /// DeliveryNack(ERR_INBOX_FULL)
+        #[arg(
+            long,
+            default_value_t = agent_mesh::DEFAULT_INBOX_MAX_FILES as u64,
+            value_parser = clap::value_parser!(u64).range(1..=(u32::MAX as u64))
+        )]
+        inbox_max_files: u64,
     },
 
     /// Send a structured command to a specific node
@@ -177,8 +235,25 @@ pub enum Commands {
         to: String,
 
         /// Raw data string to transmit
-        #[arg(long)]
-        payload: String,
+        #[arg(
+            long,
+            required_unless_present = "payload_file",
+            conflicts_with = "payload_file"
+        )]
+        payload: Option<String>,
+
+        /// Path to a file containing raw payload bytes to transmit (use '-' to read from stdin)
+        #[arg(
+            long,
+            conflicts_with = "payload",
+            value_parser = OsStringValueParser::new().map(PathBuf::from)
+        )]
+        payload_file: Option<PathBuf>,
+
+        /// Longest wait in milliseconds for the target's next acknowledgement (of a chunk, or of
+        /// the whole payload); a large transfer may take longer in total
+        #[arg(long, default_value = "10000")]
+        timeout_ms: u64,
 
         /// Hub token (visible in `ps`; prefer the OXIDE_MESH_TOKEN environment variable)
         #[arg(long, env = "OXIDE_MESH_TOKEN", hide_env_values = true)]
@@ -204,6 +279,32 @@ fn client_token(token: Option<String>) -> Option<String> {
 /// An unset or empty `--tls-ca` / `OXIDE_MESH_TLS_CA` means "no custom CA file".
 fn client_tls_ca(tls_ca: Option<PathBuf>) -> Option<PathBuf> {
     tls_ca.filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Loads raw bytes for `agent-mesh data` from either `--payload` or `--payload-file` (`-` for stdin).
+fn read_data_payload_bytes(
+    payload: Option<String>,
+    payload_file: Option<&Path>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    match (payload, payload_file) {
+        (Some(text), None) => Ok(text.into_bytes()),
+        (None, Some(path)) => {
+            if path == Path::new("-") {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("failed to read data payload from stdin: {e}"))?;
+                Ok(buf)
+            } else {
+                std::fs::read(path).map_err(|e| {
+                    format!("failed to read data payload file '{}': {e}", path.display()).into()
+                })
+            }
+        }
+        (Some(_), Some(_)) => Err("cannot pass both --payload and --payload-file".into()),
+        (None, None) => Err("either --payload or --payload-file must be provided".into()),
+    }
 }
 
 /// Builds a client for `hub_url`, presenting `token` and `tls_ca` if provided.
@@ -262,6 +363,67 @@ fn grid_master_secret(
     .into())
 }
 
+/// Resolves the cluster secret for `hub --grid-connect` following `oxideswarm` precedence:
+/// `--secret` / `OXIDESWARM_SECRET` (hex or path) > `--secret-file` / `OXIDESWARM_SECRET_FILE` >
+/// default secret file (`~/.oxideswarm/cluster.secret`) if it exists.
+///
+/// An explicit empty secret or secret-file path fails closed rather than silently disabling auth.
+fn resolve_remote_master_secret(
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    default_secret_file: Option<&Path>,
+) -> Result<Option<ClusterSecret>, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(raw) = secret {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "--secret / OXIDESWARM_SECRET is set but empty; give a valid cluster secret or remove it"
+                    .into(),
+            );
+        }
+        if let Ok(cs) = ClusterSecret::from_hex(trimmed) {
+            return Ok(Some(cs));
+        }
+        // Not hex: treat it as a path, but never echo the value (it may be a mistyped secret).
+        let path = Path::new(trimmed);
+        if !path.is_file() {
+            return Err(
+                "--secret / OXIDESWARM_SECRET is neither a valid hex cluster secret nor a readable file"
+                    .into(),
+            );
+        }
+        return Ok(Some(ClusterSecret::load_file(path)?));
+    }
+    if let Some(path) = secret_file {
+        if path.as_os_str().is_empty() {
+            return Err(
+                "--secret-file / OXIDESWARM_SECRET_FILE is set but empty; give a valid path or remove it"
+                    .into(),
+            );
+        }
+        return Ok(Some(ClusterSecret::load_file(path)?));
+    }
+    if let Some(path) = default_secret_file.filter(|p| p.is_file()) {
+        return Ok(Some(ClusterSecret::load_file(path)?));
+    }
+    Ok(None)
+}
+
+/// Resolves OXS-AUTH v3 client credentials when `--master-key` / `RUSTY_GRID_MASTER_KEY` is set.
+fn resolve_remote_v3_auth(
+    master_key: Option<&str>,
+) -> Result<Option<(NodeKeypair, PublicKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(hex) = master_key.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let master_pub = PublicKey::from_hex(hex)?;
+    let node_path = default_node_key_path().ok_or(
+        "Could not determine home directory for ~/.oxideswarm/node.key (needed with --master-key)",
+    )?;
+    let (node_key, _) = NodeKeypair::load_or_generate_file(&node_path)?;
+    Ok(Some((node_key, master_pub)))
+}
+
 /// Resolves the active task byte budget (`--max-active-mb` / `RUSTY_GRID_MAX_ACTIVE_MB`) for the
 /// embedded master of `hub --grid-master`. Refuses `0`, because a zero byte cap would reject every
 /// task.
@@ -283,6 +445,32 @@ fn build_grid_master_server_config(bind_addr: SocketAddr, max_active_bytes: usiz
     ServerConfig::new(bind_addr).with_max_active_bytes(max_active_bytes)
 }
 
+/// Resolves when `agent-mesh hub` receives a shutdown signal (`SIGINT`/Ctrl-C, or `SIGTERM` on
+/// Unix) so `hub.stop()` and `bridge.close()` run and the process exits `0`.
+async fn wait_for_hub_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => res,
+            _ = async {
+                match terminate.as_mut() {
+                    Some(sigterm) => {
+                        sigterm.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriber = FmtSubscriber::builder()
@@ -298,7 +486,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             insecure,
             grid_master,
+            grid_connect,
             secret,
+            secret_file,
+            master_key,
+            relay_url,
             max_active_mb,
         } => {
             if token.as_deref() == Some("") {
@@ -317,6 +509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             let hub = AgentMeshHub::with_config(config);
 
+            let mut bridge_opt: Option<Arc<AgentGridBridge>> = None;
             let master_handle_opt = if let Some(ref master_spec) = grid_master {
                 let spec = master_spec.trim();
                 let bind_addr: SocketAddr =
@@ -336,28 +529,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     build_grid_master_server_config(bind_addr, max_active_bytes);
                 // `secret` already holds OXIDESWARM_SECRET when the flag is absent (clap `env`).
                 let default_secret_file = ClusterSecret::default_path();
-                match grid_master_secret(
-                    secret.as_deref(),
-                    bind_addr,
-                    insecure,
-                    default_secret_file.as_deref(),
-                )? {
-                    Some(cs) => server_config = server_config.with_cluster_secret(cs),
-                    None if !bind_addr.ip().is_loopback() => eprintln!(
-                        "[HUB] WARNING: the embedded Master Grid on {bind_addr} runs WITHOUT a cluster secret (--insecure). Anyone who can reach it can run tasks on its workers."
-                    ),
-                    None => {}
+                if let Some(ref path) = secret_file {
+                    if secret.is_none() {
+                        if path.as_os_str().is_empty() {
+                            return Err(
+                                "--secret-file / OXIDESWARM_SECRET_FILE is set but empty".into()
+                            );
+                        }
+                        server_config =
+                            server_config.with_cluster_secret(ClusterSecret::load_file(path)?);
+                    }
+                }
+                if server_config.cluster_secret.is_none() {
+                    match grid_master_secret(
+                        secret.as_deref(),
+                        bind_addr,
+                        insecure,
+                        default_secret_file.as_deref(),
+                    )? {
+                        Some(cs) => server_config = server_config.with_cluster_secret(cs),
+                        None if !bind_addr.ip().is_loopback() => eprintln!(
+                            "[HUB] WARNING: the embedded Master Grid on {bind_addr} runs WITHOUT a cluster secret (--insecure). Anyone who can reach it can run tasks on its workers."
+                        ),
+                        None => {}
+                    }
                 }
 
                 let master_handle = MasterServer::spawn(server_config).await?;
                 let master_actual_addr = master_handle.server_addr();
                 let bridge = Arc::new(AgentGridBridge::new(master_handle.clone()));
-                hub.attach_bridge(bridge).await;
+                hub.attach_bridge(Arc::clone(&bridge)).await;
+                bridge_opt = Some(bridge);
                 println!(
                     "[HUB] Embedded Master Grid runtime active on {}",
                     master_actual_addr
                 );
                 Some(master_handle)
+            } else if let Some(ref connect_spec) = grid_connect {
+                let default_secret_file = ClusterSecret::default_path();
+                let remote_secret = resolve_remote_master_secret(
+                    secret.as_deref(),
+                    secret_file.as_deref(),
+                    default_secret_file.as_deref(),
+                )?;
+                let v3_auth = resolve_remote_v3_auth(master_key.as_deref())?;
+                let clean_relay_url = relay_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+
+                let mut remote_cfg = RemoteMasterConfig::new(connect_spec.trim());
+                remote_cfg.secret = remote_secret;
+                remote_cfg.v3_auth = v3_auth;
+                remote_cfg.relay_url = clean_relay_url;
+                remote_cfg.insecure = insecure;
+                remote_cfg.rpc_timeout = DEFAULT_RPC_TIMEOUT;
+
+                let backend = Arc::new(RemoteMasterBackend::new(remote_cfg)?);
+                match backend.health_check().await {
+                    Ok(()) => {
+                        println!(
+                            "[HUB] Remote Master Grid bridge connected to {}",
+                            backend.master_addr()
+                        );
+                    }
+                    Err(
+                        ref e @ (GridError::AuthFailed(_)
+                        | GridError::AuthRequired(_)
+                        | GridError::IncompatibleVersion(_)
+                        | GridError::Config(_)),
+                    ) => {
+                        return Err(format!(
+                            "Failed to connect Remote Master Grid bridge to {}: {e}",
+                            backend.master_addr()
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[HUB] WARNING: Remote Master at {} is not yet reachable ({e}); \
+                             bridge attached and will report offline in /api/nodes until reachable",
+                            backend.master_addr()
+                        );
+                    }
+                }
+
+                let bridge = Arc::new(AgentGridBridge::with_backend(backend));
+                hub.attach_bridge(Arc::clone(&bridge)).await;
+                bridge_opt = Some(bridge);
+                None
             } else {
                 None
             };
@@ -379,10 +640,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("[HUB] Token authentication: disabled (loopback only)");
             }
 
-            // Wait for Ctrl+C
-            tokio::signal::ctrl_c().await?;
+            // Wait for shutdown signal (SIGINT / Ctrl+C, or SIGTERM on Unix)
+            wait_for_hub_shutdown_signal().await?;
             println!("\n[HUB] Shutdown signal received. Stopping hub...");
             hub.stop().await;
+            if let Some(bridge) = bridge_opt {
+                bridge.close().await;
+            }
             if let Some(handle) = master_handle_opt {
                 let _ = handle.shutdown();
             }
@@ -395,11 +659,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             token,
             tls_ca,
             no_shell,
+            inbox_dir,
+            inbox_max_mb,
+            inbox_max_files,
         } => {
             let host_os = std::env::consts::OS.to_string();
             let hostname = sysinfo::System::host_name().unwrap_or_else(|| "device".to_string());
             let node_id = id.unwrap_or_else(|| format!("node-{}-{}", host_os, hostname));
             let plat = platform.unwrap_or(host_os);
+
+            let canonical_inbox = match inbox_dir {
+                Some(ref dir) => Some(agent_mesh::validate_inbox_dir(dir)?),
+                None => None,
+            };
 
             println!("========================================================");
             println!("   OxideSwarm Cross-Platform Agent Node Client          ");
@@ -410,11 +682,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if no_shell {
                 println!("Shell:    disabled (--no-shell active)");
             }
+            if let Some(ref dir) = canonical_inbox {
+                println!(
+                    "Inbox:    {} (quota {} MiB, {} files)",
+                    dir.display(),
+                    inbox_max_mb,
+                    inbox_max_files
+                );
+            }
             println!();
 
             let mut client = build_client(&hub, &node_id, &plat, token, tls_ca);
             if no_shell {
                 client = client.with_no_shell(true);
+            }
+            if let Some(dir) = canonical_inbox {
+                client = client.with_inbox_dir(dir).with_inbox_quota(
+                    inbox_max_mb.saturating_mul(1024 * 1024),
+                    usize::try_from(inbox_max_files).unwrap_or(usize::MAX),
+                );
             }
             client.validate_tls_config()?;
             client.run_daemon().await;
@@ -510,21 +796,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             from,
             to,
             payload,
+            payload_file,
+            timeout_ms,
             token,
             tls_ca,
         } => {
+            let bytes = read_data_payload_bytes(payload, payload_file.as_deref())?;
             let client = build_client(&hub, &from, std::env::consts::OS, token, tls_ca);
             client.connect().await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
 
-            println!("[DATA] Transmitting {} bytes to '{}'...", payload.len(), to);
-            let (corr_id, hash) = client.send_data_payload(&to, payload.as_bytes()).await?;
-            println!("[DATA] Transmission sent! Correlation ID: {}", corr_id);
-            println!("[DATA] SHA-256 Checksum: {}", hash);
-
-            // Wait brief moment for ACK
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            client.close().await;
+            println!("[DATA] Transmitting {} bytes to '{}'...", bytes.len(), to);
+            match client
+                .send_data_payload_with_ack(&to, &bytes, Some(timeout_ms))
+                .await
+            {
+                Ok(receipt) => {
+                    println!(
+                        "[DATA] Delivery verified! Correlation ID: {}",
+                        receipt.correlation_id
+                    );
+                    println!("[DATA] SHA-256 Checksum: {}", receipt.sha256);
+                    println!("[DATA] Chunks: {}", receipt.total_chunks);
+                    println!(
+                        "[DATA] Responder: {} ({})",
+                        receipt.responder, receipt.status
+                    );
+                    client.close().await;
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Data delivery to '{}' failed: {}", to, e);
+                    client.close().await;
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
@@ -702,6 +1006,272 @@ mod tests {
                 .to_string()
                 .contains("failed to read TLS CA certificate file"),
             "unexpected error: {err_ws}"
+        );
+    }
+
+    #[test]
+    fn node_inbox_dir_and_data_timeout_flags_parse() {
+        let node_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--id",
+            "consumer-1",
+            "--inbox-dir",
+            "/tmp/mesh-inbox",
+        ])
+        .unwrap();
+        match node_cli.command {
+            Commands::Node {
+                id,
+                inbox_dir,
+                inbox_max_mb,
+                inbox_max_files,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("consumer-1"));
+                assert_eq!(inbox_dir.as_deref(), Some(Path::new("/tmp/mesh-inbox")));
+                assert_eq!(inbox_max_mb, 1024);
+                assert_eq!(inbox_max_files, 10_000);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let quota_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "node",
+            "--inbox-dir",
+            "/tmp/mesh-inbox",
+            "--inbox-max-mb",
+            "5",
+            "--inbox-max-files",
+            "7",
+        ])
+        .unwrap();
+        match quota_cli.command {
+            Commands::Node {
+                inbox_max_mb,
+                inbox_max_files,
+                ..
+            } => {
+                assert_eq!(inbox_max_mb, 5);
+                assert_eq!(inbox_max_files, 7);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        for zero in ["--inbox-max-mb", "--inbox-max-files"] {
+            assert!(
+                Cli::try_parse_from(["agent-mesh", "node", zero, "0"]).is_err(),
+                "{zero} 0 must be refused"
+            );
+        }
+
+        let data_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload",
+            "abc",
+            "--timeout-ms",
+            "4321",
+        ])
+        .unwrap();
+        match data_cli.command {
+            Commands::Data {
+                to,
+                payload,
+                payload_file,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(to, "consumer-1");
+                assert_eq!(payload.as_deref(), Some("abc"));
+                assert!(payload_file.is_none());
+                assert_eq!(timeout_ms, 4321);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_command_payload_file_and_mutual_exclusion_parse() {
+        // 1. --payload-file <PATH> parses cleanly without --payload.
+        let file_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload-file",
+            "/tmp/payload.bin",
+        ])
+        .unwrap();
+        match file_cli.command {
+            Commands::Data {
+                to,
+                payload,
+                payload_file,
+                ..
+            } => {
+                assert_eq!(to, "consumer-1");
+                assert!(payload.is_none());
+                assert_eq!(payload_file.as_deref(), Some(Path::new("/tmp/payload.bin")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. --payload-file - (stdin) parses cleanly.
+        let stdin_cli = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload-file",
+            "-",
+        ])
+        .unwrap();
+        match stdin_cli.command {
+            Commands::Data {
+                payload,
+                payload_file,
+                ..
+            } => {
+                assert!(payload.is_none());
+                assert_eq!(payload_file.as_deref(), Some(Path::new("-")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 3. Passing both --payload and --payload-file must be rejected.
+        let conflict_err = Cli::try_parse_from([
+            "agent-mesh",
+            "data",
+            "--to",
+            "consumer-1",
+            "--payload",
+            "inline",
+            "--payload-file",
+            "/tmp/payload.bin",
+        ])
+        .expect_err("--payload and --payload-file must conflict");
+        assert_eq!(
+            conflict_err.kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+
+        // 4. Passing neither --payload nor --payload-file must be rejected.
+        let missing_err = Cli::try_parse_from(["agent-mesh", "data", "--to", "consumer-1"])
+            .expect_err("data command must require either --payload or --payload-file");
+        assert_eq!(
+            missing_err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // 5. read_data_payload_bytes reads raw binary bytes from disk without UTF-8 conversion.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_path = dir.path().join("raw.bin");
+        let raw_bytes = vec![0x00, 0x80, 0xff, 0xfe, 0x41, 0x00];
+        std::fs::write(&bin_path, &raw_bytes).unwrap();
+        assert_eq!(
+            read_data_payload_bytes(None, Some(&bin_path)).unwrap(),
+            raw_bytes
+        );
+        assert_eq!(
+            read_data_payload_bytes(Some("hello".to_string()), None).unwrap(),
+            b"hello"
+        );
+        assert!(read_data_payload_bytes(None, Some(&dir.path().join("missing.bin"))).is_err());
+    }
+
+    #[test]
+    fn hub_grid_connect_flags_parse_and_conflict_with_grid_master() {
+        let cli = Cli::try_parse_from([
+            "agent-mesh",
+            "hub",
+            "--listen",
+            "127.0.0.1:0",
+            "--grid-connect",
+            "127.0.0.1:8088",
+            "--secret-file",
+            "/tmp/cluster.secret",
+            "--master-key",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "--relay-url",
+            "https://relay.example.com/",
+        ])
+        .expect("parse hub --grid-connect flags");
+        match cli.command {
+            Commands::Hub {
+                grid_master,
+                grid_connect,
+                secret_file,
+                master_key,
+                relay_url,
+                ..
+            } => {
+                assert!(grid_master.is_none());
+                assert_eq!(grid_connect.as_deref(), Some("127.0.0.1:8088"));
+                assert_eq!(
+                    secret_file.as_deref(),
+                    Some(Path::new("/tmp/cluster.secret"))
+                );
+                assert_eq!(
+                    master_key.as_deref(),
+                    Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+                );
+                assert_eq!(relay_url.as_deref(), Some("https://relay.example.com/"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let conflict = Cli::try_parse_from([
+            "agent-mesh",
+            "hub",
+            "--grid-master",
+            "127.0.0.1:0",
+            "--grid-connect",
+            "127.0.0.1:8088",
+        ])
+        .expect_err("--grid-master and --grid-connect must conflict");
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resolve_remote_master_secret_precedence_and_empty_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = dir.path().join("default.secret");
+        let explicit_path = dir.path().join("explicit.secret");
+        let s_default = ClusterSecret::generate().unwrap();
+        let s_explicit_file = ClusterSecret::generate().unwrap();
+        let s_explicit_hex = ClusterSecret::generate().unwrap();
+        s_default.save_file(&default_path, false).unwrap();
+        s_explicit_file.save_file(&explicit_path, false).unwrap();
+
+        // Explicit secret wins over secret-file and default.
+        let chosen = resolve_remote_master_secret(
+            Some(&s_explicit_hex.to_hex()),
+            Some(&explicit_path),
+            Some(&default_path),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(chosen.to_hex(), s_explicit_hex.to_hex());
+
+        // Explicit secret-file wins over default.
+        let chosen = resolve_remote_master_secret(None, Some(&explicit_path), Some(&default_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.to_hex(), s_explicit_file.to_hex());
+
+        // Default secret file is used when present.
+        let chosen = resolve_remote_master_secret(None, None, Some(&default_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.to_hex(), s_default.to_hex());
+
+        // Empty explicit secret or secret-file fails closed.
+        assert!(resolve_remote_master_secret(Some(""), None, Some(&default_path)).is_err());
+        assert!(
+            resolve_remote_master_secret(None, Some(Path::new("")), Some(&default_path)).is_err()
         );
     }
 }

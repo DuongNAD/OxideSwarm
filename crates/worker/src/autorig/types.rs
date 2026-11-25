@@ -11,12 +11,16 @@ pub enum RigPreset {
 }
 
 impl RigPreset {
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().trim() {
-            "quadruped" => Self::Quadruped,
-            "generic" => Self::Generic,
-            _ => Self::Biped, // default
+    /// Parses a skeletal rig preset string, rejecting empty or unknown presets.
+    pub fn try_from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "biped" => Ok(Self::Biped),
+            "quadruped" => Ok(Self::Quadruped),
+            "generic" => Ok(Self::Generic),
+            "" => Err("AutoRig rig_preset cannot be empty".to_string()),
+            other => Err(format!(
+                "Unsupported AutoRig rig_preset '{other}'; valid presets are: biped, quadruped, generic"
+            )),
         }
     }
 
@@ -26,6 +30,14 @@ impl RigPreset {
             Self::Quadruped => "quadruped",
             Self::Generic => "generic",
         }
+    }
+}
+
+impl std::str::FromStr for RigPreset {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from_str(s)
     }
 }
 
@@ -81,6 +93,30 @@ impl Armature {
     }
 }
 
+/// Extracted 3D anatomical landmarks specifically oriented for quadruped rigs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuadrupedLandmarks {
+    pub pelvis: Vec3,
+    pub spine: Vec3,
+    pub chest: Vec3,
+    pub neck: Vec3,
+    pub head: Vec3,
+    pub tail_base: Vec3,
+    pub tail_tip: Vec3,
+    pub hind_hip_l: Vec3,
+    pub hind_knee_l: Vec3,
+    pub hind_ankle_l: Vec3,
+    pub hind_hip_r: Vec3,
+    pub hind_knee_r: Vec3,
+    pub hind_ankle_r: Vec3,
+    pub front_shoulder_l: Vec3,
+    pub front_elbow_l: Vec3,
+    pub front_wrist_l: Vec3,
+    pub front_shoulder_r: Vec3,
+    pub front_elbow_r: Vec3,
+    pub front_wrist_r: Vec3,
+}
+
 /// Extracted 3D anatomical landmarks from mesh geometric analysis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnatomicalLandmarks {
@@ -106,6 +142,7 @@ pub struct AnatomicalLandmarks {
     pub shoulder_r: Vec3,
     pub elbow_r: Vec3,
     pub wrist_r: Vec3,
+    pub quadruped: Option<QuadrupedLandmarks>,
 }
 
 /// Lateral body side classification for bone segments.
@@ -203,6 +240,12 @@ impl SkinWeights {
 pub enum WorkerError {
     #[error("AutoRig error: {0}")]
     AutoRig(String),
+
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
+
+    #[error("{0}")]
+    TimedOut(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

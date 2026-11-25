@@ -544,6 +544,108 @@ The full suite must pass on a clean machine before CI can require it.
 - **Do:** Teach `contains_standalone_number` in `tests/workflow_modes_test.rs` to ignore `"4090"` when adjacent to ASCII hex digits, inside a hyphen-delimited UUID hex group (`-4090-`), or formatted as a JSON numeric value (`: 4090`) or unit-suffixed measurement (`4090 ms`, `4090 mb`, `4090 ops/sec`, `4090 tasks`), while still matching standalone GPU model strings (`"gpu: geforce 4090 ti"`, `"nvidia rtx 4090"`, `"worker-gpu-rtx4090"`, `"4090"`).
 - **Done when:** `test_standalone_number_check_ignores_digits_inside_measurements` and `test_research_mode_distributed_and_report` pass in `cargo test -p rusty_grid_cli --test workflow_modes_test --locked`.
 
+### TEST-23: Find why `master_restart_recovery` loses `out.txt` on Windows
+
+- **Evidence:** CI run `42817398752`, job `129833857865`, "workspace tests (windows-latest)", on
+  pull request 206 at `e1fcf70` (2026-11-10). That pull request changes only `docs/`.
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` panicked at
+  `tests/master_restart_recovery.rs:575` with "t_run must succeed". The result of `t_run` had
+  `exit_code: 1`, an empty `stdout`, `execution_time_ms: 746`, no outputs, and the error
+  "Output files: the task did not produce 'out.txt'". The same job passed on `master` `0354b28`,
+  on the two earlier heads of the pull request (`0266d8e`, `7af1f4d`) and on the rerun of the
+  failed job (attempt 2). Linux and macOS passed in the same run. Seen once.
+- **Problem:** The cause is not known. In the test, `t_run` starts on `w1` under the first master
+  and waits for a gate file. The first master shuts down, a second one starts on the same address
+  and `--state-dir`, `w1` reconnects, and the second master adopts `t_run` as Running. The test
+  then writes the gate file and expects `t_run` to finish with the declared output `out.txt`.
+  On Windows the task is the PowerShell command built by `gated_marker_task`, which writes the
+  file with `[System.IO.File]::WriteAllText($env:OUT_FILE, $env:OUT_BODY)` and the relative name
+  `out.txt`. Two explanations fit the message, and neither has been tested:
+  1. The test is at fault: the PowerShell command ends without writing the file where the worker
+     looks for it (the Unix variant uses a shell redirect, the Windows one a .NET call).
+  2. The product is at fault: after the worker is adopted by a restarted master, output
+     collection reads the sandbox before the file is there, or reads another sandbox. That would
+     be a defect in the recovery path of FEAT-1, not in the test.
+- **Do:**
+  1. On Windows, run `cargo test -p rusty_grid_master --test master_restart_recovery --locked`
+     in a loop under CPU load until it fails, and keep the worker and master logs of each run.
+  2. For a failing run, record the exit code of PowerShell itself, the sandbox path the worker
+     collected from, whether `out.txt` exists anywhere under the sandbox base, how many lines
+     the marker file holds, and the time from assignment to the gate file (compare it with
+     `execution_time_ms`).
+  3. If the test is at fault, change only the test, and keep every assertion. If the product is
+     at fault, follow rule 4: add a test that fails without the fix, then fix the product.
+- **Done when:** The cause is written in the status log, and the test passes 50 times in a row
+  on Windows under CPU load. If production code changed, a regression test covers the cause.
+
+- **Note (2026-11-16):** The failed result narrows the search. The worker sets `exit_code` 1
+  only when a process that exited 0 misses a declared output, and it appends its note to the
+  process's own stderr (`crates/worker/src/runner.rs:1776-1786` and `append_note` at `0354b28`).
+  The result held that note and nothing else, and `error` held only the output message. So
+  PowerShell ran the whole script, exited 0 and printed nothing: no command in it failed. Either
+  `$env:OUT_FILE` was empty in that run, or `WriteAllText` wrote `out.txt` relative to a .NET
+  current directory other than the directory the worker read. 746 ms is short for a run that spans
+  PowerShell start-up, a master restart and a reconnect, and a second run of `t_run` that started
+  after the gate was written would fit it. Step 6 of the test cannot tell the two apart: adoption
+  and a new assignment to `w1` both show `Running` with `active_tasks == 1`. A failing run should
+  therefore also record the number of `run` lines in the marker file (two means a second run), the
+  worker log line "Task assigned again while its previous run is still active"
+  (`retire_previous_run` in `crates/worker/src/client.rs`), and, from the script,
+  `[Environment]::CurrentDirectory` and `$env:OUT_FILE`.
+
+- **Lead (2026-11-17, pull request 288):** looping the whole `master_restart_recovery` binary on macOS under CPU load
+  (140 runs), `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` failed 9 times
+  ("uploading output files to the master failed: blob transfer failed: the connection to the master ended") and
+  `test_master_restart_recovers_finished_queued_and_adopts_running_task_once` once (`out.txt: No such file or
+  directory`, then "Output files: cannot read the task sandbox": the task sandbox was gone). Unverified hypothesis: the
+  tests share `<tmp>/rusty_grid-<uid>/sandboxes`, and the start-up sweep of a worker that starts (`sweep_leftover_sandboxes`)
+  takes the lock of, and removes, a sandbox directory whose creator does not hold its lock yet.
+
+- **Implemented (2026-11-17, pull request 305, [design 0091](design/0091-restart-recovery-races.md)), Partial:** On macOS, with eight copies of the tests in parallel and twenty busy loops, the unchanged code failed `test_worker_disconnected_outbox_uploads_output_blobs_and_flushes_result_on_resume` 3 times in 192 runs ("the connection to the master ended"). The cause is not the shared sandbox base: when the connection ended during the upload of a finished task's outputs, the worker overwrote the buffered result with the failure of that upload, and the resume sent the failure. The worker now keeps the buffered result when the session ended (0 failures in 128 runs of the same two tests). Separately, a real race in the sandbox lock was found and fixed: `open_and_try_lock_task` could keep a lock on a lock file that a sweep had just unlinked, after which a second opener could lock a fresh file, so a sweep could remove the sandbox of a running task (`sandbox::tests::test_task_lock_taken_on_an_unlinked_file_is_not_kept` fails without the fix). That race was reproduced with a hook, not in the loops, so it is not shown to be the cause of the `out.txt` failure on Windows or of the one "sandbox gone" run seen in the lead. Looping the whole binary with the fix (48 runs, twelve busy loops) showed no `out.txt` or upload failure, only two 5-second `wait_for` timeouts in other steps under that load. TEST-23 stays open until the Windows job has passed 50 runs in a row; the Windows cause is still unknown.
+- **Partial (2026-11-19, pull request 357):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1`) in 200 completed runs (0 failures) of `cargo test -p rusty_grid_master --test master_restart_recovery --locked` under 12 busy loops on 20 logical cores (about 60 %): batch 1 passed 50/50 at `979ec2c` in 1,689.1 s; an earlier 24-spinner attempt stalled on run 51 (0 runs completed, 0 failures) before pausing for BENCH-8, and a restarted batch-2 attempt with 12 spinners was stopped at 18:28:25Z for BENCH-8 after 0 completed runs (0 failures); batches 2 to 4 then ran 150 unbroken consecutive runs (3 batches of 50) at `b079dc3` in 1,429.0 s, 1,302.1 s and 1,309.0 s (5,729.2 s across the 4 measured batches; 0 `out.txt` failures and 0 test failures). The 200 passed runs therefore span the BENCH-8 interruption and two commits (`979ec2c` and `b079dc3`, whose diff touched no `crates/master`, `crates/worker` or `tests/master_restart_recovery.rs` files; 150 runs are unbroken on `b079dc3`). Running 24 normal-priority CPU spinners on 20 logical cores starved the worker's default `BELOW_NORMAL_PRIORITY_CLASS` child task processes and stalled progress without producing an `out.txt` failure, whereas 12 busy loops on 20 logical cores (about 60 %) allowed child tasks to schedule. Because zero runs failed in 200 completed loops, no Windows cause is guessed here.
+- **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** "Done when" asks for the cause and 50 runs in a row on Windows under load. The loops are met (200 of 200 on Windows under load, pull request 357), the two races found on the way are fixed (pull request 305, design 0091), and the Windows failure of 2026-11-10 was never reproduced. Closed without a named Windows cause; the diagnostics stay. If `out.txt` is lost again, open a new item with the run and job ids.
+
+### TEST-61: macOS: hard-link isolation test control printed empty stdout
+
+- **Evidence:** Failed once on `macos-latest` in pull request 380 (docs-only commit `ad915a9b`, run `44537862155` attempt 1, job `135607992314`, 2026-11-19 ~14:23 UTC; attempt 2 passed): `macos::test_a_hard_link_to_a_secret_does_not_expose_its_content` (`crates/worker/tests/test_feat3_os_isolation.rs:1757`) panicked at its `--isolation off` control step 45 ms after the binary started with `the control must read the linked secret: ` and empty stdout (not even `END`).
+- **Problem:** The control task printed nothing at all even under `--isolation off`, and the assertion omitted `exit_code`, `error`, `execution_time_ms`, and `stderr`, leaving unknown whether the process exited non-zero, failed to spawn, failed sandbox setup, or hit an fd/pipe race after `BUG-33` (pull request 367, `close_open_fds_macos`).
+- **Do:** Capture full `TaskResult` diagnostics when the control prints empty stdout; loop the test (50 runs) and its binary (20 runs) with and without 6 CPU busy loops; prove whether `BUG-33`'s `close_open_fds_macos` path can race with the task's stdout pipe or spawn; fix any defect or harden diagnostics the `TEST-60` way.
+- **Done when:** `BUG-33` pipe/spawn safety is proven, diagnostics capture any future failure, and the root cause is fixed or left for the owner's decision after non-reproduction under loaded loops.
+- **Partial (2026-11-19, pull request 392):** Not reproduced locally on Apple M5 (10 cores, private `HOME`, `origin/master` `8641b67d`): `0/140` failures across `50/50` alone unloaded (`49.15 s`), `50/50` alone under 6 Python busy loops (`77.32 s`), `20/20` full `test_feat3_os_isolation` unloaded (`547.76 s`), and `20/20` full `test_feat3_os_isolation` under 6 busy loops (`628.09 s`), plus `5/5` in the 5 full loaded workspace runs on `origin/master`. Proof on `BUG-33` (`crates/worker/src/process_tree.rs`): `close_open_fds_macos(&[read_raw])` runs solely inside the double-forked `setsid()` grandchild `child_c` (separate OS PID and XNU descriptor table), skips `read_raw` via `fd_is_kept`, and closes only `child_c`'s inherited duplicates, so it cannot close or alter `child_a`'s stdout write end or the worker's pipe read end; a new 128-spawn 8-worker multithreaded stress test (`process_tree::tests::test_concurrent_short_spawns_preserve_piped_stdout_under_supervisor_fd_close`, with 64 extra `FD_CLOEXEC` descriptors open) passes `128/128` exact stdout captures. Fixes landed: (1) `PreparedUnix::drop` (`crates/worker/src/process_tree.rs`, sharing `imp::dismiss_lifeline` with `TreeInner::kill_and_release_once`) writes `b"0"` before closing `lifeline_write` when dropped unattached (e.g., failed spawn after `pre_exec` forked `child_c`), preventing an orphan supervisor from running `killpg` and a process-table sweep (`test_prepared_unix_drop_dismisses_lifeline_without_attach`); (2) `read_into_capture` (`crates/worker/src/runner/capture.rs`) warns on non-`EINTR` stream read errors; (3) `format_result_diag` (`crates/worker/tests/test_feat3_os_isolation.rs`) reports `exit_code`, `error`, `execution_time_ms`, `stdout`, and `stderr` on `test_a_hard_link_to_a_secret_does_not_expose_its_content` and sibling control assertions. Post-fix verification on `mac/test-61-hardlink-control-empty-stdout`: `process_tree` `23/23` (`2.20 s`), `runner::process_tree_tests` `13/13` (`2.08 s`), `test_feat3_os_isolation` `28/28` + `1` ignored (`27.02 s`), `test_sec5_hardened_runner` `11/11` (`2.58 s`), and under 6 Python busy loops `20/20` `process_tree::tests` (`50.59 s`, `0.98–2.07 s`) and `20/20` `test_a_hard_link_to_a_secret_does_not_expose_its_content` (`36.82 s`, `0.58–1.20 s`). Closing `TEST-61` without a reproduced cause (keeping diagnostics for any future CI hit) stays the owner's decision.
+- **Partial (2026-11-22, Wave 2 M1 verification of merged pull request 392 / `a7ce9e9d`):** Independently re-verified on macOS (`prod/backlog-completion-wave2`) with `154/154` hard-link isolation runs (`50/50` sequential + `80/80` parallel `8x10` + `24/24` under `1,150` inherited FDs, `0` empty-stdout flakes), `process_tree::tests` (`10/10` + `30/30` parallel + `8/8` under `1,150` inherited FDs, `0` orphans), `test_feat3_os_isolation` (`28/28` + `1` ignored), and `tests/test_wave2_e2e.py` (`F1` + Tiers 3–4). Stays `Partial | In` awaiting the owner's decision to close without a reproduced cause for the original pull request 380 CI hit.
+- **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** not reproduced in 294 runs on macOS (pull request 392 and the Wave 2 verification), with the spawn and pipe hardening of BUG-33 and the result diagnostics of `format_result_diag` in place. Closed without a reproduced cause; the diagnostics stay. A new empty-stdout failure gets a new item with its run and job ids.
+
+### TEST-96: CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master
+
+- **Evidence:** CI run `45349647014` (push to `master`, `016f39c4`, 2026-11-24 07:39 UTC), job
+  `unit tests (ubuntu-latest)` (`138292591350`): `71` of `72` `agent_mesh` unit tests passed (`12.01 s`), and
+  `client::tests::test_corrupt_and_multi_chunk_data_delivery` panicked at `crates/agent_mesh/src/client.rs:2147`
+  with `called Result::unwrap() on an Err value: Elapsed(())`, the 5 s `tokio::time::timeout` on `rx3`, the
+  final `DeliveryAck` of part 3 (a 5000-byte payload sent as 5 chunks of 1024 bytes in reverse order). Parts 1
+  and 2 (single-envelope NACKs, 3 s timeouts) passed in the same run. The next master push (`ee3590ea`) passed.
+  This failure reset the Q80 clean-push streak. Claimed via `agent_bridge.py claim`
+  (`claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`).
+- **Problem:** The test asserts a wall-clock window (an ACK within 5 s), which the lessons of design 0087 rule
+  out, and it does not say why the ACK was late. Two explanations are open: (a) a starved runner delayed the
+  hub, the consumer's reassembly and the atomic inbox write past 5 s; (b) the ACK was lost, for example a chunk
+  dropped or a pending entry evicted on the hub's routing path (`Outbox::push` in `crates/agent_mesh/src/hub.rs`
+  kicks a peer whose queue is full; the in-flight data table of design 0107 evicts a sender's oldest entries)
+  or the consumer's out-of-order reassembly not completing. Under (b) a longer wait only hides a bug.
+- **Root cause `(a)` (starved runner + blocking `fsync`, NOT a lost ACK `(b)`):** End-to-end audit of `crates/agent_mesh/src/{client,hub,delivery}.rs` rules out `(b)`:
+  - *Sender (`client.rs`):* `send_envelope` pushes all 5 chunks (~7.5 KB total) into an unbounded mpsc channel drained in FIFO order; any WebSocket close clears `pending_map` and wakes `rx3` immediately with `RecvError`, never `Elapsed(())`. The inbound loop ignores intermediate `DeliveryAck(chunk_received)` frames (`L839-851`), so `rx3` waits strictly for `DeliveryAck(data_received_verified)`.
+  - *Hub (`hub.rs`):* `Outbox::push` (`L213`) allows `1,024` messages and `32 MiB` queued bytes (`DEFAULT_MAX_QUEUED_*`); `PushError::Full` or `Closed` immediately emits `DeliveryNack(ERR_NODE_UNAVAILABLE)` back to the sender (which panics at the `DeliveryAck` match, not `Elapsed(())`). `InflightDataTracker` (`L248`, `256`/sender, `16,384` total) deduplicates `(consumer, multi_corr, sender)` across all 5 chunks and is only consulted on target disconnect; `DeliveryAck` forwarding (`L1328-1352`) does not require a tracker hit.
+  - *Consumer (`delivery.rs` + `client.rs`):* `DataConsumer::accept` + `ChunkReassembler` (`64` concurrent assemblies / `60 s` TTL) accept out-of-order chunks `[4,3,2,1,0]`, reassemble on the last chunk, and verify `total_sha256`. Unlike parts 1–2 (in-memory NACKs), part 3 is the first sub-test to run `tokio::task::spawn_blocking(|| persist_payload_atomic(...))` (`client.rs:790`), which calls `file.sync_all()` (`fsync`, `delivery.rs:768`) before emitting the final `DeliveryAck`. On a shared CI runner executing 72 `agent_mesh` tests concurrently while `test_corrupt_and_multi_chunk_data_delivery` runs on a single-threaded `#[tokio::test]` runtime, `spawn_blocking` scheduling + `fsync` stalled past the `5 s` wall-clock cap.
+- **Do:**
+  1. Read the chunk path end to end (completed: cause `(a)` confirmed) and run the 200-iteration loop under a CPU load generator on Linux (`2026-11-25`, completed).
+  2. Replaced the short 3 s / 5 s timeouts in `test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and added `[timing]` prints on success (PR #449).
+  3. Windows loaded verification (`2026-11-25`, `agent-win-2` in PR #455 on `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac`, clean tree `git status --porcelain` empty): `cargo test --locked -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) alongside `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` min `25.819 ms`, median `45.050 ms`, max `292.559 ms`; `p3_multichunk_ack` min `5.806 ms`, median `10.364 ms`, max `255.009 ms`; min free RAM `5.891 GiB`).
+- **Done when:** the root cause is written here (done), the test has no short wall-clock window (done), and
+  `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
+  loop runs under load on Linux (done; Windows `200/200` also passed on `d88083f22079c6878f273e6410493ba5138a68ac` in PR #455).
+- **Implemented (2026-11-25, `win/test-96-linux-loop`):**
+  - Linux (`2026-11-25`, `agent-win` on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` inside Docker `rust:1.96`, `rustc 1.96.1`, kernel `6.6.87.2-microsoft-standard-WSL2 x86_64`, `20` logical cores, `22543524 kB` RAM, isolated `HOME`/`TMPDIR`/`CARGO_TARGET_DIR`): `cargo test --locked -j 4 -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs (after `98.280 s` `--no-run` prebuild) alongside `1` `python3` `hashlib.sha256(4096B)` infinite CPU busy loop (`wall` total `119.722 s`, min `0.440 s`, median `0.611 s`, max `0.788 s`; test `[timing]` `total` min `89.504 ms`, median `93.208 ms`, max `109.412 ms`; `p3_multichunk_ack` min `42.672 ms`, median `43.601 ms`, max `47.266 ms`; `0` failed).
+  - Windows (`2026-11-25`, `agent-win-2` in PR #455): `200/200` passed under load as detailed in step 3 above.
+
 ## Phase 3: make the documents true
 
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
@@ -861,6 +963,50 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Do:** Add an uncharged path for announced drains. Correct the test.
 - **Done when:** Repeated evacuations leave `failover_count` at 0.
 
+### 3D-2: Wire VRAM and Blender routing
+
+- **Evidence:** Read. Confirmed by grep.
+- **Problem:** `required_vram_mb` (`crates/master/src/scheduler.rs`) still returns preset defaults for `Generative3D` that are not automatically applied when `--vram-mb` is omitted, and `crates/master` does not read `has_blender` (explicit `TaskRequirements::vram_mb` via `--vram-mb` / MCP `vram_mb` is now enforced under `FEAT-9a` / [design 0068](design/0068-task-vram-accounting.md)). `--blender-path` reaches only the capability probe, and `resolve_blender_binary` misses the macOS and Linux paths that `detect_blender` searches. A Mac can advertise Blender and then fall back silently.
+- **Do:** Wire both into `view_fits`. Share one Blender resolver.
+- **Done when:** A `--preferred-provider blender` task lands only on a Blender worker. A `high` task
+  skips a 2 GB worker.
+- **Implemented (2026-11-22, design 0105, prod/backlog-completion-wave3):** Threaded `TaskView::requires_blender`
+  (`TaskSpec::AutoRig` with trimmed case-insensitive `preferred_provider == "blender"`), `WorkerAttrIndex::blender`,
+  and `RegisteredIndex::any_has_blender` through `crates/master/src/{queue.rs,worker_index.rs,scheduler.rs,reaper.rs}`
+  (`Engine::view_fits`, `place`, `skip_reason`, `hold_back`, and `run_straggler_pass`), wired
+  `SchedulerConfig::required_vram_mb` preset defaults (`2048`/`4096`/`6144` MB for `fast`/`standard`/`high` on
+  non-`Sdf` `Generative3D` when `--gpu` or `--quality high` applies, preserving CPU-only `Sdf` and non-GPU
+  `fast`/`standard` `Auto`/`TripoSr` defaults per `BUG-3`), added non-blocking `ListWorkers` preflight `stderr`
+  warnings in `crates/cli/src/cli_app/submit.rs`, and confirmed `crates/worker/src/autorig/blender_provider.rs`
+  delegates directly to `rusty_grid_core::capabilities::resolve_blender_binary`. Verified by
+  `crates/master/tests/test_3d2_routing.rs` (`4/4`) and `crates/cli/tests/test_3d2_routing.rs` (`4/4` with
+  `--features 3d`).
+
+### 3D-3: Make AutoRig options real or refuse them
+
+- **Evidence:** Read.
+- **Problem:** `--rig-preset quadruped` gives the biped skeleton. `engines/autorig/blender_rig.py:23`
+  parses `--preset` and never reads it. `turnaround` produces an empty action in Blender. OBJ input
+  fails, because it is always written as `input_mesh.glb`. The Blender timeout is fixed at 60 s
+  (`crates/worker/src/runner.rs:2201`). A failure falls back with only a `warn!` and the same device
+  label. The blocking engines take no timeout or cancel.
+- **Do:** Refuse unimplemented presets or implement them. Pick the extension from the magic bytes.
+  Pass the task timeout. Report the provider. Fail when Blender was requested explicitly.
+- **Done when:** `quadruped` gives a non-biped skeleton or an error. An OBJ goes through Blender. The
+  result names the provider. A timeout returns within 1 s of expiry.
+- **Implemented (2026-11-22, design 0106, prod/backlog-completion-wave3):** Validated `rig_preset` (`biped`
+  15 joints, `quadruped` 19 joints, `generic` 5 axial joints), `embed_animations` (`idle`, `walk`, `turnaround`
+  with 97 keyframes in both Rust `anim_synth.rs` and `engines/autorig/blender_rig.py`), and `preferred_provider`
+  (`None`/`builtin`, `auto`, `blender`) upfront in `TaskSpec::validate()` (`crates/core/src/task.rs`),
+  `crates/worker/src/autorig/*`, and `blender_rig.py`, refusing empty or unknown values and failing explicitly
+  (no silent fallback) when `"blender"` is missing or errors; added magic-byte `.glb`/`.gltf`/`.obj` detection
+  with UTF-8 BOM/whitespace stripping in `mesh_loader.rs` and `BlenderRigProvider`; reported concrete
+  `"OxideSwarm-AutoRig-Blender"` vs `"OxideSwarm-AutoRig-Builtin"` in `TaskResult::device_name` and stdout;
+  and propagated task `timeout`, `child_pid`, and `cancel_rx` / cooperative `AtomicBool` stopping (`<= 1 s`
+  settle) across Blender supervision and Rust `autorig/*` and `gen3d/*` workloads (`crates/worker/src/runner/workloads.rs`).
+  Verified against real Blender 5.2.1 LTS plus `crates/worker/tests/test_3d3_autorig_options.rs` (`10/10`),
+  `test_autorig_pipeline` (`15/15`), and `test_challenger_m3_blender_job_object` (`10/10`).
+
 ### MR-1: Let a CLI user ship a mapper and reducer
 
 - **Evidence:** Read.
@@ -880,6 +1026,58 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Do:** Enable a rustls feature in `Cargo.toml`, or state that Rust nodes need a VPN or SSH tunnel.
 - **Done when:** A test connects the Rust client through a TLS-terminating proxy, and `cargo audit`
   passes.
+
+### MESH-2: Deliver mesh data to a consumer
+
+- **Evidence:** Read.
+- **Problem:** Nodes push payloads into an unbounded `Vec` that only tests read
+  (`crates/agent_mesh/src/client.rs:252`). `agent-mesh data` sleeps 200 ms and exits 0 without reading
+  the ACK (`crates/agent_mesh/src/main.rs:424`). `total_chunks` is always 1. Node status is always
+  `online`, and telemetry fields are placeholders.
+- **Do:** Add `agent-mesh node --inbox-dir` with a bounded buffer. Wait for the ACK and exit non-zero
+  on failure. Report real values, or remove the fields.
+- **Done when:** `agent-mesh data --to missing-node` exits non-zero. A payload appears on disk with a
+  verified hash.
+- **Implemented (2026-11-22, commits `ea3b5e0c`, `85a53f71`, `36a2d647`):** `agent-mesh node --inbox-dir <DIR>`
+  validates inbox directories via `validate_inbox_dir` (`crates/agent_mesh/src/client.rs`), reassembles multi-chunk
+  transfers (`DEFAULT_DATA_CHUNK_BYTES = 1 MiB`, bounded `ChunkReassembler` with configurable `ttl`), verifies
+  mandatory SHA-256 digests (`ring`), atomically writes verified payloads to disk (`persist_payload_atomic` via
+  `.tmp_<uuid>.part`, `sync_all`, and `rename`) into bounded `BoundedPayloadBuffer` (`256` entries / `64 MiB`), and
+  emits `DeliveryAck` or `DeliveryNack(ERR_PAYLOAD_CORRUPT | ERR_PERSIST_FAILED)`. `agent-mesh data --to <NODE>`
+  (`crates/agent_mesh/src/main.rs`, supporting `--payload`, `--payload-file <PATH>`, `-` stdin, and `--timeout-ms`)
+  awaits `DeliveryAck`/`DeliveryNack`/hub error/timeout and exits non-zero on failure or missing targets
+  (`ERR_NODE_NOT_FOUND` / `ERR_NODE_UNAVAILABLE`). `crates/agent_mesh/src/protocol.rs` and `hub.rs` compute accurate
+  `total_chunks`, live `sysinfo` + `ActiveCommandGuard` heartbeat telemetry, and honest `"online"` / `"stale"` /
+  `"offline"` node status and `/api/status` counts (`docs/reference.md` updated). Verified by
+  `crates/agent_mesh/tests/mesh_data_delivery.rs` (`7/7`), `cargo test -p agent_mesh --locked` (`124/124`),
+  `tests/test_agent_mesh_rust_hub_cross_interop.py` (`5/5`), and `tests/test_wave2_e2e.py` (`F6` + Tiers 3–4).
+
+### MESH-3: Attach the bridge to a running master
+
+- **Evidence:** Read.
+- **Problem:** `AgentGridBridge::new` takes an in-process `MasterHandle`
+  (`crates/agent_mesh/src/bridge.rs:29`). Mesh tasks therefore run on a second master with no workers
+  until someone points them at it. `grid_submit` overwrites tags, has no files or outputs, and has no
+  cancel. `parse_binary_data` reads hub-local paths that a peer names (`bridge.rs:857`).
+- **Do:** Add a `GridBackend` trait with in-process and `connect_master` versions, and
+  `--grid-connect <HOST>:8088`. Add placement, files, outputs, result and cancel. Remove the file
+  fallback. Document that workers must join.
+- **Done when:** A test with `CARGO_BIN_EXE_agent-mesh` runs `grid_submit` on a separately started
+  master.
+- **Implemented (2026-11-22, pull requests 114, 132, design 0104, prod/backlog-completion-wave3):** Decoupled
+  `AgentGridBridge` (`crates/agent_mesh/src/bridge.rs`) behind async `GridBackend`
+  (`crates/agent_mesh/src/grid_backend.rs`) with `InProcessBackend` (`--grid-master`) and
+  `RemoteMasterBackend` (`crates/agent_mesh/src/remote_backend.rs` directly atop `rusty_grid_core` TCP/P2P +
+  OXS-AUTH v2/v3); added `agent-mesh hub --grid-connect <HOST:PORT>` (`OXIDE_GRID_CONNECT`, conflicting with
+  `--grid-master`, with `--secret`/`--secret-file`/`--master-key`/`--relay-url`/`--insecure`), live `/api/nodes`
+  `"grid"` `"online"`/`"offline"` status, caller tag preservation and `placement` (`os`, `arch`, `worker`,
+  `isolation`, `require_tags`, `require_tools`), upfront `reject_unsupported_workspace` refusal, strict
+  inline-only `files` (`StagedFile`, zero hub-local disk reads), `outputs` (`expected_outputs`) -> SHA-256
+  `artifacts`, `grid_result`/`grid_cancel`, `AgentMeshClient` helpers, and worker-join documentation in
+  `docs/design/0104-mesh3-remote-master-bridge.md` and `docs/reference.md`. Verified by
+  `crates/agent_mesh/tests/grid_remote_master_e2e.rs` (`2/2` using `CARGO_BIN_EXE_agent-mesh` against
+  separately started `oxideswarm master` and `oxideswarm worker`), `test_agent_mesh_rust_hub_cross_interop.py`
+  (`5/5`), and `test_agent_mesh_token_auth.py` (`7/7`).
 
 ### MODE-1: Make `ox-mode` report only what happened
 
@@ -1008,6 +1206,30 @@ Each item below needs a design record before code.
 - **Done when:** An agent on one machine runs `cargo test -p rusty_grid_core --lib` over MCP on another
   machine at a commit that machine did not have. The second run reuses `target/`.
 
+### FEAT-5: Checkpoints for process tasks
+
+- **Evidence:** Read.
+- **Problem:** Checkpoints work for the `BuiltinTest` hash branch only
+  (`crates/worker/src/runner.rs:853-917`). `Command`, `ShellScript`, `RustCompilation` and
+  `GpuCompute` never receive one. The 3D tasks send progress as checkpoints.
+- **Do:** Add `OXIDESWARM_CHECKPOINT_DIR` in the sandbox, stored in capped `Checkpoint` frames and
+  restored before a re-run. Separate progress from state.
+- **Done when:** A `Command` test kills the worker, and a second worker finds the state file and skips
+  finished steps.
+- **Implemented (2026-11-22, design 0102, commits `a8a51357`, `06302c06`, `27cf8453`):** Added
+  `OXCP1\x01` in-band binary checkpoint encoding with BLAKE3 integrity verification
+  (`crates/worker/src/runner/checkpoint.rs`, capped at `12 MiB` / `4096` files, keeping `BuiltinTest`,
+  `Generative3D`, and `AutoRig` JSON payloads separate on Protocol 10 / Store v4), injected private
+  `$OXIDESWARM_CHECKPOINT_DIR` into `Command`, `ShellScript`, and `Workspace` sandboxes (including macOS
+  Seatbelt `--isolation fs|fs+net`), excluded checkpoint paths from `--output` (`**/*`),
+  `describe_sandbox_root`, and `expected_outputs` (`is_reserved_checkpoint_rel` + `fold_blob_path` for
+  ASCII and Unicode APFS equivalence in `crates/worker/src/staging.rs` and `runner/capture.rs`), hardened
+  pack/restore with `PinnedDir` `openat`/`O_NOFOLLOW` traversal (`crates/worker/src/sandbox.rs`), and wired
+  pre-spawn restore with `S + 1` sequence monotonicity, `1 s` periodic polling, final `SIGTERM`/cancel/timeout
+  emission, and a bounded `2 s` graceful worker shutdown drain (`crates/worker/src/client/session.rs`,
+  `docs/reference.md` updated). Verified by unit tests, `crates/worker/tests/test_feat5_process_checkpoints.rs`
+  (`5/5`), `crates/cli/tests/test_feat5_cli_e2e.rs` (`2/2`), and `tests/test_wave2_e2e.py` (`F5` + Tiers 3–4).
+
 ### FEAT-6: Master failover
 
 - **Evidence:** Read. A grep confirms that nothing constructs `ClaimMasterRole`.
@@ -1051,6 +1273,17 @@ Each item below needs a design record before code.
   a version to the client path. Plan the move away from `bincode` 1.x.
 - **Done when:** A changed `Task` layout fails CI without a bump. Mismatched peers refuse with a clear
   message.
+
+### FEAT-9: GPU workloads beyond the benchmark
+
+- **Evidence:** Read.
+- **Status:** Partial (`FEAT-9a` / decision `Q56` implemented in [design 0068](design/0068-task-vram-accounting.md)). Tasks now accept `--vram-mb` / `vram_mb` (protocol v9, store v3) with master scheduler VRAM budget tracking and anti-starvation hold-back.
+- **Problem (remaining `D6`):** `GpuCompute` multiplies seeded matrices. `kernel_name` is a label, `compute_intensity` is never read, and custom WGSL user kernels remain unimplemented. Real-GPU preference still prefers an idle `wgpu` worker over a simulated GPU worker when an idle real GPU is available.
+- **Do (default of D6):** State "benchmark only" in `README.md:26` and `PROJECT.md:3`. If the owner
+  puts kernels in scope, add a `TaskSpec` with user WGSL and buffers through blobs.
+- **Done when:** The documents say benchmark only, or a user kernel matches a CPU reference on Metal,
+  Vulkan and DirectX 12.
+- **Implemented (2026-11-21, default of D6):** `PROJECT.md` and `README.md` (alongside `docs/reference.md`) now state explicitly that built-in `GpuCompute` is benchmark only (seeded matrix multiplication; no user WGSL kernels), while user GPU workloads run as `Command` tasks (`docs/guides/gpu-workloads.md`). `FEAT-9a` (`--vram-mb` / `vram_mb` VRAM accounting) landed in pull request 232 ([design 0068](design/0068-task-vram-accounting.md)); live per-process free VRAM polling (`FEAT-9b`, [design 0067](design/0067-multi-node-llm-serving-and-admission.md)) and Linux GPU isolation rules (`R20`, [design 0074](design/0074-external-runtime-allowlist-and-gpu-workloads.md)) remain tracked separately. (Historical note: `compute_intensity` was removed from `TaskSpec::GpuCompute` in `F1-b` / [design 0044](design/0044-dead-code-and-connection-loop-unification.md).)
 
 ### FEAT-10: Compile crates with cargo
 
@@ -1262,6 +1495,31 @@ owner's decisions Q8, Q9 and Q12 are open.
   `18.9 ms` (`benchmarks/grid/results/2026-11-14-scale1-windows-amd64-1000w.json`,
   `2026-11-15-scale2-windows-amd64-1000w.json`). The status rests on the 500-worker target
   (DOC-9).
+
+### SCHED-5: Tell the user why a queued task waits when every eligible worker is above max_host_cpu_pct
+
+- **Evidence:** Reproduced under `TEST-81` (pull request 404): when host CPU sits above
+  `max_host_cpu_pct` (`85.0`) on every eligible worker, queued tasks wait silently without any hint to
+  the user; a temporary per-pass `DEBUG` log emitted 51 copies in 5 s (~10/s) while `submit 3` stalled.
+- **Problem:** When every worker sits above `85 %` host CPU, queued tasks stay `Queued` silently
+  without any hint to the user. A naive per-pass scheduler log floods (~36,000 lines/hour at
+  `DEBUG`), fires for unrelated skips whenever any other worker reads busy (for example a GPU task
+  with no GPU worker), and includes `Disconnected` workers with stale CPU readings.
+- **Do:** Write a design record choosing the visible form (for example `status`, `ListWorkers`,
+  dashboard, and/or rate-limited master logs), taking the PR 404 review constraints as input:
+  1. Count only skips whose reason is `ScheduleSkipReason::AllEligibleWorkersSaturated`.
+  2. Filter candidate seats to connected (non-`Disconnected`) workers only.
+  3. Report once per change of the busy-worker set (or equivalent non-flooding transition) rather
+     than on every scheduling pass.
+- **Done when:** Design record is approved, the master surfaces host-CPU backpressure holdbacks under
+  those constraints without flooding or stale disconnected entries, and tests cover the behavior.
+- **Implemented (`2026-11-21`):** Added [design 0099](design/0099-scheduler-backpressure-visibility.md)
+  and transition-triggered `warn!` holdback reporting in `WorkloadScheduler::schedule_batch`
+  (`crates/master/src/scheduler.rs`), gated on `ScheduleSkipReason::AllEligibleWorkersSaturated` skips
+  and connected (`status != WorkerStatus::Disconnected`), free-slotted, `host_busy` seats, emitting
+  once per change of the sorted busy-worker ID set and clearing silently (`info!` without
+  `"saturated"`) on recovery, with unit tests in `crates/master/src/scheduler.rs`, integration tests
+  in `tests/e2e_cluster.rs`, and `docs/reference.md` updated.
 
 ## Phase 8: product and ecosystem
 
@@ -2114,6 +2372,45 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `adversarial_mesh_challenge.rs`, `adversarial_challenge.rs` and `mesh_integration.rs` with the same wait.
 - **Done when:** Implemented by pull request 278. The old test did not fail locally (30 of 30 under load),
   so the fix rests on the cause seen in CI.
+
+### TEST-41: Find why a task finished during master shutdown can run twice
+
+- **Evidence:** `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns`
+  (`tests/master_restart_recovery.rs:1001`) failed on `ubuntu-latest` on 2026-11-17, in pull request 282 at
+  `7a17104` (run `44018512676`, job `133822123752`): `RV158 P3: rounds=12 ran_twice=1`, then
+  `task ran twice in 1/12 rounds`. Round 0 (`delay_ms=0`) ran the task twice; rounds 1 to 11 ran it once.
+  Pull request 282 changes only `windows/oxctl.ps1`, a Python launcher test and docs.
+- **Problem:** The probe (review item H2 of pull request 158) states that a task which finishes as the master
+  shuts down keeps its result in the worker's `pending_resume_outbox` until the restarted master acknowledges
+  it, so the task runs exactly once. One round in twelve ran it twice. Either the hand-over has a window at
+  delay 0, or the probe counts a rerun the design allows. A command task that runs twice is visible to users.
+- **Do:** Run the probe in a loop, also under CPU starvation as for TEST-36 to TEST-38, and find which side
+  lost the result or dispatched the task again. Fix that cause. If the design allows a rerun in that window,
+  say so beside the probe and in the guarantee it tests, and change the assertion with that reason.
+- **Done when:** The cause is named here, and the probe passes 200 runs in a row on Linux and on Windows.
+- **Partial (2026-11-17, pull request 288):** not reproduced on macOS in 6,884 rounds of the probe (about 570 runs of
+  12 rounds: single, 3 to 8 parallel copies, the whole test binary next to three copies of itself, 6 `yes` CPU spinners
+  on 10 cores, `RV158_ZERO` with no delay after the task finished, and a variant that kept the task alive for up to
+  450 ms after its done marker). No round ran the task twice. What reading the code ruled out: the journal cannot lose an
+  acknowledged result (`store.rs`: the writer drains and syncs on drop, a snapshot is taken under the queue lock after
+  every enqueued append, and a result that arrives after `close_and_compact_store_sync` is refused with no
+  acknowledgment); the worker keeps a result in `pending_resume_outbox` and lists it in `ResumeSession` whether the task
+  is still in the active table or already in the outbox; a master-side rerun without a `ResumeSession` that names the task
+  needs `adopt_session_tasks` to release the hold (`recovery.rs`), which charges nothing, matching the `retry=0
+  failover=0` of the CI round. That is the one path that fits the evidence, and no test has shown the worker omitting
+  the id. The probe now keeps the debug log of the master and worker crates in memory and, when a round ran the task
+  twice, prints the marker file, the task and worker id, every line that names either, and every warning and error since
+  the round began, and the round line shows `evacuation=` next to `retry=` and `failover=`. `RV158_ROUNDS` and
+  `RV158_ZERO` let a local loop run more rounds and shut the master down with no delay. The assertion is unchanged.
+  Next step: the next CI failure of this probe now carries the evidence; read which side sent `ResumeSession` without the
+  task (worker) or released the hold (master). Two other tests of the same binary failed under load: see the lead
+  under TEST-23.
+- **Partial (2026-11-19, pull request 359):** Not reproduced on Windows (`x86_64`, 20 logical cores, `rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc 2026-08-05)`) at commit `9b918d3` across 232 runs (2,784 rounds; 0 double runs and 0 failures; 4,718.3 s elapsed across the 5 batches) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (480 rounds, 852.4 s), 40 alone `RV158_ZERO=1` runs (480 rounds, 863.0 s), 60 default-delay runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,429.9 s), 60 `RV158_ZERO=1` runs under 12 busy loops on 20 logical cores (about 60 %, 720 rounds, 1,426.0 s; batches 1–4 = 200 sequential `cargo test` runs / 2,400 rounds, with a clean docs-only PR 357 pause between batches 3 and 4), and 32 runs across 8 waves of 4 parallel test-binary copies with 8 busy loops and `RV158_ZERO=1` (384 rounds, 147.0 s). Stays Partial until Linux also reaches 200 runs without a double run.
+- **Partial (2026-11-19, pull request 363):** Not reproduced on Linux (`aarch64`, 10 logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 12 (bookworm)` in the Docker Desktop container `rust:1.96-bookworm`, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `--locked`, fresh temporary `HOME` per run) at commit `ccafa90` (`ccafa9023`) across 200 sequential `cargo test --locked` runs (`2,400` rounds; 0 double runs and 0 failures; `1,697.06 s` elapsed across the 4 batches; plus a 1/1 `RV158_ZERO=1` smoke run beforehand in 7.94 s, `12` rounds, `ran_twice=0`) of `rv158_probe_result_during_master_shutdown_is_lost_and_task_reruns` (`--exact --nocapture`, `ran_twice=0` on every run): 40 alone default-delay runs (`480` rounds, `327.44 s`), 40 alone `RV158_ZERO=1` runs (`480` rounds, `340.93 s`), 60 default-delay runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `506.52 s`), and 60 `RV158_ZERO=1` runs under 6 Python busy loops on 10 logical cores (`60 %`, `720` rounds, `522.17 s`). The 200-run part of "Done when" is now met on both Windows (pull request 359) and Linux (this pull request), alongside macOS (pull request 288), while no cause is named because the single double-run of pull request 282 never reproduced; closing TEST-41 as "not reproduced in 200 runs on Linux, Windows and macOS" (keeping the pull request 288 debug-log capture) is the owner's decision.
+- **Partial (2026-11-22, Wave 2 M1 commit `09c3accd`):** Closed three remaining shutdown/durability race gaps: (1) added `durability_failed: bool` to `ResultOutcome` (`crates/master/src/queue.rs`, `queue/lifecycle.rs`) and gated `registry.send_result_ack` across all three branches in `apply_task_result_inner` (`crates/master/src/server/tasks_and_blobs.rs`) on `TaskStore` durability so un-persisted results stay in the worker's `pending_resume_outbox` (`test_failed_store_sync_suppresses_result_ack_across_all_paths`, `test_worker_retains_result_in_pending_resume_outbox_on_store_sync_failure_and_flushes_on_restart`); (2) suppressed `WorkerMessage::Disconnecting` (`farewell = None`) when a worker receives `MasterMessage::Shutdown` (`crates/worker/src/client/session.rs`) so shutdown never triggers spurious evacuations (`test_master_shutdown_via_watch_without_preclose_adopts_once_with_zero_evacuations`, `test_master_shutdown_frame_makes_the_worker_wait_and_reconnect`); (3) checked `*self.shutdown_rx.borrow_and_update()` on `WorkerSession::run` entry before `select!`, flushed `MasterMessage::Shutdown` via `ActiveLanes::send_shutdown_and_flush` (`1 s` bound, `crates/master/src/session.rs`), and added `biased;` shutdown polling in `crates/master/src/server.rs` accept loops (`test_worker_session_run_entry_sends_shutdown_when_already_signaled`). Verified on macOS with `RV158_ZERO=1 RV158_ROUNDS=48` (`48/48` `ran_twice=0`), `persistence_tests` (`17/17`), `session::tests` (`10/10`), `worker_connection_lifecycle` (`12/12`), `master_restart_recovery` (`8/8`), and `tests/test_wave2_e2e.py` (`F2` + Tiers 3–4). Stays `Partial | In` awaiting owner closure decision on the non-reproduced pull request 282 CI hit per `"Done when"`.
+- **Partial (2026-11-23, pull request 419 (open)):** Not reproduced on Linux post-`09c3accd` (`aarch64`, `10` logical cores, `Linux 7.0.14-linuxkit`, `Debian GNU/Linux 13 (trixie)` in Docker container `rust:1.96` on Apple M5 `10` cores, `rustc 1.96.1 (31fca3adb 2026-06-26)`, `cargo 1.96.1 (356927216 2026-06-26)`, `CARGO_TARGET_DIR=/tmp/t`, fresh temporary `HOME` per run) at `origin/master` commit `9800abea` (`9800abeadc2f1dca18faebe6dfd105b7d85262a2`) across `200` sequential `cargo test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture` runs (`2,400` rounds; `0` double runs `ran_twice=0` on every run, `0` failures, `1,633.96 s` elapsed) under `4` CPU busy loops (`yes > /dev/null`, `40 %` load on `10` cores) inside the container: `100/100` default-delay runs (`1,200` rounds, `860.33 s`, `min 7.35 s`, `max 16.20 s`) and `100/100` `RV158_ZERO=1` runs (`1,200` rounds, `773.63 s`, `min 7.34 s`, `max 9.39 s`). Stays `Partial | In` pending the post-`09c3accd` Windows `200`-run loop of prompt S3.
+- **Partial (2026-11-23, Windows 200/200, pull request 420):** Confirmed on Windows 11 Pro (`x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.1` / `cargo 1.96.1`, isolated NTFS temporary `HOME`/`USERPROFILE`/`TEMP`/`TMP` preserving `LOCALAPPDATA`, `CARGO_TARGET_DIR` on NTFS `E:`) at commit `cfed793d` (hardening `tests/master_restart_recovery.rs` after pre-fix baseline at `origin/master` `6a9060ba` hit the `5 s` `wait_for` guard at line `1030` in run `53/100` round `6` after `52/100` passes / `624` rounds with `ran_twice=0`): first verified all 8 tests of `cargo +1.96.0 test -p rusty_grid_master --test master_restart_recovery --locked` (`8/8` passed in `13.59 s`), then passed `200/200` sequential runs (`2,400` rounds, `ran_twice=0`, `0` failures, `2,725.53 s` total) of `cargo +1.96.0 test -p rusty_grid_master --test master_restart_recovery --locked rv158 -- --nocapture` under 4 Python CPU busy loops: `100/100` default-delay (`1,200` rounds, `ran_twice=0`, `1,308.56 s`, min `12.52 s`, median `13.00 s`, max `14.25 s`) and `100/100` `RV158_ZERO=1` (`1,200` rounds, `ran_twice=0`, `1,416.97 s`, min `14.01 s`, median `14.17 s`, max `14.36 s`). Changes in `tests/master_restart_recovery.rs`: replaced PowerShell `Add-Content`/`Test-Path`/`Start-Sleep` cmdlets in `gated_marker_task` (`#[cfg(windows)]`) with direct `.NET` `[System.IO.File]`/`[System.Threading.Thread]::Sleep` calls so cold module autoloading does not stall startup, bounded the post-gate `done_path` poll loop with early terminal-state exit and `LogSink` timeout diagnostics, and widened helper task `timeout_secs` and `rv158` marker/done waits to `120 s` (after intermediate `60 s` runs observed `BELOW_NORMAL_PRIORITY_CLASS` `powershell.exe` startup starvation up to `57.3 s` when an unrelated concurrent 12-thread Normal-priority host job competed alongside the busy loops; `ran_twice=0` in all completed rounds). Stays `Partial | In` awaiting closure decision (Linux and Windows post-`09c3accd` loops are both 200/200).
+- **Implemented (2026-11-23, pull request 426):** Done when is met: 200/200 on Linux (pull requests 363, 419) and on Windows (pull requests 359, 420) after the fixes of `09c3accd`, plus macOS (pull request 288). Cause: not reproduced. The pull request 282 CI hit never repeated. The diagnostics of pull request 288 stay in the probe (the owner delegated this decision on 2026-11-23).
 
 ### TEST-42: Make the reaper boundary test independent of scheduler delay
 
@@ -3110,6 +3407,14 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   - Pre-shutdown loaded loops (`origin/master` `98570ab`, `-j 4 -- --test-threads=1` under `4` Python CPU busy loops, before the 2026-11-19 ~22:38 UTC shutdown): before fix `20/20` passed (`31` passed per run; `150.03–169.37 s`, median `154.22 s`, total `3,106.57 s`), compared to `5/5` failures of `test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret` during full loaded workspace runs under `6` busy loops; after fix `20/20` passed (`31` passed per run; `148.63–157.44 s`, median `151.07 s`, total `3,029.12 s`), and `cargo clippy --workspace --all-targets --locked -j 4 -- -D warnings` passed.
   - Post-restart verification: after rebasing onto `origin/master` (`8513b79`), rebuilt once under the memory rules (`CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`) and verified `1/1` (`31 passed, 0 failed` in `211.33 s`) with `RUSTY_GRID_REQUIRE_APPCONTAINER=1 --test-threads=1`; after merging `origin/master` (`fd0df6a`) and adding `GO_SEEN`, `cargo fmt --all -- --check`, `ox-mode test size`, and `ox-mode doc verify` passed locally while `windows-latest` CI verifies `GO_SEEN` (local `1/1` post-`GO_SEEN` check to be added as a PR comment once free RAM `>= 6 GiB`).
   - Why `Partial`: the failing configuration (full loaded workspace under `6` busy loops) crashed this laptop twice (`0x1a MEMORY_MANAGEMENT` and an OOM shutdown), so it was not run here; the fix was looped only as this binary alone (`--test-threads=1`, `4` busy loops), where the old code also passed `20/20`. Confirmation in the failing configuration runs on the case PC (`agent-win`) after its 24-hour soak, and `TEST-69` becomes `Implemented` in that follow-up.
+- **Implemented (2026-11-23, pull requests 403, 421):** Confirmed in the failing configuration on the Windows case PC (`Windows 11 Pro`, `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated shell, `>= 28 GB` free RAM, `rustc 1.96.1` / `cargo 1.96.1`, `RUSTY_GRID_REQUIRE_APPCONTAINER=1`, isolated NTFS `HOME`/`USERPROFILE` separate from `TEMP`/`TMP` while preserving `LOCALAPPDATA`) at commit `9800abea` (`crates/worker` unchanged in `8e55dac9`):
+  - Full crate loaded loop: `20/20` sequential runs of `RUSTY_GRID_REQUIRE_APPCONTAINER=1 cargo +1.96.0 test -p rusty_grid_worker --locked` (default parallel test threads) under `6` Python CPU busy loops (`427 passed, 0 failed, 0 ignored` per run = `8,540` test runs, `0` failures; `136.26–140.33 s`, median `136.60 s`, sum `2,737.24 s`; pre-build `93.89 s`; per-run durations: `140.33`, `136.39`, `137.39`, `136.42`, `136.66`, `136.49`, `136.36`, `136.26`, `136.55`, `136.38`, `136.59`, `136.59`, `136.38`, `137.19`, `136.83`, `137.53`, `136.78`, `136.61`, `136.73`, `136.78 s`).
+  - Individual durations of the hardened `mod windows` tests in `crates/worker/tests/test_feat3_os_isolation.rs` (`-- --exact --nocapture` under the same `6` Python busy loops and `RUSTY_GRID_REQUIRE_APPCONTAINER=1`):
+    1. `windows::test_attack_junctions_and_hardlinks_inside_sandbox_cannot_expose_denied_secret`: `1.44 s`
+    2. `windows::test_concurrent_tasks_under_fs_cannot_read_or_list_each_others_sandboxes`: `2.44 s`
+    3. `windows::test_tracked_pid_is_the_task_and_cancel_and_timeout_still_kill_it`: `2.67 s`; `windows::test_self_check_accepts_both_levels_on_windows`: `0.41 s`
+    4. `windows::test_host_named_pipes_cannot_be_connected_to_under_fs`: `5.58 s`
+    5. `windows::test_appcontainer_profile_is_deleted_on_cleanup`: `0.48 s`
 
 ### TEST-81: Test masters keep 85 % host-CPU backpressure, stalling queued tasks under load
 
@@ -3509,6 +3814,127 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     - `python::test_sec6_mesh_sandbox`: single passed, after `20/20` (`total=192.31s`, `min=9.51s`, `max=9.67s`)
   - **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` passed.
 
+### TEST-91: Windows case PC: S9 real GPU stability and VRAM routing record
+
+- **Claim:** `claims/item/TEST-91__win__20261123T211437648778Z__1382298f.json`
+- **Hardware & environment (Windows case PC):** Windows 11 Pro `x86_64`, Intel Core i5-14600KF (`14` physical / `20` logical cores), `48 GB` RAM, NVIDIA GeForce RTX 5060 Ti (`16311 MiB` VRAM, driver `621.24`), non-elevated session, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`TEMP`/`TMP` under `C:\ox_tmp\w1_s9` (`OXIDESWARM_HOME` unset for unit/integration suites; child-isolated `OXIDESWARM_HOME` for loopback processes; `creationflags=CREATE_NO_WINDOW`).
+- **Tested code:** Local S9.1–S9.5 on PR #424 head `055ca0c794652d05127324f8df2349a4bb58cac7` (`git status --porcelain` empty; PR #424 still `OPEN` at test time, ahead of `720106d8`). Stage B W6 cross-machine run on `master` `720106d8da69eb5c42bc0e9c0ee4f862e7e72781` across Mac lab master + `win-case-lab` (`--isolation fs --gpu --vram-mb 16311 --workspaces --no-portal`) + `mac-lab-worker` + `linux-docker-lab`.
+- **S9 checks ([guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md#s9-real-gpu-stability-record-on-the-case-pc)):**
+  1. `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader`: `NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 621.24`.
+  2. Warm-up (`RUSTY_GRID_REQUIRE_GPU=1 cargo +1.96.0 test --locked -p rusty_grid_worker --features gpu-wgpu`): `443` passed, `0` failed across `17` test targets. Followed by `50/50` consecutive fresh passes (`0` failures; wall `96.203–106.968 s`, median `96.757 s`, total `4,891.748 s`).
+  3. `gemm_bench` (`cargo +1.96.0 run --locked --release -p rusty_grid_worker --features gpu-wgpu --example gemm_bench -- <dim>`, `3` runs each, adapter `NVIDIA GeForce RTX 5060 Ti (Vulkan, DiscreteGpu)`):
+     - `1024x1024 f32` (`2.15 GFLOP`): engine init `355 / 276 / 277 ms`; GPU best `3 / 3 / 3 ms`, median `3 / 3 / 4 ms`; CPU SIMD 1-thread `397 / 401 / 398 ms` (`132.3x / 133.7x / 99.5x`; wall `159.422 s` incl. build, `1.265 s`, `1.266 s`).
+     - `2048x2048 f32` (`17.18 GFLOP`): engine init `269 / 341 / 277 ms`; GPU best `20 / 19 / 19 ms`, median `21 / 19 / 19 ms`; CPU SIMD 1-thread `3733 / 3529 / 3419 ms` (`177.8x / 185.7x / 179.9x`; wall `5.140 / 4.891 / 4.609 s`).
+  4. Loopback GEMM + 3D VRAM routing (`cargo +1.96.0 build --locked --release --bin oxideswarm --features gpu-wgpu,3d`; master + `win-gpu` `--gpu --vram-mb 16311` + `win-cpu` `--no-gpu`, stopped cleanly by PID):
+     - `20/20` `--type gpu --gpu` GEMM submits (`--wait --json`): `0.062–0.109 s`, all `20` executed on `win-gpu` with `Status: VERIFIED_OK`.
+     - `--type 3d --engine triposr --quality high --prompt "s9 test cube"`: routed strictly to `win-gpu` (`exit_code: 1`, expected missing Python/TripoSR error `"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"`; `0` runs on `win-cpu`).
+     - With `win-gpu` stopped, both `--type 3d --engine auto` (`55 ms`) and `--type 3d --engine sdf` (`52 ms`) succeeded (`exit_code: 0`, `"Tier 0 procedural SDF mesh generated: 9992 vertices, 15224 triangles"`) on CPU-only `win-cpu`.
+  5. Kill GPU worker mid-GEMM without CPU fallback (`--type gpu --gpu --matrix-dim 8192`): killed `win-gpu` by PID while `Running` on `win-gpu` with `win-cpu` connected & idle; master logged `Re-enqueued orphaned tasks for reassignment count=1`; all `6` consecutive `1 s` polls stayed `Queued` (`assigned_worker: None`); restarted `win-gpu` and the requeued task finished on `win-gpu` in `1143 ms` (`1099511627776` FLOPs, max relative error `7.060e-6` vs `9.766e-4`, `0` non-finite, `Status: VERIFIED_OK`).
+  6. Stage B W6 cross-machine LAN verification (`720106d8` Mac lab master + `win-case-lab` `--isolation fs --gpu --vram-mb 16311 --workspaces --no-portal` + `mac-lab-worker` + `linux-docker-lab`, executed from Mac client):
+     - `doctor --expect-workers 3`: `15` passed, `0` warnings, `0` failed, `0` skipped; `C5 GPU probe win-case-lab`: `512x512 GEMM verified in 4 ms, 67.1 GFLOP/s on NVIDIA GeForce RTX 5060 Ti`; `C6 Spread`: `12` tasks of `500 ms` finished in `517 ms` across `3` workers (`linux-docker-lab` `2`, `mac-lab-worker` `4`, `win-case-lab` `6`).
+     - `20/20` `--type gpu --gpu --require-isolation fs --wait --json` GEMM submits: all `20` executed on `win-case-lab` in `0.0105–0.0181 s`, all `20` printed `Status: VERIFIED_OK` (`64x64 f32`, `Vulkan` backend, `1 ms` exec, max relative error `5.069e-7` vs `7.629e-6`, `0` non-finite).
+     - Unpinned `--type 3d --engine triposr --quality high --prompt "w6 test cube"`: routed strictly to `win-case-lab` (`0` runs on CPU workers `mac-lab-worker` / `linux-docker-lab`), exited `1` in `22 ms` with expected `"TripoSR model not available: missing Python or engines/generative_3d/entrypoint.py"`.
+     - `--type 3d --engine sdf --prompt "w6 test cube" --worker win-case-lab`: exited `0` in `78 ms`, `"Tier 0 procedural SDF mesh generated: 9992 vertices, 15224 triangles in 78 ms"` (`4,608,376`-byte GLB).
+- **Status:** Implemented (2026-11-24, pull request 434).
+### TEST-85: Windows: the `submit --type compile` runtime test times out after 60 s
+- **Evidence:** CI run `44747726996` (push of pull request 407 to `master`, 2026-11-20 13:49 UTC), job
+  `gpu-wgpu (windows-latest)` (`136327278116`), step `cargo test -p rusty_grid_cli --lib --features gpu-wgpu`:
+  `cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo`
+  (`crates/cli/src/cli_app/runtime_tests.rs`) printed "Timed out after 60s waiting for task ... to complete" and
+  panicked at the assertion "submit --type compile must succeed" (`ExitCode(1)`). 200 other tests of the step passed.
+  It is the last failing test on `master` before the Q80 streak counted from 2026-11-20.
+- **Problem:** The test builds a real crate with a local path dependency through `cargo` on a worker. A cold
+  `cargo build` on a hosted Windows runner can take longer than the 60 s wait of `submit`. The cause (a wait that is
+  too short, or a task that hangs) is not known.
+- **Do:**
+  1. Read the test and the wait it uses (`submit_args`, `run_submit_with_secret`, the `--wait` budget of `submit`).
+  2. On Windows, run the test alone and in the whole `rusty_grid_cli --lib --features gpu-wgpu` binary 20 times each,
+     the second set under 4 busy loops; record each task's `execution_time_ms` and whether `cargo` was still running
+     at the timeout.
+  3. If the task finishes but late, give the test a budget that cannot be the cause (at least 600 s), keep every
+     assertion, and print the time. If the task hangs, follow rule 4: a test that fails without the fix, then the fix.
+- **Done when:** The cause is found, or the test passes 50 runs in a row on Windows under 4 busy loops and stays green in CI on `windows-latest` through the Q80 streak window.
+- **Partial (2026-11-23, pull request 417, commit `b0d4058f`):**
+  - **Cause (not found):** The CI failure was a `60` s timeout (`crates/cli/src/cli_app/submit.rs` `:1049`, `:1220`, `:1232`: `submit --type compile` forces `wait = true` and defaults `timeout_secs` to `60` s when `--timeout-secs` is omitted, unless `--workspace` is set) on a task whose local path-dependency build normally completes in under `1` s (`exec_ms` `341–505`, `compile_wall_ms` `523–619` across `20 + 20 + 50` runs on the case PC). A task that short reaching a `60` s deadline looks like a stall rather than a slow build; the underlying cause did not reproduce locally on the case PC and remains unfound.
+  - **Fix (`crates/cli/src/cli_app/runtime_tests.rs`):** kept the product default `60` s untouched, passed `--timeout-secs 600` in the test's `submit_args` as a hang guard, widened the worker-registration `deadline` from `10` s to `60` s, and printed `TEST-85 compile_wall_ms=... exec_ms=...` with every assertion preserved so any repeat shows whether the task was slow or stuck. Stays `Partial` until the cause is found or `windows-latest` stays green through the Q80 streak window.
+  - **Baseline (`origin/master` `6a9060ba`, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.98.1`, isolated NTFS `USERPROFILE`/`HOME`/`TEMP` under `C:\ox_tmp\s1`):**
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (solo, `0` busy loops): `20/20` passed (wall `3.48–6.66` s, median `3.55` s; `exec_ms` `458–505`, median `470`).
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu` (full binary, `4` Python CPU busy loops): `20/20` passed (`228` tests/run; wall `13.00–13.12` s, median `13.06` s).
+  - **Post-fix (`b0d4058f`, same machine and isolated NTFS `USERPROFILE`/`HOME`/`TEMP`):**
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` (`4` Python CPU busy loops): `50/50` passed (wall `3.91–4.52` s, median `4.06` s; `compile_wall_ms` `523–619`, median `551`; `exec_ms` `341–431`, median `360`).
+    - `cargo test --locked -p rusty_grid_cli --lib --features gpu-wgpu`: `228/228` passed (`10.04` s); `cargo fmt --all -- --check`, `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings`, `cargo +1.96.0 clippy -p rusty_grid_cli --all-targets --features gpu-wgpu --locked -- -D warnings`, and `python3 tests/test_m1_challenger_hygiene.py` all passed.
+- **Implemented (2026-11-24, pull requests 417 and 430, branch `win/test-85-windows-50-runs`, commit `720106d8`):**
+  - **50-run loaded loop (`720106d8`, `git status --porcelain` empty, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`OXIDESWARM_HOME`/`TEMP`/`TMP` under `C:\ox_tmp\w4_test85`):**
+    - `cargo +1.96.0 test --locked -p rusty_grid_cli --lib --features gpu-wgpu cli_app::runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo -- --exact --nocapture` under `4` Python CPU busy loops: `50/50` passed (`0` failures; wall `2.34–2.88 s`, median `2.55 s`, total `127.69 s`; `compile_wall_ms` `1078–1532`, median `1247.0`; `exec_ms` `555–667`, median `581.5`).
+  - **`master` `windows-latest` CI history since 2026-11-20 (`gh run list --branch master --event push --workflow ci.yml`):**
+    - `44747726996` (`2026-11-20T13:49:38Z`, `a5da4a97`): `gpu-wgpu (windows-latest)` failed on TEST-85.
+    - All `14` subsequent `master` push CI runs (`44755048283` at `2026-11-20T14:36:15Z` through `45261621774` at `2026-11-23T20:39:25Z`, including all `8` runs from pull request 417 `8e55dac9` on `2026-11-23T07:54:04Z` onward; note `45261621774` still had non-Windows jobs queued/in progress at capture time) passed `100%` of `windows-latest` jobs (`gpu-wgpu`, `unit tests`, `workspace tests`, `clippy`, `agent bridge`). (Overall non-Windows `master` failures in that span were `44755048283` and `45250047708` cancelled `launcher scripts (macos-latest)`, and `45054272288` `workspace tests (macos-latest)` TEST-86.)
+### TEST-94: `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery`
+- **Evidence:** Stage E `E-W3` on Windows 11 Pro x86_64 (`abff2514`, `RUSTY_GRID_REQUIRE_GPU=1`, `rustc 1.96.0`): `cargo +1.96.0 test --locked -p rusty_grid_cli --lib --features gpu-wgpu` failed `2/30` runs (runs `06` and `23` of `30`, `10.500 s` each, `227 passed; 1 failed; 0 ignored`) in `cli_app::tests::test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config_or_aliases`, while `rusty_grid_worker --features gpu-wgpu` passed `30/30`. Running that test alone with `RUSTY_GRID_WIRE_CODEC=xml` reproduces the failure deterministically (`100 %`, `5.02 s`): `RUSTY_GRID_WIRE_CODEC: Unknown wire codec 'xml', expected 'bincode' or 'json'` followed by `panicked at crates\cli\src\cli_app\tests.rs:1176:26: run_worker must connect to local listener: Elapsed(())`.
+- **Problem:** `cli_app::runtime_tests::test_sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticket` mutates process-wide `RUSTY_GRID_WIRE_CODEC` (`"xml"` at `:355` and `:710`, `"json"` at `:376–423`), `OXIDESWARM_HOME`, `RUSTY_GRID_SCHEDULER_POLICY`, `RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, and `RUSTY_GRID_SPEED_HOLD_FACTOR` with raw `std::env::set_var`/`remove_var` and no process-wide lock. When `cargo test` runs `test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config_or_aliases` concurrently, `run_worker` reads `RUSTY_GRID_WIRE_CODEC=xml` (`crates/cli/src/cli_app/worker.rs:594`) and exits before binding/connecting to the local test listener.
+  1. Add `#[cfg(test)] pub(crate) mod test_env_lock` in `crates/cli/src/lib.rs` with a shared `tokio::sync::Mutex<()>` (`lock_async` / `lock_blocking`) and panic-safe `ScopedEnvVar` (`Drop` restores prior `Option<OsString>`).
+  2. Acquire `test_env_lock` in every `crates/cli/src` runtime test that mutates or depends on process env vars (`cli_app::runtime_tests`, `cli_app::tests` worker/master/CLI tests, and `connect.rs` `connect_master*` tests), replacing raw `std::env::set_var`/`remove_var` calls in `sched2` and `test_resolve_no_battery` with `ScopedEnvVar`.
+  3. Add regression test `test_cli_env_lock_serializes_wire_codec_mutation_and_restores_on_panic` proving concurrent serialization across `tokio::join!` and unwind cleanup via `catch_unwind`.
+- **Done when:** All targeted gates (`rustfmt`, `clippy --all-targets`, `clippy --features gpu-wgpu`, `test_m1_challenger_hygiene.py`) pass and `cargo +1.96.0 test --locked -p rusty_grid_cli --lib --features gpu-wgpu` (`RUSTY_GRID_REQUIRE_GPU=1`) passes `50/50` consecutive runs under `4` CPU busy loops on Windows.
+- **Implemented (2026-11-24, branch `win/test-94-cli-env-lock`):** Added `test_env_lock` (`lock_async`, `lock_blocking`, `ScopedEnvVar`) in `crates/cli/src/lib.rs`, guarded all env-mutating and runtime-reading tests across `crates/cli/src/cli_app/runtime_tests.rs`, `crates/cli/src/cli_app/tests.rs`, and `crates/cli/src/connect.rs`, and added `test_cli_env_lock_serializes_wire_codec_mutation_and_restores_on_panic`. Verified `50/50` consecutive loaded runs (`229 passed; 0 failed` per run; min `14.547s`, median `14.734s`, max `16.078s`, mean `14.840s`, total `741.984s`) on Windows under `4` Python CPU busy loops (`RUSTY_GRID_REQUIRE_GPU=1`), `cargo +1.96.0 fmt --all -- --check`, both `clippy` gates, and `test_m1_challenger_hygiene.py` (`5/5`).
+### TEST-87: macOS: worker portal loopback test fails when its LAN-side bind finds the port in use
+- **Evidence:** `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` failed on
+  `macos-latest` in pull request 419 (run `45129742542`, job `137542373519`, head `116353d0`, docs-only): the
+  panic at `crates/worker/src/client/tests.rs:4155` was `must not bind 0.0.0.0:49623 (binding
+  192.168.64.11:49623 failed: AddrInUse)`. 328 other tests in the binary passed.
+- **Problem:** The test proves the portal is not on `0.0.0.0` by binding `<lan_ip>:<portal port>`. Any other
+  socket on that address and port makes the bind fail, for example a concurrent test's outgoing connection
+  with an ephemeral local port in the same 49152–65535 range. The listener's `local_addr` is already
+  asserted to be `127.0.0.1`, so the LAN-side bind adds only noise.
+- **Do:** Write a failing check first (hold a socket on `<lan_ip>:<port>` before the bind and show the false
+  failure). Then, on `AddrInUse`, connect to `<lan_ip>:<port>` instead: refused, or an answer that is not the
+  portal's `/api/status` body, passes. Only the portal's body fails. Keep the `127.0.0.1` assertion.
+- **Done when:** 50 runs of `cargo test -p rusty_grid_worker --lib client::tests` pass under 4 busy loops
+  on Windows, plus the same run on macOS by `agent-mac`.
+- **Implemented (2026-11-24, pull request 429, branch `win/test-87-portal-lan-bind`):**
+  - **Failing check first (`crates/worker/src/client/tests.rs`):** added `test_portal_lan_bind_check_tolerates_non_portal_socket_on_addr_in_use` calling the naive `std::net::TcpListener::bind` check against an occupied loopback listener port (`127.0.0.1:26921`); failed as expected with `Os { code: 10048, kind: AddrInUse, message: "Only one usage of each socket address (protocol/network address/port) is normally permitted." }`.
+  - **Fix (`crates/worker/src/client/tests.rs`):** kept the `127.0.0.1` `local_addr().ip()` assertion in `test_loopback_targeting_worker_portal_binds_loopback_not_all_interfaces` and replaced the bare LAN bind with `assert_portal_not_listening_on_lan`. On `ErrorKind::AddrInUse`, it connects to `(lan_ip, portal_port)` and sends `GET /api/status` (bounded by `TEST_WAIT_TIMEOUT = 60 s`), failing only when the response parses as the worker portal `200 OK` JSON status (`"role":"WORKER_PORTAL"` and `"master_cluster_addr"`, `is_worker_portal_status_response`). Added three toleration cases (unrelated HTTP server, silent closing listener, bound non-listening socket) and negative control `test_portal_lan_bind_check_rejects_real_portal_on_addr_in_use` proving a live `run_portal` on the probed address still fails (`answered /api/status`).
+  - **Windows loop (`ff832b0e`, `git status --porcelain` empty, Windows 11 Pro `x86_64`, Intel Core i5-14600KF, 14 physical / 20 logical cores, 48 GB RAM, non-elevated, `rustc 1.96.0`, isolated NTFS `USERPROFILE`/`HOME`/`OXIDESWARM_HOME`/`TEMP`/`TMP`):**
+    - `cargo +1.96.0 test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops: `50/50` passed (`83` tests/run; `0` failures; wall `6.72–7.91 s`, median `6.81 s`, total `342.20 s`).
+    - `cargo +1.96.0 fmt --all -- --check` and `cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings` passed (`0` warnings).
+  - **macOS loop (`d3103d30`, `agent-mac-ag`, Apple Silicon M5, `10` logical cores, isolated temporary `HOME`/`USERPROFILE`/`OXIDESWARM_HOME` per run, real `RUSTUP_HOME`/`CARGO_HOME`):**
+    - `cargo test --locked -p rusty_grid_worker --lib client::tests` under `4` Python CPU busy loops: `50/50` passed (`84` tests/run; `0` failures; min `9.52 s`, median `9.75 s`, max `11.65 s`, total `490.43 s`).
+### TEST-92: Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses
+- **Claim:** `claims/item/TEST-92__mac-ag__20261123T213209566518Z__f60d0e83.json`
+- **CI scan and root cause:**
+  - Pull request 421 CI (`run 45180089954`, `unit tests (macos-latest)`, `job 137711364019`) emitted `WARN rusty_grid_core::capabilities: Host tool version probe timed out; treating tool as unavailable` for `tool=cargo` (`timeout_secs=3.0`) and `tool=rustc` (`timeout_secs=3.0`).
+  - Scanning the last `20` `master` push `ci.yml` runs (`280` jobs) found `0` probe timeout log hits on passing logs (where `unittest` suppresses stderr), while `unit tests (macos-latest)` Wave 2 (`n=12`: `551.0–644.0 s`, median `578.0 s`, mean `584.3 s`) and Wave 3 (`n=11`: `543.0–588.0 s`, median `554.0 s`, mean `558.4 s`) ran `5–7.5x` slower than `ubuntu-latest` (Wave 2 `n=12`: `70.0–81.0 s`, median `78.0 s`, mean `76.8 s`; Wave 3 `n=11`: `88.0–134.0 s`, median `119.0 s`, mean `112.8 s`).
+  - `dtolnay/rust-toolchain@1.96.0` sets `RUSTUP_TOOLCHAIN=1.96.0` without explicitly exporting `RUSTUP_HOME` or `CARGO_HOME`. Isolated E2E harnesses overwrote `HOME` and `USERPROFILE` to a fresh empty temp dir (or scrubbed env), causing `rustup`'s `cargo`/`rustc` shims on `PATH` to look in an empty `$HOME/.rustup` and stall on every worker startup until hitting the 3 s probe timeout in `rusty_grid_core::capabilities`.
+- **Single-worker reproduction (`720106d8da69eb5c42bc0e9c0ee4f862e7e72781`):**
+  - `without_rustup_home_toolchain_1_96` (`RUSTUP_TOOLCHAIN=1.96.0`, private `HOME`, `RUSTUP_HOME`/`CARGO_HOME` unset): `connect_s=3.205s`, `tool_tags=['tool:git']`, `probe_timeouts=1` (`tool=cargo timeout_secs=3.0`).
+  - `without_rustup_home_unset_toolchain`: `connect_s=0.075s`, `tool_tags=['tool:git']`, `probe_timeouts=0`.
+  - `with_rustup_home`: `connect_s=0.183s`, `tool_tags=['tool:cargo', 'tool:rustc', 'tool:git']`, `probe_timeouts=0`.
+- **Scope and `tool:cargo` test audit (zero product code changes, zero PR #409 overlap):**
+  - Fixed in test harnesses and CI steps rather than changing production probe logic (`0` edits under `crates/*/src/`, `0` edits to PR #409 files). Audited all `tool:cargo`/`tool:rustc` assertions across `crates/cli/src/cli_app.rs`, `crates/worker/src/client/tests.rs`, `crates/master` placement, `tests/cli_isolation_e2e.rs`, `tests/test_wave3_e2e.py`, and `tests/test_bench_grid.py`; confirmed `crates/cli` `runtime_tests::test_submit_compile_builds_crate_with_local_dependency_and_avoids_worker_without_cargo` (`1/1`, `1.55 s`) passes under `env -u RUSTUP_HOME -u CARGO_HOME RUSTUP_TOOLCHAIN=1.96.0`.
+  - **22 modified harness and CI files (`4252c7bc5ba38eb4e8451f5a651d51a8f323d084`):** `.github/workflows/ci.yml`, `test_integration.sh`, `tests/test_wave2_e2e.py`, `tests/test_wave3_e2e.py`, `crates/agent_mesh/tests/grid_remote_master_e2e.rs`, `crates/cli/tests/e2e_opaque_suite.rs`, `crates/cli/tests/e2e_tier5_hardening.rs`, `crates/cli/tests/test_feat5_cli_e2e.rs`, `crates/core/tests/m1_3d_adversarial_stress.rs`, `tests/cli_dashboard_policy_e2e.rs`, `tests/cli_enroll_e2e.rs`, `tests/cli_isolation_e2e.rs`, `tests/cli_join_e2e.rs`, `tests/cli_pair_e2e.rs`, `tests/cli_revoke_e2e.rs`, `tests/cli_secret_e2e.rs`, `tests/cli_usb_kit_e2e.rs`, `tests/cli_worker_identity_e2e.rs`, `tests/cli_worker_signals_e2e.rs`, `tests/cluster_record_layer_e2e.rs`, `tests/enroll_v3_e2e.rs`, `tests/rendezvous_discovery_e2e.rs`.
+- **20-run loaded before/after comparison (Apple Silicon M5, macOS, 10 logical cores, non-elevated, 4 Python CPU busy loops, outer `RUSTUP_TOOLCHAIN=1.96.0` with `RUSTUP_HOME` and `CARGO_HOME` unset; before=`720106d8da69eb5c42bc0e9c0ee4f862e7e72781`, after=`4252c7bc5ba38eb4e8451f5a651d51a8f323d084`):**
+  - `bash test_integration.sh`:
+    - Before: `20/20`, wall `7.472–11.489 s` (median `9.510 s`, total `191.419 s`); 3-worker reg `5.097–6.741 s` (median `5.576 s`, total `116.686 s`).
+    - After: `20/20`, wall `3.010–3.636 s` (median `3.084 s`, total `62.373 s`); 3-worker reg `0.726–0.981 s` (median `0.735 s`, total `15.009 s`).
+  - `python3 -B -m unittest tests.test_wave2_e2e.Tier1FeatureCoverageTests.test_t1_f1_04_worker_isolation_tags_advertised_accurately` (`3` workers):
+    - Before: `20/20`, wall `10.126–11.210 s` (median `10.451 s`, total `210.343 s`).
+    - After: `20/20`, wall `0.579–2.175 s` (median `0.625 s`, total `14.147 s`); per-worker connect (`60` connects) `0.14–0.22 s` (median `0.15 s`, total `9.33 s`).
+  - `python3 -B -m unittest tests.test_wave3_e2e.Tier1FeatureCoverageTests.test_t1_3d2_01_worker_blender_and_vram_capability_advertisement` (`2` workers):
+    - Before: `20/20`, wall `6.904–7.956 s` (median `7.285 s`, total `146.161 s`).
+    - After: `20/20`, wall `0.539–0.697 s` (median `0.611 s`, total `12.099 s`).
+  - `cargo test --locked -p rusty_grid_cli --test test_feat5_cli_e2e -- --nocapture`:
+    - Before: `20/20`, wall `3.267–4.092 s` (median `3.326 s`, total `67.699 s`).
+    - After: `20/20`, wall `3.192–3.739 s` (median `3.361 s`, total `67.328 s`).
+  - `cargo test --locked --test cli_worker_signals_e2e -- --nocapture`:
+    - Before: `20/20`, wall `2.048–2.709 s` (median `2.143 s`, total `43.390 s`).
+    - After: `20/20`, wall `2.057–2.848 s` (median `2.137 s`, total `43.233 s`).
+- **Full-suite verification after `4252c7bc` (`RUSTUP_TOOLCHAIN=1.96.0`, `RUSTUP_HOME`/`CARGO_HOME` unset in outer env):**
+  - `python3 -m unittest tests/test_wave2_e2e.py -v` (with CI `pmset` stub + preserved `RUSTUP_HOME`/`CARGO_HOME`): `73/73` in `79.564 s` (worker connects `0.07–0.17 s`).
+  - `python3 -B -m unittest tests/test_wave3_e2e.py -v` (after `--bin oxideswarm --features 3d` + `agent-mesh`): `63/63` in `88.548 s`.
+  - `bash test_integration.sh`: `9/9` checks in `2.894 s` (`[timing] 3 workers registered in 0.525s`).
+  - All `18` modified Rust E2E binaries passed individually: `m1_3d_adversarial_stress` (`21/21`, `87.12 s`), `grid_remote_master_e2e` (`5/5`, `11.71 s`), `e2e_opaque_suite` (`97/97`, `24.72 s`), `e2e_tier5_hardening` (`8/8`, `13.74 s`), `test_feat5_cli_e2e` (`2/2`, `1.93 s`), `cli_dashboard_policy_e2e` (`9/9`, `1.85 s`), `cli_enroll_e2e` (`5/5`, `11.42 s`), `cli_isolation_e2e` (`4/4`, `1.45 s`), `cli_join_e2e` (`6/6`, `2.61 s`), `cli_pair_e2e` (`4/4`, `0.67 s`), `cli_revoke_e2e` (`2/2`, `2.02 s`), `cli_secret_e2e` (`13/13`, `2.80 s`), `cli_usb_kit_e2e` (`2/2`, `5.10 s`), `cli_worker_identity_e2e` (`3/3`, `1.08 s`), `cli_worker_signals_e2e` (`4/4`, `0.65 s`), `cluster_record_layer_e2e` (`3/3`, `2.02 s`), `enroll_v3_e2e` (`1/1`, `2.47 s`), `rendezvous_discovery_e2e` (`3/3`, `8.24 s`).
+- **Quality gates:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `python3 tests/test_m1_challenger_hygiene.py` (`5/5`, `0.098 s`), and `python3 tests/test_launcher_scripts.py -v` (`79` total: `75` passed, `4` Windows skipped, `111.695 s`) passed.
+
 ### BUG-23: Stop the Windows master gracefully in `oxctl.ps1`
 
 - **Evidence:** Read on 2026-11-17 while preparing 0.4.0: `windows/oxctl.ps1` starts the master with
@@ -3813,6 +4239,21 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
     (`mean 0.196 ms`, `min 0.161 ms`) — down from `7.683 ms` / `7.248 ms`.
   `rusty_grid_worker --lib` and `test_sec5_hardened_runner` (with and without `--features 3d`) pass.
 
+### BUG-35: macOS: concurrent Command::spawn() calls outside process_tree can inherit unrelated pipes before FD_CLOEXEC
+Priority: P1 | Effort: M | Status: Implemented | Pull Request: 409 (open)
+
+- **Problem**: On macOS (which lacks `pipe2(O_CLOEXEC)`), Rust's standard library creates both its internal exec-status `output_pipe` and any `Stdio::piped()` descriptors with `pipe()` followed by `fcntl(F_SETFD, FD_CLOEXEC)`. While `crates/worker/src/process_tree.rs` held a private `SPAWN_LOCK` around `create_lifeline_pipe()` and task `cmd.spawn()`, runtime callers outside `process_tree` (the mobile battery poller running `pmset -g batt` every `10 s` through `run_command_bounded`, `probe_python`, `probe_blender_binary`, `isolation::macos::probe`, `agent_mesh::CommandExecutor`, CLI `mode_cli` subprocesses, and in-process `WorkerClient` test binaries spawning CLI children) did not acquire that lock. A concurrent `fork()`/`posix_spawn()` inside that non-atomic window could inherit the unrelated pipe write end without `FD_CLOEXEC`, stalling short spawns or `wait_with_output()` until an unrelated long-lived child exited.
+- **Root cause & reproduction**: Any `Command::spawn()` / `Command::output()` on macOS running concurrently with `pre_exec` (used for `process_group(0)` in `capabilities::run_command_bounded`, `agent_mesh::executor`, and task spawns) or concurrent `Stdio::piped()` spawns can race the `pipe()` + `FD_CLOEXEC` window. Under 6 CPU busy loops on Apple M5, an ordering-based test (`4` long gated `/bin/cat` threads alongside `4` threads running short `/bin/echo ok` spawns with `process_group(0)`) failed `4/5` runs without serialization (`1/5` passed, `total 253.92 s`, `min 3.58 s`, `max 64.76 s`, timing out at the `60 s` deadlock-breaker watchdog with `observed 1 stalls`).
+- **Fix ([design 0031](design/0031-containment-after-worker-crash.md))**:
+  - Added 100%-safe `rusty_grid_core::process_spawn` (`with_macos_spawn_lock`, `spawn_std`, `output_std`, `status_std`, `spawn_tokio`, `output_tokio`) holding a single process-wide `Mutex<()>` strictly around descriptor creation and `Command::spawn()` on `#[cfg(target_os = "macos")]` (never across `wait()`, `wait_with_output()`, or output reading, and bypassed on Linux `pipe2(O_CLOEXEC)` and Windows). `output_std` and `output_tokio` match `Command::output()`'s null-`stdin` default on macOS.
+  - Replaced `crates/worker/src/process_tree.rs`'s private `SPAWN_LOCK` with `rusty_grid_core::process_spawn::{with_macos_spawn_lock, spawn_tokio}` (without adding blind `close(>2)` in `pre_exec`, which would close `std`'s internal exec-error pipe).
+  - Routed runtime spawn sites in `crates/core/src/capabilities.rs` (`run_command_bounded`), `crates/worker/src/gen3d/runner.rs` (`probe_python`), `crates/worker/src/isolation/macos.rs` (`probe`), `crates/agent_mesh/src/executor.rs` (`execute_shell`), `crates/cli/src/mode_cli/{dev,test,doc}.rs`, and `crates/cli/tests/test_cli_cancel_and_result.rs` (`cli_output`); left Windows-only, Linux-only, and isolated test-only helpers untouched.
+- **Verification**:
+  - `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings` pass with zero warnings.
+  - Under 6 Python CPU busy loops on Apple M5: `rusty_grid_core --lib process_spawn::tests` passed `20/20` (`total 106.18 s`, `min 4.40 s`, `max 7.37 s`) and `rusty_grid_cli --test test_cli_cancel_and_result` passed `20/20` (`total 60.65 s`, `min 2.60 s`, `max 7.55 s`).
+  - Full `cargo test --workspace --locked` passed on macOS (`0` failed, `2,230` passed across workspace crates, `5` upstream `#[ignore]`d); `python3 tests/test_m1_challenger_hygiene.py` passed.
+  - Post-merge (`origin/master` `6a9060ba` merged at `8d7dc755`, 2026-11-23, Apple M5 10 logical cores, temporary `HOME` per run, full `crates/*/src` spawn-site audit finding `0` unrouted macOS production spawns): under `6` Python CPU busy loops, `cargo test -p rusty_grid_worker --lib --locked` passed `1/1` (`329/329`, `9.31 s`), `cargo test -p rusty_grid_worker --test test_feat3_os_isolation --locked` passed `1/1` (`28/28`, `1` ignored, `27.40 s`), `cargo test -p rusty_grid_core --lib process_spawn --locked` passed `20/20` (`total 89.52 s`, `min 3.70 s`, `max 5.03 s`), and `cargo test -p rusty_grid_cli --test test_cli_cancel_and_result --locked` passed `20/20` (`total 50.80 s`, `min 2.46 s`, `max 3.21 s`).
+
 ### CLI-2: Add a flag to move or disable the UDP discovery beacon
 
 - **Evidence:** Read in the smoke test (finding F5): the master binds UDP `127.0.0.1:8089`, and
@@ -3903,6 +4344,37 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   `crates/worker/src/isolation.rs` prove the `host.user_home` and `%USERPROFILE%` walks independently,
   verify bare-prefix exclusion under home CWD, assert refusal texts, exercise `PREPARE_LOCK` / handle /
   metadata race hooks, and fail under `RUSTY_GRID_REQUIRE_APPCONTAINER=1` instead of skipping.
+
+### SEC-16: Find what put a full-control entry for an unknown capability on `AppData`
+
+- **Evidence:** Reproduced on the owner's Windows machine, 2026-11-16, `master` `3ecc926` (Windows
+  smoke test, finding F1). The worker exits with: "another account
+  (S-1-15-3-3557520199-3666692283-...) can rename, delete or re-permission ancestor directory
+  `AppData`". A read-only `icacls` shows two explicit entries for that SID, `(F)` and
+  `(OI)(CI)(IO)(F)`. It is not the `oxideswarm.toolchain` capability, which derives to
+  `S-1-15-3-1024-...`.
+- **Problem:** The worker's check is correct, but no `fs` worker can use any sandbox base below
+  `AppData`, the default `%TEMP%` included, and the worker unit tests fail under the default
+  `%TEMP%` there. Nobody knows what created the entry. A confined process that holds that
+  capability would have full control of everything that inherits from `AppData`.
+- **Do:**
+  1. Find what created the entry and whether any confined process holds that capability. Do not
+     change the ACL without the owner.
+  2. Decide whether the worker's error message should suggest a fix.
+- **Done when:** The cause is written here, and the owner has decided what to do with the entry.
+  This needs the owner's machine.
+- **Note (2026-11-18):** On the second Windows machine (a laptop), the foreign write grants on `%TEMP%`
+  come from the Codex CLI sandbox (its capability SIDs, recorded in `%USERPROFILE%\.codex\cap_sid`) and
+  from one deleted local account. No OxideSwarm SID appears on any inspected folder. OxideSwarm's only
+  capability SID (`DeriveCapabilitySidsFromName("oxideswarm.toolchain")`) has the sub-authority 1024,
+  which the SID of this item lacks, so that SID is not OxideSwarm's either.
+- **Partial (2026-11-19, pull request 358):** The cause is on record on both Windows machines. A read-only check on the
+  case machine matched the SID of this item to the AppContainer of the Claude Desktop app's MSIX package
+  (through the AppContainer mappings and `DeriveAppContainerSidFromAppContainerName`): it belongs to that
+  package, not to OxideSwarm and not to the Codex CLI. On 2026-11-19 the entry is no longer on
+  `%USERPROFILE%\AppData`. None of the foreign grants found on either machine is OxideSwarm's. Open: the
+  owner's decision of "Done when" (the entry itself is gone) and step 2.
+- **Implemented (2026-11-23, decided by Claude on the owner's delegation of that day):** the cause is on record (the AppContainer of the Claude Desktop app's MSIX package, not OxideSwarm), and the entry is gone from `AppData`. Decisions: OxideSwarm changes no ACL it did not create; step 2, the worker's error message stays as it is, because it names the SID and the directory, which is what found the cause. No code change.
 
 ## Phase 13: the path to finished
 
@@ -4017,6 +4489,228 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   session did not record the submission), covers loopback CLI and MCP runs in
   `crates/cli/tests/test_submit_run_summary.rs` and `tests/mcp_server_e2e.rs`, and updates
   `README.md`, `CHANGELOG.md`, `docs/guides/offload-cargo-test.md`, and `docs/design/0059-first-users.md`.
+
+### ADOPT-3: Install scripts and the scripted time to first result
+
+- **Evidence:** [Design 0059](design/0059-first-users.md), D6. `scripts/install.sh` and
+  `scripts/install.ps1` do not exist. `README.md` tells a user to download an archive, compare
+  `SHA256SUMS` and unpack by hand. No record gives the time from the release page to a first
+  result.
+- **Problem:** The install is the first thing a stranger does, and it is the step with the most
+  manual commands.
+- **Do:** As D6 of design 0059, with its rules: no `sudo`, no service, no start of a master or a
+  worker, a pinned release, a checksum comparison before unpacking, `--version`, `--dir` and
+  `--dry-run`, and no pipe into a shell in `README.md`. Verify the attestation of the archive
+  when LV-5 has landed and `gh` is present. Then write the scripted measure of M15, which times
+  the Quick start from an empty home directory, with its records in `benchmarks/grid/`.
+- **Done when:** The ADOPT-3 cases in `tests/test_launcher_scripts.py` pass (a matching checksum
+  installs, a mismatch refuses and leaves no file, an unknown architecture is named, `--dry-run`
+  writes nothing, a second run replaces the binaries), and M15 by script is recorded for macOS,
+  Windows and Linux.
+- **Status (2026-11-24, Implemented, pull request 431):**
+  - Added `scripts/install.sh` (macOS/Linux, bash 3.2 compatible, LF) and `scripts/install.ps1`
+    (Windows PowerShell, CRLF, pure ASCII) with `--version` (pinned `0.4.4`), `--dir`, `--gpu`,
+    `--dry-run` (plus PowerShell `-Version`, `-Dir`, `-Gpu`, `-DryRun`, `-Help`),
+    `OXIDESWARM_DOWNLOAD_BASE`, `SHA256SUMS` verification before unpacking, `gh attestation verify`
+    against `DuongNAD/OxideSwarm/.github/workflows/release.yml` (`refs/tags/v<VERSION>`) when
+    `gh` is on `PATH` and authenticated (printing a notice or warning and continuing after
+    `SHA256SUMS` when `gh` is absent or not logged in; failing closed when authenticated
+    attestation fails), atomic binary replacement, and no `sudo`/elevation/service/daemon start
+    or `~/.oxideswarm` access; updated `README.md`, `docs/reference.md`,
+    `docs/design/0059-first-users.md`, and `CHANGELOG.md`.
+  - Added `Adopt3StaticChecks`, `InstallShTests`, and `InstallPs1Tests` to
+    `tests/test_launcher_scripts.py`, plus `benchmarks/grid/bench_m15_quickstart.py` (preserving
+    `GH_CONFIG_DIR` for `install.sh` only on Unix while keeping `HOME`/`OXIDESWARM_HOME` isolated)
+    and `benchmarks/grid/test_bench_m15.py`. Verified on `2738cc00` across Windows (`agent-win`
+    full `test_launcher_scripts.py`: `32` passed, `62` Unix skipped, `0` failed) and macOS
+    (`agent-mac-ag`: `94` OK / `11` Windows skipped including `InstallShTests`, plus CI
+    `launcher scripts (macos-latest)`); after review fixes for `GH_CONFIG_DIR` isolation and
+    unauthenticated `gh` handling, verified locally on Windows (`Adopt3StaticChecks` `1/1`,
+    `InstallPs1Tests` `8/8`, `test_bench_m15.py` `4/4`) alongside Linux/macOS CI (`InstallShTests`
+    `8/8`).
+  - Recorded macOS quarantine check (`2026-11-24`, `agent-mac-ag`, Apple Silicon M5 Darwin
+    `27.2.0`): `scripts/install.sh --version 0.4.4` against real GitHub Releases passed
+    `SHA256SUMS` and `gh attestation verify`; `xattr -l` showed `com.apple.provenance` only (no
+    `com.apple.quarantine`) and `oxideswarm --version` ran directly (`rusty-grid 0.4.4`), confirming
+    `xattr -dr com.apple.quarantine` applies to browser downloads only.
+  - Recorded M15 across all three systems (`3` cold runs each from empty `HOME`, `dirty_tree: false`):
+    Windows 11 `AMD64` (`benchmarks/grid/results/2026-11-24-m15-windows-amd64.json`, commit
+    `c0d86c6a`, median `8.551 s`, `attestation_checked: true` `3/3`), macOS `arm64`
+    (`benchmarks/grid/results/2026-11-24-m15-macos-arm64.json`, commit `2738cc00`, median
+    `8.727 s`, `attestation_checked: true` `3/3`), and Linux `amd64` Docker/Rosetta
+    (`benchmarks/grid/results/2026-11-24-m15-linux-amd64.json`, commit `2738cc00`, no `gh`,
+    `SHA256SUMS` `3/3`, median `1.434 s`).
+
+### CI-1: Keep runs for pushes on `master` from ending red or cancelled without a failing test
+
+- **Evidence:** Read through `gh run list --branch master --workflow CI --event push --limit 60` and
+  the job annotations (`gh api repos/<OWNER>/<REPO>/check-runs/<JOB_ID>/annotations`).
+  - Twelve runs of 2026-11-16 ended as cancelled (`43800093872` to `43889536272`). The annotation of
+    their jobs is "The run was canceled by" the owner's account. The workflow itself cancels only
+    runs for pull requests (`.github/workflows/ci.yml`, `concurrency`), so each was cancelled by
+    hand or by a session that uses the owner's `gh` login.
+  - Six runs of 2026-11-16 hold one or two cancelled macOS jobs (`43889143995`, `43894129643`,
+    `43914764615`, `43928207482`, `43952618376`, `43964491108`). The annotation is "The job was not
+    acquired by Runner of type hosted even after multiple attempts", beside a notice about capacity
+    for macOS arm64 runners. In the two runs read in detail (`43914764615`, `43964491108`) the jobs
+    waited 32 to 49 minutes and never got a runner. Five of the six runs count as failed with no
+    failed job.
+  - Two runs of 2026-11-17 failed with no failing test. In `44036878952` the job
+    `fuzz (tree_manifest)` could not download the pinned nightly toolchain. In `44034218213` the
+    test step of `workspace tests (windows-latest)` ended three minutes after the job started, with
+    exit code `-1073741502`.
+- **Problem:** The exit check of Q80 asks for seven days of runs for pushes in which no test fails.
+  A run that is red or cancelled for another reason has to be told apart by hand, and a cancelled
+  run tests nothing for its commit.
+- **Do:**
+  1. Add a rule to `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run
+     for a push on `master`. Say what to do instead when a newer push makes a run look
+     superfluous: leave it.
+  2. For a macOS job that was never acquired, rerun the failed jobs of that run on its current
+     head (`gh run rerun <RUN_ID> --failed`), and record the run in the status log. Do not change
+     the workflow for it.
+  3. In the `fuzz` job, make the toolchain step retry a failed download, with the options the
+     action offers or with a retry around the `rustup` call. Do not change the pinned date.
+  4. For exit code `-1073741502` in run `44034218213`, read the full log of the step and the
+     diagnostics step of TEST-29. Record what the first line with the code follows. If the step
+     never started `cargo`, it is a runner failure: say so and rerun. If a test binary returned
+     it, open an item for that test.
+  5. Add a script `scripts/ci_push_runs.py` (standard library and `gh` only) that prints, for the
+     last N days of runs for pushes on `master`, one line per run that is not green with its
+     class: failing test, job never acquired, cancelled by an account, or other. The exit check
+     of Q80 is then read from its output.
+- **Done when:** The guide has the rule of step 1. The script of step 5 has a test with recorded
+  JSON input (`tests/test_ci_push_runs.py`, standard library only) that CI runs on Linux, macOS
+  and Windows, and its output for 2026-11-16 names
+  twelve runs as cancelled by an account and six as holding a job that was never acquired. The
+  two failures of 2026-11-17 each have a status log line with a cause, or a retry in the workflow.
+
+- **Status (2026-11-17, Partial):** Steps 1, 3, 4 and 5 are done in the pull request (306); step 2 stays with the
+  coordinator (no code).
+  - Step 1: rule 7 of `docs/guides/multi-agent-collaboration.md`: no agent or session cancels a run for a push on `master`; leave it.
+  - Step 3: the `fuzz` job installs `nightly-2026-11-10` first in a bounded loop (four tries, 15 s, 30 s, 45 s apart) before
+    `dtolnay/rust-toolchain@master`, which then finds it installed. The date is unchanged.
+  - Step 4: the log of job `133873087335` (run `44034218213`) shows the step before it (`test_feat3_os_isolation`, 30 passed)
+    ending normally. The line `Process completed with exit code -1073741502` (`0xC0000142`, STATUS_DLL_INIT_FAILED) then
+    follows the start of the step `python scripts/ci_heartbeat.py ... cargo test --workspace` 31 ms after its header, with no output
+    of its own, and the diagnostics step after it (a fresh `pwsh`) fails with the same code. No `Running` line of a test
+    binary and no `cargo` output follow: `cargo` never started, so it is a runner failure (new processes could not initialise),
+    not a test. No test item is opened. Untested hypothesis: the isolation tests of the step before it create a private Desktop per
+    task and may leave the runner short of desktop heap. If the code comes back after `test_feat3_os_isolation`, open an item for that.
+  - Step 5: `scripts/ci_push_runs.py` and `tests/test_ci_push_runs.py` (13 tests over hand-made JSON; run by the `agent-bridge`
+    job on Linux, macOS and Windows). Real output for 2026-11-16: 12 runs `cancelled`, 5 `never acquired`, 5 `failing test`.
+    `43952618376` has a never-acquired macOS job and also a real failing Ubuntu test, so it counts under `failing test` (the
+    priority is failing test, never acquired, cancelled, other). For 2026-11-17: 2 `other` (the two failures of this item), 1 failing
+    test, 1 never acquired. The exit check of Q80 is read from its last line.
+- **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** steps 1, 3, 4 and 5 are in pull request 306; step 2 (rerun a never-acquired macOS job on the current head, record it) is a standing rule and is now part of prompt S5 of [guides/stability-0.4.x-handoff.md](guides/stability-0.4.x-handoff.md). The output for 2026-11-16 names 5 runs as never acquired, not 6, because run `43952618376` also holds a failing test and is counted under that class.
+
+### LV-4: An inventory of `unsafe`, with comments, a lint and Miri
+
+- **Evidence:** [Design 0058](design/0058-lasting-value.md), D2. A search for `unsafe {`,
+  `unsafe fn`, `unsafe impl` and `unsafe extern` in `crates/*/src` finds 285 sites: 176 in
+  `crates/worker`, 77 in `crates/core`, 29 in `crates/cli`, 2 in `crates/agent_mesh` and 1 in
+  `crates/master`. A search for `// SAFETY` finds 103 comments, 23 of them in `crates/worker`. No
+  crate sets `clippy::undocumented_unsafe_blocks`, `forbid(unsafe_code)` or `deny(unsafe_code)`,
+  and no workflow runs Miri.
+- **Problem:** Most `unsafe` sites are in the code that confines tasks and kills process trees. A
+  reviewer cannot tell which invariant each one relies on, and nothing stops a new site without a
+  comment.
+- **Do:**
+  1. Give every `unsafe` site a `SAFETY:` comment that states the invariant it relies on. Read
+     the site before writing the comment. Where the invariant does not hold, write the failing
+     test first, then the fix (rule 4), and use the private route of `docs/SECURITY.md` if a
+     remote peer can reach it.
+  2. Turn on `clippy::undocumented_unsafe_blocks` for the workspace, as an error.
+  3. Add `#![forbid(unsafe_code)]` to every crate and module that has no `unsafe` site.
+  4. Add a CI job on Linux that runs Miri on the unit tests it can run, and list in the job's
+     comment which tests it skips and why. Miri cannot run calls into the operating system.
+  5. Start with `crates/worker/src/isolation.rs`, together with MAINT-2.
+- **Done when:** Measure M11 of design 0058 is met: every `unsafe` site has a `SAFETY:` comment.
+  The clippy job fails on a site without one, and that job is a required check. The Miri job has
+  run once on `master`.
+- **Note (2026-11-18):** Part 1 (all crates except `isolation.rs`, `mcp.rs`, `mode_cli.rs`): pull
+  request 324, 145 sites documented.
+- **Note (2026-11-18):** Part 2 (test files): pull request 330, 34 sites.
+- **Note (2026-11-18):** Unix isolation files: pull request 336, 22 sites.
+- **Note (2026-11-18):** Part 3 (Windows isolation files): pull request 337, 117 sites.
+- **Note (2026-11-18):** Do steps 2 and 4: pull request 340. `clippy::undocumented_unsafe_blocks`
+  is `deny` in `[workspace.lints.clippy]`, and every crate has `[lints] workspace = true`; the clippy
+  jobs are required checks. The `miri (rusty_grid_core)` CI job runs `cargo miri test -p
+  rusty_grid_core --lib` on Linux; 93 of the 295 tests that Miri cannot run carry
+  `#[cfg_attr(miri, ignore = "Miri: <reason>")]`. Open: the Miri job has not run on GitHub yet.
+- **Note (2026-11-19):** Do step 3 (`win/lv-4-forbid-unsafe`): `#![forbid(unsafe_code)]` added at the
+  root of all 4 zero-`unsafe` binaries (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`), and
+  `#![deny(unsafe_code)]` at the root of all 6 library crates (`android_bridge`, `agent_mesh`,
+  `master`, `core`, `cli`, `worker`) with `#[allow(unsafe_code)]` (one-line `// LV-4:` reason on
+  each) limited to the modules/test submodules/10 `#[no_mangle]` JNI functions that require it, plus
+  `#[forbid(unsafe_code)]` on `master::store::fuzzing`; production code in `core::{blob,task}` and
+  `worker::{client,runner,staging}` stays denied. Complete module inventory is recorded in
+  [design 0058](design/0058-lasting-value.md). Open: CI Miri job run on `master`.
+- **Implemented (2026-11-24, verified on `origin/master` `abff2514`):** Audited the workspace at
+  `origin/master` (`abff2514`): all `384` non-comment `unsafe` sites (`352` blocks, `32` `fn`/`impl`/`extern`
+  items) across `crates/` and `tests/` carry `SAFETY:` / `# Safety` documentation (`0` missing); `[workspace.lints.clippy]`
+  sets `undocumented_unsafe_blocks = "deny"` and all `6` workspace member crates inherit `[lints] workspace = true`;
+  all `4` zero-`unsafe` binary roots keep `#![forbid(unsafe_code)]` and all `6` library crate roots keep
+  `#![deny(unsafe_code)]` with `#[allow(unsafe_code)]` limited to the inventoried modules/functions;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` passed with `0` warnings; `master` branch
+  protection requires `clippy (ubuntu-latest)`, `clippy (macos-latest)`, and `clippy (windows-latest)`; and
+  `miri (rusty_grid_core)` passed on `master` push CI (`run 45297098266`, job `138120143503`: `203 passed; 0 failed;
+  93 ignored` in `491.91 s`, alongside green `clippy` on all three OSes).
+### AX-1: Matrix fan-out in `submit` and in MCP
+- **Evidence:** [Design 0056](design/0056-frontier-program.md), D2, part A1. One `submit` call
+  places one task on one worker. `crates/cli/src/cli_app/submit.rs` has no `--matrix` flag (the
+  flag `--matrix-dim` belongs to the GPU benchmark task), and the MCP tool `submit` has no `matrix`
+  field (`crates/cli/src/mcp.rs`).
+- **Problem:** Checking one change on macOS, Windows and Linux takes three calls and three
+  results that the caller merges. This is the first job of the first audience of design 0059, and
+  the purpose of Q1.
+- **Do:** As part A1 of design 0056. The expansion happens in the client, so the wire format does
+  not change:
+  1. `submit --matrix os=macos,windows,linux -- <command>` submits one task per value with the
+     matching `require:` entry. `--matrix` may repeat for a product, up to a fixed cell limit.
+  2. With `--workspace`, the tree syncs to each chosen worker.
+  3. The client waits for every cell. `--json` prints one record per cell: cell, worker, exit
+     code, duration, and the head and tail of the output. The exit code is non-zero when any cell
+     fails.
+  4. A cell that no worker matches is reported as unplaced after a check against `ListWorkers`.
+     It does not hang.
+  5. The MCP tool `submit` takes the same `matrix` field and returns the array.
+  6. A design record, the `README.md` reference and `docs/guides/mcp-client-setup.md` land in the
+     same pull request.
+- **Done when:** An end-to-end test with three tagged workers returns three cell records from one
+  call, and a cell without a worker is reported unplaced. A live record shows one MCP call
+  testing a change on macOS, Windows and Linux. That record is exit check E8 of design 0088,
+  together with AX-2, AX-3 and CACHE-1 in a release.
+- **Partial (2026-11-22, design 0101, commits `0e13d69d`, `58c41543`, `36a2d647`):** Implemented client-side
+  matrix fan-out across `crates/cli/src/matrix.rs`, `cli_app.rs`, `cli_app/submit.rs`, `mcp.rs`, `mcp/submit.rs`,
+  and `mcp/submit_matrix.rs` (plus `README.md`, `docs/reference.md`, and `docs/guides/mcp-client-setup.md`) with
+  zero wire or store changes on Protocol 10 / Store v4: repeatable `--matrix <KEY=V1,V2>` and MCP `matrix`
+  (array or axis object) across `os`, `arch`, `worker`, `iso`, `tool`, `tag`, and process `env:<VAR>`,
+  `--max-matrix-cells` (`64` default, `256` cap), pre-flight `ListWorkers` unplaced-cell detection without
+  hanging (skipping uploads when zero cells are placeable), 1x `--input` / `--workspace --sync` upload
+  deduplication, concurrent `JoinSet` dispatch with `safe_deadline` / `safe_std_deadline` overflow protection
+  (also applied to `mcp/task_result.rs` and `doctor.rs`), per-cell `--output-dir/<cell_slug>` isolation with
+  `ensure_non_symlink_cell_dir` symlink refusal across both CLI and MCP, bounded JSON-escaped inline streams
+  with `MatrixReport` / `RunSummary`, `-32602` validation, and `isError: true` propagation. Verified by unit
+  tests (`matrix` 11/11, `mcp` 16/16, `submit_matrix` 1/1), `crates/cli/tests/test_ax1_matrix.rs` (`9/9`,
+  covering 3 tagged workers and unplaced cells), and `tests/test_wave2_e2e.py` (`F3`, `F4`, Tiers 3–4).
+- **Implemented (2026-11-24, live 3-OS MCP call record at `720106d8`):** Executed one MCP `tools/call`
+  (`submit` with `command: "cargo"`, `args: ["test", "-p", "rusty_grid_core", "--lib", "--locked"]`,
+  `matrix: ["os=macos,windows,linux"]`, `workspace: {"name": "ax1-live-2026-11-24", "sync_dir": "."}`,
+  `timeout_secs: 1800`, `wait: true`) over `oxideswarm mcp` (`protocolVersion: "2024-11-05"`,
+  `rusty-grid 0.4.4`): `isError: false`, `status: "completed"`, `total_cells: 3`, `completed_cells: 3`,
+  `failed_cells: 0`, `unplaced_cells: 0`, `machines: 3`, `workspace.files: 837`, `task_time_sum_ms: 101807`,
+  `waited_ms: 102185` (overall `wall_s: 102.221`):
+  - `cell-00-macos` (`os=macos`, `mac-lab-worker`, `aarch64`, `--isolation off`): `exit_code: 0`,
+    `duration_ms: 33790` (`24.51 s` compile, `8.34 s` test), `296 passed; 0 failed`.
+  - `cell-01-windows` (`os=windows`, `win-case-lab`, `x86_64`, `--isolation off`): `exit_code: 0`,
+    `duration_ms: 52763` (`46.09 s` compile, `5.32 s` test; skipped 2 workspace symlinks with Windows
+    `ERROR_PRIVILEGE_NOT_HELD (1314)`). Under Windows AppContainer `--isolation fs`, compiling `ring v0.17.14`
+    failed with MSVC `fatal error C1083: Cannot open include file: 'stddef.h'` outside AppContainer-readable
+    directories.
+  - `cell-02-linux` (`os=linux`, `linux-docker-lab`, `aarch64`, Docker `rust:1.96` on the Mac,
+    `--isolation off`): `exit_code: 0`, `duration_ms: 15254` (`8.51 s` compile, `6.59 s` test),
+    `296 passed; 0 failed`.
 
 ## Phase 15: coordination between agents
 
@@ -4179,3 +4873,23 @@ does alone. Order: BENCH-2, BENCH-5, BENCH-3, BENCH-4, BENCH-6, then BENCH-7 bef
   another project had started on the Mac. Amendment 2 replaced it with 1c and 1d on the Windows machine
   alone. Steps 2 and 3 ended their grid runs before that cargo test started. A second attempt of 4b was
   needed for the same reason; the void records are not committed.
+
+### TEST-97: Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery
+
+- **Evidence:** Stage E `E-D3` Python loop on `abff2514` (`tests/test_agent_bridge.py`, runs `01`–`03`) on Windows with Google Drive mounted at `G:\`: `2` of `70` non-skipped tests failed deterministically in every run (`Claims.test_without_a_hub_claim_prints_a_notice_and_exits_zero` expecting `'No hub found'` got `'0110'`, and `ActivityFilesAndOverlap.test_overlap_without_a_hub_exits_zero_with_a_notice` expecting `'No hub found'` got `'[OVERLAP] No shared files with other active agents.'`), while `@unittest.skipIf(os.path.exists("G:\\"), ...)` skipped the `2` tests in `WithoutHub`. Claimed via `agent_bridge.py claim` (`claims/item/TEST-97__win-2__20261124T160534948637Z__7d8bb16c.json`).
+- **Problem:** `hub_candidates()` in `scripts/agent_bridge.py` scans hardcoded drive roots `("G:\\", "H:\\", "D:\\")` even when `HOME`, `USERPROFILE`, `OXIDESWARM_HOME`, and `OXIDESWARM_AGENT_HUB` are isolated/unset. Any test calling `use_hub=False` on a Windows host with a mounted Drive therefore discovers the real `OxideSwarm_Agent_Hub`, and `Claims.test_without_a_hub_claim_prints_a_notice_and_exits_zero` wrote live dummy design claims (`0110`–`0113`, verified and deleted) onto the hub.
+- **Do:**
+  1. Add `DISABLE_DRIVE_SCAN_ENV = "OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN"` in `scripts/agent_bridge.py` (matching `TEST-30`'s `OXIDESWARM_BRIDGE_ASSUME_LISTENING` pattern) and skip the `("G:\\", "H:\\", "D:\\")` loop in `hub_candidates()` when set.
+  2. Set `OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN=1` in `BridgeCase.setUp()` (`tests/test_agent_bridge.py`), remove the `G:\` `skipIf` on `WithoutHub`, and add `WithoutHub.test_drive_scan_opt_out_isolates_hub_discovery`.
+- **Done when:** `python -u tests/test_agent_bridge.py` passes `20/20` sequential runs on Windows with `G:\` mounted, `0` skipped `WithoutHub` tests, and `0` writes to the real hub.
+- **Implemented (2026-11-24, branch `win2/test-97-bridge-drive-scan`):** Implemented `OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN`, unskipped `WithoutHub`, added `test_drive_scan_opt_out_isolates_hub_discovery`, and verified `1/1` pre-loop smoke (`73/73 OK`, `141.408 s`, `DesignClaimsBefore=12 After=12 DiffCount=0`) plus `20/20` sequential runs on Windows with `G:\` mounted (`73/73 OK` per run, `0` skipped, `0` hub claim diffs, `total 2,480.673 s`, `min 116.565 s`, `median 121.884 s`, `max 140.520 s`, `minRAM 4.716 GiB`).
+
+### TEST-98: Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs
+
+- **Evidence:** Stage E `E-D3` on `ca03e1ae` (`tests/test_launcher_scripts.py`, run `01` while Stage C `S7` `win-dell` `oxideswarm.exe worker` ran live on the same Windows host): `33` of `34` Windows tests passed (`62` Unix skipped, `197.999 s`) and `StaticRepositoryChecks.test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation` failed at `tests/test_launcher_scripts.py:1833` (`AssertionError: 1 != 0`) because `packaging/usb/uninstall.ps1:188` invoked `windows/revoke-isolation-acls.ps1` and exited `2` (`WARNING: Refusing to revoke isolation ACL grants... while another worker is running; stop all workers first (or pass -Force)`). Claimed via `agent_bridge.py claim` (`claims/item/TEST-98__win-2__20261124T172506156991Z__f7dbab9d.json`).
+- **Problem:** `windows/revoke-isolation-acls.ps1:177-182` queries all `oxideswarm.exe`/`rusty-grid.exe` `worker` processes across the whole Windows host. With `ps_env` only isolating temp/home paths, `test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation` detected unrelated host workers outside its temp sandbox `tmp`.
+- **Do:**
+  1. Add optional test seam `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT` filtering in `windows/revoke-isolation-acls.ps1` after the `Win32_Process` query so production behavior stays unchanged when unset while test sandboxes can scope worker detection to `tmp`.
+  2. Set `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT=tmp` in `ps_env` (`tests/test_launcher_scripts.py`) and add a positive-detection check proving a worker spawned inside `tmp` still exits `2` (`"while another worker is running"`) and preserves the manifest.
+- **Done when:** `python -u tests/test_launcher_scripts.py` passes `20/20` sequential runs on Windows even with an active `oxideswarm.exe worker` running outside the test sandbox.
+- **Implemented (2026-11-24, branch `win2/test-98-revoke-worker-scope`):** Implemented `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT` filtering in `windows/revoke-isolation-acls.ps1` plus `ps_env` isolation and positive scoped-worker detection test in `tests/test_launcher_scripts.py`, and verified `1/1` smoke (`96` tests in `190.755 s`, `OK (skipped=62)`) plus `20/20` sequential runs on Windows alongside live Stage C `S7` (`96` tests / `62` skipped / `0` failures per run; `total 3,452.253 s`, `min 153.528 s`, `median 168.249 s`, `max 222.552 s`, `minRAM 4.523 GiB`).

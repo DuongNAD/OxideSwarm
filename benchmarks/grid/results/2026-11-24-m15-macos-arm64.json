@@ -1,0 +1,114 @@
+{
+  "benchmark": "ADOPT-3 M15 scripted Quick start from empty HOME",
+  "measure": "M15",
+  "date_utc": "2026-11-23T21:32:59Z",
+  "git": {
+    "commit": "2738cc005b1d9dd15653eb7af4e2721150235596",
+    "dirty_tree": false
+  },
+  "release_version": "0.4.4",
+  "target": "aarch64-apple-darwin",
+  "local_archive_http": true,
+  "attestation_checked": true,
+  "installed_binary_version": "rusty-grid 0.4.4",
+  "hardware": {
+    "cpu_model": "Apple M5",
+    "cores": 10,
+    "ram_bytes": 34359738368
+  },
+  "os": {
+    "system": "Darwin",
+    "release": "27.2.0",
+    "version": "Darwin Kernel Version 27.2.0: Wed Oct 14 23:48:06 PDT 2026; root:xnu-13432.41.4~25/RELEASE_ARM64_T8142",
+    "machine": "arm64"
+  },
+  "network": "loopback (127.0.0.1), single machine",
+  "power": [
+    "Now drawing from 'AC Power'",
+    " -InternalBattery-0 (id=36700259)\t100%; charged; 0:00 remaining present: true"
+  ],
+  "load_average_before": [
+    3.72,
+    6.25,
+    10.88
+  ],
+  "load_average_after": [
+    4.85,
+    6.32,
+    10.78
+  ],
+  "python": "3.11.8",
+  "note": "",
+  "summary": {
+    "install_s": {
+      "median": 7.819,
+      "min": 7.677,
+      "max": 8.358,
+      "runs": 3
+    },
+    "master_ready_s": {
+      "median": 0.337,
+      "min": 0.301,
+      "max": 0.342,
+      "runs": 3
+    },
+    "worker_ready_s": {
+      "median": 0.361,
+      "min": 0.352,
+      "max": 0.698,
+      "runs": 3
+    },
+    "first_submit_s": {
+      "median": 0.01,
+      "min": 0.01,
+      "max": 0.013,
+      "runs": 3
+    },
+    "total_s": {
+      "median": 8.727,
+      "min": 8.525,
+      "max": 9.031,
+      "runs": 3
+    },
+    "all_attestation_checked": true,
+    "all_succeeded": true
+  },
+  "runs": [
+    {
+      "run": 1,
+      "install_s": 7.677,
+      "master_ready_s": 0.337,
+      "worker_ready_s": 0.698,
+      "first_submit_s": 0.013,
+      "total_s": 8.727,
+      "attestation_checked": true,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 301,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    },
+    {
+      "run": 2,
+      "install_s": 8.358,
+      "master_ready_s": 0.301,
+      "worker_ready_s": 0.361,
+      "first_submit_s": 0.01,
+      "total_s": 9.031,
+      "attestation_checked": true,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 301,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    },
+    {
+      "run": 3,
+      "install_s": 7.819,
+      "master_ready_s": 0.342,
+      "worker_ready_s": 0.352,
+      "first_submit_s": 0.01,
+      "total_s": 8.525,
+      "attestation_checked": true,
+      "submit_exit_code": 0,
+      "submit_stdout_bytes": 301,
+      "installed_binary_version": "rusty-grid 0.4.4"
+    }
+  ]
+}

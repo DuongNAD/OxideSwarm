@@ -28,10 +28,40 @@ writing standard in [docs/README.md](README.md#writing-standard)).
 
 ## Install
 
-Download the archives from the [Releases page](https://github.com/DuongNAD/OxideSwarm/releases)
-(the latest is `v0.4.4`), or [build from source](#build-from-source).
+Use the two-step installer scripts (`scripts/install.sh` on macOS/Linux, `scripts/install.ps1` on
+Windows), download the archives by hand from the
+[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.5`), or
+[build from source](#build-from-source).
 
-Each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
+`scripts/install.sh` (bash 3.2 compatible) and `scripts/install.ps1` (Windows PowerShell) install
+`oxideswarm`, `rusty-grid`, and `ox-mode` for the current user only (no `sudo` or elevation, no
+service setup, no daemon start, and no edits to `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`):
+
+```bash
+# macOS / Linux (defaults: --version 0.4.5, --dir "$HOME/.local/bin")
+curl -fsSLO https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.sh
+bash install.sh [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
+```
+
+```powershell
+# Windows (defaults: --version 0.4.5, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
+Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
+# PowerShell flag names (-Version, -Dir, -Gpu, -DryRun, -Help) are also accepted.
+```
+
+Both scripts verify `SHA256SUMS` before unpacking, run `gh attestation verify` against
+`DuongNAD/OxideSwarm/.github/workflows/release.yml` (`refs/tags/v<VERSION>`) when `gh` is on `PATH`
+and authenticated (if `gh` is absent or not logged in, they print a notice or warning and continue
+after `SHA256SUMS` verification; if `gh` is authenticated and attestation fails, they fail closed),
+and atomically replace existing binaries in `--dir`. `--dry-run` prints the resolved target, URLs,
+and destination without downloading or writing files; unsupported OS/architecture pairs fail with
+both names printed. `OXIDESWARM_DOWNLOAD_BASE` overrides the download base URL (default
+`https://github.com/DuongNAD/OxideSwarm/releases/download`). On macOS (Darwin `27.2.0`), binaries
+fetched by `scripts/install.sh` via `curl` carry `com.apple.provenance` only and no
+`com.apple.quarantine` flag, so `xattr -dr com.apple.quarantine` applies to browser downloads only.
+
+For manual downloads, each release carries one archive per system, `oxideswarm-<version>-<target>.tar.gz` (Linux, macOS) or
 `.zip` (Windows), and a `-gpu` variant built with `--features gpu-wgpu` for a worker whose GPU should
 do work. Targets: `x86_64-unknown-linux-gnu` (built on Ubuntu 22.04, needs glibc 2.35 or newer), `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-pc-windows-msvc`. An archive holds `oxideswarm`, `rusty-grid`, `ox-mode`, the licences and the
@@ -40,21 +70,21 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify oxideswarm-0.4.4-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
-tar -xzf oxideswarm-0.4.4-aarch64-apple-darwin.tar.gz
+gh attestation verify oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
+tar -xzf oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.4.4-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.4.4-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.5-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.5-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-gh attestation verify .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
-Expand-Archive .\oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
+Expand-Archive .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.4-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.5-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
@@ -186,8 +216,10 @@ flowchart LR
 **Also included:**
 - **Map/reduce:** `oxideswarm mapreduce` has built-in kernels, or it ships your own scripts
   ([design 0016](design/0016-mapreduce-cli-script-shipping.md)).
-- **Web dashboard:** live workers, tasks and links over plain HTTP. It listens on loopback by
-  default, and needs a token once the master has a secret.
+- **Web dashboard:** live workers, tasks, links, and cluster **Members** administration (view
+  enrolled members and active lanes, approve/reject pending enrollments, rename/revoke members,
+  create/revoke invites under `Admin` scope) over plain HTTP. It listens on loopback by default,
+  and needs a token once the master has a secret.
 - **Observability:** Prometheus metrics at `GET /metrics` on the dashboard listener (`Observer`
   scope when authentication is active) and opt-in OTLP/HTTP JSON task lifecycle traces when built
   with `--features otel` (`OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
@@ -199,7 +231,13 @@ flowchart LR
   keys, MAC-protected `p2p_ticket` P2P fallback, and upfront rejection of unsupported `https://`
   rendezvous URLs (terminate TLS in a local reverse proxy).
 - **Host protection:** above 85 % host CPU, the master stops sending new tasks to that worker
-  (`--max-host-cpu-pct`). Tasks run at below-normal priority.
+  (`--max-host-cpu-pct`). When queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`,
+  the master emits a warning containing `"saturated"` once per change of the connected busy-worker
+  set (excluding `Disconnected` workers and capability/GPU mismatches such as `NoGpuWorkersAvailable`,
+  [design 0099](design/0099-scheduler-backpressure-visibility.md)). Tasks run at below-normal priority.
+  On Windows, task processes and host probes run without a console window (`CREATE_NO_WINDOW`, also
+  under `--isolation off`), so Ctrl+C in the worker's console reaches only the worker, which then
+  stops its tasks ([design 0108](design/0108-windows-tasks-without-console-windows.md)).
 - **Output capture:** up to 10 MiB per stream, keeping both the head and the tail, so a long build
   log still ends with its summary ([design 0022](design/0022-head-and-tail-stream-capture.md)).
 - **GPU:** a worker built with `--features gpu-wgpu` detects GPU compute hardware (`--gpu`,
@@ -363,19 +401,19 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.4.4` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.5` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
 | Delivery is at least once | A task can run twice after a worker is lost, so tasks with side effects must be idempotent | None; session resume (FEAT-1) and crash containment (FEAT-2) shrink the window |
 | One master, no automatic failover | The master is a single point of failure; `--state-dir` makes a restart lossless, but a person restarts it | SCALE-4 ([design 0050](design/0050-scale-out-architecture.md)) |
-| Revoking a member does not yet close its client connections or cancel the tasks it submitted | `oxideswarm invite`, `join` and `members` (`ENROLL-1a`, `ENROLL-1b`) enrol per-machine keys under `--auth members|both`. `members revoke` blocks future handshakes and disconnects the member's worker sessions, whose tasks go back to the queue. Closing its client connections, cancelling its tasks and the dashboard members page remain planned | `ENROLL-1c`, `ENROLL-1d` ([design 0051](design/0051-machine-identity-and-invites.md)) |
+| Revoking a member does not yet cancel the tasks it submitted | `oxideswarm invite`, `join` and `members` (`ENROLL-1a`, `ENROLL-1b`) enrol per-machine keys under `--auth members|both`. `members revoke` (`ENROLL-1c` part 1) and the dashboard **Members** tab (`ENROLL-1d`) block future handshakes, close every worker and client connection of the member across TCP and P2P lanes, and requeue its worker tasks immediately. Cancelling tasks submitted by the revoked member (a store format change) and the live two-network `--p2p` run remain open | `ENROLL-1c` step 2, `ENROLL-1` ([design 0051](design/0051-machine-identity-and-invites.md)) |
 | On Windows, `cargo` under isolation needs a worker that is not elevated | Since release `0.1.2` (FEAT-3d) a Windows workspace worker runs with `--isolation fs`; an elevated worker drops `tool:cargo` | Run the worker as an ordinary user ([design 0033](design/0033-os-level-task-isolation.md) D4) |
 | Workspace trees skip symbolic links that leave the tree or traverse another link, and creating links on Windows needs Developer Mode | Out-of-tree or chained links are skipped with a notice; a Windows worker without Developer Mode skips symbolic links during sync and prints a warning to the task's `stderr` | By design ([design 0039](design/0039-agent-workspaces.md) W11) |
 | Only the hash branch of the built-in test task resumes from a checkpoint | Every other task restarts from the beginning after a worker loss | FEAT-5 |
-| User GPU workloads run on macOS and Windows under `--isolation fs` via `--isolation-read-dir`; Linux isolation omits GPU devices | The built-in GPU task is a verified matrix-multiply benchmark. Command tasks run native Metal (Apple Silicon) and Vulkan/CUDA/OptiX (Windows NVIDIA) under `--isolation fs`, `--isolation-read-dir` exposes external Python/ML runtimes read-only ([gpu-workloads.md](guides/gpu-workloads.md); cross-machine `--isolation off` baseline in [benchmarks/gpu-run](../benchmarks/gpu-run/README.md)), and `--vram-mb` (FEAT-9a) reserves static VRAM on `master`; Linux Landlock lacks `/dev/nvidia*` and `/dev/dri/*` rules, and live per-process free VRAM polling is not built | `R20` (Linux), `FEAT-9` ([design 0074](design/0074-external-runtime-allowlist-and-gpu-workloads.md)) |
+| User GPU workloads run on macOS and Windows under `--isolation fs` via `--isolation-read-dir`; Linux isolation omits GPU devices | The built-in GPU task is a verified matrix-multiply benchmark. Command tasks run native Metal (Apple Silicon) and Vulkan/CUDA/OptiX (Windows NVIDIA) under `--isolation fs`, `--isolation-read-dir` exposes external Python/ML runtimes read-only ([gpu-workloads.md](guides/gpu-workloads.md); cross-machine `--isolation off` baseline in [benchmarks/gpu-run](../benchmarks/gpu-run/README.md)), and `--vram-mb` (FEAT-9a) reserves static VRAM on `master`; Linux Landlock lacks `/dev/nvidia*` and `/dev/dri/*` rules, and live per-process free VRAM polling is not built | `R20` (Linux), `FEAT-9b` (live VRAM polling, [design 0067](design/0067-multi-node-llm-serving-and-admission.md)), [design 0074](design/0074-external-runtime-allowlist-and-gpu-workloads.md) |
 | The Android app does not compile | Phones join through Termux only | AND-1 |
-| Compatibility spans one protocol version, newer master first | A `0.4.0` master serves `0.3.0` workers and clients, but an older master refuses newer peers, and a peer two versions behind is refused | PROTO-5 keeps a CI job against the release one version back |
+| Compatibility spans one protocol version, newer master first | A `0.4.0` master serves `0.3.0` workers and clients, but an older master refuses newer peers, and a peer two versions behind is refused | PROTO-5 (Partial: `ci.yml` pins `v0.3.0` alongside the newest release; awaiting live PR CI run) |
 
 The plan and the order of the work are in [docs/ROADMAP.md](ROADMAP.md). Every item, with its
 evidence and its "done when", is in [docs/BACKLOG.md](BACKLOG.md).
@@ -450,31 +488,44 @@ export OXIDE_MESH_TOKEN="$(openssl rand -hex 24)"
 # 3. Connect an agent node (Windows / Mac / Linux / Android); every command below reads OXIDE_MESH_TOKEN:
 ./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos
 python3 scripts/agent_node.py --hub ws://127.0.0.1:8090/ws --id node-android-3 --platform android
+# To persist verified incoming data payloads atomically to disk, add --inbox-dir (quota: 1024 MiB and
+# 10000 files unless --inbox-max-mb / --inbox-max-files say otherwise):
+./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos --inbox-dir ./mesh-inbox
 # To disable shell command execution on untrusted nodes, add --no-shell:
 ./target/release/agent-mesh node --hub ws://127.0.0.1:8090/ws --id node-mac-1 --platform macos --no-shell
 
-# 4. Route a command from any node or terminal:
+# 4. Route a command or verified data payload from any node or terminal:
 ./target/release/agent-mesh send --hub ws://127.0.0.1:8090/ws --to node-android-3 --command shell_exec --args '{"cmd": "uname -m"}'
+./target/release/agent-mesh data --hub ws://127.0.0.1:8090/ws --to node-mac-1 --payload "hello-mesh" --timeout-ms 10000
+./target/release/agent-mesh data --hub ws://127.0.0.1:8090/ws --to node-mac-1 --payload-file ./artifact.bin --timeout-ms 10000   # use `-` for stdin
 
 # 5. Query the online nodes catalog:
 ./target/release/agent-mesh list --hub ws://127.0.0.1:8090/ws
 ```
 
-#### Master Grid Runtime Integration (`--grid-master`)
+#### Master Grid Runtime Integration (`--grid-master` / `--grid-connect`)
 
-`--grid-master [ADDR]` makes the hub start its own embedded Master Grid coordinator on `ADDR`. It does not connect
-to a master that is already running, so give it a free port. A non-loopback `ADDR` needs a cluster secret
-(`--secret` / `OXIDESWARM_SECRET`, else the default `~/.oxideswarm/cluster.secret`) or an explicit `--insecure`:
-the hub refuses to start an unauthenticated master that the network can reach. Pass `--max-active-mb <MB>` (or set
-`RUSTY_GRID_MAX_ACTIVE_MB`) to configure the embedded master's active queue byte budget (default 256 MiB, minimum 1 MiB).
+- `--grid-master [ADDR]` (`OXIDE_GRID_MASTER`): makes `agent-mesh hub` start its own embedded Master Grid coordinator on `ADDR` (defaults to `127.0.0.1:0`). It does not connect to an already-running master, so give it a free port.
+- `--grid-connect <HOST:PORT>` (`OXIDE_GRID_CONNECT`, conflicts with `--grid-master`): attaches `AgentGridBridge` as a **client** to an already-running Master (`HOST:PORT`, bare `HOST` defaulting to `:8088`, `auto` / `auto:<PORT>`, or an iroh P2P ticket; [design 0104](design/0104-mesh3-remote-master-bridge.md)). **Worker-join requirement:** `--grid-connect` connects only as a client, not a worker, so at least one `oxideswarm worker` must join the running Master for bridged tasks to schedule and run.
+
+A non-loopback `--grid-master` or `--grid-connect` target (as well as `auto` or P2P targets) refuses to run unauthenticated without `--insecure` (CLI flag only; no environment variable): pass `--secret` (`OXIDESWARM_SECRET`), `--secret-file` (`OXIDESWARM_SECRET_FILE`, else `~/.oxideswarm/cluster.secret`), or `--master-key` (`RUSTY_GRID_MASTER_KEY`, OXS-AUTH v3 using `~/.oxideswarm/node.key`). Use `--relay-url` (`RUSTY_GRID_RELAY_URL`) for custom P2P relays, and `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`, default 256 MiB, minimum 1 MiB) for embedded `--grid-master` queue budgets. On `--grid-connect`, auth/version/config errors fail fast on startup, whereas a transiently unreachable Master attaches the bridge with a warning and `/api/nodes` reports `"grid"` `"status": "offline"` until the Master responds (`"online"`).
 
 ```bash
-# Start the hub with an embedded master on 127.0.0.1:9088 (loopback, so no secret is needed):
+# Option A: start the hub with an embedded master on 127.0.0.1:9088 (loopback):
 ./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-master 127.0.0.1:9088 --max-active-mb 512
 
-# When --grid-master is configured, agent mesh nodes can dispatch compute envelopes:
-# grid_compute, grid_compile, grid_submit, and grid_status execute end-to-end against the grid.
-# When --grid-master is omitted, grid envelopes return ERR_BRIDGE_NOT_CONFIGURED.
+# Option B: attach the hub to an already-running Master (with joined oxideswarm worker nodes):
+./target/release/agent-mesh hub --listen 127.0.0.1:8090 --grid-connect 127.0.0.1:8088
+
+# When either --grid-master or --grid-connect is configured, agent mesh nodes can dispatch:
+# grid_compute/compute, grid_compile/grid_compilation/compile, grid_submit/submit,
+# grid_status/status, grid_result/result, grid_cancel/cancel,
+# grid_3d_generate/3d_generate/generate_3d, and grid_auto_rig/auto_rig.
+# Caller `tags` are preserved and `placement` (`os`, `arch`, `worker`, `isolation`,
+# `require_tags`, `require_tools`/`tools`), inline `files`/`staged_files` (never hub-local
+# disk paths), `outputs`/`expected_outputs` -> `payload["artifacts"]` (with SHA-256),
+# and `wait: false|true` are supported (non-null `workspace` is refused upfront).
+# When neither --grid-master nor --grid-connect is set, grid envelopes return ERR_BRIDGE_NOT_CONFIGURED.
 ```
 
 *Platform guides: [DEPLOYMENT.md](../DEPLOYMENT.md).*
@@ -549,6 +600,14 @@ or `~/.oxideswarm/cluster.secret`.
 ./target/release/oxideswarm submit --worker <WORKER_NAME> --wait -- uname -a
 ./target/release/oxideswarm submit --require-tag laptop --arch x86_64 --wait -- hostname
 
+# Fan out across matching workers and print per-cell JSON records
+./target/release/oxideswarm submit --matrix os=macos,windows,linux --json -- hostname
+./target/release/oxideswarm submit --matrix tag=row-1,row-2 --matrix env:MODE=fast,slow --json -- sh -c 'echo "$MODE"'
+
+# Fan out N parallel shards (1-based OX_SHARD_INDEX / OX_SHARD_TOTAL) or build a Rust nextest archive once per (os, arch)
+./target/release/oxideswarm shard --count 4 --junit-out target/shard-junit.xml --shell -- 'pytest --splits "$OX_SHARD_TOTAL" --group "$OX_SHARD_INDEX" --junitxml=junit.xml'
+./target/release/oxideswarm shard --count 4 --build-once --junit-out target/shard-junit.xml
+
 # Send input with the task (each file at most 32 MiB): a script, standard input, environment variables
 ./target/release/oxideswarm submit --type shell --interpreter python3 --script-file job.py --wait
 ./target/release/oxideswarm submit --stdin-file data.txt --env MODE=fast --wait --command wc -- -l
@@ -620,7 +679,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--scheduler-policy <POLICY>` | `weighted` (`RUSTY_GRID_SCHEDULER_POLICY`, `[master].scheduler_policy`) | Load-balancing policy across eligible workers: `weighted` (`weighted-least-loaded`), `least-loaded`, or `round-robin` |
 | `--speed-hold-factor <FACTOR>` | `1.5` (`RUSTY_GRID_SPEED_HOLD_FACTOR`, `[master].speed_hold_factor`) | Hold-back factor for speed-aware placement (`0` turns D2 off; otherwise finite `> 1.0`; holds a repeated task or excludes clearly slower candidates when their expected run time is at least `factor` times the fastest worker's, [design 0060](design/0060-speed-aware-placement.md)) |
 | `--default-retry-max <N>` (alias `--max-retries`) | `3` (`RUSTY_GRID_DEFAULT_RETRY_MAX`, `RUSTY_GRID_MAX_RETRIES`, `[master].default_retry_max`) | Default maximum execution retries per task |
-| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch |
+| `--max-host-cpu-pct <PCT>` | `85.0` (`RUSTY_GRID_MAX_HOST_CPU_PCT`, `[master].max_host_cpu_pct`) | Host CPU percentage ceiling before anti-stuttering backpressure throttles dispatch; when queued tasks skip with `ScheduleSkipReason::AllEligibleWorkersSaturated`, the master logs a warning once per change of the connected busy-worker set ([design 0099](design/0099-scheduler-backpressure-visibility.md)) |
 | `--preserve-gpu <BOOL>` | `true` (`RUSTY_GRID_PRESERVE_GPU`, `[master].preserve_gpu`) | Reserve GPU workers for GPU-requiring tasks when CPU-only workers are available |
 | `--fail-unfulfillable-tasks [BOOL]` | `false` (`RUSTY_GRID_FAIL_UNFULFILLABLE_TASKS`, `[master].fail_unfulfillable_tasks`) | When at least one connected (`Connected` or `Busy`) worker is schedulable, immediately fail tasks whose required capabilities or placement constraints no registered worker can satisfy (`--fail-unfulfillable-tasks` with no value sets `true`). A task whose only matching worker is `Disconnected` stays queued until that worker reconnects or is pruned `1 hour` after its last heartbeat (`ReaperConfig::stale_worker_timeout` in `crates/master/src/reaper.rs`, no CLI flag), so a `--wait` caller blocks until then (or `--timeout-secs`). |
 | `--p2p` | `false` (`RUSTY_GRID_P2P`, `[master].p2p`) | Enable Iroh QUIC/DERP P2P endpoint for NAT traversal |
@@ -656,7 +715,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
-| `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` |
+| `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` (`os:`, `arch:`, `slots:`, `link:`, `id:`, `state:`, `iso:`, `tool:`, `feat:`, `ext:`, `proto:`, `opt:`, and `speed:` are reserved) |
 | `--cores <N>` (alias `--cpu-cores`) | Auto-detected (`RUSTY_GRID_CORES`, `RUSTY_GRID_CPU_CORES`, `[worker].cores`) | Override advertised CPU core count |
 | `--ram-mb <MB>` (aliases `--override-ram-mb`, `--ram`) | Auto-detected (`RUSTY_GRID_RAM_MB`, `RUSTY_GRID_OVERRIDE_RAM_MB`, `[worker].ram_mb`) | Override advertised RAM in megabytes |
 | `--gpu` | `false` (`RUSTY_GRID_GPU`, `RUSTY_GRID_ENABLE_GPU`, `[worker].gpu`) | Insist on a real hardware wgpu adapter (warns if unavailable or built without `gpu-wgpu`) |
@@ -699,7 +758,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `-- <ARGS>...` | — | Trailing command arguments passed to `--command` |
 | `--cores <N>` | `1` | Minimum CPU cores required on the assigned worker |
 | `--ram-mb <MB>` (alias `--ram`) | `0` | Minimum RAM in megabytes required on the assigned worker |
-| `--vram-mb <MB>` (alias `--vram`) | `0` (unset) | Minimum GPU VRAM in megabytes required on the assigned worker (implies `--gpu` when `> 0`) |
+| `--vram-mb <MB>` (alias `--vram`) | `0` (unset) | Minimum GPU VRAM in megabytes required on the assigned worker (implies `--gpu` when `> 0`). For `--type 3d`, omitting `--vram-mb` applies preset VRAM defaults (`fast` = `2048` MB, `standard` = `4096` MB, `high` = `6144` MB) whenever `--gpu` is set or `--quality high` is used on non-`sdf` engines, while `--engine sdf` and non-`--gpu` `fast`/`standard` defaults remain `0` MB (CPU-eligible); `submit` emits a non-blocking `stderr` warning if no connected worker satisfies the effective VRAM requirement ([design 0105](design/0105-3d2-vram-blender-routing.md)) |
 | `--gpu` | `false` | Require a worker that advertises a GPU |
 | `--timeout-secs <SECS>` | `60` (`1800` with `--workspace`; `[submit].timeout_secs`) | Task execution timeout in seconds |
 | `--max-retries <N>` | Master default | Maximum execution retries for this task |
@@ -708,7 +767,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--os <OS>` | — | Pin to worker OS: `macos` (`mac`, `darwin`, `osx`), `windows` (`win`), `linux`, `android` |
 | `--arch <ARCH>` | — | Pin to worker CPU architecture: `x86_64` (`amd64`, `x64`), `aarch64` (`arm64`) |
 | `--worker <NAME\|ID>` | — | Pin to a specific worker by name (case-insensitive) or UUID prefix |
-| `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`) |
+| `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`; reserved prefixes such as `opt:` and `speed:` are refused) |
 | `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, e.g. `cargo`, `rustc`, `git`) |
 | `--require-isolation <LEVEL>` | — | Require a worker confined at least at `fs` or `fs+net` (`worker --isolation`); the constraint is `require:iso=<level>`, met when the worker's `iso:` tag is at that level or above (`off < fs < fs+net`; a worker without the tag counts as `off`) |
 | `--source <PATH[:SANDBOX]>` (alias `--source-dir`) | Repeatable | Compile tasks: Rust source file or Cargo crate directory to compile (`cargo build --offline` when `Cargo.toml` is present, else `rustc`) |
@@ -728,26 +787,31 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--verify <N>` | — | After the task completes, run it again on `N` other connected workers that match its placement (each pinned with `require:worker=<id>`) and compare the declared outputs by BLAKE3. The replicas run only on workers with the operating system and CPU architecture of the worker that ran the first copy, since one deterministic program can give different results on two systems (design 0089 D6). Prints `verified` or `mismatch` (the differing files and workers) and exits `4` on a mismatch; `--json` adds a `verify` object (`status`, `workers`, `differing`). Needs `--output` or `--verify-file`, not `--worker`; fewer than `N` matching workers or a failed replica is an error (exit 1). Client side only (no wire change; design 0089 D3). Only for deterministic tasks: a non-deterministic task will report a mismatch. The D5 run summary (`Tasks:`, `Waited:`, `waited_ms`, `task_time_sum_ms`, `machines`) covers the first submitted task only and does not count `--verify` replicas. The MCP `submit` tool takes `verify` and `verify_file` |
 | `--verify-file <PATH>` | — | With `--verify`: compare only this sandbox file (for example a `checksums.sha256` the task writes) byte for byte instead of every declared output; it is collected even without `--output` |
 | `--verify-any-system` | Off | With `--verify`: let the replicas run on matching workers with another operating system or CPU architecture; the MCP `submit` tool takes `verify_any_system` |
+| `--matrix <KEY=V1,V2>` | Repeatable | Fan out the task over the Cartesian product of `KEY=V1,V2,...` axes (implies `--wait`; cannot be combined with `--verify` or `-o`/`--output-asset`). Placement keys: `os`, `arch`, `worker`, `iso`, `tool`, `tag` (`tag` and `tool` may repeat); `Command` and `ShellScript` tasks also accept `env:<VAR>`. Pre-flight `ListWorkers` reports unfulfillable cells as `unplaced` without hanging, shared `--input` and `--workspace` trees upload once, and `--output` files save to `<output_dir>/<cell_slug>/` ([design 0101](design/0101-matrix-fanout.md)) |
+| `--max-matrix-cells <N>` | `64` (max `256`) | With `--matrix`: maximum expanded Cartesian cells allowed per submission |
+| `--repeatable` | `false` | Mark the task safe to re-run speculatively (`opt:repeatable` in `Task::tags`, MCP `repeatable`): if a non-workspace attempt runs past `10 s` and past `3x` the fastest matching worker's `SpeedBook` average, the reaper assigns one extra copy on an idle matching worker (capped at `max(1, total_cluster_slots / 10)`), keeps the first clean result, and cancels the sibling ([design 0060](design/0060-speed-aware-placement.md)) |
 | `--matrix-dim <N>` | `64` | GPU tasks: square matrix dimension $N \times N$ (up to `8192` on physical GPU, `2048` on simulated GPU) |
 | `--work-group-size <N>` | `16` | GPU tasks: compute shader workgroup tile edge length |
 | `--prompt <TEXT>` | — | 3D generation tasks: text prompt describing the mesh to synthesize |
 | `--image <IMAGE_PATH>` | — | 3D generation tasks: input image path (PNG, JPEG, WebP) |
-| `--quality <QUALITY>` | `standard` | 3D generation quality preset: `fast`, `standard`, or `high` |
+| `--quality <QUALITY>` | `standard` | 3D generation quality preset: `fast`, `standard`, or `high` (non-`sdf` `high` defaults to `6144` MB VRAM on the scheduler; `fast`/`standard` with `--gpu` default to `2048`/`4096` MB) |
 | `--engine <ENGINE>` | `auto` | 3D generation engine: `auto`, `sdf` (CPU procedural SDF), or `triposr` (Python `engines/generative_3d/entrypoint.py`) |
 | `--export-texture` | `true` | 3D generation tasks: bake PBR UV texture maps into the output `.glb` |
 | `--no-export-texture` | `false` | 3D generation tasks: disable texture map generation |
-| `--input-mesh <MESH_PATH>` | — | Auto-rigging tasks: input mesh file (`.glb`, `.gltf`, or `.obj`) |
-| `--rig-preset <PRESET>` | `biped` | Auto-rigging skeletal preset: `biped`, `quadruped`, or `generic` |
-| `--embed-animations <ANIMATIONS>` | — | Comma-separated animation clips to embed (e.g. `idle,walk,turnaround`) |
-| `--preferred-provider <PROVIDER>` | `builtin` | Auto-rigging provider: `builtin` (Rust skinning) or `blender` (headless Blender `engines/autorig/blender_rig.py`) |
+| `--input-mesh <MESH_PATH>` | — | Auto-rigging tasks: input mesh file (`.glb`, `.gltf`, or `.obj`, detected from magic bytes with UTF-8 BOM/whitespace handling; the built-in Rust engine accepts `.glb`/`.obj` and rejects `.gltf` with an error pointing to `--preferred-provider blender`) |
+| `--rig-preset <PRESET>` | `biped` | Auto-rigging skeletal preset: `biped` (15 joints), `quadruped` (19 joints), or `generic` (5 axial joints); empty or unknown values are refused upfront |
+| `--embed-animations <ANIMATIONS>` | — (empty on CLI; `idle,walk,turnaround` in API default) | Comma-separated animation clips to embed: `idle`, `walk`, `turnaround`; empty entries or unknown clip names are refused upfront |
+| `--preferred-provider <PROVIDER>` | `builtin` (omitted / `None`) | Auto-rigging provider: `builtin` (pure-Rust skinning), `auto` (try Blender, fall back to built-in Rust on non-cancel/non-timeout failure or missing binary), or `blender` (routes only to `has_blender` workers via preflight/scheduler and fails explicitly if Blender is missing or fails, with no silent fallback); empty or unknown values are refused upfront |
 | `-o`, `--output-asset <OUTPUT_PATH>` (alias `--glb-output`) | — | Destination path to write the generated or rigged `.glb` asset |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[submit].insecure`) | Allow submitting to a remote, `auto`, or P2P master without a cluster secret |
 
 #### Inspection, MapReduce, Doctor, Secret, Mode & MCP Subcommands
 | Subcommand | Flags / Aliases | Description |
 | :--- | :--- | :--- |
+| `oxideswarm submit` | See [`oxideswarm submit` Flags](#oxideswarm-submit-flags) | Submit a single task or `--matrix` fan-out |
+| `oxideswarm shard` | `--count <N>`, `--build-once`, `--build-source <DIR>`, `--junit-out <PATH>`, `--junit-glob <PATTERN>`, `--output-dir <DIR>`, `--fail-fast`, `--json`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--insecure`, `--type <TYPE>` (alias `--task-type`), `--shell`, `--command <PROG>`, `--script-file <PATH>`, `--interpreter <PROG>`, `--stdin-file <PATH>`, `--cores <N>`, `--ram-mb <MB>` (alias `--ram`), `--vram-mb <MB>` (alias `--vram`), `--gpu`, `--timeout-secs <SECS>`, `--max-retries <N>`, `--repeatable`, `--os <OS>`, `--arch <ARCH>`, `--worker <NAME\|ID>`, `--require-isolation <LEVEL>`, `--require-tag <TAG>`, `--require-tool <TOOL>`, `--env <KEY=VALUE>`, `--input <LOCAL[:SANDBOX]>` (alias `--file`), `--output <PATTERN>` (alias `--expected-output`), `--workspace <NAME>`, `--sync <DIR>`, `--no-sync`, `--cwd <REL>`, `--workspace-max-files <N>`, `--workspace-max-mb <MB>`, `-- <ARGS>...` | Fan out a command, shell script, or Cargo nextest `--build-once` suite across `N` (`1..=256`) parallel shards (default `--timeout-secs` `60`, or `1800` with `--build-once` / `--workspace`) with 1-based `OX_SHARD_INDEX`/`OX_SHARD_TOTAL`, `slots:`-weighted Smooth Weighted Round-Robin spreading through soft `prefer:worker=<id>` tags (ignored while that worker is busy or gone), `--fail-fast` cancellation, `--junit-out` XML merging, and per-`(os, arch)` `--build-once` staging via `OXIDESWARM_BUILD_ONCE_ARCHIVE` in `Task::inputs` (`--workspace` is mutually exclusive with `--build-once` and `--input` and serializes on one worker; [design 0103](design/0103-ax2-sharded-runs.md), [sharded-runs guide](guides/sharded-runs.md)) |
 | `oxideswarm status` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--task-id <UUID>` (alias `--task`), `--workers`, `--json`, `--insecure` | Query cluster summary metrics, a specific task's status (`--task-id`), or connected workers (`--workers`) |
-| `oxideswarm workers` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags, and running task counts |
+| `oxideswarm workers` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List connected workers with OS/arch, cores, RAM, GPU, tags (including master-computed `speed:<factor>` from `SpeedBook` over shared keys, also exposed as `speed` in `workers --json`, `status --json`, and `WorkerUiInfo::speed_factor` on `/api/status` and the dashboard, [design 0060](design/0060-speed-aware-placement.md)), and running task counts |
 | `oxideswarm workspaces` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | List the master's workspace affinity map (`name`, `worker`, `last_used_utc`; lists the master's affinity map only, not the workspaces stored on workers, which needs W2b) |
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
 | `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
@@ -767,17 +831,17 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm join` | `--code <CODE>`, `--pair-host <HOST:PORT>`, `--invite-file <PATH>`, `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | With `--code <CODE>` (optional `--pair-host <HOST:PORT>` when broadcasts are blocked), discover the inviting machine on UDP `8087`, run SPAKE2, receive the encrypted invite, send `PairPendingNotice` back after `EnrollPending`, and confirm `[y/N]` on stdin ([design 0052](design/0052-short-code-pairing.md)). With `--invite-file <PATH>`, decrypt a passphrase-protected `invite.oxs` file from a v1 USB setup kit with an invisible passphrase prompt (`[y/N]` + optional 6-digit pairing check, [design 0053](design/0053-usb-setup-kit.md)). Otherwise read an invite (`oxs1-invite:...`, [design 0051](design/0051-machine-identity-and-invites.md)) or a shared-secret join token (`oxs1-join:...`, [design 0048](design/0048-join-token.md)) from **standard input** (piped, or pasted at a no-echo prompt on a terminal; any positional argument is refused without echo). For an invite, `join` requires a controlling terminal (`stdin` when interactive, or `/dev/tty` on Unix and `CONIN$` on Windows when the invite is piped in via e.g. `pbpaste \| oxideswarm join`) to read the `[y/N]` confirmation: for `--no-approval` invites it flushes pending terminal input, prints the pinned master fingerprint and code-execution warning (without a pairing code), and asks `[y/N]` before opening any connection; for approval-required invites it connects with OXS-AUTH v3 purpose `enroll` and the pinned `master_key`, prints the 6-digit pairing check, master fingerprint, and warning, waits for admin approval (`ENROLLED`) and user confirmation (`[y/N]`), and confirms on the stream within 120 s. Only after confirmation does `join` write `~/.oxideswarm/node.key` and `master_key` in `~/.oxideswarm/rusty-grid.toml` and run the checks its roles allow (a worker-only member runs read-only checks; `doctor` task probes require `client`; when migrating a stopped named worker from v2 to v3 under `--auth both`, an admin runs `oxideswarm members release-worker <WORKER_ID>` so it keeps its persisted `worker_id`). For a join token, `join` saves the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` and runs `doctor` |
 | `oxideswarm usb create` | `<DIR>`, `--machines <N>` (alias `--uses`, default `1`), `--expires <DURATION>` (default `7d`, up to `30d`, or `48h` with `--no-approval`), `--roles <ROLES>` (default `worker`; `admin` refused), `--workspaces`, `--gpu`, `--archives <DIR>` (alias `--from-dir`), `--download`, `--release <VERSION>`, `--no-autostart`, `--isolation <MODE>` (`off` or `fs`), `--no-approval`, `--passphrase-stdin`, `--replace`, `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>`, `--relay-url <URL>`, `--insecure` | Write a v1 passphrase-encrypted USB setup kit into `<DIR>/OxideSwarm` containing `invite.oxs` (Argon2id + ChaCha20-Poly1305 encrypted OXS-AUTH v3 invite), `kit.json`, verified `archives/SHA256SUMS` (local `--archives` or HTTPS `--download`), and cross-platform installers/uninstallers (`install.sh`, `install.ps1`, click-to-run wrappers, [design 0053](design/0053-usb-setup-kit.md)) |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
-| `oxideswarm mcp` | `--master <ADDR\|auto\|TICKET>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio (`submit` and `task_result` payloads include `waited_ms`, `task_time_sum_ms`, and `machines` covering the submitted task only, before any `verify` replicas run; for a task submitted in the same session, `task_result` measures `waited_ms` from that session's `submit` call to the `task_result` reply, so it includes caller time between calls and increases on repeat queries, and returns `null` when that session did not submit the task—for example after an MCP restart, from another client, or after entry eviction; [design 0059](design/0059-first-users.md)) |
+| `oxideswarm mcp` | `--master <ADDR\|auto\|TICKET>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio (`submit` and `task_result` payloads include `waited_ms`, `task_time_sum_ms`, and `machines` covering the submitted task only, before any `verify` replicas run; `submit` also accepts `matrix` and `max_matrix_cells` for client-side multi-target fan-out, returning per-cell records and marking unplaced cells upfront via `ListWorkers`; `shard` fans out `1..=256` parallel shards with `OX_SHARD_INDEX`/`OX_SHARD_TOTAL`, `build_once`, `fail_fast`, and `junit_out` XML merging, with `files`, `workspace`, `output_dir`, `build_source`, and `junit_out` confined inside the server working directory without `..` or symlinks; for a task submitted in the same session, `task_result` measures `waited_ms` from that session's `submit` call to the `task_result` reply, so it includes caller time between calls and increases on repeat queries, and returns `null` when that session did not submit the task—for example after an MCP restart, from another client, or after entry eviction; [design 0059](design/0059-first-users.md), [design 0101](design/0101-matrix-fanout.md), [design 0103](design/0103-ax2-sharded-runs.md), [MCP guide](guides/mcp-client-setup.md), [sharded-runs guide](guides/sharded-runs.md)) |
 | `oxideswarm rendezvous` | `--listen <ADDR>` (default `127.0.0.1:8090`, `OXIDESWARM_RENDEZVOUS_LISTEN`), `--port-file <PATH>`, `--max-leases <N>` (default `256`), `--max-ttl-secs <SECS>` (default `3600`), `--allow-unsigned`, `--insecure`, `--secret <HEX>`, `--secret-file <PATH>` | Run the standalone Tier 3 HTTP rendezvous registry ([design 0066](design/0066-usable-rendezvous-discovery.md)). Serves multiple clusters isolated by deterministic Ed25519 `lease_key` slots (`X-OxideSwarm-Lease-Auth` required on read) without holding cluster secrets unless `--secret` or `--secret-file` is passed explicitly; refuses unsigned non-loopback binds without `--insecure` |
 
 #### `agent-mesh` CLI Subcommands (`crates/agent_mesh`)
 | Subcommand | Flags | Description |
 | :--- | :--- | :--- |
-| `agent-mesh hub` | `-l` / `--listen <ADDR>` (default `127.0.0.1:8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--insecure`, `--grid-master [<ADDR>]` (`OXIDE_GRID_MASTER`), `--secret <SECRET>` (`OXIDESWARM_SECRET`), `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`) | Start the WebSocket/HTTP Agent Mesh Relay Hub (and optional co-hosted Grid Master when `--grid-master` is passed) |
-| `agent-mesh node` (alias `agent`) | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`; supports `wss://`), `--id <ID>`, `--platform <PLATFORM>`, `--no-shell`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Connect a persistent agent mesh node to the hub |
+| `agent-mesh hub` | `-l` / `--listen <ADDR>` (default `127.0.0.1:8088`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--insecure`, `--grid-master [<ADDR>]` (`OXIDE_GRID_MASTER`), `--grid-connect <HOST:PORT>` (`OXIDE_GRID_CONNECT`, conflicts with `--grid-master`), `--secret <SECRET>` (`OXIDESWARM_SECRET`), `--secret-file <PATH>` (`OXIDESWARM_SECRET_FILE`), `--master-key <HEX>` (`RUSTY_GRID_MASTER_KEY`), `--relay-url <URL>` (`RUSTY_GRID_RELAY_URL`), `--max-active-mb <MB>` (`RUSTY_GRID_MAX_ACTIVE_MB`) | Start the WebSocket/HTTP Agent Mesh Relay Hub, with either an optional embedded Grid Master (`--grid-master`) or a remote client bridge to an already-running Master (`--grid-connect`, requiring joined `oxideswarm worker` nodes), reporting live `/api/nodes` `"grid"` `"online"`/`"offline"` liveness ([design 0104](design/0104-mesh3-remote-master-bridge.md)) |
+| `agent-mesh node` (alias `agent`) | `--hub <URL>` (default `ws://127.0.0.1:8088/ws`; supports `wss://`), `--id <ID>`, `--platform <PLATFORM>`, `--no-shell`, `--inbox-dir <DIR>`, `--inbox-max-mb <MiB>` (default `1024`, at least `1`), `--inbox-max-files <N>` (default `10000`, at least `1`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Connect a persistent agent mesh node to the hub. Every `DataPayload` chunk must carry its SHA-256 (else `DeliveryNack(ERR_PAYLOAD_CORRUPT)`); a multi-chunk transfer must also carry `metadata.total_sha256`, gets `DeliveryAck(chunk_received)` for each chunk but the last, is reassembled within `64 MiB` per transfer, `64` transfers, `128 MiB` in all and a `60 s` idle expiry, and gets one `DeliveryAck(data_received_verified)` only after the whole payload matched its SHA-256 (design 0107). With `--inbox-dir <DIR>` the directory is validated upfront (created with mode `0700` on Unix when missing), the verified payload is written atomically as a mode `0600` file before that receipt, and a payload that would take the directory past `--inbox-max-mb` or `--inbox-max-files` (measured from the directory before each write, so files a reader removes free their share) is refused with `DeliveryNack(ERR_INBOX_FULL)`; a write error answers `DeliveryNack(ERR_PERSIST_FAILED)` |
 | `agent-mesh send` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `-c` / `--command <CMD>`, `-a` / `--args <JSON>`, `--timeout-ms <MS>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Dispatch a structured command to a mesh node via the hub |
 | `agent-mesh list` | `--hub <URL>`, `--from <ID>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Query the catalog of active nodes connected to the hub |
-| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>`, `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload with SHA-256 verification to a target node |
+| `agent-mesh data` | `--hub <URL>`, `--from <ID>`, `--to <ID>`, `--payload <TEXT>` / `--payload-file <PATH>` (`-` for stdin), `--timeout-ms <MS>` (default `10000`), `--token <TOKEN>` (`OXIDE_MESH_TOKEN`), `--tls-ca <PATH>` (`OXIDE_MESH_TLS_CA`) | Transmit a data payload (inline UTF-8 via `--payload` or arbitrary binary bytes via `--payload-file <PATH>`, including `-` for raw stdin; above `1 MiB` it is split into `1 MiB` chunks) with SHA-256 verification to a target node. At most `2` chunks are unacknowledged at a time: the next chunk goes out after the target's `DeliveryAck(chunk_received)`. Delivery is reported only for a `DeliveryAck(data_received_verified)` from the target itself that follows its acknowledgement of every earlier chunk; an ACK or NACK from any other node is ignored, a `DeliveryNack` from the target or the hub fails. `--timeout-ms` bounds each wait for the target's next acknowledgement, not the whole transfer. Prints the correlation ID, SHA-256 and chunk count on success, and exits non-zero on missing node, disconnect, `DeliveryNack`, or timeout (design 0107) |
 
 ### Network port topology
 
@@ -785,7 +849,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | :--- | :--- | :--- | :--- |
 | **8088** | TCP | Master Grid Coordinator | Primary cluster communication port for worker node registration, heartbeat exchanges, task distribution, and CLI client requests (`submit`, `status`, `workers`, `mapreduce`). Protected by mutual HMAC-SHA256 handshake (`cluster_auth`). |
 | **8088** | TCP (WS/HTTP) | Agent Mesh Relay Hub | Default listener for `agent-mesh hub`. **Critical Port Conflict:** The default binding `127.0.0.1:8088` collides with the Master Grid port when co-located on the same physical host. Operators MUST bind the Hub to alternate ports (e.g. `--port 8090`) when co-locating services. |
-| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, Prometheus metrics (`/metrics`), live status graphs, task submission, and WebSocket streams (`/ws`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master on the same port, it binds `127.0.0.1:8080` when targeting a loopback master or `0.0.0.0:8080` otherwise to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
+| **8080** | HTTP | Master Dashboard & Worker Standby | Embedded Axum web server providing cluster telemetry, Prometheus metrics (`/metrics`), live status graphs, task submission, WebSocket streams (`/ws`), and `Admin`-scoped member/invite endpoints (`GET /api/members`, `POST /api/members/{name_or_id}/approve\|reject\|revoke\|rename`, `GET\|POST /api/invites`, `DELETE /api/invites/{id}`). Bound to loopback by default; requires explicit `--web-ui-addr 0.0.0.0:8080` to expose across LAN. Protected by RBAC bearer tokens or derived cluster admin token (`oxs1-dashboard-admin`). When a standalone worker runs without a master on the same port, it binds `127.0.0.1:8080` when targeting a loopback master or `0.0.0.0:8080` otherwise to serve an HTTP 307 redirect to the discovered Master (`worker --no-portal` turns that off). |
 | **8089** | UDP | Master Discovery Beacon | When the master listens on a non-loopback address, it binds `0.0.0.0:8089` and broadcasts its cluster address and optional dashboard URL to subnet broadcast (`255.255.255.255:8089`); when the master listens on loopback, it binds that loopback address (`127.0.0.1:8089`), answers local unicast probes only, and does not broadcast. When a cluster secret is present, beacon payloads include HMAC-SHA256 signatures to prevent rogue discovery spoofing. Workers with `--master auto` listen here. |
 | **8087** | UDP | Short-Code Pairing Discovery | Bound only for the lifetime of an active `oxideswarm invite --code` session (at most 10 minutes), paired with an ephemeral TCP listener (`<= 4 KiB` frames). `join --code` queries nameplate matches on UDP `8087` and connects over TCP to run SPAKE2 (`oxs-pair-v1`), with a strict single-guess burn rule ([design 0052](design/0052-short-code-pairing.md)). |
 | **8090** | TCP (HTTP) | Standalone Rendezvous Registry | Default listener for `oxideswarm rendezvous` (`127.0.0.1:8090`; override with `--listen` or `OXIDESWARM_RENDEZVOUS_LISTEN`). Accepts signed `POST /api/rendezvous/register` leases and serves `GET /api/rendezvous/master?key=<hex>` to requests with a valid `X-OxideSwarm-Lease-Auth` signature (`http://` only; terminate TLS in a local reverse proxy). **Port Note:** `README.md` `agent-mesh hub` examples also show `8090`; bind one to an alternate port when running both on the same host. |
@@ -801,8 +865,8 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | Variable | Component | Purpose |
 | :--- | :--- | :--- |
 | `OXIDESWARM_SECRET` | Global & Agent Mesh | 64-character hex cluster secret for mutual node authentication (`--secret`) |
-| `OXIDESWARM_SECRET_FILE` | Global | File path pointing to cluster secret (`--secret-file`, mode `0600`; preferred over inline hex) |
-| `RUSTY_GRID_MASTER_KEY` | Worker, CLI & MCP | Pinned master static X25519 public key (64 hex characters) for OXS-AUTH v3 Noise `IK` authentication (`--master-key`, `master_key`, `[worker].master_key`, `[client].master_key`, `[submit].master_key`, `[status].master_key`, [design 0051](design/0051-machine-identity-and-invites.md)) |
+| `OXIDESWARM_SECRET_FILE` | Global & Agent Mesh | File path pointing to cluster secret (`--secret-file` on `oxideswarm` and `agent-mesh hub`, mode `0600`; preferred over inline hex) |
+| `RUSTY_GRID_MASTER_KEY` | Worker, CLI, MCP & Agent Mesh | Pinned master static X25519 public key (64 hex characters) for OXS-AUTH v3 Noise `IK` authentication (`--master-key` on `oxideswarm` and `agent-mesh hub --grid-connect`, `master_key`, `[worker].master_key`, `[client].master_key`, `[submit].master_key`, `[status].master_key`, [design 0051](design/0051-machine-identity-and-invites.md)) |
 | `RUSTY_GRID_CONFIG` | Global | Path to TOML or JSON configuration file (`--config`) |
 | `OXIDESWARM_HOME` | Global & Launchers | Base state directory override for `cluster.secret`, `master_key.bin`, `worker_id`, `blobs`, `windows_acl_grants.txt`, and launcher PID/log files (default: `~/.oxideswarm` or `%USERPROFILE%\.oxideswarm`) |
 | `RUST_LOG` | Global | Standard `tracing_subscriber::EnvFilter` directive overriding `--verbose` / `--quiet` |
@@ -823,13 +887,13 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_P2P_TICKET_FILE` | Master | File path where generated P2P ticket string is written (`--p2p-ticket-file`) |
 | `RUSTY_GRID_P2P_KEY_FILE` | Master | File path where master P2P identity key is persisted (`--p2p-key-file`) |
 | `RUSTY_GRID_EPHEMERAL_KEY` | Master | Forces generation of ephemeral P2P key without file persistence (`--ephemeral-key`) |
-| `RUSTY_GRID_RELAY_URL` | Master, Worker & Client | Custom `https://` iroh relay URL for P2P endpoints (`--relay-url`, `[master].relay_url`, `[worker].relay_url`, `[client].relay_url`, `[submit].relay_url`, `[status].relay_url`; selects `RelayMode::Custom` on `presets::Minimal` and conflicts with `RUSTY_GRID_P2P_MINIMAL`, [design 0049](design/0049-custom-relay.md)) |
-| `RUSTY_GRID_P2P_MINIMAL` | Master, Worker & CLI | Selects `iroh::endpoint::presets::Minimal` (disabling DERP relay and pkarr/DNS address lookup) in `oxideswarm master`, `oxideswarm worker`, and client P2P connections (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0030](design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md)) |
+| `RUSTY_GRID_RELAY_URL` | Master, Worker, Client & Agent Mesh | Custom `https://` iroh relay URL for P2P endpoints (`--relay-url` on `oxideswarm` and `agent-mesh hub --grid-connect`, `[master].relay_url`, `[worker].relay_url`, `[client].relay_url`, `[submit].relay_url`, `[status].relay_url`; selects `RelayMode::Custom` on `presets::Minimal` and conflicts with `RUSTY_GRID_P2P_MINIMAL`, [design 0049](design/0049-custom-relay.md)) |
+| `RUSTY_GRID_P2P_MINIMAL` | Master, Worker, CLI & Agent Mesh | Selects `iroh::endpoint::presets::Minimal` (disabling DERP relay and pkarr/DNS address lookup) in `oxideswarm master`, `oxideswarm worker`, client P2P connections, and `agent-mesh hub --grid-connect` (`1`, `true`, `yes`, or `on`), logging a startup warning ([design 0030](design/0030-mcp-post-reply-cancel-and-p2p-endpoint-lifecycle.md)) |
 | `RUSTY_GRID_MAX_QUEUE_SIZE` | Master | Maximum queued or running (non-terminal) tasks held in the queue (`--max-queue-size`; minimum `1`) |
 | `RUSTY_GRID_MAX_BATCH_SIZE` | Master | Maximum tasks placed in one scheduling batch (`--max-batch-size`, `[master].max_batch_size`; default `1024`, minimum `1`, [design 0050](design/0050-scale-out-architecture.md)) |
 | `RUSTY_GRID_SCHEDULER_POLICY` | Master | Load-balancing policy (`--scheduler-policy`: `weighted`, `least-loaded`, or `round-robin`; default `weighted`) |
 | `RUSTY_GRID_SPEED_HOLD_FACTOR` | Master | Speed-aware placement hold-back factor (`--speed-hold-factor`, `[master].speed_hold_factor`: `0` disables D2, otherwise finite `> 1.0`; default `1.5`, [design 0060](design/0060-speed-aware-placement.md)) |
-| `RUSTY_GRID_WIRE_CODEC` | Master, Worker & Client | Wire format serialization codec (`--wire-codec`: `bincode` or `json`; default `bincode`; invalid values exit `1`) |
+| `RUSTY_GRID_WIRE_CODEC` | Master, Worker, Client & Agent Mesh | Wire format serialization codec (`--wire-codec`: `bincode` or `json`; default `bincode`; invalid values exit `1`) |
 | `RUSTY_GRID_DEFAULT_RETRY_MAX` | Master | Default task retry ceiling on failure (`--default-retry-max`; default `3`) |
 | `RUSTY_GRID_MAX_RETRIES` | Master | Secondary alias for default task retry ceiling (`--max-retries`) |
 | `RUSTY_GRID_MAX_RETAINED_TASKS` | Master | Maximum count of finished tasks retained in memory (`--max-retained-tasks`; default `10000`) |
@@ -852,9 +916,9 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_ENABLE_WEB_UI` | Master | Explicit override to force-enable web dashboard server (`1` or `true`) |
 | `RUSTY_GRID_DISABLE_DISCOVERY` | Master | Disables UDP discovery beacon listener/broadcaster when set (wins over `--discovery-port`) |
 | `RUSTY_GRID_DISCOVERY_PORT` | Master | UDP discovery beacon port (`--discovery-port`; default `8089`, `0` = off) |
-| `OXIDESWARM_RENDEZVOUS` | Master, Worker & Clients | `http://HOST[:PORT][/PATH]` rendezvous registry URL for publishing or discovering the coordinator lease (`--rendezvous`; `https://` is rejected upfront) |
+| `OXIDESWARM_RENDEZVOUS` | Master, Worker, Clients & Agent Mesh | `http://HOST[:PORT][/PATH]` rendezvous registry URL for publishing or discovering the coordinator lease (`--rendezvous`; `https://` is rejected upfront) |
 | `OXIDESWARM_RENDEZVOUS_LISTEN` | Rendezvous | Listen address for `oxideswarm rendezvous` (`--listen`; default `127.0.0.1:8090`) |
-| `RUSTY_GRID_RENDEZVOUS` | Master, Worker & Clients | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
+| `RUSTY_GRID_RENDEZVOUS` | Master, Worker, Clients & Agent Mesh | Secondary alias for `OXIDESWARM_RENDEZVOUS` |
 | `OXIDE_DEV_MODE` | Master | Enables dashboard local development bypass on loopback interfaces (`1` or `true`; equivalent to `--dev`) |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Master (`--features otel`) | Full `http://` or `https://` OTLP/HTTP JSON trace endpoint URL (`POST` as given; takes precedence over `OTEL_EXPORTER_OTLP_ENDPOINT`; URLs carrying embedded credentials are rejected, [design 0050](design/0050-scale-out-architecture.md)) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Master (`--features otel`) | Base `http://` or `https://` OTLP collector URL (appends `/v1/traces` when path is empty or `/`; URLs carrying embedded credentials are rejected, [design 0050](design/0050-scale-out-architecture.md)) |
@@ -931,6 +995,10 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `RUSTY_GRID_SANDBOX_DIR` | Task Runner | Absolute path to the isolated scratch working directory (or the workspace `tree/` directory for workspace tasks) |
 | `RUSTY_GRID_WORKSPACE` | Task Runner | Workspace name when the task runs inside a persistent named workspace (`Task::workspace`) |
 | `RUSTY_GRID_WORKSPACE_DIR` | Task Runner | Absolute path to `<workspace_root>/<name>/tree` when the task runs inside a persistent named workspace |
+| `OXIDESWARM_CHECKPOINT_DIR` | Task Runner | Absolute path to the sandbox-private checkpoint directory for `Command`, `ShellScript`, and `Workspace` tasks (excluded from `--output` globs; at most 4,096 entries, 32 levels deep, 12 MiB encoded; large checkpoints are accepted at most every 5 s; not captured on Windows under `--isolation`; [design 0102](design/0102-process-task-checkpoints.md)) |
+| `OX_SHARD_INDEX` | `oxideswarm shard` / MCP `shard` | 1-based shard index (`1..=OX_SHARD_TOTAL`) injected into each shard's `TaskSpec::Command` or `TaskSpec::ShellScript` environment (overrides colliding `--env` entries) |
+| `OX_SHARD_TOTAL` | `oxideswarm shard` / MCP `shard` | Total shard count (`N`) injected into each shard's environment (overrides colliding `--env` entries) |
+| `OXIDESWARM_BUILD_ONCE_ARCHIVE` | `oxideswarm shard --build-once` | Sandbox-relative path to the staged `(os, arch)` `cargo nextest archive` file inside shard `Task::inputs` (overrides colliding `--env` entries) |
 
 #### Tier E: Subnet Discovery & Network Helpers
 | Variable | Component | Purpose |
@@ -947,6 +1015,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `OXIDE_MESH_TLS_CA` | Agent Mesh | Path to an additional trusted CA certificate (PEM or DER) for `wss://` hub connections behind a private TLS proxy (`--tls-ca`; proxy leaf certificate must have `CA:FALSE` and `subjectAltName`, signed by a `CA:TRUE` root) |
 | `OXIDE_MESH_NO_SHELL` | Agent Mesh / Launchers | When set to `1`, disables `shell_exec` command execution on node launchers (`--no-shell`; PowerShell launcher: `-NoShell`) |
 | `OXIDE_GRID_MASTER` | Agent Mesh | Bind address for the embedded Grid Master inside `agent-mesh hub` (`--grid-master`) |
+| `OXIDE_GRID_CONNECT` | Agent Mesh | Target already-running Master address (`HOST:PORT`, bare `HOST`, `auto`, or iroh P2P ticket) for `agent-mesh hub --grid-connect` (conflicts with `OXIDE_GRID_MASTER`; [design 0104](design/0104-mesh3-remote-master-bridge.md)) |
 
 #### Tier G: Platform Packaging, Service Automation, Agent Hub & Launchers
 | Variable | Component | Purpose |
@@ -965,6 +1034,7 @@ $$\text{CLI Flags} > \text{Environment Variables} > \text{Configuration File (\t
 | `OXIDESWARM_EVENT_KIND` / `OXIDESWARM_EVENT_FILE` / `OXIDESWARM_EVENT_TITLE` / `OXIDESWARM_EVENT_PRIORITY` / `OXIDESWARM_EVENT_FROM` | Agent Bridge | Event metadata variables passed to `--on-event` hooks by `scripts/agent_bridge.py watch` |
 | `OXIDESWARM_SYNC_DIR` | Sync Probe | Base directory override for `scripts/sync_network/sync_network.py` |
 | `OXIDE_ROOT` | Benchmarks | Root workspace directory override used by benchmark runners |
+| `OXIDESWARM_DOWNLOAD_BASE` | Install Scripts | Download base URL override for `scripts/install.sh` and `scripts/install.ps1` (default: `https://github.com/DuongNAD/OxideSwarm/releases/download`; [design 0059](design/0059-first-users.md)) |
 | `OX_SCRIPT_ROOT` | Test Suite | Custom script root used by `test_launcher_scripts.py` for regression verification |
 
 ### Workflow modes (`ox-mode`)
@@ -1044,12 +1114,12 @@ OxideSwarm/
 
 These task types build only with the Cargo feature `3d` (`cargo build --release --bin oxideswarm --features 3d`). A worker built without it does not advertise them, and the master never places a 3D task on it. The code is in `crates/worker/src/gen3d`, `crates/worker/src/autorig` and `engines/`.
 
-The worker executes two 3D asset pipeline task types (architecture and limits in [docs/design/0023-generative-3d-and-autorig-subsystem.md](design/0023-generative-3d-and-autorig-subsystem.md), [0015](design/0015-engine-names-and-cpu-fallback.md), and [0017](design/0017-honest-3d-sdf-fallback.md)):
+The worker executes two 3D asset pipeline task types (architecture and limits in [docs/design/0023-generative-3d-and-autorig-subsystem.md](design/0023-generative-3d-and-autorig-subsystem.md), [0015](design/0015-engine-names-and-cpu-fallback.md), [0017](design/0017-honest-3d-sdf-fallback.md), [0105](design/0105-3d2-vram-blender-routing.md), and [0106](design/0106-3d3-honest-autorig-options.md)):
 
 | Subsystem | Task Spec & CLI | Execution Tiers & Drivers | Current Limits (`docs/BACKLOG.md`) |
 | :--- | :--- | :--- | :--- |
-| **Generative 3D** (`crates/worker/src/gen3d`) | `TaskSpec::Generative3D(Generative3DSpec)` via `oxideswarm submit --type 3d --prompt <TEXT> [--quality fast\|standard\|high] [--engine auto\|sdf\|triposr] [-o <OUT.glb>]` | **Tier 0 (`sdf`, `auto`)**: in-process pure-Rust analytical SDF Marching Cubes (`32³`/`48³`/`64³`), manifold topology repair, conformal box UV unwrapping, barycentric PBR albedo PNG baking, and binary glTF 2.0 (`.glb`) export on CPU (`device_name = "Procedural-SDF-PureRust"`, no GPU required).<br>**Tier 1 (`triposr` stub, `3D-1`)**: supervised Python subprocess running `engines/generative_3d/entrypoint.py` (located via `OXIDESWARM_GEN3D_SCRIPT` or relative to the worker working directory, using `OXIDESWARM_PYTHON` / `RUSTY_GRID_PYTHON` / `.venv`). | **Partial (`3D-1`, `3D-2`, `3D-3`)**: Tier 0 maps prompt keywords (`robot`/`mech`/`droid`/`cyber`/`armor`, `chibi`/`cute`/`mascot`/`creature`/`stylized`, `orb`/`sphere`/`math`/`test`, else humanoid) to four fixed analytical SDF presets (`SdfPreset`), rejects `--image` input, and takes no timeout or cancel (`Planned` under `3D-3`). `engines/generative_3d/entrypoint.py` is a stub with no model code that exits `1` unconditionally (`Planned` under `3D-1`); `--engine trellis` is refused upfront. Explicit `oxideswarm submit --vram-mb <MB>` requirements are enforced by the scheduler (`FEAT-9a`, [design 0068](design/0068-task-vram-accounting.md)), while heuristic preset-based `required_vram_mb` routing when `--vram-mb` is omitted remains `Planned` under `3D-2`. |
-| **Auto-Rigging & Animation** (`crates/worker/src/autorig`) | `TaskSpec::AutoRig(AutoRigSpec)` via `oxideswarm submit --type autorig --input-mesh <MESH.glb\|.obj> [--rig-preset biped\|quadruped\|generic] [--embed-animations idle,walk,turnaround] [--preferred-provider builtin\|blender] [-o <OUT.glb>]` | **Built-in (`builtin`)**: in-process pure-Rust `.glb`/`.obj` loader, 3×3 PCA symmetry and 50-slab 15-landmark extraction, 15-joint biped topological DAG armature + 4×4 Inverse Bind Matrices, geodesic surface skinning with sagittal barrier and top-4 weight normalization, procedural TRS keyframe synthesis (`idle`, `walk`, `turnaround`), and rigged `.glb` export.<br>**Headless Blender (`blender`)**: supervised Blender subprocess (`--blender-path` / `RUSTY_GRID_BLENDER_PATH`) running `engines/autorig/blender_rig.py` (on-disk or embedded via `include_str!`), falling back to the built-in Rust engine if Blender is absent or fails. | **Partial (`3D-2`, `3D-3`, `Planned`)**: Under `3D-2` (`Planned`), `crates/master` never reads `has_blender`, so a `--preferred-provider blender` task can land on a worker without Blender, and `--blender-path` reaches only the capability probe while `resolve_blender_binary` misses the macOS/Linux paths `detect_blender` searches. Under `3D-3` (`Planned`): `extract_landmarks` ignores `_preset`, `build_standard_armature` always builds the same 15-joint biped skeleton, and `blender_rig.py` parses `--preset` without reading it; `turnaround` produces an empty action in Blender; Blender input is always written as `input_mesh.glb` so `.obj` input through Blender fails; Blender uses a fixed 60 s timeout instead of the task timeout (and no task cancel), while built-in rigging takes no timeout or cancel; and a Blender failure falls back to the built-in rigger with only a `warn!` and the same `"OxideSwarm-AutoRig"` device label. |
+| **Generative 3D** (`crates/worker/src/gen3d`) | `TaskSpec::Generative3D(Generative3DSpec)` via `oxideswarm submit --type 3d --prompt <TEXT> [--quality fast\|standard\|high] [--engine auto\|sdf\|triposr] [-o <OUT.glb>]` | **Tier 0 (`sdf`, `auto`)**: in-process pure-Rust analytical SDF Marching Cubes (`32³`/`48³`/`64³`), manifold topology repair, conformal box UV unwrapping, barycentric PBR albedo PNG baking, and binary glTF 2.0 (`.glb`) export on CPU (`device_name = "Procedural-SDF-PureRust"`, no GPU required), with task `timeout` and cooperative `AtomicBool` cancellation settling within `<= 1 s`.<br>**Tier 1 (`triposr` stub, `3D-1`)**: supervised Python subprocess running `engines/generative_3d/entrypoint.py` (located via `OXIDESWARM_GEN3D_SCRIPT` or relative to the worker working directory, using `OXIDESWARM_PYTHON` / `RUSTY_GRID_PYTHON` / `.venv`). | **Implemented (`3D-2`, `3D-3`); Partial (`3D-1`)**: Tier 0 maps prompt keywords (`robot`/`mech`/`droid`/`cyber`/`armor`, `chibi`/`cute`/`mascot`/`creature`/`stylized`, `orb`/`sphere`/`math`/`test`, else humanoid) to four fixed analytical SDF presets (`SdfPreset`) and rejects `--image` input. `engines/generative_3d/entrypoint.py` is a stub with no model code that exits `1` unconditionally (`Planned` under `3D-1`); `--engine trellis` is refused upfront. Scheduler VRAM routing (`3D-2`, [design 0105](design/0105-3d2-vram-blender-routing.md)) enforces explicit `--vram-mb <MB>` and applies preset defaults (`fast` = `2048` MB, `standard` = `4096` MB, `high` = `6144` MB) for non-`sdf` tasks when `--gpu` is set or `--quality high` is requested (preserving `0` MB CPU defaults for `sdf` and non-GPU `fast`/`standard` `auto`/`triposr` tasks), with non-blocking CLI `ListWorkers` preflight warnings on `stderr`. |
+| **Auto-Rigging & Animation** (`crates/worker/src/autorig`) | `TaskSpec::AutoRig(AutoRigSpec)` via `oxideswarm submit --type autorig --input-mesh <MESH.glb\|.gltf\|.obj> [--rig-preset biped\|quadruped\|generic] [--embed-animations idle,walk,turnaround] [--preferred-provider builtin\|auto\|blender] [-o <OUT.glb>]` | **Built-in (`builtin`)**: in-process pure-Rust `.glb`/`.obj` loader (with UTF-8 BOM/whitespace stripping; refuses `.gltf`), 3×3 PCA symmetry and anatomical landmark extraction (including longitudinal `QuadrupedLandmarks`), preset-specific topological DAG armatures (`biped` 15 joints, `quadruped` 19 joints, `generic` 5 axial joints) + 4×4 Inverse Bind Matrices, geodesic surface skinning with sagittal barrier and top-4 weight normalization, procedural TRS keyframe synthesis (`idle` 73 frames, `walk` 37 frames, `turnaround` 97 frames at 30 Hz), and rigged `.glb` export (`device_name = "OxideSwarm-AutoRig-Builtin"`, stdout `provider: builtin`).<br>**Headless Blender (`blender`)**: supervised Blender subprocess (`--blender-path` / `RUSTY_GRID_BLENDER_PATH`, sharing `rusty_grid_core::capabilities::resolve_blender_binary`) running `engines/autorig/blender_rig.py` (on-disk or embedded via `include_str!`) with `--python-exit-code 1`, `--preset`, magic-byte `.glb`/`.gltf`/`.obj` staging (leading BOM/whitespace stripped on `.obj`/`.gltf`), and 97-frame `turnaround` keyframes (`device_name = "OxideSwarm-AutoRig-Blender"`, stdout `provider: blender`). | **Implemented (`3D-2`, `3D-3`)**: `TaskSpec::validate()` and worker/Blender drivers refuse empty or unknown `rig_preset`, `embed_animations`, and `preferred_provider` values upfront. `--preferred-provider blender` sets `requires_blender` on `TaskView`/`Shape` so the master scheduler and straggler reaper route exclusively to `has_blender == true` workers (with CLI preflight `stderr` warning when none are connected), and fails explicitly if Blender is missing or exits non-zero; `auto` falls back to `builtin` only on missing Blender or non-cancel/non-timeout errors, while omitted/`None` uses `builtin`. Both Blender process-tree supervision and cooperative `AtomicBool` Rust rigging honor task `timeout` and `cancel_rx`, settling within `<= 1 s`. |
 
 ### Tests and verification
 
@@ -1088,4 +1158,4 @@ python3 tests/test_launcher_scripts.py
 The scripts exit non-zero and say FAIL when a check fails; their reports are computed from what was observed in
 that run.
 
-**Benchmarks.** [benchmarks/grid](../benchmarks/grid/README.md) measures no-op task overhead with 1 to 4 workers and a first versus a repeated upload of the same input tree on loopback, with the script that produced each dated record in [benchmarks/grid/results](../benchmarks/grid/results). The records state their machine, load and limits.
+**Benchmarks.** [benchmarks/grid](../benchmarks/grid/README.md) measures no-op task overhead with 1 to 4 workers, a first versus a repeated upload of the same input tree, and `AX-2` Spike R2 / Measure M1 sharded runs on loopback, with the script that produced each dated record in [benchmarks/grid/results](../benchmarks/grid/results). The records state their machine, load and limits.

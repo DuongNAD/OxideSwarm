@@ -5,13 +5,20 @@ Checks:
 1. All internal markdown links and anchor links across all tracked .md files in the repository.
 2. Absence of CRLF (\\r\\n) in any tracked .sh shell scripts.
 3. Genuine absence of all 6 legacy status files.
+4. Presence, CFF 1.2.0 required fields, LF endings, and Cargo.toml workspace parity for CITATION.cff.
 """
 
+import datetime
 import os
 import re
 import subprocess
 import unittest
 import urllib.parse
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11 fallback
+    tomllib = None
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -129,6 +136,122 @@ def parse_markdown_links(content):
             text = m.group(1)
             target = m.group(2).strip()
             yield (line_num, text, target)
+
+
+REQUIRED_CFF_KEYS = (
+    "cff-version",
+    "message",
+    "title",
+    "abstract",
+    "authors",
+    "version",
+    "date-released",
+    "license",
+    "repository-code",
+    "keywords",
+)
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    for idx, ch in enumerate(line):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if idx == 0 or line[idx - 1].isspace():
+                return line[:idx].rstrip()
+    return line.rstrip()
+
+
+def _unquote_yaml_scalar(value: str) -> str:
+    v = value.strip()
+    if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+        return v[1:-1]
+    return v
+
+
+def parse_top_level_cff(content: str) -> dict:
+    """Pure-stdlib YAML-subset parser for top-level keys, scalars, and lists in CITATION.cff."""
+    data = {}
+    current_list_key = None
+
+    for raw_line in content.splitlines():
+        line = _strip_yaml_comment(raw_line)
+        if not line.strip():
+            continue
+
+        # Top-level key (no leading whitespace)
+        if not line[0].isspace():
+            if ":" not in line:
+                continue
+            key, rest = line.split(":", 1)
+            key = key.strip()
+            val = rest.strip()
+            current_list_key = None
+            if not val:
+                data[key] = []
+                current_list_key = key
+            elif val.startswith("[") and val.endswith("]"):
+                inner = val[1:-1].strip()
+                items = [_unquote_yaml_scalar(part) for part in inner.split(",") if part.strip()]
+                data[key] = items
+            else:
+                data[key] = _unquote_yaml_scalar(val)
+        elif current_list_key is not None:
+            stripped = line.lstrip()
+            if stripped.startswith("- "):
+                raw_item = stripped[2:].strip()
+                mapping_match = None
+                if not raw_item.startswith(("'", '"')):
+                    mapping_match = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", raw_item)
+                if mapping_match:
+                    sub_key = mapping_match.group(1)
+                    sub_val = _unquote_yaml_scalar(mapping_match.group(2))
+                    data[current_list_key].append({sub_key: sub_val})
+                else:
+                    data[current_list_key].append(_unquote_yaml_scalar(raw_item))
+            elif stripped == "-":
+                data[current_list_key].append({})
+            else:
+                # Continuation mapping line under a list item (e.g., author subfields)
+                if data[current_list_key]:
+                    last = data[current_list_key][-1]
+                    if isinstance(last, dict):
+                        mapping_match = re.match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", stripped)
+                        if mapping_match:
+                            last[mapping_match.group(1)] = _unquote_yaml_scalar(mapping_match.group(2))
+                    else:
+                        data[current_list_key][-1] = f"{last} {stripped}".strip()
+
+    return data
+
+
+def load_workspace_package(cargo_toml_path: str) -> dict:
+    """Reads [workspace.package] fields from Cargo.toml using stdlib tomllib or a <3.11 fallback."""
+    if tomllib is not None:
+        with open(cargo_toml_path, "rb") as f:
+            parsed = tomllib.load(f)
+        return dict(parsed.get("workspace", {}).get("package", {}))
+
+    with open(cargo_toml_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    pkg = {}
+    in_section = False
+    for raw_line in lines:
+        stripped = raw_line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == "[workspace.package]"
+            continue
+        if in_section and "=" in stripped:
+            key, val = stripped.split("=", 1)
+            pkg[key.strip()] = _unquote_yaml_scalar(val.strip())
+    return pkg
 
 
 class TestMilestone1EmpiricalStress(unittest.TestCase):
@@ -284,6 +407,129 @@ class TestMilestone1EmpiricalStress(unittest.TestCase):
             f"Found {len(broken_links)} broken internal markdown link(s):\n{error_message}"
         )
         print(f"[PASS] 0 broken internal links or anchors detected.")
+
+    def test_citation_cff_matches_cargo_workspace(self):
+        """Verify CITATION.cff exists with LF endings, required CFF 1.2.0 keys, and Cargo.toml parity."""
+        cff_path = os.path.join(self.repo_root, "CITATION.cff")
+        cargo_path = os.path.join(self.repo_root, "Cargo.toml")
+        self.assertTrue(os.path.isfile(cff_path), "CITATION.cff must exist at repository root.")
+
+        with open(cff_path, "rb") as f:
+            raw = f.read()
+        self.assertNotIn(b"\r\n", raw, "CITATION.cff must use LF endings, not CRLF.")
+        self.assertNotIn(b"\r", raw, "CITATION.cff must use LF endings, not solitary CR.")
+
+        content = raw.decode("utf-8")
+        cff = parse_top_level_cff(content)
+
+        for key in REQUIRED_CFF_KEYS:
+            self.assertIn(key, cff, f"CITATION.cff missing required key '{key}'.")
+            self.assertTrue(cff[key], f"CITATION.cff key '{key}' must be non-empty.")
+
+        self.assertEqual(cff["cff-version"], "1.2.0")
+        self.assertIsInstance(cff["date-released"], str)
+        self.assertRegex(cff["date-released"], r"^\d{4}-\d{2}-\d{2}$")
+        try:
+            datetime.date.fromisoformat(cff["date-released"])
+        except ValueError as exc:
+            self.fail(f"CITATION.cff date-released is not a valid calendar date: {cff['date-released']!r} ({exc})")
+
+        self.assertIsInstance(cff["repository-code"], str)
+        self.assertTrue(
+            cff["repository-code"].startswith("https://"),
+            f"repository-code must start with https://, got {cff['repository-code']!r}",
+        )
+        self.assertIsInstance(cff["authors"], list)
+        self.assertGreaterEqual(len(cff["authors"]), 1)
+        for author in cff["authors"]:
+            self.assertIsInstance(
+                author,
+                dict,
+                f"CITATION.cff authors entries must be CFF 1.2.0 entity/person mappings, got {author!r}",
+            )
+            has_entity_name = isinstance(author.get("name"), str) and bool(author["name"].strip())
+            has_person_name = (
+                isinstance(author.get("family-names"), str) and bool(author["family-names"].strip())
+            ) or (
+                isinstance(author.get("given-names"), str) and bool(author["given-names"].strip())
+            )
+            self.assertTrue(
+                has_entity_name or has_person_name,
+                f"CITATION.cff author mapping must define non-empty 'name' or 'family-names'/'given-names', got {author!r}",
+            )
+
+        self.assertIsInstance(cff["keywords"], list)
+        self.assertGreaterEqual(len(cff["keywords"]), 1)
+        for kw in cff["keywords"]:
+            self.assertIsInstance(kw, str)
+            self.assertTrue(kw.strip(), "CITATION.cff keywords entries must be non-empty strings.")
+
+        cargo_pkg = load_workspace_package(cargo_path)
+        self.assertEqual(
+            cff["version"],
+            cargo_pkg.get("version"),
+            "CITATION.cff version must match Cargo.toml [workspace.package].version.",
+        )
+
+        cargo_license = cargo_pkg.get("license", "")
+        expected_licenses = {part.strip() for part in cargo_license.split(" OR ") if part.strip()}
+        cff_licenses_raw = cff["license"]
+        if len(expected_licenses) > 1:
+            self.assertIsInstance(
+                cff_licenses_raw,
+                list,
+                "CITATION.cff license must be a YAML list when Cargo.toml specifies multiple licenses.",
+            )
+        if isinstance(cff_licenses_raw, list):
+            for item in cff_licenses_raw:
+                self.assertIsInstance(item, str, "CITATION.cff license entries must be strings.")
+                self.assertTrue(item.strip(), "CITATION.cff license entries must be non-empty.")
+                self.assertNotIn(
+                    " OR ",
+                    item,
+                    f"CITATION.cff license entry must be a single SPDX identifier, not an expression: {item!r}",
+                )
+            actual_licenses = set(cff_licenses_raw)
+        elif isinstance(cff_licenses_raw, str):
+            self.assertNotIn(
+                " OR ",
+                cff_licenses_raw,
+                f"CITATION.cff license must be a single SPDX identifier, not an expression: {cff_licenses_raw!r}",
+            )
+            actual_licenses = {cff_licenses_raw}
+        else:
+            self.fail(
+                f"CITATION.cff license must be a string or list of strings, got {type(cff_licenses_raw).__name__}"
+            )
+        self.assertEqual(
+            actual_licenses,
+            expected_licenses,
+            "CITATION.cff license set must match Cargo.toml [workspace.package].license.",
+        )
+        print(f"\n[PASS] CITATION.cff valid (CFF 1.2.0, version {cff['version']}, licenses {sorted(actual_licenses)}).")
+
+    def test_gitattributes_pins_cff_eol_lf(self):
+        """Verify .gitattributes pins *.cff / CITATION.cff to text eol=lf for Windows checkouts."""
+        gitattributes_path = os.path.join(self.repo_root, ".gitattributes")
+        self.assertTrue(os.path.isfile(gitattributes_path), ".gitattributes must exist at repository root.")
+        with open(gitattributes_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        cff_rules = [
+            ln for ln in lines
+            if not ln.lstrip().startswith("#")
+            and re.match(r"^(?:\*\.cff|CITATION\.cff)\s+.*\beol=lf\b", ln.strip())
+        ]
+        self.assertTrue(
+            cff_rules,
+            ".gitattributes must pin *.cff (or CITATION.cff) with text eol=lf.",
+        )
+        out = subprocess.check_output(
+            ["git", "check-attr", "text", "eol", "--", "CITATION.cff"],
+            cwd=self.repo_root,
+            text=True,
+        )
+        self.assertIn("text: set", out)
+        self.assertIn("eol: lf", out)
 
 
 if __name__ == '__main__':

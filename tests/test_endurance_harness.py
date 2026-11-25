@@ -20,6 +20,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -405,21 +406,83 @@ class SamplerAndPrivacyTests(unittest.TestCase):
                 self.assertTrue(qres["path"].endswith(".quarantine.json"))
                 self.assertEqual(qres["hits"][0]["field"], "$.scenarios[0].error")
 
-    def test_transfer_refuses_non_loopback_and_remote_flags(self):
+    def test_transfer_link_and_remote_arg_validation(self):
         ap = endurance.build_parser()
-        ok_args = ap.parse_args(["transfer"])
-        endurance.validate_transfer_args(ok_args)
+        endurance.validate_transfer_args(ap.parse_args(["transfer"]))
 
         for bad_argv in (
-            ["transfer", "--link", "lan-tcp"],
-            ["transfer", "--link", "quic-relay"],
+            ["transfer", "--link", "unknown"],
             ["transfer", "--master", "127.0.0.1:8088"],
             ["transfer", "--secret-file", "secret.txt"],
             ["transfer", "--insecure"],
+            ["transfer", "--link", "lan-tcp"],
+            ["transfer", "--link", "lan-tcp", "--master", "192.0.2.10:18188"],
+            ["transfer", "--link", "lan-quic", "--secret-file", "secret.txt"],
+            ["transfer", "--link", "quic-relay"],
         ):
             bad_args = ap.parse_args(bad_argv)
             with self.assertRaises(ValueError, msg="expected ValueError for %s" % bad_argv):
                 endurance.validate_transfer_args(bad_args)
+
+        for ok_argv in (
+            ["transfer", "--link", "lan-tcp", "--master", "192.0.2.10:18188", "--secret-file", "secret.txt"],
+            ["transfer", "--link", "lan-quic", "--master", "@ticket.txt", "--insecure"],
+            ["transfer", "--link", "quic-relay", "--master", "{\"id\":\"abcd\"}", "--secret-file", "secret.txt"],
+        ):
+            endurance.validate_transfer_args(ap.parse_args(ok_argv))
+
+    def test_resolve_master_arg_and_p2p_ticket_privacy(self):
+        with tempfile.TemporaryDirectory() as d:
+            tfile = os.path.join(d, "master.ticket")
+            ticket = '{"id":"' + ("a" * 64) + '","addrs":[{"Relay":"https://relay.example./"},{"Ip":"192.0.2.10:1234"},{"Ip":"[2001:db8::1]:1234"}]}'
+            with open(tfile, "w", encoding="utf-8") as f:
+                f.write(ticket + "\n")
+
+            self.assertEqual(endurance.resolve_master_arg("@" + tfile), ticket)
+            self.assertEqual(endurance.resolve_master_arg("127.0.0.1:18188"), "127.0.0.1:18188")
+            with self.assertRaises(ValueError):
+                endurance.resolve_master_arg("@" + os.path.join(d, "missing.ticket"))
+
+            scrubbed = endurance.redact_text(
+                f"connect failed ticket={ticket} via [2001:db8::2]:999 and [::1]:80",
+                extra_secrets=[tfile],
+            )
+            self.assertIn("<p2p-ticket>", scrubbed)
+            self.assertIn("<ipv6>", scrubbed)
+            self.assertIn("[::1]:80", scrubbed)
+            self.assertNotIn("a" * 32, scrubbed)
+
+            hits = endurance.find_privacy_hits({"msg": ticket})
+            self.assertTrue(hits)
+            self.assertEqual(hits[0]["field"], "$.msg")
+
+            sec = os.path.join(d, "lab.secret")
+            rc = endurance.RemoteEnduranceCluster(
+                "/bin/echo",
+                os.path.join(d, "rc"),
+                ticket,
+                secret_file=sec,
+                require_tags=["os:windows", "iso:fs"],
+                target_worker="win-case-lab",
+            )
+            try:
+                cmd = rc.build_cli_cmd(["submit", "--wait", "--", "echo", "hi"])
+                self.assertIn("--secret-file", cmd)
+                self.assertIn(os.path.abspath(sec), cmd)
+                self.assertIn("--worker", cmd)
+                self.assertIn("win-case-lab", cmd)
+                self.assertIn("--require-tag", cmd)
+                self.assertIn("os:windows", cmd)
+                self.assertIn("iso:fs", cmd)
+                self.assertLess(cmd.index("--require-tag"), cmd.index("--"))
+                wcmd = rc.build_cli_cmd(["workers", "--json"])
+                self.assertNotIn("--require-tag", wcmd)
+                self.assertNotIn("--worker", wcmd)
+                self.assertFalse(rc._matches_tags({"name": "win-case-lab", "tags": ["os:windows", "iso:fs", "state:disconnected"]}))
+                self.assertTrue(rc._matches_tags({"name": "win-case-lab", "tags": ["os:windows", "iso:fs", "state:busy"]}))
+                self.assertTrue(rc._matches_tags({"name": "win-case-lab", "tags": ["os:windows", "iso:fs", "state:connected"]}))
+            finally:
+                rc.stop()
 
 
 class SoakHarnessTests(unittest.TestCase):
@@ -863,6 +926,41 @@ class SoakHarnessTests(unittest.TestCase):
                 min_created_epoch=1000.0,
             )
             self.assertEqual([x["pid"] for x in win_mode_posix_wd], [8001, 8002, 8004])
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits")
+    def test_soak_cluster_creates_0700_dirs_under_0022_umask(self):
+        old_umask = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory(prefix="ox_t90_") as td:
+                workdir = os.path.join(td, "cluster")
+                fake_proc = mock.MagicMock()
+                fake_proc.pid = 424242
+                fake_proc.poll.return_value = None
+                cluster = endurance.SoakCluster(
+                    "/usr/bin/true",
+                    workdir,
+                    workers=2,
+                    workspaces=True,
+                )
+                os.makedirs(cluster.workspace_dirs[1], mode=0o755, exist_ok=True)
+                os.chmod(cluster.workspace_dirs[1], 0o755)
+                with (
+                    mock.patch.object(cluster, "current_master_addr", return_value="127.0.0.1:8088"),
+                    mock.patch.object(cluster, "_spawn_role_proc", return_value=(fake_proc, mock.MagicMock())),
+                ):
+                    cluster._start_worker_locked(0)
+                    cluster._start_worker_locked(1)
+                for path in (
+                    cluster.workdir,
+                    cluster.sandbox_dirs[0],
+                    cluster.workspace_dirs[0],
+                    cluster.sandbox_dirs[1],
+                    cluster.workspace_dirs[1],
+                ):
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                    self.assertEqual(mode, 0o700, "expected 0o700 on %s, got %s" % (path, oct(mode)))
+        finally:
+            os.umask(old_umask)
 
 
 class EnduranceCiWorkflowTests(unittest.TestCase):

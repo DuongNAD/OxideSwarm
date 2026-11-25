@@ -1,5 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use rusty_grid_core::process_spawn;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -211,17 +213,18 @@ async fn test_cli_negative_validations() {
     let submit_image = tokio::task::spawn_blocking({
         let home = temp_dir.path().to_path_buf();
         move || {
-            cli(&home)
-                .arg("submit")
-                .arg("--master")
-                .arg("127.0.0.1:8080")
-                .arg("--type")
-                .arg("3d")
-                .arg("--image")
-                .arg("non_existent_image_12345.png")
-                .arg("--wait")
-                .output()
-                .expect("run submit CLI")
+            process_spawn::output_std(
+                cli(&home)
+                    .arg("submit")
+                    .arg("--master")
+                    .arg("127.0.0.1:8080")
+                    .arg("--type")
+                    .arg("3d")
+                    .arg("--image")
+                    .arg("non_existent_image_12345.png")
+                    .arg("--wait"),
+            )
+            .expect("run submit CLI")
         }
     });
 
@@ -238,17 +241,18 @@ async fn test_cli_negative_validations() {
     let submit_mesh = tokio::task::spawn_blocking({
         let home = temp_dir.path().to_path_buf();
         move || {
-            cli(&home)
-                .arg("submit")
-                .arg("--master")
-                .arg("127.0.0.1:8080")
-                .arg("--type")
-                .arg("autorig")
-                .arg("--input-mesh")
-                .arg(&empty_mesh)
-                .arg("--wait")
-                .output()
-                .expect("run submit CLI")
+            process_spawn::output_std(
+                cli(&home)
+                    .arg("submit")
+                    .arg("--master")
+                    .arg("127.0.0.1:8080")
+                    .arg("--type")
+                    .arg("autorig")
+                    .arg("--input-mesh")
+                    .arg(&empty_mesh)
+                    .arg("--wait"),
+            )
+            .expect("run submit CLI")
         }
     });
 
@@ -375,19 +379,20 @@ async fn test_cli_3d_triposr_fails_honestly_on_cpu_worker() {
         let home = temp_dir.path().to_path_buf();
         let master_str = master_addr.to_string();
         move || {
-            cli(&home)
-                .arg("submit")
-                .arg("--master")
-                .arg(&master_str)
-                .arg("--type")
-                .arg("3d")
-                .arg("--prompt")
-                .arg("robot")
-                .arg("--engine")
-                .arg("triposr")
-                .arg("--wait")
-                .output()
-                .expect("run triposr submit")
+            process_spawn::output_std(
+                cli(&home)
+                    .arg("submit")
+                    .arg("--master")
+                    .arg(&master_str)
+                    .arg("--type")
+                    .arg("3d")
+                    .arg("--prompt")
+                    .arg("robot")
+                    .arg("--engine")
+                    .arg("triposr")
+                    .arg("--wait"),
+            )
+            .expect("run triposr submit")
         }
     });
 
@@ -452,19 +457,20 @@ async fn test_cli_3d_trellis_rejected_immediately_on_cpu_worker() {
         let home = temp_dir.path().to_path_buf();
         let master_str = master_addr.to_string();
         move || {
-            cli(&home)
-                .arg("submit")
-                .arg("--master")
-                .arg(&master_str)
-                .arg("--type")
-                .arg("3d")
-                .arg("--prompt")
-                .arg("mech")
-                .arg("--engine")
-                .arg("trellis")
-                .arg("--wait")
-                .output()
-                .expect("run trellis submit")
+            process_spawn::output_std(
+                cli(&home)
+                    .arg("submit")
+                    .arg("--master")
+                    .arg(&master_str)
+                    .arg("--type")
+                    .arg("3d")
+                    .arg("--prompt")
+                    .arg("mech")
+                    .arg("--engine")
+                    .arg("trellis")
+                    .arg("--wait"),
+            )
+            .expect("run trellis submit")
         }
     });
 
@@ -501,19 +507,20 @@ async fn test_cli_3d_default_engine_with_image_fails_before_submit() {
         let home = temp_dir.path().to_path_buf();
         let img = img_path.clone();
         move || {
-            cli(&home)
-                .arg("submit")
-                .arg("--master")
-                .arg("127.0.0.1:9999")
-                .arg("--type")
-                .arg("3d")
-                .arg("--prompt")
-                .arg("robot")
-                .arg("--image")
-                .arg(&img)
-                .arg("--wait")
-                .output()
-                .expect("run submit CLI")
+            process_spawn::output_std(
+                cli(&home)
+                    .arg("submit")
+                    .arg("--master")
+                    .arg("127.0.0.1:9999")
+                    .arg("--type")
+                    .arg("3d")
+                    .arg("--prompt")
+                    .arg("robot")
+                    .arg("--image")
+                    .arg(&img)
+                    .arg("--wait"),
+            )
+            .expect("run submit CLI")
         }
     });
 

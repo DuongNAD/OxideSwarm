@@ -419,6 +419,14 @@ impl TaskRunner {
         let mut total_bytes: usize = 0;
 
         for expected in expected_outputs {
+            if let Ok(norm) = crate::sandbox::normalize_relative_path_str(expected) {
+                if super::is_reserved_checkpoint_rel(&norm) {
+                    warn!(task_id = %task_id, path = %expected, "Ignoring illegal expected output path targeting checkpoint directory");
+                    return Err(format!(
+                        "output artifact '{expected}' targets the reserved checkpoint directory"
+                    ));
+                }
+            }
             let target = match sanitize_relative_path(root_dir, Path::new(expected)) {
                 Ok(p) => p,
                 Err(err) => {
@@ -724,5 +732,50 @@ mod output_stat_error_tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expected_outputs_reject_case_variant_and_dot_slash_checkpoint_paths() {
+        use crate::runner::{RunnerConfig, PROCESS_CHECKPOINT_DIR_NAME};
+        use crate::sandbox::SandboxConfig;
+        use rusty_grid_core::capabilities::WorkerCapabilities;
+        use rusty_grid_core::task::TaskId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cp_dir = dir.path().join(PROCESS_CHECKPOINT_DIR_NAME);
+        std::fs::create_dir_all(&cp_dir).unwrap();
+        std::fs::write(cp_dir.join("secret.txt"), b"top-secret").unwrap();
+
+        let runner = TaskRunner::new(
+            uuid::Uuid::new_v4(),
+            WorkerCapabilities::default(),
+            RunnerConfig::new(SandboxConfig::new(dir.path().join("base"))),
+        );
+        let id = TaskId::from_uuid(uuid::Uuid::new_v4());
+
+        for bad_expected in [
+            ".oxideswarm_checkpoint/secret.txt",
+            ".OXIDESWARM_CHECKPOINT/secret.txt",
+            "./.Oxideswarm_Checkpoint/secret.txt",
+            ".\\.Oxideswarm_Checkpoint\\secret.txt",
+            ".oxideswarm_chec\u{212a}point/secret.txt",
+            "./.oxideswarm_chec\u{212a}point/secret.txt",
+            ".oxide\u{017f}warm_checkpoint/secret.txt",
+            ".\\.oxide\u{017f}warm_checkpoint\\secret.txt",
+        ] {
+            let err = runner
+                .harvest_output_artifacts_from_dir(
+                    dir.path(),
+                    &[bad_expected.to_string()],
+                    id,
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("reserved checkpoint directory"),
+                "expected '{bad_expected}' to be rejected, got: {err}"
+            );
+        }
     }
 }
