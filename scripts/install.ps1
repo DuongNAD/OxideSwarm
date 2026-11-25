@@ -5,7 +5,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$DefaultVersion = '0.4.4'
+$DefaultVersion = '0.4.5'
 $Repo = 'DuongNAD/OxideSwarm'
 $SignerWorkflow = 'DuongNAD/OxideSwarm/.github/workflows/release.yml'
 $DefaultDownloadBase = 'https://github.com/DuongNAD/OxideSwarm/releases/download'
@@ -19,7 +19,7 @@ Install oxideswarm.exe, rusty-grid.exe, and ox-mode.exe for the current user
 after verifying SHA256SUMS (and GitHub build provenance attestation when `gh` is installed and authenticated).
 
 Options:
-  --version, -Version <VERSION>  Release version to install (default: 0.4.4)
+  --version, -Version <VERSION>  Release version to install (default: 0.4.5)
   --dir, -Dir <DIR>              Destination directory (default: %LOCALAPPDATA%\OxideSwarm\bin)
   --gpu, -Gpu                    Install the -gpu build (with wgpu support)
   --dry-run, -DryRun             Print resolved target and URLs without downloading or writing files

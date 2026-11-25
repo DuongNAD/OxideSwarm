@@ -5,7 +5,7 @@
 # Compatible with bash 3.2 (macOS /bin/bash) and Linux bash.
 set -eu
 
-DEFAULT_VERSION="0.4.4"
+DEFAULT_VERSION="0.4.5"
 REPO="DuongNAD/OxideSwarm"
 SIGNER_WORKFLOW="DuongNAD/OxideSwarm/.github/workflows/release.yml"
 DEFAULT_DOWNLOAD_BASE="https://github.com/DuongNAD/OxideSwarm/releases/download"
@@ -24,7 +24,7 @@ Install oxideswarm, rusty-grid, and ox-mode for the current user after verifying
 SHA256SUMS (and GitHub build provenance attestation when `gh` is installed and authenticated).
 
 Options:
-  --version <VERSION>  Release version to install (default: 0.4.4)
+  --version <VERSION>  Release version to install (default: 0.4.5)
   --dir <DIR>          Destination directory (default: $HOME/.local/bin)
   --gpu                Install the -gpu build (with wgpu support)
   --dry-run            Print resolved target and URLs without downloading or writing files
