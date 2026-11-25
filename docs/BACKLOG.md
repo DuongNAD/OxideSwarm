@@ -207,6 +207,9 @@ Recounted on 2026-11-24 from the rows with pull request 452: 289 items, 199 Impl
 Recounted on 2026-11-24 from the rows with pull request 455: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 456: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 458: 290 items, 199 Implemented, 22 Partial and 69 Planned; 22 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 459: 291 items, 199 Implemented, 22 Partial and 70 Planned; 23 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 460: 291 items, 199 Implemented, 22 Partial and 70 Planned; 23 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 457: 291 items, 200 Implemented, 21 Partial and 70 Planned; 22 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -325,9 +328,10 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
 | TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Partial | In |  |
-| TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Partial | In |  |
+| TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Implemented |  | 449, 455 |
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
+| TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -652,6 +656,38 @@ The full suite must pass on a clean machine before CI can require it.
   - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
   - Check 5 (Clean stop): `passed` (`0` leftover soak/cluster/keep-awake processes, work dir removed).
   Stays `Partial` pending the full 24-hour 3-machine (Mac master + two Windows workers) run.
+- **Update (2026-11-25, 17h48m 3-machine LAN TCP soak record, branch `mac/test-25-s7-3machine-record`):**
+  Ran Stage C `S7` (`endurance.py soak --master-only --link lan-tcp --duration 24h --fault-scale 1.0
+  --load-scale 1.0 --slots 2 --workspaces --max-queue-size 64`, `rusty-grid 0.4.4` release on PR `#395`
+  `d8cf052e`) across Mac Apple M5 master (`07:48:45Z` start) + Windows case PC `win-case` (`07:49:54Z`
+  registered) + Windows Dell `win-dell` (`07:50:00Z` registered) from `2026-11-24T07:49:50Z` to
+  `2026-11-25T01:38:43Z` (`64,133 s` / `17.81 h` / `17 h 48 m`). `win-dell` departed cleanly on schedule at
+  `2026-11-24T21:30:33Z` (`13 h 40 m`), and `win-case` stopped at `2026-11-25T01:38:43Z` (`17 h 48 m`)
+  when the Windows Antigravity host server restarted (Windows OS did not reboot; not an OxideSwarm fault);
+  owner ended `S7` (`SIGINT` `03:05:43Z`, master `SIGTERM` `03:07:21Z`, harness exited `03:09:06Z` with
+  `KeyboardInterrupt` / `aborted_base=True`, emitting no `s7_24h_record.json`), and the `0`-worker tail
+  (`01:38:43Z`–`03:07:21Z`, `master-9.log` with `0` results and `0` `ERROR`s) is excluded from the measured
+  run. Committed sanitized record
+  `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json`:
+  - Check 1 (Accounting): `49,355` unique master-logged task results across `master-0..8.log` (`48,290` `0`,
+    `1,065` `130`, `0` `124` watchdog timeouts; `0` duplicates; `win-case` `38,951` ok / `839` cancelled across
+    `28` logs; `win-dell` `9,339` ok / `226` cancelled across `21` logs), `123` failover sweeps (`win-case` `76`,
+    `win-dell` `47`, `0` reaper/superseded failovers), `74` orphan requeue events (`134` tasks), `0` queue
+    record errors, `0` log-level `ERROR` or panics across master or `49` worker logs; pre-restart `01:48:24Z`
+    `/api/tasks` window (`10,029` tasks: `9,783` completed, `217` cancelled, `29` queued post-disconnect,
+    `6` retries / `6` failovers); client-side `TaskLedger` SHA-256 verification `not_evaluated_due_to_early_stop`.
+  - Check 2 (Resource plateau): `not_evaluated_due_to_early_stop` (continuous `60 s` `BackgroundSampler` lost
+    on `KeyboardInterrupt`); observational series stayed flat: Mac master `53.52 MiB` RSS / `35` FDs at
+    `01:48:24Z` (`+17h58m`), `win-dell` `oxideswarm.exe` `25.5–26.8 MB` across H1–H13 (`4.04–5.18 GiB` free
+    RAM, `C:` `52.59–57.49 GB`), `win-case` `C:` `42.68 -> 38.12 -> 37.52 GiB` (`0` errors).
+  - Check 3 (Disk & journal): `master-blobs` `4,249,880,320 B` (`01:48:24Z`) and `4,255,124,429 B` idle
+    (`<= 4 GiB` cap, `5,689` LRU eviction events / `9,542` blobs, `0` `.part`/`.tmp` leftovers); `journal.bin`
+    compacted on shutdown from `1,123,749 B` (`01:48:24Z`) to `24 B` (`snapshot.bin` `12,707,196 B`, `256`
+    `cold_results` dirs); remote worker idle snapshots `not_evaluated_due_to_early_stop`.
+  - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
+  - Check 5 (Clean stop): `passed` (`0` leftover processes on Mac or Windows workers; Mac workdir preserved
+    outside `/tmp` locally).
+  Stays `Partial | In` pending a full uninterrupted `24 h` 3-machine run.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -872,33 +908,38 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
-### TEST-96: CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master
+### TEST-99: Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs
 
-- **Evidence:** CI run `45349647014` (push to `master`, `016f39c4`, 2026-11-24 07:39 UTC), job
-  `unit tests (ubuntu-latest)` (`138292591350`): `71` of `72` `agent_mesh` unit tests passed (`12.01 s`), and
-  `client::tests::test_corrupt_and_multi_chunk_data_delivery` panicked at `crates/agent_mesh/src/client.rs:2147`
-  with `called Result::unwrap() on an Err value: Elapsed(())`, the 5 s `tokio::time::timeout` on `rx3`, the
-  final `DeliveryAck` of part 3 (a 5000-byte payload sent as 5 chunks of 1024 bytes in reverse order). Parts 1
-  and 2 (single-envelope NACKs, 3 s timeouts) passed in the same run. The next master push (`ee3590ea`) passed.
-  This failure reset the Q80 clean-push streak. Claimed via `agent_bridge.py claim`
-  (`claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`).
-- **Problem:** The test asserts a wall-clock window (an ACK within 5 s), which the lessons of design 0087 rule
-  out, and it does not say why the ACK was late. Two explanations are open: (a) a starved runner delayed the
-  hub, the consumer's reassembly and the atomic inbox write past 5 s; (b) the ACK was lost, for example a chunk
-  dropped or a pending entry evicted on the hub's routing path (`Outbox::push` in `crates/agent_mesh/src/hub.rs`
-  kicks a peer whose queue is full; the in-flight data table of design 0107 evicts a sender's oldest entries)
-  or the consumer's out-of-order reassembly not completing. Under (b) a longer wait only hides a bug.
-- **Root cause `(a)` (starved runner + blocking `fsync`, NOT a lost ACK `(b)`):** End-to-end audit of `crates/agent_mesh/src/{client,hub,delivery}.rs` rules out `(b)`:
-  - *Sender (`client.rs`):* `send_envelope` pushes all 5 chunks (~7.5 KB total) into an unbounded mpsc channel drained in FIFO order; any WebSocket close clears `pending_map` and wakes `rx3` immediately with `RecvError`, never `Elapsed(())`. The inbound loop ignores intermediate `DeliveryAck(chunk_received)` frames (`L839-851`), so `rx3` waits strictly for `DeliveryAck(data_received_verified)`.
-  - *Hub (`hub.rs`):* `Outbox::push` (`L213`) allows `1,024` messages and `32 MiB` queued bytes (`DEFAULT_MAX_QUEUED_*`); `PushError::Full` or `Closed` immediately emits `DeliveryNack(ERR_NODE_UNAVAILABLE)` back to the sender (which panics at the `DeliveryAck` match, not `Elapsed(())`). `InflightDataTracker` (`L248`, `256`/sender, `16,384` total) deduplicates `(consumer, multi_corr, sender)` across all 5 chunks and is only consulted on target disconnect; `DeliveryAck` forwarding (`L1328-1352`) does not require a tracker hit.
-  - *Consumer (`delivery.rs` + `client.rs`):* `DataConsumer::accept` + `ChunkReassembler` (`64` concurrent assemblies / `60 s` TTL) accept out-of-order chunks `[4,3,2,1,0]`, reassemble on the last chunk, and verify `total_sha256`. Unlike parts 1–2 (in-memory NACKs), part 3 is the first sub-test to run `tokio::task::spawn_blocking(|| persist_payload_atomic(...))` (`client.rs:790`), which calls `file.sync_all()` (`fsync`, `delivery.rs:768`) before emitting the final `DeliveryAck`. On a shared CI runner executing 72 `agent_mesh` tests concurrently while `test_corrupt_and_multi_chunk_data_delivery` runs on a single-threaded `#[tokio::test]` runtime, `spawn_blocking` scheduling + `fsync` stalled past the `5 s` wall-clock cap.
-- **Do:** (Code fix landed on `mac/test-96-mesh-multichunk-ack-guard`; 200-iteration loaded Linux loop waits until after Stage C `S7` finishes — `loop after S7`.)
-  1. Read the chunk path end to end (completed: cause `(a)` confirmed) and run the 200-iteration loop under a CPU load generator on Linux after `S7` (`loop after S7`).
-  2. Replaced the short 3 s / 5 s timeouts in `test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and added `[timing]` prints on success.
-  3. Windows loaded verification (`2026-11-25`, `agent-win-2` on `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac`, clean tree `git status --porcelain` empty): `cargo test --locked -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) alongside `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` min `25.819 ms`, median `45.050 ms`, max `292.559 ms`; `p3_multichunk_ack` min `5.806 ms`, median `10.364 ms`, max `255.009 ms`; min free RAM `5.891 GiB`). Stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
-- **Done when:** the root cause is written here (done), the test has no short wall-clock window (done), and
-  `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
-  loop runs under load on Linux (`loop after S7`; Windows `200/200` passed on `d88083f22079c6878f273e6410493ba5138a68ac`).
+- **Evidence:** Discovered during `E-D2` on Windows 11 x86_64 at clean `origin/master` `d88083f2` (claim
+  `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, report Hub
+  `test_runs/win-2_e-d2_2026-11-25.md`). Both the isolated `E-D2` harness (`45/45` completed runs of
+  `cargo test --locked -p rusty_grid_master --lib`, `428 passed; 8 failed` per run before owner order stopped
+  the loop) and a plain developer environment run (no `HOME`/`USERPROFILE`/`TEMP` override, no busy loops) fail
+  deterministically with `Config("members directory '...' is accessible by other accounts (...)")` in these 8 tests:
+  1. `registry::tests::test_release_non_live_worker_id_flushes_outside_registry_lock` (`crates/master/src/registry.rs:3323`)
+  2. `server::auth_and_member_tests::test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush` (`crates/master/src/server/auth_and_member_tests.rs:1112`)
+  3. `server::auth_and_member_tests::test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_and_item7_prune` (`crates/master/src/server/auth_and_member_tests.rs:651`)
+  4. `server::members::non_member_claim_tests::revoke_prunes_claims_of_earlier_removed_members` (`crates/master/src/members.rs:4891`)
+  5. `server::members::tests::admin_invite_rule_revoked_keys_role_merge_and_id_only_resolution` (`crates/master/src/members.rs:3355`)
+  6. `server::members::tests::claim_worker_id_evicting_drops_oldest_non_live_claims_and_caps_live_claims_at_64` (`crates/master/src/members.rs:3506`)
+  7. `server::members::tests::test_r5_role_upgrade_rollback_concurrent_approval_and_failed_write_consistency` (`crates/master/src/members.rs:4262`)
+  8. `server::members::tests::test_r6_m1_release_worker_write_error_s1_dirty_retry_and_nit2_double_fault` (`crates/master/src/members.rs:4613`)
+- **Problem:** On Windows, `check_members_file_permissions` (`crates/master/src/members.rs:562-597`) checks the
+  DACL of `path.parent()` (`members directory`) via `open_grants` and rejects any existing directory that grants
+  read or write access to another account. These 8 tests pass `tempfile::tempdir().path()` directly as the
+  members directory; on Windows hosts whose `%TEMP%` or `%LOCALAPPDATA%` has foreign read/write ACEs (unlike
+  `windows-latest` CI runners), `tempfile::tempdir()` inherits those ACEs and `MemberStore::load_from_dir`
+  refuses to load it. Other `members` tests pass a non-existent child directory (such as `dir.path().join("members")`)
+  so `write_members_file_atomic` (`crates/master/src/members.rs:608`) creates it via `create_private_dir_all` with
+  a protected DACL.
+- **Do:**
+  1. Update the 8 tests to create their `MemberStore` inside a private subdirectory (e.g. `dir.path().join("members")`
+     or `create_private_dir_all`) rather than the raw `tempfile::tempdir()` root, keeping dedicated negative
+     tests that intentionally test open-directory refusal separate.
+  2. Verify `cargo test --locked -p rusty_grid_master --lib` passes on both Windows hosts with foreign `%TEMP%` ACEs
+     and CI.
+- **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
+  --lib` passes `436/436` locally) and CI stays green.
 
 ## Phase 3: make the documents true
 
@@ -3266,5 +3307,8 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: BUG-38 live-verified (`win/bug-38-live-check`, Drive `test_runs/win_bug38_live_2026-11-25.md`): installed `v0.4.4` (`e7aca4c7`) Kit A (`-Slots 1`, GPU `n`, throwaway loopback master) in ConPTY, verified `doctor` + `submit cmd /c ver`, then ran `origin/master` (`d88083f2`) Kit B `Update OxideSwarm.cmd` `3/3` times consecutively over the running worker (`Updated. Worker ... runs rusty-grid 0.4.4`, `0` lock errors, `doctor` passing after each), confirmed Kit B `Uninstall OxideSwarm.cmd` prints the full install path before `? [y/N]`, verified zero leftovers (process, folder, ACL grants, HKCU pointer), and removed throwaway master and kits.
 - 2026-11-25: TEST-96 Partial (`win2/test-96-windows-loop`): verified `200/200` sequential passes on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) under `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` `25.819–292.559 ms`, median `45.050 ms`; `p3_multichunk_ack` `5.806–255.009 ms`, median `10.364 ms`; min free RAM `5.891 GiB`); stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-25: TEST-93 Partial (`win/test-93-windows-loop`): verified `20/20` sequential loaded Windows passes on clean `origin/master` `d88083f2` (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` per run (`wall 1.891–3.922 s`, `median 3.312 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency 679.700 µs–1.65159 ms`, `max_latency 7.5054–16.1910 ms`); stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
+- 2026-11-25: TEST-96 Implemented (`win/test-96-linux-loop`, text moved to `docs/BACKLOG-ARCHIVE.md`): verified `200/200` sequential loaded Linux passes on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` inside Docker `rust:1.96` (`rustc 1.96.1`, kernel `6.6.87.2-microsoft-standard-WSL2 x86_64`, `20` logical cores, `cargo test --locked -j 4 -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture`) alongside `1` `python3` `hashlib.sha256(4096B)` CPU busy loop (`wall` total `119.722 s`, min `0.440 s`, median `0.611 s`, max `0.788 s`; test `[timing]` `total 89.504–109.412 ms` median `93.208 ms`, `p3_multichunk_ack 42.672–47.266 ms` median `43.601 ms`; `agent-win-2` also verified `200/200` on Windows in PR #455); all `Do` and `Done when` steps are met.
+- 2026-11-25: TEST-25 Partial (3-machine Stage C `S7` `lan-tcp` soak stopped at `17.81 h` / `17 h 48 m`, branch `mac/test-25-s7-3machine-record`): Mac M5 master + `win-case` + `win-dell` on PR `#395` `d8cf052e` (`win-dell` planned leave `21:30:33Z`, `win-case` stopped `01:38:43Z` on Antigravity host restart, not a product fault; `0`-worker tail `01:38:43Z`–`03:07:21Z` excluded); committed `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json` (`49,355` unique results across `master-0..8.log` with `48,290` `0`, `1,065` `130`, `0` `124` timeouts, `0` duplicates, `0` `ERROR`/panics across master or `49` worker logs, `master-blobs` `<= 4 GiB` with `5,689` eviction events, `journal.bin` `1,123,749 -> 24 B`, `0` leftover processes); stays `Partial | In` pending a full `24 h` 3-machine run.
+- 2026-11-25: TEST-99 added (Planned, In; claim `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, `win2/test-99-master-members-tempdir-acl`): `8` `rusty_grid_master` `members`/`registry` unit tests fail deterministically (`428 passed; 8 failed`) in both plain developer env and isolated `E-D2` harness on Windows 11 (`d88083f2`) because they pass `tempfile::tempdir().path()` directly to `MemberStore::load_from_dir` when `%TEMP%` has foreign ACEs instead of a private subdirectory created via `create_private_dir_all`.
 - 2026-11-25: BUG-39 added (Planned, In; claim `claims/item/BUG-39__win__20261125T031711167999Z__aa5175b1.json`, `win2/bug-39-icacls-unresolvable-sid`): `private_file::windows_tests::icacls_printed_remedies_remove_both_inherited_and_explicit_foreign_grants` (`crates/core/src/private_file.rs:2135`) fails deterministically in both plain developer env and isolated `E-D2` harness (`50/50`) on Windows 11 (`d88083f2`) because `icacls /remove:g "*<sid>"` exits `1332` (`ERROR_NONE_MAPPED`) when the DACL carries an unresolvable SID.
 - 2026-11-25: BUG-39 Implemented (`win/bug-39-icacls-remedy`, pull request `461`): added `ACE_FLAG_INHERITED` (`0x10`), `explicit_offending_sids`, `sid_is_resolvable` (`LookupAccountSidW`), and `*_for_aces` / `*_with_resolver` builders across `crates/core/src/private_file.rs`, `crates/worker/src/sandbox.rs`, and `crates/master/src/members.rs` so inherited-only ACEs are omitted from `/remove:g` (stripped by `/inheritance:r`) and explicit unresolvable SIDs emit `icacls "<path>" /reset && icacls "<path>" /inheritance:r /grant:r ...` (`exit 0`); updated `packaging/usb/install.ps1` (`Test-SidResolvable` + `Get-SandboxBaseFix` emitting `icacls "<dir>" /reset` on non-root dirs with unresolvable explicit SIDs, `$null` on drive roots); added failing-first Windows test (`icacls_printed_remedy_handles_inherited_and_explicit_unresolvable_sids`), 3 pure cross-platform builder unit tests, and `test_windows_usb_bug39_sandbox_base_fix_unresolvable_sid` (`tests/test_launcher_scripts.py`), with `rusty_grid_core --lib` (`313/313`), `sandbox::tests` (`18/18` isolated temp), `members` (`30/30` isolated temp), `StaticRepositoryChecks`, `test_m1_challenger_hygiene.py` (`5/5`), `fmt`, and workspace `clippy` (`0` warnings) passing.
