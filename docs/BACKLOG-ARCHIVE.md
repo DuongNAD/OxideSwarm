@@ -615,6 +615,37 @@ The full suite must pass on a clean machine before CI can require it.
 - **Partial (2026-11-22, Wave 2 M1 verification of merged pull request 392 / `a7ce9e9d`):** Independently re-verified on macOS (`prod/backlog-completion-wave2`) with `154/154` hard-link isolation runs (`50/50` sequential + `80/80` parallel `8x10` + `24/24` under `1,150` inherited FDs, `0` empty-stdout flakes), `process_tree::tests` (`10/10` + `30/30` parallel + `8/8` under `1,150` inherited FDs, `0` orphans), `test_feat3_os_isolation` (`28/28` + `1` ignored), and `tests/test_wave2_e2e.py` (`F1` + Tiers 3–4). Stays `Partial | In` awaiting the owner's decision to close without a reproduced cause for the original pull request 380 CI hit.
 - **Implemented (2026-11-23, closed by Claude on the owner's delegation of that day):** not reproduced in 294 runs on macOS (pull request 392 and the Wave 2 verification), with the spawn and pipe hardening of BUG-33 and the result diagnostics of `format_result_diag` in place. Closed without a reproduced cause; the diagnostics stay. A new empty-stdout failure gets a new item with its run and job ids.
 
+### TEST-96: CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master
+
+- **Evidence:** CI run `45349647014` (push to `master`, `016f39c4`, 2026-11-24 07:39 UTC), job
+  `unit tests (ubuntu-latest)` (`138292591350`): `71` of `72` `agent_mesh` unit tests passed (`12.01 s`), and
+  `client::tests::test_corrupt_and_multi_chunk_data_delivery` panicked at `crates/agent_mesh/src/client.rs:2147`
+  with `called Result::unwrap() on an Err value: Elapsed(())`, the 5 s `tokio::time::timeout` on `rx3`, the
+  final `DeliveryAck` of part 3 (a 5000-byte payload sent as 5 chunks of 1024 bytes in reverse order). Parts 1
+  and 2 (single-envelope NACKs, 3 s timeouts) passed in the same run. The next master push (`ee3590ea`) passed.
+  This failure reset the Q80 clean-push streak. Claimed via `agent_bridge.py claim`
+  (`claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`).
+- **Problem:** The test asserts a wall-clock window (an ACK within 5 s), which the lessons of design 0087 rule
+  out, and it does not say why the ACK was late. Two explanations are open: (a) a starved runner delayed the
+  hub, the consumer's reassembly and the atomic inbox write past 5 s; (b) the ACK was lost, for example a chunk
+  dropped or a pending entry evicted on the hub's routing path (`Outbox::push` in `crates/agent_mesh/src/hub.rs`
+  kicks a peer whose queue is full; the in-flight data table of design 0107 evicts a sender's oldest entries)
+  or the consumer's out-of-order reassembly not completing. Under (b) a longer wait only hides a bug.
+- **Root cause `(a)` (starved runner + blocking `fsync`, NOT a lost ACK `(b)`):** End-to-end audit of `crates/agent_mesh/src/{client,hub,delivery}.rs` rules out `(b)`:
+  - *Sender (`client.rs`):* `send_envelope` pushes all 5 chunks (~7.5 KB total) into an unbounded mpsc channel drained in FIFO order; any WebSocket close clears `pending_map` and wakes `rx3` immediately with `RecvError`, never `Elapsed(())`. The inbound loop ignores intermediate `DeliveryAck(chunk_received)` frames (`L839-851`), so `rx3` waits strictly for `DeliveryAck(data_received_verified)`.
+  - *Hub (`hub.rs`):* `Outbox::push` (`L213`) allows `1,024` messages and `32 MiB` queued bytes (`DEFAULT_MAX_QUEUED_*`); `PushError::Full` or `Closed` immediately emits `DeliveryNack(ERR_NODE_UNAVAILABLE)` back to the sender (which panics at the `DeliveryAck` match, not `Elapsed(())`). `InflightDataTracker` (`L248`, `256`/sender, `16,384` total) deduplicates `(consumer, multi_corr, sender)` across all 5 chunks and is only consulted on target disconnect; `DeliveryAck` forwarding (`L1328-1352`) does not require a tracker hit.
+  - *Consumer (`delivery.rs` + `client.rs`):* `DataConsumer::accept` + `ChunkReassembler` (`64` concurrent assemblies / `60 s` TTL) accept out-of-order chunks `[4,3,2,1,0]`, reassemble on the last chunk, and verify `total_sha256`. Unlike parts 1–2 (in-memory NACKs), part 3 is the first sub-test to run `tokio::task::spawn_blocking(|| persist_payload_atomic(...))` (`client.rs:790`), which calls `file.sync_all()` (`fsync`, `delivery.rs:768`) before emitting the final `DeliveryAck`. On a shared CI runner executing 72 `agent_mesh` tests concurrently while `test_corrupt_and_multi_chunk_data_delivery` runs on a single-threaded `#[tokio::test]` runtime, `spawn_blocking` scheduling + `fsync` stalled past the `5 s` wall-clock cap.
+- **Do:**
+  1. Read the chunk path end to end (completed: cause `(a)` confirmed) and run the 200-iteration loop under a CPU load generator on Linux (`2026-11-25`, completed).
+  2. Replaced the short 3 s / 5 s timeouts in `test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and added `[timing]` prints on success (PR #449).
+  3. Windows loaded verification (`2026-11-25`, `agent-win-2` in PR #455 on `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac`, clean tree `git status --porcelain` empty): `cargo test --locked -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) alongside `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` min `25.819 ms`, median `45.050 ms`, max `292.559 ms`; `p3_multichunk_ack` min `5.806 ms`, median `10.364 ms`, max `255.009 ms`; min free RAM `5.891 GiB`).
+- **Done when:** the root cause is written here (done), the test has no short wall-clock window (done), and
+  `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
+  loop runs under load on Linux (done; Windows `200/200` also passed on `d88083f22079c6878f273e6410493ba5138a68ac` in PR #455).
+- **Implemented (2026-11-25, `win/test-96-linux-loop`):**
+  - Linux (`2026-11-25`, `agent-win` on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` inside Docker `rust:1.96`, `rustc 1.96.1`, kernel `6.6.87.2-microsoft-standard-WSL2 x86_64`, `20` logical cores, `22543524 kB` RAM, isolated `HOME`/`TMPDIR`/`CARGO_TARGET_DIR`): `cargo test --locked -j 4 -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs (after `98.280 s` `--no-run` prebuild) alongside `1` `python3` `hashlib.sha256(4096B)` infinite CPU busy loop (`wall` total `119.722 s`, min `0.440 s`, median `0.611 s`, max `0.788 s`; test `[timing]` `total` min `89.504 ms`, median `93.208 ms`, max `109.412 ms`; `p3_multichunk_ack` min `42.672 ms`, median `43.601 ms`, max `47.266 ms`; `0` failed).
+  - Windows (`2026-11-25`, `agent-win-2` in PR #455): `200/200` passed under load as detailed in step 3 above.
+
 ## Phase 3: make the documents true
 
 The standard in `docs/README.md` requires "only what the code does". These items apply it.

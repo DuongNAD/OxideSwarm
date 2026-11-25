@@ -3605,6 +3605,62 @@ public class Program {
             )
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell USB kit test")
+    def test_windows_usb_bug39_sandbox_base_fix_unresolvable_sid(self):
+        install_ps1 = os.path.join(ROOT, "packaging", "usb", "install.ps1")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_usb_bug39_"))
+        try:
+            inh_dir = os.path.join(tmp, "inh_dir")
+            exp_dir = os.path.join(tmp, "exp_dir")
+            os.makedirs(inh_dir, exist_ok=True)
+            os.makedirs(exp_dir, exist_ok=True)
+            unres_sid = "S-1-5-21-111111111-222222222-333333333-99999"
+            ps_script = "\n".join([
+                f"$src = Get-Content -LiteralPath '{install_ps1.replace(chr(39), chr(39)*2)}' -Raw",
+                "$errs = $null; $toks = $null",
+                "$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$toks, [ref]$errs)",
+                "if ($errs.Count -gt 0) { throw 'parse failed' }",
+                "foreach ($fnAst in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {",
+                "    if ($fnAst.Name -in @('Get-AccountName', 'Test-SidResolvable', 'Get-SandboxBaseFix')) {",
+                "        . ([scriptblock]::Create($fnAst.Extent.Text))",
+                "    }",
+                "}",
+                f"if (Test-SidResolvable '{unres_sid}') {{ throw 'synthetic SID should not resolve' }}",
+                "if (-not (Test-SidResolvable 'S-1-1-0')) { throw 'S-1-1-0 should resolve' }",
+                f"$fixInh = Get-SandboxBaseFix @{{ dir = '{inh_dir.replace(chr(39), chr(39)*2)}'; holders = @(@{{ sid = '{unres_sid}'; inherited = $true; resolvable = $false }}) }}",
+                "if ($fixInh -ne $null) { throw \"expected null for inherited-only holder, got: $fixInh\" }",
+                f"$fixRes = Get-SandboxBaseFix @{{ dir = '{inh_dir.replace(chr(39), chr(39)*2)}'; holders = @(@{{ sid = 'S-1-1-0'; inherited = $false; resolvable = $true }}) }}",
+                "if ($fixRes -notmatch '/remove:g \"\\*S-1-1-0\"') { throw \"expected /remove:g for resolvable holder, got: $fixRes\" }",
+                f"$expPath = '{exp_dir.replace(chr(39), chr(39)*2)}'",
+                "$driveRoot = [IO.Path]::GetPathRoot($expPath)",
+                f"$fixDrive = Get-SandboxBaseFix @{{ dir = $driveRoot; holders = @(@{{ sid = '{unres_sid}'; inherited = $false; resolvable = $false }}) }}",
+                "if ($fixDrive -ne $null) { throw \"expected null for unresolvable explicit SID on drive root, got: $fixDrive\" }",
+                "$item = Get-Item -LiteralPath $expPath -Force",
+                "$acl = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)",
+                f"$id = [Security.Principal.SecurityIdentifier]'{unres_sid}'",
+                "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))",
+                "$item.SetAccessControl($acl)",
+                "$fixExp = Get-SandboxBaseFix @{ dir = $expPath; holders = @(@{ sid = '" + unres_sid + "'; inherited = $false; resolvable = $false }) }",
+                "if ($fixExp -notmatch '/reset' -or $fixExp -match '/remove:g') { throw \"expected icacls /reset for unresolvable explicit SID, got: $fixExp\" }",
+                "$cmdOut = & cmd.exe /C $fixExp 2>&1",
+                "if ($LASTEXITCODE -ne 0) { throw \"icacls /reset fix exited $LASTEXITCODE : $cmdOut\" }",
+                "$after = (Get-Item -LiteralPath $expPath -Force).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)",
+                f"$rem = @($after.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {{ $_.IdentityReference.Value -eq '{unres_sid}' }})",
+                "if ($rem.Count -ne 0) { throw 'unresolvable explicit SID was not removed' }",
+                "Write-Output 'BUG39_USB_FIX_OK'",
+            ])
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout)
+            self.assertIn("BUG39_USB_FIX_OK", res.stdout)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_windows_usb_bug38_static_prompt_and_update_wait(self):
         uninstall_text = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
         self.assertIn("in ${InstallRoot}? [y/N]", uninstall_text)

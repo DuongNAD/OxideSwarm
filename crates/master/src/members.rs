@@ -561,7 +561,7 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
 #[cfg(windows)]
 fn check_members_file_permissions(path: &Path) -> GridResult<()> {
     use rusty_grid_core::private_file::{
-        current_user_sid, open_acl_or_volume_message, open_grants, read_dacl,
+        current_user_sid, open_acl_or_volume_message_for_aces, open_grants, read_dacl,
     };
     let user_sid = current_user_sid().map_err(|e| {
         GridError::Config(format!(
@@ -578,16 +578,22 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
     let offenders = open_grants(&aces, &user_sid);
     // On a volume without permissions (exFAT, FAT32) the message says so instead of suggesting an
     // `icacls` command that cannot work there (BUG-24, design 0085).
-    if let Some(msg) = open_acl_or_volume_message(path, "members file", &offenders, &user_sid) {
+    if let Some(msg) =
+        open_acl_or_volume_message_for_aces(path, "members file", &aces, &offenders, &user_sid)
+    {
         tracing::warn!("{msg}");
         return Err(GridError::Config(msg));
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if let Ok((dir_aces, _)) = read_dacl(parent) {
             let dir_offenders = open_grants(&dir_aces, &user_sid);
-            if let Some(msg) =
-                open_acl_or_volume_message(parent, "members directory", &dir_offenders, &user_sid)
-            {
+            if let Some(msg) = open_acl_or_volume_message_for_aces(
+                parent,
+                "members directory",
+                &dir_aces,
+                &dir_offenders,
+                &user_sid,
+            ) {
                 tracing::warn!("{msg}");
                 return Err(GridError::Config(msg));
             }
