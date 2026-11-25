@@ -638,12 +638,13 @@ The full suite must pass on a clean machine before CI can require it.
 - **Do:**
   1. Read the chunk path end to end (completed: cause `(a)` confirmed) and run the 200-iteration loop under a CPU load generator on Linux (`2026-11-25`, completed).
   2. Replaced the short 3 s / 5 s timeouts in `test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and added `[timing]` prints on success (PR #449).
+  3. Windows loaded verification (`2026-11-25`, `agent-win-2` in PR #455 on `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac`, clean tree `git status --porcelain` empty): `cargo test --locked -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) alongside `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` min `25.819 ms`, median `45.050 ms`, max `292.559 ms`; `p3_multichunk_ack` min `5.806 ms`, median `10.364 ms`, max `255.009 ms`; min free RAM `5.891 GiB`).
 - **Done when:** the root cause is written here (done), the test has no short wall-clock window (done), and
   `cargo test -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery` passes `200/200`
-  loop runs under load on Linux (done).
+  loop runs under load on Linux (done; Windows `200/200` also passed on `d88083f22079c6878f273e6410493ba5138a68ac` in PR #455).
 - **Implemented (2026-11-25, `win/test-96-linux-loop`):**
   - Linux (`2026-11-25`, `agent-win` on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` inside Docker `rust:1.96`, `rustc 1.96.1`, kernel `6.6.87.2-microsoft-standard-WSL2 x86_64`, `20` logical cores, `22543524 kB` RAM, isolated `HOME`/`TMPDIR`/`CARGO_TARGET_DIR`): `cargo test --locked -j 4 -p agent_mesh --lib client::tests::test_corrupt_and_multi_chunk_data_delivery -- --exact --nocapture` passed **`200/200`** sequential runs (after `98.280 s` `--no-run` prebuild) alongside `1` `python3` `hashlib.sha256(4096B)` infinite CPU busy loop (`wall` total `119.722 s`, min `0.440 s`, median `0.611 s`, max `0.788 s`; test `[timing]` `total` min `89.504 ms`, median `93.208 ms`, max `109.412 ms`; `p3_multichunk_ack` min `42.672 ms`, median `43.601 ms`, max `47.266 ms`; `0` failed).
-  - Also verified `200/200` on Windows 11 x86_64 (`agent-win-2`, `PR #455` on `d88083f22079c6878f273e6410493ba5138a68ac` under `1` Python `hashlib.sha256` CPU busy loop).
+  - Windows (`2026-11-25`, `agent-win-2` in PR #455): `200/200` passed under load as detailed in step 3 above.
 
 ## Phase 3: make the documents true
 
