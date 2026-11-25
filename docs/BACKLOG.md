@@ -201,6 +201,9 @@ Recounted on 2026-11-24 from the rows with pull request 449: 285 items, 195 Impl
 Recounted on 2026-11-24 from the rows with pull request 451: 286 items, 196 Implemented, 20 Partial and 70 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 450: 287 items, 197 Implemented, 20 Partial and 70 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 447: 287 items, 197 Implemented, 21 Partial and 69 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 448: 287 items, 197 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 453: 288 items, 198 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 452: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -314,7 +317,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
 | TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Partial | In | (unlanded claim `TEST-70`) |
-| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Planned | In |  |
+| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Partial | In |  |
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
@@ -448,6 +451,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
+| BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -828,9 +832,11 @@ The full suite must pass on a clean machine before CI can require it.
   `self.workspace_dirs[idx]` with `os.makedirs(self.workspace_dirs[idx], exist_ok=True)`, which uses default
   `0o777` masked by the process umask (`0o022` on Ubuntu CI -> `0o755`), while `rusty_grid_worker` rejects any
   Unix `--workspace-root` whose mode is not `0o700` (and `sandbox_dirs[idx]` at line 2932 has the same pattern).
-- **Do:** Create `workspace_dirs[idx]` (and `sandbox_dirs[idx]`) with `mode=0o700` and enforce `os.chmod(..., 0o700)`
-  on Unix in `benchmarks/endurance/endurance.py`; add a unit check in `tests/test_endurance_harness.py` that
-  fails under `umask 0o022` without the fix.
+- **Do:** Create `workspace_dirs[idx]` (and `sandbox_dirs[idx]`, `state_dir`, `blob_dir`, `workdir`, and isolated
+  process `home`/`tmp`/`oxideswarm` directories) via `_ensure_private_dir` (`mode=0o700` + `os.chmod(..., 0o700)` on
+  Unix) in `benchmarks/endurance/endurance.py`; add `test_soak_cluster_creates_0700_dirs_under_0022_umask` in
+  `tests/test_endurance_harness.py` that fails under `umask 0o022` without the fix. Linux `endurance.py soak`
+  smoke run waits until after Stage C `S7` (`loop after S7` / Linux verification).
 - **Done when:** `tests/test_endurance_harness.py` verifies `0o700` permissions on created soak directories under
   a `0o022` umask, and a Linux `endurance.py soak` smoke run starts and connects workers cleanly.
 
@@ -1713,6 +1719,41 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** Both regression tests, `doctor::tests`, `fmt`, and single-crate `clippy` pass; the PR records
   the `v0.4.3`/`v0.4.4` verification and `sysinfo 0.30.13` root cause.
 - **Status (2026-11-24):** Implemented (`mac/bug-37-doctor-c5-gpu-queued`).
+
+### BUG-38: Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt
+
+- **Status (2026-11-24):** Implemented (win/bug-38-usb-kit-windows). Fixed `${InstallRoot}?` interpolation in `packaging/usb/uninstall.ps1:140` and added bounded worker-exit polling plus `Copy-Item` retry on transient sharing/user-mapped-section locks in `packaging/usb/install.ps1` (`OXIDESWARM_USB_STOP_WAIT_MS` / `OXIDESWARM_USB_COPY_WAIT_MS`), with static and live Windows regression tests in `tests/test_launcher_scripts.py`.
+
+- **Evidence:** Live Windows 11 Pro x86_64 check of the released `v0.4.4` USB kit (`packaging/usb/install.ps1:931-955`,
+  `packaging/usb/uninstall.ps1:140`; both byte-identical on `origin/master` `77553214`) against a throwaway loopback
+  `v0.4.4` master (`127.0.0.1:19500`, `OXIDESWARM_USB_POINTER_KEY` isolated; recorded in Hub
+  `test_runs/win_usb_kit_044_2026-11-25.md`).
+  - Fresh `Install OxideSwarm.cmd -Slots 1`, `doctor` (`8 passed, 0 warnings, 0 failed, 1 skipped` on `C5`),
+    `submit --wait --command cmd -- /c ver` (`Exit Code: 0`, `13 ms`), and `Uninstall OxideSwarm.cmd` all pass.
+  - `Update OxideSwarm.cmd` (`install.ps1 -Update`) failed 2/2 times with `rc=1`:
+    1. `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The requested operation cannot be performed on a file with a user-mapped section open.`
+    2. `stopping the worker started earlier (PID 29324)` -> `ERROR: failed while unpacking oxideswarm-0.4.4-x86_64-pc-windows-msvc.zip: The process cannot access the file '%LOCALAPPDATA%\OxideSwarm-USB\bin\oxideswarm.exe' because it is being used by another process.`
+  - `Uninstall OxideSwarm.cmd` (`packaging/usb/uninstall.ps1:140`) printed `"Remove the OxideSwarm install in  [y/N]:"`
+    with the install path omitted.
+- **Problem:**
+  1. `packaging/usb/install.ps1:931-955` calls `Stop-Process -Id ([int]$old) -Force` + a fixed `Start-Sleep -Seconds 2`,
+     deletes `run\worker.pid`, and immediately runs a single-shot `Copy-Item $f (Join-Path $Bin $b) -Force`. On Windows
+     before the exited worker's memory-mapped executable section closes (or transient lock clears), `Copy-Item` throws
+     and aborts `-Update` without restarting the worker (`doctor` fails with `0 connected`).
+  2. `packaging/usb/uninstall.ps1:140` writes `"Remove the OxideSwarm install in $InstallRoot? [y/N]"`. Because `?` is
+     a valid identifier character in PowerShell, `"$InstallRoot?"` resolves to unset `$InstallRoot?` (`$null`), hiding the
+     target folder path from the confirmation prompt.
+- **Do:**
+  1. Wait for stopped worker PIDs to exit (polling `Get-Process` up to ~10 s, matching `uninstall.ps1:174-179`) and
+     retry/stage binary replacement in `packaging/usb/install.ps1` with a short backoff when Windows reports a transient
+     sharing/user-mapped section lock on `oxideswarm.exe` / `rusty-grid.exe` / `ox-mode.exe` (and on failure avoid
+     leaving a silently dead worker or document the retry cleanly).
+  2. Fix `packaging/usb/uninstall.ps1:140` to `${InstallRoot}?`.
+  3. Add unit/regression coverage in `tests/test_launcher_scripts.py` verifying `$InstallRoot` renders before `?` in
+     the uninstall prompt and verifying update wait/retry behavior on Windows.
+- **Done when:** `Update OxideSwarm.cmd` succeeds repeatedly against an active Windows worker, `Uninstall OxideSwarm.cmd`
+  prints the full install folder before `? [y/N]`, and the launcher test suite passes on Windows (`install.ps1` /
+  `uninstall.ps1`).
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -3167,9 +3208,11 @@ Add one dated line per finished item, newest last.
 - 2026-11-24: TEST-95 added (Planned, In; claim `claims/item/TEST-95__mac-ag__20261124T080206576890Z__34038612.json`): in `tests/test_wave3_e2e.py`, `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards` failed in pull request 432 CI (run `45272824360`, job `138036810990`) with `ValueError: invalid literal for int() with base 10: ''` reading an empty `shard_*.pid` written non-atomically under `--fail-fast`; code fix and 20-run loop wait until after Stage C `S7` (Index header recounted: 259 items, 194 Implemented, 16 Partial and 49 Planned; 20 open items are In and 45 are Out).
 - 2026-11-24: Phase 18 added (pull request 368, updating the 2026-11-19 / 2026-11-20 draft against `origin/master`, pull request 442 decisions Q41, Q54, Q60 to Q63 and Q98, Q96 closing Q43, and 3D-2 already Implemented): R21, APP-1 (coding agent first while LIVA is on hold, Q98), R22 (Partial, 1 record from pull request 254), R14 to R18, FEAT-9b, LLM-15 (`368`), and LLM-1 to LLM-14 (`24` rows, all `Line` `Out`; Index header recounted: 282 items, 194 Implemented, 17 Partial and 71 Planned; 19 open items are In and 69 are Out). No item is built before the stability release (`Q80`) and no model item before spike `R21` has a record (`Q54`).
 - 2026-11-24: TEST-96 added (Planned, In; claim `claims/item/TEST-96__mac__20261124T132513025277Z__b5050a8f.json`): `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` timed out waiting 5 s for the multi-chunk `DeliveryAck` on master push `016f39c4` (CI run `45349647014`, job `138292591350`, `unit tests (ubuntu-latest)`); root cause (starved runner or lost ACK) and fix wait until after Stage C `S7` (Index header recounted: 285 items, 195 Implemented, 18 Partial and 72 Planned; 21 open items are In and 69 are Out).
+- 2026-11-24: TEST-90 Partial (`mac/test-90-soak-dir-0700`, `loop after S7`): added `_ensure_private_dir` (`os.makedirs(..., mode=0o700, exist_ok=True)` plus `os.chmod(..., 0o700)` on POSIX) in `benchmarks/endurance/endurance.py` across `SoakCluster._start_worker_locked` (`sandbox_dirs`, `workspace_dirs`), `SoakCluster._start_master_locked` (`state_dir`, `blob_dir`), `EnduranceCluster` / `RemoteEnduranceCluster` `workdir` & `sandbox_dirs`, and `_isolated_process_env` (`home`, `tmp`, `ox_home`), plus failing-first `test_soak_cluster_creates_0700_dirs_under_0022_umask` in `tests/test_endurance_harness.py` (failed `0o755 != 0o700` under `umask 0o022` before the fix); verified `5/5` sequential passes of `tests/test_endurance_harness.py` (`23` tests/run) and `tests/test_m1_challenger_hygiene.py` (`5/5 OK`); stays `Partial | In` until a Linux `endurance.py soak` smoke run runs after `S7` / in Linux CI.
 - 2026-11-24: TEST-95 Partial (`mac/test-95-atomic-pid-writes`, `loop after S7`): added `HarnessAtomicWriteTests` (failing-first check reproduced `ValueError: invalid literal for int() with base 10: ''` on empty `shard_2.pid` and failed on unpatched shims/scripts before fix) and converted all five `.pid`/marker writers in `tests/test_wave3_e2e.py` to same-directory temp-file + atomic rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_*.pid` and `install_fake_blender` `PROBE_PID_FILE`/`HANG_PID_FILE`/`HANG_MARKER_FILE`; temp file + `mv -f` in `test_t2_ax2_03`); verified `test_m1_challenger_hygiene.py` (`5/5 OK`) and `20/20` sequential runs of `tests/test_wave3_e2e.py` (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures, no busy loops during Stage C `S7`); stays `Partial | In` until the `20`-run loaded loop runs after `S7`.
 - 2026-11-24: TEST-97 Implemented (`win2/test-97-bridge-drive-scan`, claim `claims/item/TEST-97__win-2__20261124T160534948637Z__7d8bb16c.json`, text moved to `docs/BACKLOG-ARCHIVE.md`): isolated `tests/test_agent_bridge.py` (`use_hub=False`) from scanning real Windows `G:\`/`H:\`/`D:\` Google Drive mounts via `OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN`, removed the `G:\` skip guard on `WithoutHub`, added `WithoutHub.test_drive_scan_opt_out_isolates_hub_discovery`, and verified `20/20` sequential runs (`73/73 OK` per run, `0` skipped, `0` Drive claim diffs, `total 2,480.673 s`, median `121.884 s`, `minRAM 4.716 GiB`).
 - 2026-11-24: TEST-98 Implemented (`win2/test-98-revoke-worker-scope`, claim `claims/item/TEST-98__win-2__20261124T172506156991Z__f7dbab9d.json`, text moved to `docs/BACKLOG-ARCHIVE.md`): added `OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT` filtering in `windows/revoke-isolation-acls.ps1`, scoped `ps_env` plus added a positive scoped-worker detection test in `tests/test_launcher_scripts.py`, and verified `20/20` sequential runs on Windows alongside live Stage C `S7` (`96` tests / `62` skipped / `0` failures per run; `total 3,452.253 s`, median `168.249 s`, `minRAM 4.523 GiB`).
 - 2026-11-24: TEST-96 Partial (`mac/test-96-mesh-multichunk-ack-guard`, `loop after S7`): audited sender `send_envelope`, hub `Outbox::push` / `InflightDataTracker`, and consumer `DataConsumer` / `ChunkReassembler` / `persist_payload_atomic` end to end and confirmed root cause `(a)` (starved CI runner + `spawn_blocking` `file.sync_all()` `fsync` in part 3 delaying `DeliveryAck(data_received_verified)` past `5 s`, not lost/evicted ACKs `(b)` which fail immediately with `RecvError` or `DeliveryNack`); replaced all `3 s` / `5 s` wall-clock windows in `crates/agent_mesh/src/client.rs::test_corrupt_and_multi_chunk_data_delivery` with `60 s` hang guards (`HANG_GUARD` / `HANG_GUARD_MS`) and `[timing]` prints; stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-24: TEST-93 Partial (`win/test-93-quic-heartbeat-structural`): audited all 1,098 lines of `tests/m2_challenger_1_stress.rs` (line 472 `avg_latency < 50 ms` was the sole Category 1 wall-clock upper bound), replaced it in `test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation` with a structural QUIC `STREAM_DATA` flow-control backpressure (`64 KiB` stream receive window, `16 KiB` chunks, paused server sink) + in-order `HeartbeatAck` verification under a `60 s` hang guard and `[timing]` printout, and verified `10/10` sequential Windows passes (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress`, no busy loops during Stage C `S7`, `12` passed/`0` failed per run; wall `2.250–3.469 s`, median `2.821 s`, total `27.453 s`; `avg_latency` `677.343–787.493 µs`, `max_latency` `6.8813–8.1431 ms`); `fmt` and `-j 4` `clippy` clean (`0` warnings); stays Partial pending `20/20` loaded runs (`loop after S7`).
 - 2026-11-24: BUG-37 Implemented (`mac/bug-37-doctor-c5-gpu-queued`, claim `claims/item/BUG-37__mac-ag__20261124T220733857026Z__aaad783f.json`): reproduced/audited `v0.4.3` vs `v0.4.4` macOS releases (zero diff in `doctor.rs`/master/core; Scenario A/B1/B2 passed C5 `4–41 ms` at `ram_available_mb=2130`, exposing `sysinfo 0.30.13` subtracting `547,571` macOS compressor pages from `free + inactive + purgeable`, fixed on `master` by PR `#439` `sysinfo 0.38.4`); proved `doctor`'s `TaskRequirements::gpu` (`ram_mb: 1024`) stalls C5 in `is_seat_ram_short` whenever `512 <= ram_available_mb < 1024` while C3/C4 (`512`) and `submit --type gpu` (`0`) run; set `ram_mb = 0` on `doctor` probes in `crates/cli/src/doctor.rs` and added regression tests in `doctor.rs` (failing-first at `512`) and `scheduler.rs`.
+- 2026-11-24: BUG-38 Implemented (pull request 453, branch `win/bug-38-usb-kit-windows`): fixed PowerShell `${InstallRoot}?` variable interpolation in `packaging/usb/uninstall.ps1:140` so interactive uninstall renders the full install path, and hardened `packaging/usb/install.ps1` `-Update` to collect and deduplicate stopped worker PIDs (`run\worker.pid` and `Win32_Process`), poll `Get-Process -Id` every `250 ms` up to `OXIDESWARM_USB_STOP_WAIT_MS` (default `15000 ms`) before removing `run\worker.pid`, and retry binary replacement (`Copy-Item`) every `250 ms` up to `OXIDESWARM_USB_COPY_WAIT_MS` (default `15000 ms`) on transient Windows sharing/user-mapped-section locks; added static and live Windows ConPTY + lock-retry regression tests (`test_windows_usb_bug38_static_prompt_and_update_wait` and `test_windows_usb_bug38_uninstall_prompt_and_update_retry_live`) in `tests/test_launcher_scripts.py` (with `tests/test_m1_challenger_hygiene.py` and the `test_windows_usb` suite passing on Windows 11).
