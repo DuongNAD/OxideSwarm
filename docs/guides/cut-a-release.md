@@ -35,6 +35,8 @@ grep -n "STORE_FORMAT_VERSION" crates/master/src/store.rs
 1. Ask the owner for explicit approval to cut `<X.Y.Z>` and record the date and exact quote (`"<OWNER_APPROVAL>"`) for the pull request description (matching pull requests `321` and `339`).
 2. Create `<AUTHOR>/release-<X.Y.Z>` from `origin/master` and update the release files:
    - [Cargo.toml](../../Cargo.toml): set `[workspace.package] version = "<X.Y.Z>"`. Workspace crates inherit `version.workspace = true`; keep `version = "0.0.0"` in `fuzz/Cargo.toml`.
+   - [CITATION.cff](../../CITATION.cff): set `version` to `"<X.Y.Z>"` and `date-released` to the release date (`s5b_release_readiness_m2_citation_and_skew_pin_e2e` compares it with `Cargo.toml`).
+   - [scripts/install.sh](../../scripts/install.sh) and [scripts/install.ps1](../../scripts/install.ps1): set the default version (`DEFAULT_VERSION`, `$DefaultVersion`, and the `(default: ...)` help text) to `<X.Y.Z>`; keep CRLF line endings in `install.ps1`.
    - [Cargo.lock](../../Cargo.lock) and [fuzz/Cargo.lock](../../fuzz/Cargo.lock): refresh the OxideSwarm workspace package version entries and confirm `cargo check --workspace --all-targets --locked` passes.
    - [CHANGELOG.md](../../CHANGELOG.md): move the items under `## [Unreleased]` into `## [<X.Y.Z>] - <YYYY-MM-DD>`, write a summary paragraph naming protocol and store compatibility, and add `### Upgrading from <PREV>`. Leave an empty `## [Unreleased]` section at the top.
    - [README.md](../../README.md): update `the latest is v<X.Y.Z>` and the archive filenames in `Install`.
@@ -58,7 +60,7 @@ cargo check --workspace --all-targets --locked
 On the release author's workstation:
 
 ```bash
-git add Cargo.toml Cargo.lock fuzz/Cargo.lock CHANGELOG.md README.md docs/reference.md DEPLOYMENT.md docs/ROADMAP.md docs/BACKLOG.md
+git add Cargo.toml Cargo.lock fuzz/Cargo.lock CITATION.cff scripts/install.sh scripts/install.ps1 CHANGELOG.md README.md docs/reference.md DEPLOYMENT.md docs/ROADMAP.md docs/BACKLOG.md
 git commit -m "release: prepare <X.Y.Z> (no wire change)"
 git push -u origin <AUTHOR>/release-<X.Y.Z>
 gh pr create --title "release: prepare <X.Y.Z> (no wire change)" --body "Release preparation for <X.Y.Z>, approved by the owner in chat on <YYYY-MM-DD> (\"<OWNER_APPROVAL>\"). No wire change: protocol <P>, store format <S>; it mixes freely with <PREV>.\n\n- Versions: Cargo.toml, Cargo.lock, fuzz/Cargo.lock\n- CHANGELOG.md, README.md, docs/reference.md, DEPLOYMENT.md, docs/ROADMAP.md, docs/BACKLOG.md\n\nAfter merge: tag v<X.Y.Z> on the merge commit, then run the Mac and Windows release checks."
