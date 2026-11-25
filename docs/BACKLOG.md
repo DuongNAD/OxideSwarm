@@ -206,6 +206,7 @@ Recounted on 2026-11-24 from the rows with pull request 453: 288 items, 198 Impl
 Recounted on 2026-11-24 from the rows with pull request 452: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 455: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 456: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 458: 290 items, 199 Implemented, 22 Partial and 69 Planned; 22 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -454,6 +455,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
+| BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -1759,6 +1761,39 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** `Update OxideSwarm.cmd` succeeds repeatedly against an active Windows worker, `Uninstall OxideSwarm.cmd`
   prints the full install folder before `? [y/N]`, and the launcher test suite passes on Windows (`install.ps1` /
   `uninstall.ps1`).
+
+### BUG-39: Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID
+
+- **Evidence:** Discovered during `E-D2` on Windows 11 x86_64 at clean `origin/master` `d88083f2` (claim
+  `claims/item/BUG-39__win__20261125T031711167999Z__aa5175b1.json`, report Hub
+  `test_runs/win-2_e-d2_2026-11-25.md`). Both the isolated `E-D2` harness (`50/50` runs of
+  `cargo test --locked -p rusty_grid_core --lib`, `307 passed; 2 failed`) and a plain developer environment run
+  (`%TEMP%`, no `HOME`/`USERPROFILE`/`TEMP` override, no busy loops) fail deterministically in
+  `private_file::windows_tests::icacls_printed_remedies_remove_both_inherited_and_explicit_foreign_grants` at
+  `crates/core/src/private_file.rs:2135` with:
+  `dir remedy failed: stdout=Successfully processed 0 files; Failed processing 0 files` (`stderr=`).
+  Reproduced directly with `icacls.exe`: when `%TEMP%` or `%LOCALAPPDATA%` carries an inherited unresolvable
+  SID (`S-1-5-21-<domain>-<rid>:(I)(OI)(CI)(RX)` or `(OI)(CI)(M)`), running `icacls <path> /inheritance:r
+  /grant:r ... /remove:g "*S-1-5-21-<domain>-<rid>" ...` exits `1332` (`ERROR_NONE_MAPPED`) and modifies `0`
+  files; running `icacls <path> /remove:g` or `/remove` on an explicit unresolvable SID also exits `1332`,
+  whereas omitting inherited-only unresolvable SIDs (removed by `/inheritance:r`) or running `icacls <path> /reset`
+  before `/inheritance:r /grant:r` exits `0`.
+- **Problem:** `crates/core/src/private_file.rs` (`icacls_private_file_command`, `icacls_private_dir_command`, and
+  `append_icacls_remove_args`, lines `265–299`) appends `/remove:g "*<sid>"` for every offending SID regardless of
+  whether the SID is inherited-only (`INHERITED_ACE` `0x10`) or unresolvable via `LookupAccountSidW`. On a Windows
+  machine whose `%TEMP%`, `%LOCALAPPDATA%`, or profile directory contains a leftover/unresolvable SID from a
+  deleted local/domain account or container, the printed `icacls` remedy fails with `ERROR_NONE_MAPPED` (`1332`)
+  and leaves the file or directory unprotected (`packaging/usb/install.ps1:613` `Get-SandboxBaseFix` has the same
+  `/remove:g "*<sid>"` pattern for explicit holders).
+- **Do:**
+  1. Write a failing-first test in `crates/core/src/private_file.rs` covering an inherited unresolvable/foreign SID
+     and an explicit unresolvable SID (without requiring an unresolvable SID on the host).
+  2. Fix the printed remedy builder (`private_file.rs`: omit inherited-only ACEs from `/remove:g` since
+     `/inheritance:r` already strips them, and handle unresolvable explicit SIDs via `/reset` or safe Win32/SDDL
+     remediation; check `packaging/usb/install.ps1:613` and existing unit tests).
+- **Done when:** the new regression test fails before the fix and passes after, `cargo test --locked -p
+  rusty_grid_core --lib` and `cargo test --locked -p rusty_grid_worker --lib sandbox::tests` pass on Windows hosts
+  with inherited/unresolvable SIDs as well as CI, and `cargo fmt` + `clippy` pass with 0 warnings.
 
 ### LV-15: Release runbook, secret inventory and a second releaser
 
@@ -3224,3 +3259,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: BUG-38 live-verified (`win/bug-38-live-check`, Drive `test_runs/win_bug38_live_2026-11-25.md`): installed `v0.4.4` (`e7aca4c7`) Kit A (`-Slots 1`, GPU `n`, throwaway loopback master) in ConPTY, verified `doctor` + `submit cmd /c ver`, then ran `origin/master` (`d88083f2`) Kit B `Update OxideSwarm.cmd` `3/3` times consecutively over the running worker (`Updated. Worker ... runs rusty-grid 0.4.4`, `0` lock errors, `doctor` passing after each), confirmed Kit B `Uninstall OxideSwarm.cmd` prints the full install path before `? [y/N]`, verified zero leftovers (process, folder, ACL grants, HKCU pointer), and removed throwaway master and kits.
 - 2026-11-25: TEST-96 Partial (`win2/test-96-windows-loop`): verified `200/200` sequential passes on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) under `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` `25.819–292.559 ms`, median `45.050 ms`; `p3_multichunk_ack` `5.806–255.009 ms`, median `10.364 ms`; min free RAM `5.891 GiB`); stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-25: TEST-93 Partial (`win/test-93-windows-loop`): verified `20/20` sequential loaded Windows passes on clean `origin/master` `d88083f2` (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` per run (`wall 1.891–3.922 s`, `median 3.312 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency 679.700 µs–1.65159 ms`, `max_latency 7.5054–16.1910 ms`); stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
+- 2026-11-25: BUG-39 added (Planned, In; claim `claims/item/BUG-39__win__20261125T031711167999Z__aa5175b1.json`, `win2/bug-39-icacls-unresolvable-sid`): `private_file::windows_tests::icacls_printed_remedies_remove_both_inherited_and_explicit_foreign_grants` (`crates/core/src/private_file.rs:2135`) fails deterministically in both plain developer env and isolated `E-D2` harness (`50/50`) on Windows 11 (`d88083f2`) because `icacls /remove:g "*<sid>"` exits `1332` (`ERROR_NONE_MAPPED`) when the DACL carries an unresolvable SID.
