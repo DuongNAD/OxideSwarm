@@ -539,6 +539,7 @@ async fn test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_a
     };
 
     let dir = tempfile::tempdir().unwrap();
+    let members_dir = dir.path().join("members");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -548,7 +549,7 @@ async fn test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_a
     let master_kp = NodeKeypair::generate().unwrap();
     let master_pub = *master_kp.public_key();
     let member_kp = NodeKeypair::generate().unwrap();
-    let members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+    let members = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
     let inv = members
         .create_invite(vec![MemberRole::Worker], 1, 3600, false)
         .unwrap();
@@ -648,7 +649,7 @@ async fn test_round3_item6_v2_reclaims_squatted_worker_id_and_survives_restart_a
 
     // 3. Master restarts from disk; v2 worker's ownership of `v2_wid` was persisted in
     // `v2_worker_seq`, so v3 member is refused BEFORE v2 reconnects, and v2 reconnects cleanly.
-    let reloaded_members = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+    let reloaded_members = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
     let handle2 = MasterServer::spawn(make_cfg(reloaded_members))
         .await
         .unwrap();
@@ -936,6 +937,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
     use rusty_grid_core::protocol::{EndpointRole, ProtocolCapabilities, PROTOCOL_VERSION_CURRENT};
 
     let dir = tempfile::tempdir().unwrap();
+    let members_dir = dir.path().join("members");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -944,7 +946,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
     let secret = ClusterSecret::generate().unwrap();
     let master_kp = NodeKeypair::generate().unwrap();
     let master_pub = *master_kp.public_key();
-    let members = MemberStore::load_from_dir(Some(dir.path()))
+    let members = MemberStore::load_from_dir(Some(&members_dir))
         .unwrap()
         .with_auth_mode(AuthMode::Both);
     let inv = members
@@ -1044,7 +1046,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
 
     // Restore valid `save_path` for `S1` enrollment + approval, then break `save_path` for
     // the post-approval rollback write and verify `handle.shutdown()` flushes the rollback.
-    let valid_members_path = dir.path().join("members.json");
+    let valid_members_path = members_dir.join("members.json");
     members.set_save_path(Some(valid_members_path.clone()));
 
     let joiner_kp = NodeKeypair::generate().unwrap();
@@ -1108,7 +1110,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
     assert!(!members.contains(joiner_kp.public_key()));
     assert!(members.is_dirty());
     // Disk still has `joiner_kp` before retry/shutdown flush.
-    assert!(MemberStore::load_from_dir(Some(dir.path()))
+    assert!(MemberStore::load_from_dir(Some(&members_dir))
         .unwrap()
         .contains(joiner_kp.public_key()));
 
@@ -1126,7 +1128,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
         !members.is_dirty(),
         "S1: periodic resync task must clear dirty flag once save_path recovers"
     );
-    let reloaded_periodic = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+    let reloaded_periodic = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
     assert!(
         !reloaded_periodic.contains(joiner_kp.public_key()),
         "S1: periodic resync must remove declined unconfirmed member from members.json"
@@ -1188,7 +1190,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(members.is_dirty());
-    assert!(MemberStore::load_from_dir(Some(dir.path()))
+    assert!(MemberStore::load_from_dir(Some(&members_dir))
         .unwrap()
         .contains(joiner_kp2.public_key()));
 
@@ -1196,7 +1198,7 @@ async fn test_r6_m1_release_worker_wire_error_and_s1_shutdown_flush() {
     handle.shutdown().unwrap();
     assert!(!members.is_dirty());
 
-    let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+    let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
     assert!(
         !reloaded.contains(joiner_kp2.public_key()),
         "S1: shutdown flush must remove declined unconfirmed member from members.json"

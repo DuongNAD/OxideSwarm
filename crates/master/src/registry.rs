@@ -3184,6 +3184,7 @@ mod tests {
     #[tokio::test]
     async fn test_release_non_live_worker_id_flushes_outside_registry_lock() {
         let dir = tempfile::tempdir().unwrap();
+        let members_dir = dir.path().join("members");
         // The v3 claim below belongs to an enrolled member: a reload drops non-members' claims.
         let v3_kp = rusty_grid_core::noise_auth::NodeKeypair::generate().unwrap();
         let members = crate::server::members::MemberStore::from_entries(vec![
@@ -3193,7 +3194,7 @@ mod tests {
                 vec![crate::server::members::MemberRole::Worker],
             ),
         ])
-        .with_save_path(dir.path().join(crate::server::members::MEMBERS_FILE_NAME))
+        .with_save_path(members_dir.join(crate::server::members::MEMBERS_FILE_NAME))
         .with_auth_mode(crate::server::members::AuthMode::Both);
         let registry = WorkerRegistry::new();
         let wid = Uuid::new_v4();
@@ -3320,7 +3321,7 @@ mod tests {
             .unwrap();
         assert_eq!(members.workers_owned_by(&v3_member_id), vec![wid]);
         let reloaded =
-            crate::server::members::MemberStore::load_from_dir(Some(dir.path())).unwrap();
+            crate::server::members::MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         assert_eq!(reloaded.workers_owned_by(&v3_member_id), vec![wid]);
     }
 
