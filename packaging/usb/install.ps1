@@ -610,17 +610,18 @@ function Format-SandboxBaseProblem($problem) {
 function Get-SandboxBaseFix($problem) {
     $explicit = @(@($problem.holders) | Where-Object { -not $_.inherited })
     if ($explicit.Count -eq 0) { return $null }
+    $target = $problem.dir
     $hasUnresolvable = $false
     foreach ($h in $explicit) {
         $ok = if ($h.ContainsKey('resolvable')) { [bool]$h.resolvable } else { Test-SidResolvable $h.sid }
         if (-not $ok) { $hasUnresolvable = $true; break }
     }
     if ($hasUnresolvable) {
-        $psPath = $problem.dir.Replace("'", "''")
-        $purges = ($explicit | ForEach-Object { '$a.PurgeAccessRules([Security.Principal.SecurityIdentifier]''' + $_.sid + ''')' }) -join '; '
-        return ('powershell -NoProfile -Command "$item = Get-Item -LiteralPath ''' + $psPath + ''' -Force; $a = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access); ' + $purges + '; $item.SetAccessControl($a)"')
+        $full = [IO.Path]::GetFullPath($target)
+        $root = [IO.Path]::GetPathRoot($full)
+        if ([string]::Equals($full.TrimEnd('\'), $root.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { return $null }
+        return ('icacls "' + $target + '" /reset')
     }
-    $target = $problem.dir
     if ($target.EndsWith('\')) { $target += '\' }
     $sids = ($explicit | ForEach-Object { '"*' + $_.sid + '"' }) -join ' '
     return ('icacls "' + $target + '" /remove:g ' + $sids)
