@@ -208,6 +208,7 @@ Recounted on 2026-11-24 from the rows with pull request 455: 289 items, 199 Impl
 Recounted on 2026-11-24 from the rows with pull request 456: 289 items, 199 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 458: 290 items, 199 Implemented, 22 Partial and 69 Planned; 22 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 459: 291 items, 199 Implemented, 22 Partial and 70 Planned; 23 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 460: 291 items, 199 Implemented, 22 Partial and 70 Planned; 23 open items are In and 69 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -654,6 +655,38 @@ The full suite must pass on a clean machine before CI can require it.
   - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
   - Check 5 (Clean stop): `passed` (`0` leftover soak/cluster/keep-awake processes, work dir removed).
   Stays `Partial` pending the full 24-hour 3-machine (Mac master + two Windows workers) run.
+- **Update (2026-11-25, 17h48m 3-machine LAN TCP soak record, branch `mac/test-25-s7-3machine-record`):**
+  Ran Stage C `S7` (`endurance.py soak --master-only --link lan-tcp --duration 24h --fault-scale 1.0
+  --load-scale 1.0 --slots 2 --workspaces --max-queue-size 64`, `rusty-grid 0.4.4` release on PR `#395`
+  `d8cf052e`) across Mac Apple M5 master (`07:48:45Z` start) + Windows case PC `win-case` (`07:49:54Z`
+  registered) + Windows Dell `win-dell` (`07:50:00Z` registered) from `2026-11-24T07:49:50Z` to
+  `2026-11-25T01:38:43Z` (`64,133 s` / `17.81 h` / `17 h 48 m`). `win-dell` departed cleanly on schedule at
+  `2026-11-24T21:30:33Z` (`13 h 40 m`), and `win-case` stopped at `2026-11-25T01:38:43Z` (`17 h 48 m`)
+  when the Windows Antigravity host server restarted (Windows OS did not reboot; not an OxideSwarm fault);
+  owner ended `S7` (`SIGINT` `03:05:43Z`, master `SIGTERM` `03:07:21Z`, harness exited `03:09:06Z` with
+  `KeyboardInterrupt` / `aborted_base=True`, emitting no `s7_24h_record.json`), and the `0`-worker tail
+  (`01:38:43Z`–`03:07:21Z`, `master-9.log` with `0` results and `0` `ERROR`s) is excluded from the measured
+  run. Committed sanitized record
+  `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json`:
+  - Check 1 (Accounting): `49,355` unique master-logged task results across `master-0..8.log` (`48,290` `0`,
+    `1,065` `130`, `0` `124` watchdog timeouts; `0` duplicates; `win-case` `38,951` ok / `839` cancelled across
+    `28` logs; `win-dell` `9,339` ok / `226` cancelled across `21` logs), `123` failover sweeps (`win-case` `76`,
+    `win-dell` `47`, `0` reaper/superseded failovers), `74` orphan requeue events (`134` tasks), `0` queue
+    record errors, `0` log-level `ERROR` or panics across master or `49` worker logs; pre-restart `01:48:24Z`
+    `/api/tasks` window (`10,029` tasks: `9,783` completed, `217` cancelled, `29` queued post-disconnect,
+    `6` retries / `6` failovers); client-side `TaskLedger` SHA-256 verification `not_evaluated_due_to_early_stop`.
+  - Check 2 (Resource plateau): `not_evaluated_due_to_early_stop` (continuous `60 s` `BackgroundSampler` lost
+    on `KeyboardInterrupt`); observational series stayed flat: Mac master `53.52 MiB` RSS / `35` FDs at
+    `01:48:24Z` (`+17h58m`), `win-dell` `oxideswarm.exe` `25.5–26.8 MB` across H1–H13 (`4.04–5.18 GiB` free
+    RAM, `C:` `52.59–57.49 GB`), `win-case` `C:` `42.68 -> 38.12 -> 37.52 GiB` (`0` errors).
+  - Check 3 (Disk & journal): `master-blobs` `4,249,880,320 B` (`01:48:24Z`) and `4,255,124,429 B` idle
+    (`<= 4 GiB` cap, `5,689` LRU eviction events / `9,542` blobs, `0` `.part`/`.tmp` leftovers); `journal.bin`
+    compacted on shutdown from `1,123,749 B` (`01:48:24Z`) to `24 B` (`snapshot.bin` `12,707,196 B`, `256`
+    `cold_results` dirs); remote worker idle snapshots `not_evaluated_due_to_early_stop`.
+  - Check 4 (Probe p99) & fault-events list: `not_evaluated_due_to_early_stop`.
+  - Check 5 (Clean stop): `passed` (`0` leftover processes on Mac or Windows workers; Mac workdir preserved
+    outside `/tmp` locally).
+  Stays `Partial | In` pending a full uninterrupted `24 h` 3-machine run.
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -3294,5 +3327,6 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: BUG-38 live-verified (`win/bug-38-live-check`, Drive `test_runs/win_bug38_live_2026-11-25.md`): installed `v0.4.4` (`e7aca4c7`) Kit A (`-Slots 1`, GPU `n`, throwaway loopback master) in ConPTY, verified `doctor` + `submit cmd /c ver`, then ran `origin/master` (`d88083f2`) Kit B `Update OxideSwarm.cmd` `3/3` times consecutively over the running worker (`Updated. Worker ... runs rusty-grid 0.4.4`, `0` lock errors, `doctor` passing after each), confirmed Kit B `Uninstall OxideSwarm.cmd` prints the full install path before `? [y/N]`, verified zero leftovers (process, folder, ACL grants, HKCU pointer), and removed throwaway master and kits.
 - 2026-11-25: TEST-96 Partial (`win2/test-96-windows-loop`): verified `200/200` sequential passes on clean `origin/master` `d88083f22079c6878f273e6410493ba5138a68ac` on Windows 11 x86_64 (`10` physical / `12` logical cores, `16 GB` RAM, `rustc 1.96.0`, `CARGO_BUILD_JOBS=2`, `CARGO_INCREMENTAL=0`, isolated temp `HOME`/`TEMP`) under `1` Python `hashlib.sha256` CPU busy-loop child process (`wall` total `206.584 s`, min `0.770 s`, median `0.992 s`, max `2.808 s`; test `[timing]` `total` `25.819–292.559 ms`, median `45.050 ms`; `p3_multichunk_ack` `5.806–255.009 ms`, median `10.364 ms`; min free RAM `5.891 GiB`); stays `Partial | In` pending the `200/200` loaded Linux loop (`loop after S7`).
 - 2026-11-25: TEST-93 Partial (`win/test-93-windows-loop`): verified `20/20` sequential loaded Windows passes on clean `origin/master` `d88083f2` (`cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` per run (`wall 1.891–3.922 s`, `median 3.312 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency 679.700 µs–1.65159 ms`, `max_latency 7.5054–16.1910 ms`); stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
+- 2026-11-25: TEST-25 Partial (3-machine Stage C `S7` `lan-tcp` soak stopped at `17.81 h` / `17 h 48 m`, branch `mac/test-25-s7-3machine-record`): Mac M5 master + `win-case` + `win-dell` on PR `#395` `d8cf052e` (`win-dell` planned leave `21:30:33Z`, `win-case` stopped `01:38:43Z` on Antigravity host restart, not a product fault; `0`-worker tail `01:38:43Z`–`03:07:21Z` excluded); committed `benchmarks/endurance/results/2026-11-24-soak-17h48m-lan-tcp-macos-arm64-to-windows-amd64.json` (`49,355` unique results across `master-0..8.log` with `48,290` `0`, `1,065` `130`, `0` `124` timeouts, `0` duplicates, `0` `ERROR`/panics across master or `49` worker logs, `master-blobs` `<= 4 GiB` with `5,689` eviction events, `journal.bin` `1,123,749 -> 24 B`, `0` leftover processes); stays `Partial | In` pending a full `24 h` 3-machine run.
 - 2026-11-25: TEST-99 added (Planned, In; claim `claims/item/TEST-99__win__20261125T031742011362Z__df7e9ebe.json`, `win2/test-99-master-members-tempdir-acl`): `8` `rusty_grid_master` `members`/`registry` unit tests fail deterministically (`428 passed; 8 failed`) in both plain developer env and isolated `E-D2` harness on Windows 11 (`d88083f2`) because they pass `tempfile::tempdir().path()` directly to `MemberStore::load_from_dir` when `%TEMP%` has foreign ACEs instead of a private subdirectory created via `create_private_dir_all`.
 - 2026-11-25: BUG-39 added (Planned, In; claim `claims/item/BUG-39__win__20261125T031711167999Z__aa5175b1.json`, `win2/bug-39-icacls-unresolvable-sid`): `private_file::windows_tests::icacls_printed_remedies_remove_both_inherited_and_explicit_foreign_grants` (`crates/core/src/private_file.rs:2135`) fails deterministically in both plain developer env and isolated `E-D2` harness (`50/50`) on Windows 11 (`d88083f2`) because `icacls /remove:g "*<sid>"` exits `1332` (`ERROR_NONE_MAPPED`) when the DACL carries an unresolvable SID.
