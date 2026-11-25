@@ -320,6 +320,9 @@ function Get-PrivateSecurity {
 function Get-AccountName($sid) {
     try { return (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value } catch { return $sid }
 }
+function Test-SidResolvable($sid) {
+    try { [void](New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]); return $true } catch { return $false }
+}
 # The first account other than this user, SYSTEM, Administrators, TrustedInstaller or an app package
 # that owns $path or is granted one of the $mask rights on it; $null when there is none. Entries that
 # only flow to children (inherit-only) do not count for $path itself.
@@ -545,7 +548,7 @@ function Get-ForeignRights($path, [int]$mask) {
         if ($known) {
             if (-not $r.IsInherited) { $known.inherited = $false }
         } else {
-            $holders.Add(@{ sid = $sid; name = (Get-AccountName $sid); inherited = [bool]$r.IsInherited })
+            $holders.Add(@{ sid = $sid; name = (Get-AccountName $sid); inherited = [bool]$r.IsInherited; resolvable = (Test-SidResolvable $sid) })
         }
     }
     return , $holders
@@ -607,6 +610,16 @@ function Format-SandboxBaseProblem($problem) {
 function Get-SandboxBaseFix($problem) {
     $explicit = @(@($problem.holders) | Where-Object { -not $_.inherited })
     if ($explicit.Count -eq 0) { return $null }
+    $hasUnresolvable = $false
+    foreach ($h in $explicit) {
+        $ok = if ($h.ContainsKey('resolvable')) { [bool]$h.resolvable } else { Test-SidResolvable $h.sid }
+        if (-not $ok) { $hasUnresolvable = $true; break }
+    }
+    if ($hasUnresolvable) {
+        $psPath = $problem.dir.Replace("'", "''")
+        $purges = ($explicit | ForEach-Object { '$a.PurgeAccessRules([Security.Principal.SecurityIdentifier]''' + $_.sid + ''')' }) -join '; '
+        return ('powershell -NoProfile -Command "$item = Get-Item -LiteralPath ''' + $psPath + ''' -Force; $a = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access); ' + $purges + '; $item.SetAccessControl($a)"')
+    }
     $target = $problem.dir
     if ($target.EndsWith('\')) { $target += '\' }
     $sids = ($explicit | ForEach-Object { '"*' + $_.sid + '"' }) -join ' '
