@@ -56,7 +56,7 @@ pub(super) const MIB: u64 = 1024 * 1024;
 const INSECURE_PEER_HELP: &str = "Continue WITHOUT a cluster secret although the master is remote, found by 'auto' discovery, or reached through a P2P ticket. The master is then not authenticated: a rogue host can run commands on a worker or receive what a client submits. Without this flag such a connection is refused when no secret is configured.";
 
 /// Help text of `--relay-url` across master, worker, and client commands.
-const RELAY_URL_HELP: &str = "Custom iroh relay URL (https://...) to use instead of n0's public relays (env RUSTY_GRID_RELAY_URL, config relay_url). Cannot be combined with RUSTY_GRID_P2P_MINIMAL.";
+pub(crate) const RELAY_URL_HELP: &str = "Custom iroh relay URL (https://...) to use instead of n0's public relays (env RUSTY_GRID_RELAY_URL, config relay_url). Cannot be combined with RUSTY_GRID_P2P_MINIMAL.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -182,6 +182,9 @@ pub enum Commands {
 
     /// Validate `.oxideswarm/plan.toml` and view the team wave snapshot
     Plan(crate::plan::PlanArgs),
+
+    /// Sync the current worktree and run task verification profiles across the grid (TEAM-3)
+    Verify(crate::verify_gate::VerifyGateArgs),
 
     /// Model Context Protocol (MCP) server for external AI coding agents (Claude Desktop, Cline, Cursor)
     Mcp(crate::mcp::McpArgs),
@@ -1344,6 +1347,9 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
             }
         }
         Commands::Plan(args) => crate::plan::run_plan_command(args),
+        Commands::Verify(args) => {
+            crate::verify_gate::run_verify_command(args, config_file, secret_opts).await
+        }
         Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
         Commands::Rendezvous(args) => {
             crate::rendezvous_cmd::run_rendezvous(args, secret_opts).await

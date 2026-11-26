@@ -61,6 +61,7 @@ pub(crate) mod submit;
 mod submit_matrix;
 mod submit_support;
 mod task_result;
+mod verify;
 mod workers;
 mod workspaces;
 
@@ -943,6 +944,42 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 "required": []
             }),
         },
+        ToolDefinition {
+            name: "verify",
+            description: "Sync the current worktree into worker workspaces, run the task's configured verify profiles across the grid, and return compact (<= 4 KiB) failure JSON.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Task id declared in .oxideswarm/plan.toml"
+                    },
+                    "profiles": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional subset of task verify profile names to run"
+                    },
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Optional path inside the repository to .oxideswarm/plan.toml"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the working directory"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional git base ref overriding [project].base for owned_paths diff check"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Execution timeout per verify batch in seconds (default 1800)"
+                    }
+                },
+                "required": ["task"]
+            }),
+        },
     ]
 }
 
@@ -1564,6 +1601,48 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             Ok(())
         }
+        "verify" => {
+            let task = check_opt_str(obj, "task")?
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "Missing or invalid required property 'task' (string)".to_string()
+                })?;
+            if task.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "Property 'task' ('{task}') must not contain whitespace"
+                ));
+            }
+            for field in ["plan_path", "repo_dir"] {
+                if let Some(p) = check_opt_str(obj, field)? {
+                    if p.trim().is_empty()
+                        || std::path::Path::new(p)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return Err(format!(
+                            "Property '{field}' ('{p}') must be non-empty and must not contain '..'"
+                        ));
+                    }
+                }
+            }
+            if let Some(base) = check_opt_str(obj, "base")? {
+                if base.trim().is_empty()
+                    || base.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(format!(
+                        "Property 'base' ('{base}') must be a non-empty git ref without whitespace"
+                    ));
+                }
+            }
+            let _ = check_opt_str_array(obj, "profiles")?;
+            if let Some(t) = check_opt_u64(obj, "timeout_secs")? {
+                if t == 0 {
+                    return Err("Property 'timeout_secs' must be at least 1".to_string());
+                }
+            }
+            Ok(())
+        }
         other => Err(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1583,15 +1662,16 @@ pub async fn call_tool_with_context(
         return ToolCallResult::error(err);
     }
     match name {
-        "status" => status::tool_status(state, args).await,
-        "workers" => workers::tool_workers(state, args).await,
-        "submit" => submit::tool_submit(state, args, ctx).await,
-        "shard" => shard::tool_shard(state, args, ctx).await,
-        "task_result" => task_result::tool_task_result(state, args, ctx).await,
-        "cancel" => cancel::tool_cancel(state, args).await,
-        "doctor" => doctor::tool_doctor(state, args).await,
-        "workspaces" => workspaces::tool_workspaces(state).await,
-        "plan_snapshot" => plan::tool_plan_snapshot(args).await,
+        "status" => Box::pin(status::tool_status(state, args)).await,
+        "workers" => Box::pin(workers::tool_workers(state, args)).await,
+        "submit" => Box::pin(submit::tool_submit(state, args, ctx)).await,
+        "shard" => Box::pin(shard::tool_shard(state, args, ctx)).await,
+        "task_result" => Box::pin(task_result::tool_task_result(state, args, ctx)).await,
+        "cancel" => Box::pin(cancel::tool_cancel(state, args)).await,
+        "doctor" => Box::pin(doctor::tool_doctor(state, args)).await,
+        "workspaces" => Box::pin(workspaces::tool_workspaces(state)).await,
+        "plan_snapshot" => Box::pin(plan::tool_plan_snapshot(args)).await,
+        "verify" => Box::pin(verify::tool_verify(state, args, ctx)).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -2555,7 +2635,7 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),
@@ -3195,5 +3275,17 @@ mod tests {
             ToolContent::Text { text } => text.as_str(),
         };
         assert!(msg_files.contains("files"), "{msg_files}");
+    }
+
+    #[test]
+    fn test_call_tool_future_size_stays_bounded() {
+        let state = McpState::new("127.0.0.1:0".to_string(), None);
+        let args = json!({});
+        let fut = call_tool(&state, "submit", &args);
+        let fut_size = std::mem::size_of_val(&fut);
+        assert!(
+            fut_size <= 16 * 1024,
+            "call_tool future must stay small enough for 2 MiB Linux test stacks, got {fut_size} bytes"
+        );
     }
 }
