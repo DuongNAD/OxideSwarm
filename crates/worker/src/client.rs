@@ -1370,6 +1370,24 @@ impl WorkerClient {
         self.initial_telemetry_delay = delay;
     }
 
+    /// Returns a snapshot observer of task IDs currently held in the worker's
+    /// `pending_resume_outbox` awaiting `oxs:result-ack:<token>` from the master.
+    #[doc(hidden)]
+    pub fn pending_resume_result_task_ids_observer(
+        &self,
+    ) -> impl Fn() -> Vec<TaskId> + Send + Sync {
+        let outbox = Arc::clone(&self.pending_resume_outbox);
+        move || {
+            outbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .results
+                .iter()
+                .map(|r| r.result.task_id)
+                .collect()
+        }
+    }
+
     /// Returns the active backoff configuration.
     pub fn backoff_config(&self) -> &BackoffConfig {
         &self.backoff_config
@@ -1688,5 +1706,7 @@ impl WorkerClient {
     }
 }
 
+// LV-4: cfg(windows) WaitForSingleObject test probe in client/tests.rs (production client.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests;

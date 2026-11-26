@@ -36,9 +36,9 @@ pub fn to_clean_absolute_path(path: &Path) -> Option<PathBuf> {
 /// Probes whether a Python executable candidate is runnable by invoking `<program> --version`
 /// with sensitive environment variables stripped.
 pub fn probe_python<P: AsRef<std::ffi::OsStr>>(program: P) -> bool {
-    rusty_grid_core::cluster_auth::probe_command(program)
-        .arg("--version")
-        .output()
+    let mut cmd = rusty_grid_core::cluster_auth::probe_command(program);
+    cmd.arg("--version");
+    rusty_grid_core::process_spawn::output_std(&mut cmd)
         .map(|out| out.status.success())
         .unwrap_or(false)
 }

@@ -21,6 +21,36 @@ pub const ERR_DUPLICATE_NODE_ID: &str = "ERR_DUPLICATE_NODE_ID";
 pub const ERR_INVALID_NODE_ID: &str = "ERR_INVALID_NODE_ID";
 pub const ERR_SENDER_MISMATCH: &str = "ERR_SENDER_MISMATCH";
 pub const ERR_NODE_UNAVAILABLE: &str = "ERR_NODE_UNAVAILABLE";
+pub const ERR_NODE_NOT_FOUND: &str = "ERR_NODE_NOT_FOUND";
+pub const ERR_PAYLOAD_CORRUPT: &str = "ERR_PAYLOAD_CORRUPT";
+pub const ERR_PERSIST_FAILED: &str = "ERR_PERSIST_FAILED";
+/// A consumer refused a `DataPayload` because its `--inbox-dir` quota (bytes or files) is used up.
+pub const ERR_INBOX_FULL: &str = "ERR_INBOX_FULL";
+
+/// `DeliveryAck` status a consumer sends for each verified chunk of a multi-chunk transfer that is
+/// not complete yet. It is flow control for the sender (design 0107 D3), never a delivery receipt.
+pub const ACK_STATUS_CHUNK_RECEIVED: &str = "chunk_received";
+/// `DeliveryAck` status a consumer sends once the whole payload (every chunk) matched its SHA-256
+/// and, with `--inbox-dir`, was persisted. Only this status completes a data transfer.
+pub const ACK_STATUS_DATA_VERIFIED: &str = "data_received_verified";
+/// `DeliveryAck` status the hub sends when it queued a command for its target.
+pub const ACK_STATUS_TARGET_FORWARDED: &str = "target_forwarded";
+
+/// Most chunks of one transfer a sender keeps unacknowledged (design 0107 D3). Together with
+/// `max_chunk_json_bytes` it bounds what one transfer can put into the hub's queue for the consumer.
+pub const DATA_CHUNK_WINDOW: usize = 2;
+
+/// Upper bound of the JSON text of one `DataPayload` carrying `chunk_bytes` raw bytes: each byte is
+/// one Latin-1 character, which JSON writes in at most 6 bytes (`\u00XX` for control characters),
+/// plus a fixed allowance for the envelope fields.
+pub const fn max_chunk_json_bytes(chunk_bytes: usize) -> usize {
+    chunk_bytes.saturating_mul(6).saturating_add(4096)
+}
+
+/// Default chunk size threshold (1 MiB) above which `DataPayload` transfers split into multiple
+/// ordered chunks. Kept above 256 KiB so single-chunk transfers up to 256 KiB and Python
+/// `OxideAgentNode` interop stay single-frame.
+pub const DEFAULT_DATA_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Node ids the hub reserves for itself and for routing targets; no peer may register them.
 pub const RESERVED_NODE_IDS: [&str; 4] = ["hub", "grid", "grid-master", "all"];
@@ -517,6 +547,76 @@ impl AgentMeshEnvelope {
         (envelope, hash)
     }
 
+    /// Splits `data_bytes` into one or more ordered `DataPayload` envelopes bounded by
+    /// `max_chunk_bytes` (clamped to `>= 1`), returning `(envelopes, correlation_id, total_sha256)`.
+    ///
+    /// Empty `&[]` and slices with `len() <= max_chunk_bytes` emit a single envelope
+    /// (`total_chunks: 1`, `sequence_number: 0`, `checksum_sha256: Some(total_sha256)`).
+    /// Larger slices emit `N` chunks sharing `correlation_id`, each carrying its per-chunk
+    /// `checksum_sha256` and `metadata["total_sha256"] = total_sha256`.
+    pub fn new_data_payload_chunks(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        data_bytes: &[u8],
+        max_chunk_bytes: usize,
+    ) -> (Vec<Self>, String, String) {
+        let from = from.into();
+        let to = to.into();
+        let chunk_limit = max_chunk_bytes.max(1);
+        let total_sha256 = compute_sha256(data_bytes);
+        let corr_id = default_correlation_id();
+        let now = current_time_ms();
+
+        if data_bytes.len() <= chunk_limit {
+            let text: String = data_bytes.iter().map(|&b| b as char).collect();
+            let envelope = Self::DataPayload {
+                version: default_version(),
+                correlation_id: corr_id.clone(),
+                from,
+                to,
+                payload_type: Some("raw_bytes".to_string()),
+                sequence_number: 0,
+                total_chunks: 1,
+                chunk_size_bytes: data_bytes.len(),
+                data: Some(text),
+                checksum_sha256: Some(total_sha256.clone()),
+                payload: None,
+                metadata: None,
+                timestamp: now,
+            };
+            return (vec![envelope], corr_id, total_sha256);
+        }
+
+        let chunks: Vec<&[u8]> = data_bytes.chunks(chunk_limit).collect();
+        let total_chunks = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+        let mut envelopes = Vec::with_capacity(chunks.len());
+
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let chunk_sha = compute_sha256(chunk);
+            let text: String = chunk.iter().map(|&b| b as char).collect();
+            let mut metadata = HashMap::new();
+            metadata.insert("total_sha256".to_string(), total_sha256.clone());
+            metadata.insert("total_bytes".to_string(), data_bytes.len().to_string());
+            envelopes.push(Self::DataPayload {
+                version: default_version(),
+                correlation_id: corr_id.clone(),
+                from: from.clone(),
+                to: to.clone(),
+                payload_type: Some("raw_bytes".to_string()),
+                sequence_number: idx as u32,
+                total_chunks,
+                chunk_size_bytes: chunk.len(),
+                data: Some(text),
+                checksum_sha256: Some(chunk_sha),
+                payload: None,
+                metadata: Some(metadata),
+                timestamp: now,
+            });
+        }
+
+        (envelopes, corr_id, total_sha256)
+    }
+
     pub fn new_delivery_ack(
         from: impl Into<String>,
         to: impl Into<String>,
@@ -658,5 +758,98 @@ mod tests {
         assert_eq!(env.from_node(), "node-win");
         assert_eq!(env.to_node(), "node-android");
         assert_eq!(env.msg_type(), "CommandRequest");
+    }
+
+    #[test]
+    fn test_new_data_payload_chunks_single_and_multi() {
+        // Empty payload -> 1 chunk
+        let (empty_envs, empty_corr, empty_sha) =
+            AgentMeshEnvelope::new_data_payload_chunks("a", "b", b"", 64);
+        assert_eq!(empty_envs.len(), 1);
+        assert_eq!(empty_sha, compute_sha256(b""));
+        if let AgentMeshEnvelope::DataPayload {
+            correlation_id,
+            sequence_number,
+            total_chunks,
+            chunk_size_bytes,
+            checksum_sha256,
+            ..
+        } = &empty_envs[0]
+        {
+            assert_eq!(correlation_id, &empty_corr);
+            assert_eq!(*sequence_number, 0);
+            assert_eq!(*total_chunks, 1);
+            assert_eq!(*chunk_size_bytes, 0);
+            assert_eq!(checksum_sha256.as_deref(), Some(empty_sha.as_str()));
+        } else {
+            panic!("Expected DataPayload");
+        }
+
+        // Exact boundary -> 1 chunk
+        let exact = vec![0xABu8; 64];
+        let (exact_envs, _, exact_sha) =
+            AgentMeshEnvelope::new_data_payload_chunks("a", "b", &exact, 64);
+        assert_eq!(exact_envs.len(), 1);
+        if let AgentMeshEnvelope::DataPayload {
+            total_chunks,
+            chunk_size_bytes,
+            checksum_sha256,
+            ..
+        } = &exact_envs[0]
+        {
+            assert_eq!(*total_chunks, 1);
+            assert_eq!(*chunk_size_bytes, 64);
+            assert_eq!(checksum_sha256.as_deref(), Some(exact_sha.as_str()));
+        } else {
+            panic!("Expected DataPayload");
+        }
+
+        // Multi-chunk -> 3 chunks (64 + 64 + 17 = 145 bytes)
+        let large: Vec<u8> = (0..145).map(|i| (i % 251) as u8).collect();
+        let (envs, corr, total_sha) =
+            AgentMeshEnvelope::new_data_payload_chunks("src", "dst", &large, 64);
+        assert_eq!(envs.len(), 3);
+        assert_eq!(total_sha, compute_sha256(&large));
+
+        let mut reassembled = Vec::new();
+        for (i, env) in envs.iter().enumerate() {
+            if let AgentMeshEnvelope::DataPayload {
+                correlation_id,
+                sequence_number,
+                total_chunks,
+                chunk_size_bytes,
+                data,
+                checksum_sha256,
+                metadata,
+                ..
+            } = env
+            {
+                assert_eq!(correlation_id, &corr);
+                assert_eq!(*sequence_number, i as u32);
+                assert_eq!(*total_chunks, 3);
+                let chunk_bytes: Vec<u8> = data
+                    .as_ref()
+                    .unwrap()
+                    .chars()
+                    .map(|c| u8::try_from(u32::from(c)).unwrap())
+                    .collect();
+                assert_eq!(*chunk_size_bytes, chunk_bytes.len());
+                assert!(verify_sha256(
+                    &chunk_bytes,
+                    checksum_sha256.as_deref().unwrap()
+                ));
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(|m| m.get("total_sha256"))
+                        .map(String::as_str),
+                    Some(total_sha.as_str())
+                );
+                reassembled.extend_from_slice(&chunk_bytes);
+            } else {
+                panic!("Expected DataPayload");
+            }
+        }
+        assert_eq!(reassembled, large);
     }
 }

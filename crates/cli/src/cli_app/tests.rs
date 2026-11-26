@@ -4,7 +4,10 @@ use super::submit::{
     apply_default_spec_placement, build_placement, build_task_spec, read_task_input,
     run_submit_with_secret, MAX_TASK_INPUT_BYTES,
 };
-use super::tasks::{parse_worker_link, worker_is_connected, worker_state};
+use super::tasks::{
+    parse_worker_link, parse_worker_speed, parse_worker_speed_str, worker_is_connected,
+    worker_state,
+};
 use super::worker::{resolve_isolation, run_worker, ISOLATION_ENV};
 use super::*;
 use crate::config::SecretText;
@@ -781,6 +784,7 @@ max_active_mb = 768
 
 #[tokio::test]
 async fn test_master_with_larger_max_active_bytes_accepts_what_default_refuses_and_reports_bytes() {
+    let _env_guard = crate::test_env_lock::lock_async().await;
     // 1. `--max-active-mb 0` is refused at startup with `ExitCode::FAILURE`.
     let tmp_blob = tempfile::tempdir().unwrap();
     let blob_dir_str = tmp_blob.path().to_str().unwrap().to_string();
@@ -1093,6 +1097,7 @@ fn test_every_cli_long_flag_is_documented_in_reference() {
 
 #[tokio::test]
 async fn test_run_cli_registers_mode_runner_hook() {
+    let _env_guard = crate::test_env_lock::lock_async().await;
     let temp = tempfile::tempdir().expect("tempdir");
     let cfg_path = temp.path().join("rusty-grid.toml");
     std::fs::write(&cfg_path, "").expect("write empty config");
@@ -1122,14 +1127,17 @@ async fn test_run_cli_registers_mode_runner_hook() {
 
 #[test]
 fn test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config_or_aliases() {
-    std::env::remove_var("RUSTY_GRID_NO_BATTERY");
-    std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
-    std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
+    let _env_guard = crate::test_env_lock::lock_blocking();
+    let _no_bat_clear = crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_NO_BATTERY");
+    let _alias_oxide_clear = crate::test_env_lock::ScopedEnvVar::remove("OXIDE_SWARM_NO_BATTERY");
+    let _alias_disable_clear =
+        crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_DISABLE_BATTERY");
 
     assert!(!resolve_no_battery());
 
-    std::env::set_var("OXIDE_SWARM_NO_BATTERY", "yes");
-    std::env::set_var("RUSTY_GRID_DISABLE_BATTERY", "on");
+    let _alias_oxide_set = crate::test_env_lock::ScopedEnvVar::set("OXIDE_SWARM_NO_BATTERY", "yes");
+    let _alias_disable_set =
+        crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_DISABLE_BATTERY", "on");
     assert!(
         !resolve_no_battery(),
         "undocumented alias env vars must not disable battery protection"
@@ -1237,7 +1245,7 @@ fn test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config
             );
 
             // 2. With `RUSTY_GRID_NO_BATTERY=1` in the environment, `run_worker` disables battery probing.
-            std::env::set_var("RUSTY_GRID_NO_BATTERY", "1");
+            let _no_bat_set = crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_NO_BATTERY", "1");
             assert!(
                 resolve_no_battery(),
                 "RUSTY_GRID_NO_BATTERY=1 must disable host battery probing in the CLI layer"
@@ -1255,10 +1263,6 @@ fn test_resolve_no_battery_only_accepts_rusty_grid_no_battery_env_and_not_config
             );
         });
     });
-
-    std::env::remove_var("RUSTY_GRID_NO_BATTERY");
-    std::env::remove_var("OXIDE_SWARM_NO_BATTERY");
-    std::env::remove_var("RUSTY_GRID_DISABLE_BATTERY");
 }
 
 #[test]
@@ -1287,6 +1291,7 @@ async fn test_v3_submit_against_fake_v2_master_never_sends_submit_task_and_leave
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    let _env_guard = crate::test_env_lock::lock_async().await;
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("marker");
     let marker_for_srv = marker.clone();
@@ -1477,4 +1482,71 @@ fn test_submit_require_tool_flag_parses_and_builds_placement() {
         build_placement(&submit_args(&["--require-tool", "git", "--", "true"])).unwrap();
     apply_default_spec_placement(&cargo_spec, &mut explicit_placement);
     assert_eq!(explicit_placement.to_task_tags(), ["require:tool=git"]);
+}
+
+#[test]
+fn test_submit_repeatable_flag_and_reserved_opt_speed_tags() {
+    let default_args = submit_args(&["--", "echo", "hi"]);
+    assert!(!default_args.repeatable);
+
+    let rep_args = submit_args(&["--repeatable", "--", "echo", "hi"]);
+    assert!(rep_args.repeatable);
+
+    let mut caps = WorkerCapabilities::new("w1", 4, 4096, false, false, None)
+        .with_tags(vec!["os:linux".into(), "speed:1.25".into()]);
+    assert_eq!(parse_worker_speed_str(&caps), Some("1.25"));
+    assert_eq!(parse_worker_speed(&caps), Some(1.25));
+
+    caps.tags = vec!["speed:invalid".into()];
+    assert_eq!(parse_worker_speed(&caps), None);
+
+    assert!(rusty_grid_core::placement::validate_user_tag("opt:repeatable").is_err());
+    assert!(rusty_grid_core::placement::validate_user_tag("speed:1.0").is_err());
+    assert!(build_placement(&submit_args(&[
+        "--require-tag",
+        "opt:repeatable",
+        "--",
+        "true"
+    ]))
+    .is_err());
+    assert!(build_placement(&submit_args(&["--require-tag", "speed:1.0", "--", "true"])).is_err());
+}
+
+#[tokio::test]
+async fn test_cli_env_lock_serializes_wire_codec_mutation_and_restores_on_panic() {
+    let _env_guard = crate::test_env_lock::lock_async().await;
+    let _baseline_clear = crate::test_env_lock::ScopedEnvVar::remove("RUSTY_GRID_WIRE_CODEC");
+
+    // 1. Panicking while holding ScopedEnvVar restores the previous value on unwind.
+    let panic_res = std::panic::catch_unwind(|| {
+        let _xml = crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_WIRE_CODEC", "xml");
+        panic!("simulated panic while env var overridden");
+    });
+    assert!(panic_res.is_err());
+    assert_eq!(
+        std::env::var_os("RUSTY_GRID_WIRE_CODEC"),
+        None,
+        "ScopedEnvVar::drop must restore RUSTY_GRID_WIRE_CODEC on unwind"
+    );
+    drop(_baseline_clear);
+    drop(_env_guard);
+
+    // 2. Concurrent tasks contending on test_env_lock::lock_async() never observe "xml".
+    for _ in 0..20 {
+        let mutator = tokio::spawn(async {
+            let _lock = crate::test_env_lock::lock_async().await;
+            let _xml = crate::test_env_lock::ScopedEnvVar::set("RUSTY_GRID_WIRE_CODEC", "xml");
+            tokio::task::yield_now().await;
+        });
+        let reader = tokio::spawn(async {
+            let _lock = crate::test_env_lock::lock_async().await;
+            assert!(
+                resolve_wire_codec(None, None).is_ok(),
+                "locked sibling must never observe transient invalid RUSTY_GRID_WIRE_CODEC=xml"
+            );
+        });
+        let (r1, r2) = tokio::join!(mutator, reader);
+        r1.unwrap();
+        r2.unwrap();
+    }
 }

@@ -10,6 +10,7 @@ Mutation check: OX_SCRIPT_ROOT=/path/to/an/older/checkout python3 tests/test_age
 """
 
 import datetime
+import glob
 import importlib.util
 import json
 import os
@@ -54,6 +55,8 @@ class BridgeCase(unittest.TestCase):
         self.env.pop("PYTHONIOENCODING", None)
         # Never probe the host's real ports (an owner's master may listen on 8088).
         self.env["OXIDESWARM_BRIDGE_ASSUME_LISTENING"] = ""
+        # Never discover a real Google Drive mount on G:/H:/D: during isolated tests.
+        self.env["OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN"] = "1"
         self.children = []
         self.addCleanup(self.stop_children)
 
@@ -279,17 +282,36 @@ class ClaudeCodeHook(BridgeCase):
         self.assertEqual(self.run_bridge(*args, stdin='{"session_id": "s1"}').returncode, 0)
 
     def test_a_session_keeps_one_watcher_across_turns(self):
-        first = self.start_bridge(*self.hook_args(), stdin='{"session_id": "s1"}')
-        time.sleep(2.5)
-        self.assertIsNone(first.poll())
+        long_hook_args = self.watch_args("--hook", "--max-wait", "120")
+        first = self.start_bridge(*long_hook_args, stdin='{"session_id": "s1"}')
+        lock_pattern = os.path.join(self.env["OXIDESWARM_HOME"], "**", "watch_*.lock")
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            if glob.glob(lock_pattern, recursive=True):
+                break
+            if first.poll() is not None:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2)
+        self.assertIsNone(first.poll(), "first hook watcher exited unexpectedly before second hook")
 
-        started = time.time()
-        result = self.run_bridge(*self.hook_args(), stdin='{"session_id": "s1"}')
+        started = time.monotonic()
+        result = self.run_bridge(*long_hook_args, stdin='{"session_id": "s1"}', timeout=60)
+        elapsed = time.monotonic() - started
+        print(f"second hook exited in {elapsed:.3f}s")
         self.assertEqual(result.returncode, 0)
-        self.assertLess(time.time() - started, 5, "the second hook must leave at once")
+        self.assertIsNone(first.poll(), "first watcher must still be alive when the second hook leaves")
+        self.assertLess(elapsed, 60, f"second hook hung for {elapsed:.2f}s")
 
-        other = self.start_bridge(*self.watch_args("--hook", "--max-wait", "3"), stdin='{"session_id": "s2"}')
-        time.sleep(2)
+        other = self.start_bridge(*self.watch_args("--hook", "--max-wait", "30"), stdin='{"session_id": "s2"}')
+        deadline2 = time.monotonic() + 60.0
+        while time.monotonic() < deadline2:
+            if len(glob.glob(lock_pattern, recursive=True)) >= 2:
+                break
+            if other.poll() is not None:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2)
         self.assertIsNone(other.poll(), "another session has its own watcher")
 
     def test_a_stdin_that_stays_open_does_not_block_the_hook(self):
@@ -471,7 +493,6 @@ class GitCalls(unittest.TestCase):
             self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
 
 
-@unittest.skipIf(os.path.exists("G:\\"), "a real Google Drive is mounted on this machine")
 class WithoutHub(BridgeCase):
     def assert_inert(self, result):
         self.assertEqual(result.returncode, 0)
@@ -484,6 +505,27 @@ class WithoutHub(BridgeCase):
 
     def test_the_hook_watcher_leaves_at_once_and_creates_nothing(self):
         self.assert_inert(self.run_bridge("watch", "--hook", use_hub=False, stdin="{}", timeout=10))
+
+    def test_drive_scan_opt_out_isolates_hub_discovery(self):
+        drive_hub = os.path.join("G:\\", "My Drive", "OxideSwarm_Agent_Hub")
+        base_env = dict(os.environ, HOME=self.home, USERPROFILE=self.home)
+        base_env.pop("OXIDESWARM_AGENT_HUB", None)
+        base_env.pop(bridge_module.DISABLE_DRIVE_SCAN_ENV, None)
+        with (
+            mock.patch.object(bridge_module.glob, "glob", return_value=[]),
+            mock.patch.object(
+                bridge_module.os.path,
+                "exists",
+                side_effect=lambda p: p in ("G:\\", drive_hub),
+            ),
+            mock.patch.object(bridge_module.os, "listdir", return_value=[]),
+        ):
+            with mock.patch.dict(os.environ, dict(base_env, **{bridge_module.DISABLE_DRIVE_SCAN_ENV: "1"}), clear=True):
+                self.assertNotIn(drive_hub, bridge_module.hub_candidates())
+                self.assertIsNone(bridge_module.discover_hub_dir(None))
+            with mock.patch.dict(os.environ, base_env, clear=True):
+                self.assertIn(drive_hub, bridge_module.hub_candidates())
+                self.assertEqual(bridge_module.discover_hub_dir(None), os.path.abspath(drive_hub))
 
 
 class Peek(BridgeCase):

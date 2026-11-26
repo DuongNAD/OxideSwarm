@@ -7,10 +7,12 @@
 //! * **Worker tags.** A worker adds [`system_tags`] (`os:<os>`, `arch:<arch>`) and `slots:<n>`
 //!   itself, and its operator may add user tags ([`validate_user_tag`]). In `ListWorkers` /
 //!   `ClusterStatus` answers the master adds `link:<path>`, `id:<worker uuid>`, `state:<state>`,
-//!   `proto:<n>` (the protocol version the worker registered with, design 0083)
+//!   `proto:<n>` (the protocol version the worker registered with, design 0083), `speed:<factor>`
+//!   (measured relative task speed, design 0060 D4)
 //!   and `feat:<feature>` (`feat:workspaces` when the worker negotiated `WORKSPACES`), and the
 //!   worker adds its task isolation level as `iso:<level>` ([`IsolationLevel`], design 0033)
-//!   and probed host tools as `tool:<name>` (design 0039). Those eleven prefixes are
+//!   and probed host tools as `tool:<name>` (design 0039). Together with `opt:` (task option tags
+//!   such as `opt:repeatable`, design 0060 D3), those thirteen prefixes are
 //!   [`RESERVED_TAG_PREFIXES`]: no user tag may start with one.
 //! * **Task constraints.** `require:<key>=<value>` entries of `Task::tags`, parsed into a
 //!   [`Placement`]. Keys: `os`, `arch`, `worker` (UUID or name), `iso` (a minimum
@@ -50,10 +52,18 @@ pub const EXT_TAG_PREFIX: &str = "ext:";
 /// Prefix of the tag the master adds to a listed worker with the protocol version it registered
 /// with (`proto:9`, design 0083 D4).
 pub const PROTO_TAG_PREFIX: &str = "proto:";
+/// Prefix of opt-in task-behavior tags set by CLI/MCP flags (`opt:repeatable`, design 0060 D3).
+pub const OPT_TAG_PREFIX: &str = "opt:";
+/// Task tag marking a task safe to re-run speculatively if a running attempt becomes a straggler
+/// (design 0060 D3).
+pub const OPT_REPEATABLE_TAG: &str = "opt:repeatable";
+/// Prefix of the measured relative speed tag the master adds to listed workers (`speed:1.0`,
+/// design 0060 D4).
+pub const SPEED_TAG_PREFIX: &str = "speed:";
 /// Tag the master adds to a listed worker when it negotiated `ProtocolCapabilities::WORKSPACES`.
 pub const FEAT_WORKSPACES_TAG: &str = "feat:workspaces";
-/// Tag prefixes only the worker or the master may set.
-pub const RESERVED_TAG_PREFIXES: [&str; 11] = [
+/// Tag prefixes only the worker or the master (or dedicated task option flags) may set.
+pub const RESERVED_TAG_PREFIXES: [&str; 13] = [
     OS_TAG_PREFIX,
     ARCH_TAG_PREFIX,
     SLOTS_TAG_PREFIX,
@@ -65,6 +75,8 @@ pub const RESERVED_TAG_PREFIXES: [&str; 11] = [
     FEAT_TAG_PREFIX,
     EXT_TAG_PREFIX,
     PROTO_TAG_PREFIX,
+    OPT_TAG_PREFIX,
+    SPEED_TAG_PREFIX,
 ];
 /// Longest user tag, in bytes.
 pub const MAX_USER_TAG_LEN: usize = 64;
@@ -184,6 +196,34 @@ pub fn validate_user_tag(tag: &str) -> Result<(), String> {
 /// The value of the first tag in `tags` that starts with `prefix`, without the prefix.
 pub fn tag_value<'a>(tags: &'a [String], prefix: &str) -> Option<&'a str> {
     tags.iter().find_map(|t| t.strip_prefix(prefix))
+}
+
+/// True when `tags` carries [`OPT_REPEATABLE_TAG`] (`opt:repeatable`, design 0060 D3).
+pub fn is_repeatable_tags(tags: &[String]) -> bool {
+    tags.iter().any(|t| t == OPT_REPEATABLE_TAG)
+}
+
+/// Validates bare (non-`require:`) tags on a submitted [`crate::task::Task`].
+///
+/// Rejects reserved `speed:` tags and `opt:` tags other than [`OPT_REPEATABLE_TAG`] (design 0060
+/// D3/D4). `require:` constraints are validated separately by [`Placement::from_task_tags`].
+pub fn validate_task_user_tags(tags: &[String]) -> Result<(), String> {
+    for tag in tags {
+        if tag.starts_with(REQUIRE_PREFIX) {
+            continue;
+        }
+        if tag.starts_with(SPEED_TAG_PREFIX) {
+            return Err(format!(
+                "task tag `{tag}` starts with `{SPEED_TAG_PREFIX}`, which only the master may set"
+            ));
+        }
+        if tag.starts_with(OPT_TAG_PREFIX) && tag != OPT_REPEATABLE_TAG {
+            return Err(format!(
+                "task tag `{tag}` starts with reserved prefix `{OPT_TAG_PREFIX}` (only `{OPT_REPEATABLE_TAG}` is supported)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The worker id the master put in a listed worker's tags (`id:<uuid>`), if any.
@@ -524,9 +564,29 @@ mod tests {
             "tool:git",
             "feat:workspaces",
             "ext:32770",
+            "proto:10",
+            "opt:repeatable",
+            "speed:1.0",
         ] {
             assert!(validate_user_tag(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn test_task_user_tag_rules_and_repeatable() {
+        assert!(is_repeatable_tags(&tags(&[OPT_REPEATABLE_TAG])));
+        assert!(!is_repeatable_tags(&tags(&["smoke"])));
+        assert_eq!(
+            validate_task_user_tags(&tags(&["smoke", OPT_REPEATABLE_TAG, "require:tag=gpu"])),
+            Ok(())
+        );
+        assert!(validate_task_user_tags(&tags(&["speed:1.0"])).is_err());
+        assert!(validate_task_user_tags(&tags(&["opt:unknown"])).is_err());
+        assert!(Placement::from_task_tags(&tags(&[OPT_REPEATABLE_TAG]))
+            .unwrap()
+            .is_empty());
+        assert!(Placement::from_task_tags(&tags(&["require:tag=opt:repeatable"])).is_err());
+        assert!(Placement::from_task_tags(&tags(&["require:tag=speed:1.0"])).is_err());
     }
 
     #[test]

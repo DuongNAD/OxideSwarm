@@ -376,7 +376,7 @@ when the owner adds them.
 | LV-1 | Fuzz targets for every parser, in CI | Assurance | M | R12 | `fuzz/` (new), `.github/workflows/ci.yml` | Measure M10 is met, and the LV-1 test of the test plan passes | Planned |
 | LV-2 | Deterministic simulation of master and workers | Assurance | L | R11 | `crates/master/`, `crates/core/src/transport.rs`, `tests/` | The LV-2 test of the test plan passes, and proof run V1 is recorded | Planned |
 | LV-3 | A checked model of the task state machine and failover | Assurance | M | LV-2 | a new directory, `docs/design/` | CI checks the model, and the LV-3 test passes | Planned |
-| LV-4 | Inventory of `unsafe`, with comments, lints and Miri | Assurance | M | | `crates/*/src/`, `.github/workflows/ci.yml` | Measure M11 is met, and the lint is a required check | Planned |
+| LV-4 | Inventory of `unsafe`, with comments, lints and Miri | Assurance | M | | `crates/*/src/`, `.github/workflows/ci.yml` | Measure M11 is met, and the lint is a required check | Implemented |
 | LV-5 | Supply chain: dependency policy, provenance, outside checklist | Assurance | M | | `deny.toml` (new), `.github/workflows/release.yml`, `README.md` | Measure M12 is met, and the LV-5 test passes | Planned |
 | LV-6 | Independent security review | Assurance | Owner | LV-1 | `docs/SECURITY.md` | The findings and the fixes are published with their dates | Planned |
 | LV-7 | Testing page with numbers from a script | Assurance | S | LV-1, LV-2 | `docs/TESTING.md` (new), `scripts/` | The page is built in CI and linked from `README.md` | Planned |
@@ -432,3 +432,39 @@ listed in [ROADMAP.md](../ROADMAP.md) as Q31 to Q35.
 - 2026-11-17: LV-4 and LV-15 entered [BACKLOG.md](../BACKLOG.md) as part of Phase 13, after the owner
   accepted Q82 of [design 0088](0088-evaluation-of-2026-11-17-and-what-finished-means.md). The text of
   the items is unchanged.
+- 2026-11-19: LV-4 step 3 Partial (`win/lv-4-forbid-unsafe`): added `#![forbid(unsafe_code)]` to all
+  4 zero-`unsafe` binary crate roots (`oxideswarm`, `rusty-grid`, `ox-mode`, `agent-mesh`) and
+  `#![deny(unsafe_code)]` to all 6 library crate roots with surgical `#[allow(unsafe_code)]` (each
+  with a one-line `// LV-4:` reason) strictly on modules, test submodules, and `#[no_mangle]` JNI
+  entrypoints that require it:
+  - `rusty_grid_android_bridge` (`crates/android_bridge/src/lib.rs`): 0 `unsafe` blocks/fns/impls;
+    `#[allow(unsafe_code)]` only on the 10 `#[no_mangle]` JNI export fns (`nativeStartWorker`,
+    `nativeSetSandboxDir`, `nativeSetClusterSecret`, `nativeUpdateTelemetry`,
+    `nativeUpdateTelemetryDetailed`, `nativeStopWorker`, `nativeIsRunning`,
+    `nativeGetWorkerStatus`, `nativeDiscoverMaster`, `nativeTriggerFastEvacuation`); helpers and
+    tests denied.
+  - `agent_mesh` (`crates/agent_mesh`): `#[allow(unsafe_code)]` on `executor` (`cfg(unix)`
+    `libc::killpg` and signal test); clean denied modules: `bridge`, `client`, `hub`, `protocol`.
+  - `rusty_grid_master` (`crates/master`): `#[allow(unsafe_code)]` on `store` (`cfg(unix)`
+    `libc::geteuid` owner check) with `#[forbid(unsafe_code)]` on `store::fuzzing`; clean denied
+    modules (20): `auth`, `blob_store`, `cold_results`, `dashboard`, `fair_share`, `liveness`,
+    `mapreduce`, `member_connections`, `metrics`, `otel`, `queue`, `reaper`, `registry`,
+    `rendezvous`, `scheduler`, `server`, `session`, `speed`, `web_ui`, `worker_index`.
+  - `rusty_grid_core` (`crates/core`): `#[allow(unsafe_code)]` on 3 production modules
+    (`capabilities`, `noise_auth`, `private_file`) plus `#[cfg(test)] mod tests` in `blob` and `task`
+    (keeping production `blob` and `task` code denied); clean denied modules: `arbitrage`,
+    `blob_transfer`, `cluster_auth`, `discovery`, `error`, `mapreduce`, `mode`, `placement`,
+    `protocol`, `transport`, `window_tests`, `wire_layout_tests`.
+  - `rusty_grid_cli` (`crates/cli`): `#[allow(unsafe_code)]` on `join` (terminal no-echo) and
+    `mode_cli::dev_launch` (`cfg(unix)` `libc::killpg`); clean denied modules: `blobs`, `cli_app`,
+    `config`, `connect`, `doctor`, `mcp`, `members_cmd`, `pair`, `rendezvous_cmd`, `run_summary`,
+    `secret_cmd`, `size_check`, `usb_kit`, `verify`, `wordlist`, and `mode_cli::{dev, doc, research,
+    test}` + `mode_cli` itself.
+  - `rusty_grid_worker` (`crates/worker`): `#[allow(unsafe_code)]` on 5 production modules
+    (`blob_cache`, `isolation` including OS backends `linux`/`macos`/`windows`, `process_tree`,
+    `sandbox`, `workspace`) plus test submodules `client::tests`, `runner::outcome_tests`,
+    `runner::process_tree_tests`, and `staging::tests` (keeping production `client`, `runner`,
+    `staging` code denied); clean denied modules: `autorig`, `backoff`, `blob_client`, `cpu_simd`,
+    `gen3d`, `gpu`, `heartbeat`, `identity`, `sim`, `wgpu_engine`.
+  - `fuzz/` (excluded from `[workspace]`): 0 `unsafe` hits.
+- 2026-11-24: `LV-4` Implemented (`origin/master` `abff2514`): verified all `384` non-comment `unsafe` sites (`352` blocks, `32` `fn`/`impl`/`extern` items) across `crates/` and `tests/` have `SAFETY:` / `# Safety` docs (`0` missing), all `6` workspace member crates inherit `[lints] workspace = true` (`undocumented_unsafe_blocks = "deny"`), `cargo clippy --workspace --all-targets --locked -- -D warnings` passes (`0` warnings), all three `clippy (*)` jobs are required status checks on `master`, and `miri (rusty_grid_core)` passed on `master` push CI (`run 45297098266`, job `138120143503`: `203 passed; 0 failed; 93 ignored` in `491.91 s`).

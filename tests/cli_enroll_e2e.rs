@@ -16,8 +16,31 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
 
+fn preserve_toolchain_env(cmd: &mut Command) {
+    let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| std::path::PathBuf::from(h).join(".rustup"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", p);
+    }
+    if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| std::path::PathBuf::from(h).join(".cargo"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("CARGO_HOME", p);
+    }
+}
+
 fn cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
+    preserve_toolchain_env(&mut cmd);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("OXIDESWARM_HOME", home.join(".oxideswarm"))
@@ -347,7 +370,14 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
     let port_file = master_home.path().join("master.port");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file);
     let master = Service::spawn(master_cmd, master_home.path().join("master.log"));
 
@@ -1145,6 +1175,8 @@ fn test_cli_enroll_invite_join_approve_roles_contention_and_host_admin() {
             "127.0.0.1:0",
             "--auth",
             "members",
+            "--max-host-cpu-pct",
+            "100",
             "--port-file",
         ])
         .arg(&port_file_m);
@@ -1215,7 +1247,15 @@ fn test_cli_enroll_over_p2p_ticket_minimal_preset() {
     let ticket_file = master_home.path().join("master.ticket");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--p2p", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--p2p",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .arg("--p2p-ticket-file")
         .arg(&ticket_file);
@@ -1378,7 +1418,14 @@ fn start_master(home: &Path, extra_args: &[&str]) -> (Service, String) {
     let log_file = home.join(format!("master-{id}.log"));
     let mut master_cmd = cli(home);
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .args(extra_args);
     let master = Service::spawn(master_cmd, log_file);
@@ -1895,6 +1942,8 @@ fn test_n1_readonly_home_secret_only_master_and_n2_d6_named_worker_v2_to_v3_and_
             "127.0.0.1:0",
             "--auth",
             "secret",
+            "--max-host-cpu-pct",
+            "100",
             "--port-file",
         ])
         .arg(&port_file_ro);
@@ -2001,7 +2050,15 @@ fn test_n1_readonly_home_secret_only_master_and_n2_d6_named_worker_v2_to_v3_and_
     let ticket_file = master_home.path().join("master.ticket");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--p2p", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--p2p",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file)
         .arg("--p2p-ticket-file")
         .arg(&ticket_file);

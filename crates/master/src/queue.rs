@@ -5,6 +5,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ mod lifecycle;
 mod recovery;
 mod retention;
 mod scheduling;
+pub use scheduling::SpeculativeStartOutcome;
 
 #[cfg(test)]
 mod recovery_tests;
@@ -320,6 +322,27 @@ pub struct RetryAttempt {
     pub error: Option<String>,
 }
 
+/// Active in-memory speculative copy of a running `opt:repeatable` task (`0060` D3).
+///
+/// Not persisted across master restarts (`STORE_FORMAT_VERSION` remains `4`).
+#[derive(Debug, Clone)]
+pub struct SpeculativeAttempt {
+    pub worker_id: Uuid,
+    pub session_id: u64,
+    pub session_live: Arc<AtomicBool>,
+    pub scheduled_instant: Instant,
+    pub started_instant: Option<Instant>,
+    pub state: TaskState,
+}
+
+/// Snapshot of a running `opt:repeatable` task eligible for straggler inspection by the reaper.
+#[derive(Debug, Clone)]
+pub struct StragglerCandidate {
+    pub view: TaskView,
+    pub primary_worker_id: Uuid,
+    pub elapsed: Duration,
+}
+
 /// Internal in-memory task entry holding complete metadata.
 #[derive(Debug, Clone)]
 pub struct TaskEntry {
@@ -354,6 +377,10 @@ pub struct TaskEntry {
     /// assignments made without session information). Results, progress and checkpoints are only
     /// accepted from this worker *and* session, so a superseded or reaped session cannot touch it.
     pub assigned_session: Option<u64>,
+    /// Per-session liveness flag from the `WorkerRegistry` reservation that dispatched or adopted
+    /// this assignment (`None` when assigned without registry reservation info). Used so late or
+    /// pre-sweep cleanups never decrement `active_tasks` on a session that was reaped and revived.
+    pub assigned_session_live: Option<Arc<AtomicBool>>,
     /// True when the current dispatch resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
     /// When set (`Some((worker_id, hold_until))`), this `Queued` task is held for `worker_id` to
@@ -382,7 +409,23 @@ pub struct TaskEntry {
     /// (`ProtocolCapabilities::TREE_V2`), recorded when `BlobStore::resolve_inputs_with_features`
     /// decodes the manifest at task admission or store recovery.
     pub requires_tree_v2: bool,
+    /// Active speculative attempt when the reaper launched a straggler copy (`0060` D3).
+    pub speculative: Option<SpeculativeAttempt>,
+    /// True once a speculative copy has been launched for this task (at most one per task).
+    pub speculative_spawned: bool,
+    /// When the master last accepted a checkpoint of at least [`LARGE_CHECKPOINT_BYTES`] for this
+    /// task (in memory only); large checkpoints are accepted at most once per
+    /// [`LARGE_CHECKPOINT_MIN_INTERVAL`] so one task cannot keep the journal compacting.
+    pub last_large_checkpoint_at: Option<Instant>,
 }
+
+/// Checkpoints at least this large are rate limited per task (design 0102 D7).
+pub const LARGE_CHECKPOINT_BYTES: usize = 1024 * 1024;
+/// Minimum time between two accepted large checkpoints of one task (design 0102 D7).
+pub const LARGE_CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Checkpoints may grow the active bytes only up to `max - max / CHECKPOINT_HEADROOM_DIVISOR`, so
+/// running tasks' checkpoints can never take the room new submissions need (design 0102 D7).
+pub const CHECKPOINT_HEADROOM_DIVISOR: usize = 4;
 
 impl TaskEntry {
     pub fn to_info(&self) -> TaskInfo {
@@ -494,6 +537,14 @@ pub const DEFAULT_MAX_ACTIVE_BYTES: usize = 256 * 1024 * 1024;
 /// Fixed bookkeeping cost charged to every retained task on top of its payload.
 const RETAINED_ENTRY_OVERHEAD_BYTES: usize = 1024;
 
+/// VRAM tier derived from a `Generative3D` task when no explicit `vram_mb` is set (`3D-2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Generative3DVramTier {
+    Fast,
+    Standard,
+    High,
+}
+
 /// What a scheduling pass needs to know about a queued task, without the task's payload.
 ///
 /// A pass looks at far more tasks than it places (everything in front of the first placeable one),
@@ -509,6 +560,11 @@ pub struct TaskView {
     pub requirements: TaskRequirements,
     /// `requirements.gpu_required || spec.requires_gpu()`: only GPU-capable workers may run it.
     pub requires_gpu: bool,
+    /// `AutoRig` with `preferred_provider == Some("blender")` (case-insensitive): only workers
+    /// advertising `capabilities.has_blender` may run it.
+    pub requires_blender: bool,
+    /// Preset VRAM tier for GPU/neural `Generative3D` tasks without explicit `requirements.vram_mb`.
+    pub gen3d_vram_tier: Option<Generative3DVramTier>,
     /// Compilation and GPU specs, which throttled or low-battery mobile workers must not receive.
     pub heavy: bool,
     /// Protocol features a worker must advertise to run the task: `FILE_STAGING` for inline staged
@@ -521,6 +577,9 @@ pub struct TaskView {
     /// validates them, so an error only reaches here for a task that bypassed it; such a task is
     /// placed nowhere.
     pub placement: Result<Placement, String>,
+    /// Soft worker affinity (`prefer:worker=<id|name>` tag). Honored while the preferred worker is
+    /// connected and not avoided; falls back to `placement` when absent or unavailable.
+    pub prefer_worker: Option<String>,
     /// Named persistent workspace (`Task::workspace`), if any (design 0039 D4).
     pub workspace: Option<String>,
 }
@@ -538,6 +597,8 @@ impl TaskView {
             queued_for: Duration::ZERO,
             requirements: task.requirements.clone(),
             requires_gpu: task.requirements.requires_gpu_or_vram() || task.spec.requires_gpu(),
+            requires_blender: task_requires_blender(task),
+            gen3d_vram_tier: gen3d_vram_tier_for(task),
             heavy: matches!(
                 task.spec,
                 TaskSpec::RustCompilation { .. } | TaskSpec::GpuCompute { .. }
@@ -545,8 +606,57 @@ impl TaskView {
             required_features: required_features(task),
             avoid: Vec::new(),
             placement: task.scheduling_placement(),
+            prefer_worker: task_prefer_worker(task),
             workspace: task.workspace.as_ref().map(|w| w.name.clone()),
         }
+    }
+}
+
+pub(crate) fn task_prefer_worker(task: &Task) -> Option<String> {
+    task.tags
+        .iter()
+        .find_map(|t| t.strip_prefix("prefer:worker="))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+pub(crate) fn task_requires_blender(task: &Task) -> bool {
+    matches!(
+        &task.spec,
+        TaskSpec::AutoRig(spec)
+            if spec
+                .preferred_provider
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("blender"))
+    )
+}
+
+fn gen3d_vram_tier_for(task: &Task) -> Option<Generative3DVramTier> {
+    if task.requirements.effective_vram_mb() > 0 {
+        return None;
+    }
+    let TaskSpec::Generative3D(spec) = &task.spec else {
+        return None;
+    };
+    // `auto` always runs the CPU SDF tier on the worker (3D-1 D3), so it needs no VRAM.
+    if matches!(
+        spec.engine(),
+        rusty_grid_core::task::Engine3D::Sdf | rusty_grid_core::task::Engine3D::Auto
+    ) {
+        return None;
+    }
+    let q = spec.quality.trim();
+    if task.requirements.gpu_required || q.eq_ignore_ascii_case("high") {
+        if q.eq_ignore_ascii_case("fast") {
+            Some(Generative3DVramTier::Fast)
+        } else if q.eq_ignore_ascii_case("high") {
+            Some(Generative3DVramTier::High)
+        } else {
+            Some(Generative3DVramTier::Standard)
+        }
+    } else {
+        None
     }
 }
 
@@ -625,10 +735,13 @@ pub enum ResultDisposition {
     /// From a worker or session the task is not currently assigned to (failed over, reaped,
     /// superseded, or simply never its task). Dropped without touching the FSM.
     Stale,
+    /// One attempt of a speculatively duplicated `opt:repeatable` task failed or could not be
+    /// delivered while the sibling attempt continues running (`0060` D3).
+    SiblingFailed,
 }
 
 /// Outcome of `TaskQueue::record_result_from`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResultOutcome {
     pub disposition: ResultDisposition,
     /// State of the task after the call.
@@ -646,15 +759,29 @@ pub struct ResultOutcome {
     pub timeout_secs: u64,
     /// True when this attempt resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
+    /// Reporting worker's assigned session id, when tracked.
+    pub session_id: Option<u64>,
+    /// Reporting worker's dispatch reservation `session_live` handle, when tracked.
+    pub session_live: Option<Arc<AtomicBool>>,
+    /// When a speculative sibling existed and this result completed the task cleanly, the losing
+    /// `(worker_id, session_id, session_live)` that must receive `MasterMessage::CancelTask` and
+    /// have its dispatch released (`0060` D3).
+    pub cancel_sibling: Option<(Uuid, Option<u64>, Option<Arc<AtomicBool>>)>,
+    /// True when the attached `TaskStore` failed to enqueue the durable journal record or had
+    /// already entered a failed state (so callers must not send `oxs:result-ack:<token>`).
+    pub durability_failed: bool,
 }
 
 /// Outcome of `TaskQueue::cancel_task_detailed`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct CancelOutcome {
     /// False when the task had already finished; nothing was changed.
     pub newly_cancelled: bool,
     /// Worker currently executing the task, which must be told to stop.
     pub worker_to_notify: Option<Uuid>,
+    /// Speculative sibling `(worker_id, session_id, session_live)` also executing the task, which
+    /// must stop too.
+    pub extra_worker_to_notify: Option<(Uuid, u64, Option<Arc<AtomicBool>>)>,
     /// The cancelled result recorded for the task, to hand to everybody waiting on it.
     pub result: Option<TaskResult>,
 }
@@ -702,13 +829,30 @@ fn owned_by(entry: &TaskEntry, worker_id: &Uuid, session_id: Option<u64>) -> boo
         }
 }
 
+/// True when `entry`'s active speculative attempt belongs to `(worker_id, session_id)`.
+fn owned_by_speculative(entry: &TaskEntry, worker_id: &Uuid, session_id: Option<u64>) -> bool {
+    entry.speculative.as_ref().is_some_and(|spec| {
+        spec.worker_id == *worker_id
+            && match session_id {
+                Some(claimed) => claimed == spec.session_id,
+                None => true,
+            }
+    })
+}
+
 /// Outcome of [`TaskQueue::adopt_session_tasks`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdoptionOutcome {
-    /// Tasks adopted into `TaskState::Running` on `(worker_id, session_id)`.
-    pub adopted: Vec<TaskId>,
-    /// Tasks reported in `running` that could not be adopted (unknown, terminal, expired hold, or
-    /// owned by another worker) and must receive `MasterMessage::CancelTask`.
+    /// Tasks newly adopted from an `adoptable_by` hold into `TaskState::Running` on
+    /// `(worker_id, session_id)`. Only these tasks need a fresh active-task slot credit.
+    pub newly_adopted: Vec<TaskId>,
+    /// Tasks reported in `running` that were already active (`Scheduled` or `Running`) on
+    /// `(worker_id, session_id)` (including active speculative attempts on this session).
+    /// These already hold a slot and must neither be re-credited nor cancelled.
+    pub already_owned: Vec<TaskId>,
+    /// Tasks reported in `running` that could not be adopted (unknown, terminal on another
+    /// worker/session, expired hold, or owned by another worker/session) and must receive
+    /// `MasterMessage::CancelTask`.
     pub stale_to_cancel: Vec<TaskId>,
     /// Tasks previously held for `worker_id` that were omitted from `running` (or whose hold
     /// expired) and transitioned to `TaskState::Failed` (for example `Running` with
@@ -945,6 +1089,7 @@ fn mark_entry_scheduled(
     entry.state = TaskState::Scheduled;
     entry.assigned_worker_id = Some(worker_id);
     entry.assigned_session = session_id;
+    entry.assigned_session_live = None;
     entry.resumed_from_checkpoint = entry.task.latest_checkpoint.is_some();
     entry.adoptable_by = None;
     entry.fail_if_not_adopted = false;
@@ -1473,5 +1618,67 @@ impl TaskQueue {
             #[cfg(test)]
             ready_views_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Variant of `assigned_loads` that computes each active or held task's VRAM reservation via
+    /// `vram_for_task`, so preset-VRAM `Generative3D` tasks reserve their configured VRAM across
+    /// scheduling passes and straggler checks without mutating `TaskRequirements`.
+    pub(crate) async fn assigned_loads_with<F>(
+        &self,
+        vram_for_task: F,
+    ) -> HashMap<Uuid, AssignedLoad>
+    where
+        F: Fn(&Task) -> u64,
+    {
+        let inner = self.inner.read().await;
+        let now = Instant::now();
+        let mut loads = HashMap::with_capacity(inner.worker_assignments.len());
+        for (worker_id, task_ids) in &inner.worker_assignments {
+            let mut load = AssignedLoad::default();
+            for task_id in task_ids {
+                let Some(entry) = inner.tasks.get(task_id) else {
+                    continue;
+                };
+                let attempt_state = if entry.assigned_worker_id == Some(*worker_id) {
+                    entry.state
+                } else if let Some(ref spec) = entry.speculative {
+                    if spec.worker_id == *worker_id {
+                        spec.state
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                if !attempt_state.is_active() {
+                    continue;
+                }
+                load.tasks += 1;
+                load.slots += entry.task.requirements.cpu_cores.max(1);
+                if attempt_state == TaskState::Scheduled {
+                    load.unstarted_ram_mb += entry.task.requirements.ram_mb;
+                }
+                load.vram_mb = load.vram_mb.saturating_add(vram_for_task(&entry.task));
+            }
+            if load.tasks > 0 {
+                loads.insert(*worker_id, load);
+            }
+        }
+        for task_id in &inner.held_tasks {
+            let Some(entry) = inner.tasks.get(task_id) else {
+                continue;
+            };
+            if entry.state == TaskState::Queued {
+                if let Some((worker_id, until)) = entry.adoptable_by {
+                    if now < until {
+                        let load = loads.entry(worker_id).or_default();
+                        load.tasks += 1;
+                        load.slots += entry.task.requirements.cpu_cores.max(1);
+                        load.vram_mb = load.vram_mb.saturating_add(vram_for_task(&entry.task));
+                    }
+                }
+            }
+        }
+        loads
     }
 }

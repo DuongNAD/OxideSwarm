@@ -17,8 +17,31 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
 const PREFIX: &str = "oxs1-join:";
 
+fn preserve_toolchain_env(cmd: &mut Command) {
+    let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".rustup"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", p);
+    }
+    if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".cargo"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("CARGO_HOME", p);
+    }
+}
+
 fn cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
+    preserve_toolchain_env(&mut cmd);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env_remove("OXIDESWARM_HOME")
@@ -184,7 +207,14 @@ fn test_a_machine_joins_with_one_token_and_the_cluster_passes_the_doctor() {
     let port_file = master_home.path().join("master.port");
     let mut master_cmd = cli(master_home.path());
     master_cmd
-        .args(["master", "--listen", "127.0.0.1:0", "--port-file"])
+        .args([
+            "master",
+            "--listen",
+            "127.0.0.1:0",
+            "--max-host-cpu-pct",
+            "100",
+            "--port-file",
+        ])
         .arg(&port_file);
     let master = Service::spawn(master_cmd, master_home.path().join("master.log"));
     let mut port = None;

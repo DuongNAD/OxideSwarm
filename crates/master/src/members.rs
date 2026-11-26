@@ -561,7 +561,7 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
 #[cfg(windows)]
 fn check_members_file_permissions(path: &Path) -> GridResult<()> {
     use rusty_grid_core::private_file::{
-        current_user_sid, open_acl_or_volume_message, open_grants, read_dacl,
+        current_user_sid, open_acl_or_volume_message_for_aces, open_grants, read_dacl,
     };
     let user_sid = current_user_sid().map_err(|e| {
         GridError::Config(format!(
@@ -578,16 +578,22 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
     let offenders = open_grants(&aces, &user_sid);
     // On a volume without permissions (exFAT, FAT32) the message says so instead of suggesting an
     // `icacls` command that cannot work there (BUG-24, design 0085).
-    if let Some(msg) = open_acl_or_volume_message(path, "members file", &offenders, &user_sid) {
+    if let Some(msg) =
+        open_acl_or_volume_message_for_aces(path, "members file", &aces, &offenders, &user_sid)
+    {
         tracing::warn!("{msg}");
         return Err(GridError::Config(msg));
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if let Ok((dir_aces, _)) = read_dacl(parent) {
             let dir_offenders = open_grants(&dir_aces, &user_sid);
-            if let Some(msg) =
-                open_acl_or_volume_message(parent, "members directory", &dir_offenders, &user_sid)
-            {
+            if let Some(msg) = open_acl_or_volume_message_for_aces(
+                parent,
+                "members directory",
+                &dir_aces,
+                &dir_offenders,
+                &user_sid,
+            ) {
                 tracing::warn!("{msg}");
                 return Err(GridError::Config(msg));
             }
@@ -674,15 +680,19 @@ impl MemberStoreInner {
     }
 }
 
-/// Resolves a target identifier by exact ID or unique hex ID prefix (`>= 4` hex characters).
-/// Never matches by display name so an attacker cannot shadow an ID prefix with a crafted name.
-fn resolve_id_or_prefix<'a, I>(target: &str, ids: I, kind: &str) -> GridResult<String>
+enum IdLookupError {
+    Empty,
+    Ambiguous(usize),
+    NotFound,
+}
+
+fn resolve_id_or_prefix_typed<'a, I>(target: &str, ids: I) -> Result<String, IdLookupError>
 where
     I: IntoIterator<Item = &'a str>,
 {
     let q = target.trim();
     if q.is_empty() {
-        return Err(GridError::Config(format!("{kind} target cannot be empty")));
+        return Err(IdLookupError::Empty);
     }
     let q_clean = q.replace('-', "").to_ascii_lowercase();
     let all: Vec<&'a str> = ids.into_iter().collect();
@@ -704,17 +714,38 @@ where
             return Ok(prefix_matches[0].to_string());
         }
         if prefix_matches.len() > 1 {
-            return Err(GridError::Config(format!(
-                "ambiguous {kind} ID prefix '{q}'; matches {} entries",
-                prefix_matches.len()
-            )));
+            return Err(IdLookupError::Ambiguous(prefix_matches.len()));
         }
     }
-    Err(GridError::Config(format!("no {kind} matching ID '{q}'")))
+    Err(IdLookupError::NotFound)
 }
 
-/// Resolves a target identifier for `members rename` by exact ID, unique hex ID prefix (`>= 4`
-/// hex chars), or finally unique exact `name`.
+/// Resolves a target identifier by exact ID or unique hex ID prefix (`>= 4` hex characters).
+/// Never matches by display name so an attacker cannot shadow an ID prefix with a crafted name.
+fn resolve_id_or_prefix<'a, I>(target: &str, ids: I, kind: &str) -> GridResult<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let q = target.trim();
+    match resolve_id_or_prefix_typed(target, ids) {
+        Ok(id) => Ok(id),
+        Err(IdLookupError::Empty) => {
+            Err(GridError::Config(format!("{kind} target cannot be empty")))
+        }
+        Err(IdLookupError::Ambiguous(count)) => Err(GridError::Config(format!(
+            "ambiguous {kind} ID prefix '{q}'; matches {count} entries"
+        ))),
+        Err(IdLookupError::NotFound) => {
+            Err(GridError::Config(format!("no {kind} matching ID '{q}'")))
+        }
+    }
+}
+
+/// Resolves a target identifier by exact ID, unique hex ID prefix (`>= 4` hex chars), or finally
+/// unique exact `name`. An exact ID always wins. An ID prefix that is also the exact name of a
+/// *different* entry is refused as ambiguous: names are chosen by joiners and may be hex, so
+/// neither reading may silently win (a crafted name cannot redirect an ID, and an admin who
+/// typed a name never revokes the entry whose ID happens to start with it).
 fn resolve_id_prefix_or_name<'a, I>(target: &str, items: I, kind: &str) -> GridResult<String>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -724,8 +755,26 @@ where
         return Err(GridError::Config(format!("{kind} target cannot be empty")));
     }
     let all: Vec<(&'a str, &'a str)> = items.into_iter().collect();
-    if let Ok(id) = resolve_id_or_prefix(q, all.iter().map(|(id, _)| *id), kind) {
-        return Ok(id);
+    match resolve_id_or_prefix_typed(q, all.iter().map(|(id, _)| *id)) {
+        Ok(id) => {
+            let named_other = all.iter().any(|(other, name)| *name == q && *other != id);
+            if id != q && named_other {
+                return Err(GridError::Config(format!(
+                    "ambiguous {kind} target '{q}': it is an ID prefix and the name of another \
+                     entry; specify the full ID instead"
+                )));
+            }
+            return Ok(id);
+        }
+        Err(IdLookupError::Ambiguous(count)) => {
+            return Err(GridError::Config(format!(
+                "ambiguous {kind} ID prefix '{q}'; matches {count} entries"
+            )));
+        }
+        Err(IdLookupError::Empty) => {
+            return Err(GridError::Config(format!("{kind} target cannot be empty")));
+        }
+        Err(IdLookupError::NotFound) => {}
     }
     let name_matches: Vec<&str> = all
         .iter()
@@ -2057,6 +2106,10 @@ impl MemberStore {
     /// Rejects a pending enrollment request by exact ID or unique hex ID prefix (`>= 4` chars)
     /// without consuming an invite use.
     pub fn reject_pending(&self, target: &str) -> GridResult<String> {
+        // Same lock order as `run_admin_mutation`: a reject never lands between an approval's
+        // check and its commit, so a concurrent approve and reject resolve to one success and
+        // one "no pending enrollment".
+        let _write_guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let now = now_unix_secs();
         guard.prune_pending(now);
@@ -2152,15 +2205,19 @@ impl MemberStore {
         )
     }
 
-    /// Revokes an enrolled member by exact ID or unique hex ID prefix (`>= 4` chars), records its
-    /// public key in `revoked_keys`, and releases its owned worker IDs.
-    /// Returns `(revoked_entry, owned_worker_ids)`.
+    /// Revokes an enrolled member by exact ID, unique hex ID prefix (`>= 4` chars), or unique
+    /// exact display name, records its public key in `revoked_keys`, and releases its owned worker
+    /// IDs. Returns `(revoked_entry, owned_worker_ids)`.
     pub fn revoke_member(&self, target: &str) -> GridResult<(MemberEntry, Vec<Uuid>)> {
         self.run_admin_mutation(
             |guard| {
-                let id = resolve_id_or_prefix(
+                let id = resolve_id_prefix_or_name(
                     target,
-                    guard.state.by_pubkey.values().map(|m| m.id.as_str()),
+                    guard
+                        .state
+                        .by_pubkey
+                        .values()
+                        .map(|m| (m.id.as_str(), m.name.as_str())),
                     "member",
                 )?;
                 let pubkey = *guard
@@ -2659,6 +2716,29 @@ impl MemberStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_id_prefix_or_name_refuses_a_prefix_that_is_another_entrys_name() {
+        let a = "beef0123456789abcdef0123456789ab";
+        let b = "cafe0123456789abcdef0123456789ab";
+        let items = [(a, "laptop"), (b, "beef")];
+        // "beef" is a prefix of `a` and the name of `b`: neither reading may win.
+        let err = resolve_id_prefix_or_name("beef", items, "member").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        // The full ID, a prefix that names nobody, and a plain name still resolve.
+        assert_eq!(resolve_id_prefix_or_name(a, items, "member").unwrap(), a);
+        assert_eq!(
+            resolve_id_prefix_or_name("cafe", items, "member").unwrap(),
+            b
+        );
+        assert_eq!(
+            resolve_id_prefix_or_name("laptop", items, "member").unwrap(),
+            a
+        );
+        // A name equal to the prefix of its own ID is not ambiguous.
+        let own = [(a, "beef")];
+        assert_eq!(resolve_id_prefix_or_name("beef", own, "member").unwrap(), a);
+    }
     use rusty_grid_core::noise_auth::{compute_enroll_proof, NodeKeypair};
 
     #[test]
@@ -3175,7 +3255,8 @@ mod tests {
     #[test]
     fn admin_invite_rule_revoked_keys_role_merge_and_id_only_resolution() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let members_dir = dir.path().join("members");
+        let store = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
 
         // Item 6: admin invite requires approval and uses == 1.
         assert!(store
@@ -3278,7 +3359,7 @@ mod tests {
         // Item 7: revoking a member records its public key in `revoked_keys` (persisted across reload)
         // and refuses re-enrollment of that key.
         store.revoke_member(&cand_real.member_id()[..6]).unwrap();
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         let proof2 = compute_enroll_proof(&worker_inv.invite_secret.0, &hash);
         match reloaded
             .handle_enroll_request(
@@ -3354,6 +3435,7 @@ mod tests {
     #[test]
     fn claim_worker_id_evicting_drops_oldest_non_live_claims_and_caps_live_claims_at_64() {
         let dir = tempfile::tempdir().unwrap();
+        let members_dir = dir.path().join("members");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3366,7 +3448,7 @@ mod tests {
             *member_kp.public_key(),
             vec![MemberRole::Worker],
         )])
-        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        .with_save_path(members_dir.join(MEMBERS_FILE_NAME));
         let member_id_owned = member_kp.member_id();
         let member_id = member_id_owned.as_str();
 
@@ -3429,7 +3511,7 @@ mod tests {
             .claim_worker_id_evicting(pre_reload_wid, member_id, |_existing| false)
             .expect("eviction must succeed and flush updated worker_last_seq");
         assert_eq!(evicted_before_reload, vec![history[7]]);
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         let post_reload_wid = Uuid::new_v4();
         let evicted_after_reload = reloaded
             .claim_worker_id_evicting(post_reload_wid, member_id, |_existing| false)
@@ -4114,7 +4196,8 @@ mod tests {
         //    invite's `uses_remaining` is restored to 1 (both in memory and on disk, even if
         //    another invite was created during the confirm window).
         let dir = tempfile::tempdir().unwrap();
-        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let members_dir = dir.path().join("members");
+        let store = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         let existing_kp = NodeKeypair::generate().unwrap();
         let seed_inv = store
             .create_invite(vec![MemberRole::Client], 1, 3600, false)
@@ -4185,7 +4268,7 @@ mod tests {
         );
         assert_eq!(store.unconfirmed_tracking_counts(), (0, 0));
 
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         assert_eq!(
             reloaded.get(existing_kp.public_key()).unwrap().roles,
             vec![MemberRole::Client]
@@ -4253,7 +4336,8 @@ mod tests {
         //    must still be rolled back consistently (member removed, invite use restored, no
         //    leaked tracker op) while returning `Err` so the caller logs it.
         let dir_fail = tempfile::tempdir().unwrap();
-        let store_fail = MemberStore::load_from_dir(Some(dir_fail.path())).unwrap();
+        let members_dir_fail = dir_fail.path().join("members");
+        let store_fail = MemberStore::load_from_dir(Some(&members_dir_fail)).unwrap();
         let inv_fail = store_fail
             .create_invite(vec![MemberRole::Worker], 1, 3600, true)
             .unwrap();
@@ -4283,7 +4367,8 @@ mod tests {
         // 4. NIT 4: Concurrent worker claim bookkeeping bursts alongside admin mutations persist
         //    every claim and coalesce bursts without losing updates.
         let dir_burst = tempfile::tempdir().unwrap();
-        let store_burst = MemberStore::load_from_dir(Some(dir_burst.path()))
+        let members_dir_burst = dir_burst.path().join("members");
+        let store_burst = MemberStore::load_from_dir(Some(&members_dir_burst))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let burst_kp = NodeKeypair::generate().unwrap();
@@ -4335,7 +4420,7 @@ mod tests {
         }
         admin_handle.join().unwrap();
 
-        let reloaded_burst = MemberStore::load_from_dir(Some(dir_burst.path())).unwrap();
+        let reloaded_burst = MemberStore::load_from_dir(Some(&members_dir_burst)).unwrap();
         assert_eq!(
             reloaded_burst.get(burst_kp.public_key()).unwrap().name,
             "burst-worker-renamed"
@@ -4377,7 +4462,7 @@ mod tests {
             1,
             "8 concurrent worker claims queued behind write_lock must coalesce into 1 disk write"
         );
-        let reloaded_after_coalesce = MemberStore::load_from_dir(Some(dir_burst.path())).unwrap();
+        let reloaded_after_coalesce = MemberStore::load_from_dir(Some(&members_dir_burst)).unwrap();
         let owned_after_coalesce = reloaded_after_coalesce.workers_owned_by(&burst_mid);
         assert_eq!(owned_after_coalesce.len(), wids.len() + coalesce_wids.len());
         for wid in &coalesce_wids {
@@ -4427,7 +4512,8 @@ mod tests {
         //    a regular file) and restores both v3 and v2 claims in memory unless concurrently
         //    reclaimed.
         let dir_m1 = tempfile::tempdir().unwrap();
-        let store_m1 = MemberStore::load_from_dir(Some(dir_m1.path()))
+        let members_dir_m1 = dir_m1.path().join("members");
+        let store_m1 = MemberStore::load_from_dir(Some(&members_dir_m1))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let v3_kp = NodeKeypair::generate().unwrap();
@@ -4512,7 +4598,8 @@ mod tests {
         //    retry (`flush_dirty` or a reconnect bookkeeping flush) writes the rollback to disk so
         //    the declined member cannot come back after a restart and the 1-use invite stays valid.
         let dir_s1 = tempfile::tempdir().unwrap();
-        let store_s1 = MemberStore::load_from_dir(Some(dir_s1.path()))
+        let members_dir_s1 = dir_s1.path().join("members");
+        let store_s1 = MemberStore::load_from_dir(Some(&members_dir_s1))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let inv_s1 = store_s1
@@ -4535,15 +4622,15 @@ mod tests {
         assert!(!store_s1.contains(cand_s1.public_key()));
         assert!(store_s1.is_dirty());
         // Before retry, disk still holds the pre-rollback approved member.
-        assert!(MemberStore::load_from_dir(Some(dir_s1.path()))
+        assert!(MemberStore::load_from_dir(Some(&members_dir_s1))
             .unwrap()
             .contains(cand_s1.public_key()));
 
         // Restore valid save path and retry via `flush_dirty()`.
-        store_s1.set_save_path(Some(dir_s1.path().join(MEMBERS_FILE_NAME)));
+        store_s1.set_save_path(Some(members_dir_s1.join(MEMBERS_FILE_NAME)));
         store_s1.flush_dirty().unwrap();
         assert!(!store_s1.is_dirty());
-        let reloaded_s1 = MemberStore::load_from_dir(Some(dir_s1.path())).unwrap();
+        let reloaded_s1 = MemberStore::load_from_dir(Some(&members_dir_s1)).unwrap();
         assert!(
             !reloaded_s1.contains(cand_s1.public_key()),
             "S1: retried rollback write must remove unconfirmed member on disk"
@@ -4592,13 +4679,13 @@ mod tests {
         store_s1.set_save_path(Some(blocker_s1.join(MEMBERS_FILE_NAME)));
         assert!(store_s1.rollback_approved_enrollment(rb_s1b).is_err());
         assert!(store_s1.is_dirty());
-        store_s1.set_save_path(Some(dir_s1.path().join(MEMBERS_FILE_NAME)));
+        store_s1.set_save_path(Some(members_dir_s1.join(MEMBERS_FILE_NAME)));
         // Reconnect of already-owned `existing_wid` flushes because `dirty == true`.
         store_s1
             .claim_worker_id(existing_wid, &existing_worker_kp.member_id())
             .unwrap();
         assert!(!store_s1.is_dirty());
-        let reloaded_s1b = MemberStore::load_from_dir(Some(dir_s1.path())).unwrap();
+        let reloaded_s1b = MemberStore::load_from_dir(Some(&members_dir_s1)).unwrap();
         assert!(!reloaded_s1b.contains(cand_s1b.public_key()));
         assert_eq!(reloaded_s1b.list_invites()[0].uses_remaining, 1);
 
@@ -4607,7 +4694,8 @@ mod tests {
         //    `dirty` must be set and honoured by a later flush so disk drops the staged member and
         //    restores the invite use.
         let dir_nit2 = tempfile::tempdir().unwrap();
-        let store_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path()))
+        let members_dir_nit2 = dir_nit2.path().join("members");
+        let store_nit2 = MemberStore::load_from_dir(Some(&members_dir_nit2))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let inv_nit2 = store_nit2
@@ -4658,15 +4746,15 @@ mod tests {
             "NIT 2: failed resync_write after staged_write + disconnect must mark store dirty"
         );
         // Confirm `staged_write` really landed on disk and `resync_write` really failed.
-        assert!(MemberStore::load_from_dir(Some(dir_nit2.path()))
+        assert!(MemberStore::load_from_dir(Some(&members_dir_nit2))
             .unwrap()
             .contains(cand_nit2.public_key()));
 
         // Restore valid save path and flush dirty state -> disk matches memory again.
-        store_nit2.set_save_path(Some(dir_nit2.path().join(MEMBERS_FILE_NAME)));
+        store_nit2.set_save_path(Some(members_dir_nit2.join(MEMBERS_FILE_NAME)));
         store_nit2.flush_dirty().unwrap();
         assert!(!store_nit2.is_dirty());
-        let reloaded_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path())).unwrap();
+        let reloaded_nit2 = MemberStore::load_from_dir(Some(&members_dir_nit2)).unwrap();
         assert!(!reloaded_nit2.contains(cand_nit2.public_key()));
         assert_eq!(reloaded_nit2.list_invites()[0].uses_remaining, 1);
     }
@@ -4787,13 +4875,14 @@ mod non_member_claim_tests {
     #[test]
     fn revoke_prunes_claims_of_earlier_removed_members() {
         let dir = tempfile::tempdir().unwrap();
+        let members_dir = dir.path().join("members");
         let kept = NodeKeypair::generate().unwrap();
         let revoked = NodeKeypair::generate().unwrap();
         let store = MemberStore::from_entries(vec![
             MemberEntry::new("kept", *kept.public_key(), vec![MemberRole::Worker]),
             MemberEntry::new("revoked", *revoked.public_key(), vec![MemberRole::Worker]),
         ])
-        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        .with_save_path(members_dir.join(MEMBERS_FILE_NAME));
         let kept_wid = Uuid::new_v4();
         let revoked_wid = Uuid::new_v4();
         let orphan_wid = Uuid::new_v4();
@@ -4814,12 +4903,12 @@ mod non_member_claim_tests {
         assert!(store.workers_owned_by(NON_MEMBER).is_empty());
         assert_eq!(store.workers_owned_by(&kept.member_id()), vec![kept_wid]);
 
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         assert_eq!(reloaded.workers_owned_by(&kept.member_id()), vec![kept_wid]);
         assert!(reloaded.workers_owned_by(&revoked.member_id()).is_empty());
         assert!(reloaded.workers_owned_by(NON_MEMBER).is_empty());
         let on_disk: MembersFile = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(MEMBERS_FILE_NAME)).unwrap(),
+            &std::fs::read_to_string(members_dir.join(MEMBERS_FILE_NAME)).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -4857,5 +4946,101 @@ mod non_member_claim_tests {
             vec![member_wid]
         );
         assert!(!on_disk.worker_last_seq.contains_key(&orphan_wid));
+    }
+
+    fn deterministic_keys_with_same_4hex_prefix() -> (String, PublicKey, PublicKey, PublicKey) {
+        let mut seen: std::collections::HashMap<String, PublicKey> =
+            std::collections::HashMap::new();
+        let mut pair: Option<(String, PublicKey, PublicKey)> = None;
+        for i in 0u32..200_000 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let pk = PublicKey::from_bytes(bytes);
+            let prefix = pk.member_id()[..4].to_string();
+            if let Some(first) = seen.get(&prefix) {
+                match pair {
+                    None => pair = Some((prefix, *first, pk)),
+                    Some((shared_prefix, pk_a, pk_b)) if shared_prefix != prefix => {
+                        return (shared_prefix, pk_a, pk_b, pk);
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                seen.insert(prefix, pk);
+            }
+        }
+        panic!("failed to find deterministic keys sharing a 4-hex member ID prefix");
+    }
+
+    #[test]
+    fn ambiguous_hex_prefix_rejects_name_shadowing_on_rename_and_revoke() {
+        let (shared_prefix, pk_a, pk_b, pk_shadower) = deterministic_keys_with_same_4hex_prefix();
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemberStore::from_entries(vec![
+            MemberEntry::new("honest-a", pk_a, vec![MemberRole::Worker]),
+            MemberEntry::new("honest-b", pk_b, vec![MemberRole::Worker]),
+            MemberEntry::new(&shared_prefix, pk_shadower, vec![MemberRole::Worker]),
+        ])
+        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+
+        let err_rename = store.rename_member(&shared_prefix, "hijacked").unwrap_err();
+        assert!(
+            matches!(&err_rename, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error on rename, got {err_rename:?}"
+        );
+
+        let err_revoke = store.revoke_member(&shared_prefix).unwrap_err();
+        assert!(
+            matches!(&err_revoke, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error on revoke, got {err_revoke:?}"
+        );
+
+        // No member was modified or revoked.
+        let members = store.list_members();
+        assert_eq!(members.len(), 3);
+        assert_eq!(
+            members
+                .iter()
+                .find(|m| m.public_key == pk_shadower)
+                .unwrap()
+                .name,
+            shared_prefix
+        );
+
+        // Also test without any member named `shared_prefix`: still ambiguous, never "no member".
+        store.revoke_member(&pk_shadower.member_id()).unwrap();
+        let err_rename_unmatched = store
+            .rename_member(&shared_prefix, "still-blocked")
+            .unwrap_err();
+        assert!(
+            matches!(&err_rename_unmatched, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error without matching name on rename, got {err_rename_unmatched:?}"
+        );
+        let err_revoke_unmatched = store.revoke_member(&shared_prefix).unwrap_err();
+        assert!(
+            matches!(&err_revoke_unmatched, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous ID prefix error without matching name on revoke, got {err_revoke_unmatched:?}"
+        );
+        assert_eq!(store.list_members().len(), 2);
+
+        // A unique 4-hex prefix that is also another member's name is refused too: neither the
+        // ID reading nor the name reading may win silently. The full ID still works.
+        let unique_prefix = pk_a.member_id()[..4].to_string();
+        let uniq_store = MemberStore::from_entries(vec![
+            MemberEntry::new("target-by-id", pk_a, vec![MemberRole::Worker]),
+            MemberEntry::new(&unique_prefix, pk_shadower, vec![MemberRole::Worker]),
+        ]);
+        let err = uniq_store
+            .rename_member(&unique_prefix, "id-won")
+            .unwrap_err();
+        assert!(
+            matches!(&err, GridError::Config(msg) if msg.contains("ambiguous")),
+            "expected ambiguous target error, got {err:?}"
+        );
+        let renamed = uniq_store
+            .rename_member(&pk_a.member_id(), "id-won")
+            .unwrap();
+        assert_eq!(renamed.id, pk_a.member_id());
+        assert_eq!(renamed.name, "id-won");
     }
 }

@@ -5,7 +5,11 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_core::process_spawn;
+
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use tokio::sync::watch;
 
@@ -43,7 +47,15 @@ async fn spawn_test_cluster() -> (
         .expect("server config")
         .with_discovery_port(0)
         .with_blob_store(blob_dir, 64 * 1024 * 1024);
-    let master = MasterServer::spawn(server_cfg).await.expect("spawn master");
+    let master = MasterServer::spawn_with_config(
+        server_cfg,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master");
     let master_addr = master.server_addr().to_string();
 
     let worker_cfg = WorkerConfig::new(&master_addr)
@@ -73,18 +85,16 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
     let home = temp.path();
 
     // 1. Human `submit --wait` prints the two D5 summary lines immediately after Execution Time.
-    let ok_out = cli_cmd(home)
-        .args([
-            "submit",
-            "--master",
-            &master_addr,
-            "--wait",
-            "--",
-            "echo",
-            "adopt2-ok",
-        ])
-        .output()
-        .expect("run submit --wait");
+    let ok_out = process_spawn::output_std(cli_cmd(home).args([
+        "submit",
+        "--master",
+        &master_addr,
+        "--wait",
+        "--",
+        "echo",
+        "adopt2-ok",
+    ]))
+    .expect("run submit --wait");
     assert!(
         ok_out.status.success(),
         "submit --wait failed: {}",
@@ -139,19 +149,17 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
     );
 
     // 2. Failed waited run reports `0 finished, 1 failed, on 1 machines`.
-    let fail_out = cli_cmd(home)
-        .args([
-            "submit",
-            "--master",
-            &master_addr,
-            "--type",
-            "shell",
-            "--command",
-            "exit 3",
-            "--wait",
-        ])
-        .output()
-        .expect("run failed submit --wait");
+    let fail_out = process_spawn::output_std(cli_cmd(home).args([
+        "submit",
+        "--master",
+        &master_addr,
+        "--type",
+        "shell",
+        "--command",
+        "exit 3",
+        "--wait",
+    ]))
+    .expect("run failed submit --wait");
     assert_eq!(fail_out.status.code(), Some(3));
     let fail_stdout = String::from_utf8_lossy(&fail_out.stdout);
     assert!(
@@ -164,19 +172,17 @@ async fn test_submit_wait_prints_summary_lines_and_json_fields() {
     );
 
     // 3. `submit --wait --json` carries waited_ms, task_time_sum_ms, and machines.
-    let json_out = cli_cmd(home)
-        .args([
-            "submit",
-            "--master",
-            &master_addr,
-            "--wait",
-            "--json",
-            "--",
-            "echo",
-            "adopt2-json-ok",
-        ])
-        .output()
-        .expect("run submit --wait --json");
+    let json_out = process_spawn::output_std(cli_cmd(home).args([
+        "submit",
+        "--master",
+        &master_addr,
+        "--wait",
+        "--json",
+        "--",
+        "echo",
+        "adopt2-json-ok",
+    ]))
+    .expect("run submit --wait --json");
     assert!(
         json_out.status.success(),
         "submit --wait --json failed: {}",

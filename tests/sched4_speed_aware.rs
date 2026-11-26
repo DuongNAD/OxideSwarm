@@ -60,10 +60,13 @@ impl TwoSpeedCluster {
     async fn spawn(sched_config: SchedulerConfig, include_slow: bool) -> Self {
         let sandbox_dir = TempDir::new().expect("tempdir for worker sandboxes");
         let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
-        let master =
-            MasterServer::spawn_with_config(server_cfg, sched_config, ReaperConfig::default())
-                .await
-                .expect("MasterServer::spawn_with_config failed");
+        let master = MasterServer::spawn_with_config(
+            server_cfg,
+            sched_config.without_host_cpu_backpressure(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("MasterServer::spawn_with_config failed");
         let master_addr = master.server_addr().to_string();
 
         let fast_cfg = WorkerConfig::new(master_addr.clone())
@@ -283,7 +286,7 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
     let server_cfg = ServerConfig::new("127.0.0.1:0".parse().unwrap());
     let master = MasterServer::spawn_with_config(
         server_cfg,
-        SchedulerConfig::default(),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
         ReaperConfig::default(),
     )
     .await
@@ -398,4 +401,470 @@ async fn sched4_near_equal_workers_spread_after_warmup() {
         count_a >= 2 && count_b >= 2,
         "near-equal workers must spread work instead of packing onto one (a={count_a}, b={count_b})"
     );
+}
+
+#[tokio::test]
+async fn sched4c_repeatable_straggler_rescued_non_repeatable_control_and_sibling_fail_tolerated() {
+    use rusty_grid_core::capabilities::WorkerCapabilities;
+    use rusty_grid_core::placement::{tag_value, OPT_REPEATABLE_TAG, SPEED_TAG_PREFIX};
+    use rusty_grid_core::protocol::{
+        MasterMessage, MessageTransport, ProtocolCapabilities, WorkerMessage,
+        PROTOCOL_VERSION_CURRENT,
+    };
+    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+
+    async fn connect_mock(
+        addr: std::net::SocketAddr,
+        caps: WorkerCapabilities,
+    ) -> (
+        Uuid,
+        mpsc::Sender<WorkerMessage>,
+        mpsc::Receiver<MasterMessage>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let wid = Uuid::new_v4();
+        let (tx_up, mut rx_up) = mpsc::channel::<WorkerMessage>(32);
+        let (tx_down, rx_down) = mpsc::channel::<MasterMessage>(32);
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut transport = MessageTransport::new(stream);
+        transport
+            .send_msg(&WorkerMessage::Register {
+                worker_id: wid,
+                capabilities: caps,
+                protocol_version: PROTOCOL_VERSION_CURRENT,
+                features: ProtocolCapabilities::all_supported(),
+            })
+            .await
+            .unwrap();
+        let ack: Option<MasterMessage> = transport.recv_msg().await.unwrap();
+        assert!(matches!(
+            ack,
+            Some(MasterMessage::RegisterAck { accepted: true, .. })
+        ));
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = transport.recv_msg::<MasterMessage>() => {
+                        match msg {
+                            Ok(Some(m)) => {
+                                if tx_down.send(m).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    up = rx_up.recv() => {
+                        match up {
+                            Some(m) => {
+                                if transport.send_msg(&m).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+        (wid, tx_up, rx_down, handle)
+    }
+
+    let reaper_cfg = ReaperConfig::default()
+        .with_scan_interval(Duration::from_millis(80))
+        .with_straggler_min_elapsed(Duration::from_millis(400))
+        .with_straggler_multiplier(3.0);
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
+        reaper_cfg,
+    )
+    .await
+    .unwrap();
+    let addr = master.server_addr();
+
+    let (fast_id, fast_tx, mut fast_rx, fast_h) = connect_mock(
+        addr,
+        WorkerCapabilities::new("w-fast", 1, 8192, false, false, None)
+            .with_tags(vec!["tier-fast".into()]),
+    )
+    .await;
+    let (slow_id, slow_tx, mut slow_rx, slow_h) = connect_mock(
+        addr,
+        WorkerCapabilities::new("w-slow", 1, 8192, false, false, None)
+            .with_tags(vec!["tier-slow".into()]),
+    )
+    .await;
+    assert!(
+        wait_for(
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            || async {
+                master.list_workers().await.is_ok_and(|ws| {
+                    ws.iter()
+                        .filter(|w| w.status == WorkerStatus::Connected)
+                        .count()
+                        == 2
+                })
+            }
+        )
+        .await
+    );
+
+    let spec = TaskSpec::command("work", vec!["job".into()]);
+
+    // Prime SpeedBook with 2 fast samples on w-fast (50 ms) and 2 slower samples on w-slow (150 ms).
+    for _ in 0..2 {
+        for (wid, tx, rx, tag, dur_ms) in [
+            (
+                fast_id,
+                &fast_tx,
+                &mut fast_rx,
+                "require:tag=tier-fast",
+                50u64,
+            ),
+            (
+                slow_id,
+                &slow_tx,
+                &mut slow_rx,
+                "require:tag=tier-slow",
+                150u64,
+            ),
+        ] {
+            let tid = master
+                .submit_task(
+                    Task::new(spec.clone(), TaskRequirements::generic(1, 30))
+                        .with_tags(vec![tag.into()]),
+                )
+                .await
+                .unwrap();
+            let assigned = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(MasterMessage::AssignTask { task }) = rx.recv().await {
+                        if task.id == tid {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await;
+            assert!(assigned.is_ok());
+            tx.send(WorkerMessage::from(TaskResult::success(
+                wid, tid, "ok", dur_ms, false,
+            )))
+            .await
+            .unwrap();
+            let res = master
+                .wait_task(tid, Some(Duration::from_secs(10)))
+                .await
+                .unwrap();
+            assert!(res.is_success());
+        }
+    }
+
+    // SCHED-4d check: list_workers exposes speed:1.0 on w-fast and speed:3.0 on w-slow.
+    let listed = master.list_workers().await.unwrap();
+    let fast_listed = listed.iter().find(|w| w.worker_id == fast_id).unwrap();
+    let slow_listed = listed.iter().find(|w| w.worker_id == slow_id).unwrap();
+    assert_eq!(
+        tag_value(&fast_listed.capabilities.tags, SPEED_TAG_PREFIX),
+        Some("1.0")
+    );
+    assert_eq!(
+        tag_value(&slow_listed.capabilities.tags, SPEED_TAG_PREFIX),
+        Some("3.0")
+    );
+
+    // Occupy w-fast with a short blocker so the repeatable task lands on w-slow first.
+    let blocker_id = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("block", vec![]),
+                TaskRequirements::generic(1, 30),
+            )
+            .with_tags(vec!["require:tag=tier-fast".into()]),
+        )
+        .await
+        .unwrap();
+    let got_blocker = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = fast_rx.recv().await {
+                if task.id == blocker_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(got_blocker.is_ok());
+    fast_tx
+        .send(WorkerMessage::TaskProgress {
+            worker_id: fast_id,
+            task_id: blocker_id,
+            status: rusty_grid_core::task::TaskStatus::Running,
+        })
+        .await
+        .unwrap();
+
+    // Submit repeatable task -> lands on w-slow and marks Running.
+    let rep_id = master
+        .submit_task(
+            Task::new(spec.clone(), TaskRequirements::generic(1, 30))
+                .with_tags(vec![OPT_REPEATABLE_TAG.into()]),
+        )
+        .await
+        .unwrap();
+    let got_rep_on_slow = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = slow_rx.recv().await {
+                if task.id == rep_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(got_rep_on_slow.is_ok());
+    slow_tx
+        .send(WorkerMessage::TaskProgress {
+            worker_id: slow_id,
+            task_id: rep_id,
+            status: rusty_grid_core::task::TaskStatus::Running,
+        })
+        .await
+        .unwrap();
+
+    // Wait 550ms (> 400ms floor and > 3 * 50ms), then free w-fast.
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    fast_tx
+        .send(WorkerMessage::from(TaskResult::success(
+            fast_id, blocker_id, "done", 600, false,
+        )))
+        .await
+        .unwrap();
+    master
+        .wait_task(blocker_id, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+
+    // Reaper straggler pass dispatches speculative copy of rep_id onto w-fast.
+    let got_spec_on_fast = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = fast_rx.recv().await {
+                if task.id == rep_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        got_spec_on_fast.is_ok(),
+        "w-fast must receive speculative copy"
+    );
+
+    // Slow primary fails AFTER speculative copy is running -> task does NOT fail!
+    slow_tx
+        .send(WorkerMessage::from(TaskResult::failure(
+            slow_id,
+            rep_id,
+            2,
+            "",
+            "slow failed",
+            700,
+            None,
+        )))
+        .await
+        .unwrap();
+
+    // Fast sibling completes cleanly -> task succeeds on w-fast.
+    fast_tx
+        .send(WorkerMessage::from(TaskResult::success(
+            fast_id, rep_id, "rescued", 45, false,
+        )))
+        .await
+        .unwrap();
+    let rep_res = master
+        .wait_task(rep_id, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert!(rep_res.is_success());
+    assert_eq!(rep_res.worker_id, fast_id);
+    assert_eq!(rep_res.stdout_str(), "rescued");
+
+    // Now test sibling cancellation when w-fast wins while w-slow is still running:
+    let b2_id = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("block2", vec![]),
+                TaskRequirements::generic(1, 30),
+            )
+            .with_tags(vec!["require:tag=tier-fast".into()]),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = fast_rx.recv().await {
+                if task.id == b2_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let rep3_id = master
+        .submit_task(
+            Task::new(spec.clone(), TaskRequirements::generic(1, 30))
+                .with_tags(vec![OPT_REPEATABLE_TAG.into()]),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = slow_rx.recv().await {
+                if task.id == rep3_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    slow_tx
+        .send(WorkerMessage::TaskProgress {
+            worker_id: slow_id,
+            task_id: rep3_id,
+            status: rusty_grid_core::task::TaskStatus::Running,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    fast_tx
+        .send(WorkerMessage::from(TaskResult::success(
+            fast_id, b2_id, "ok", 600, false,
+        )))
+        .await
+        .unwrap();
+    master
+        .wait_task(b2_id, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = fast_rx.recv().await {
+                if task.id == rep3_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    fast_tx
+        .send(WorkerMessage::from(TaskResult::success(
+            fast_id, rep3_id, "win3", 40, false,
+        )))
+        .await
+        .unwrap();
+    let rep3_res = master
+        .wait_task(rep3_id, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert_eq!(rep3_res.worker_id, fast_id);
+
+    // Slow sibling must receive CancelTask with "no longer assigned to this worker".
+    let cancelled_on_slow = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::CancelTask { task_id, reason }) = slow_rx.recv().await {
+                if task_id == rep3_id {
+                    break reason;
+                }
+            }
+        }
+    })
+    .await
+    .expect("w-slow must receive CancelTask when fast sibling completes");
+    assert!(cancelled_on_slow
+        .as_deref()
+        .is_some_and(|r| r.contains("no longer assigned to this worker")));
+
+    // Non-repeatable control: never duplicated onto w-fast even past 400ms.
+    let b3_id = master
+        .submit_task(
+            Task::new(
+                TaskSpec::command("block3", vec![]),
+                TaskRequirements::generic(1, 30),
+            )
+            .with_tags(vec!["require:tag=tier-fast".into()]),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = fast_rx.recv().await {
+                if task.id == b3_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let ctrl_id = master
+        .submit_task(Task::new(spec, TaskRequirements::generic(1, 30)))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(MasterMessage::AssignTask { task }) = slow_rx.recv().await {
+                if task.id == ctrl_id {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    slow_tx
+        .send(WorkerMessage::TaskProgress {
+            worker_id: slow_id,
+            task_id: ctrl_id,
+            status: rusty_grid_core::task::TaskStatus::Running,
+        })
+        .await
+        .unwrap();
+    fast_tx
+        .send(WorkerMessage::from(TaskResult::success(
+            fast_id, b3_id, "ok", 100, false,
+        )))
+        .await
+        .unwrap();
+    master
+        .wait_task(b3_id, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    assert!(
+        fast_rx.try_recv().is_err(),
+        "non-repeatable control task must never be duplicated onto idle fast worker"
+    );
+    slow_tx
+        .send(WorkerMessage::from(TaskResult::success(
+            slow_id, ctrl_id, "ctrl", 700, false,
+        )))
+        .await
+        .unwrap();
+    let ctrl_res = master
+        .wait_task(ctrl_id, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert_eq!(ctrl_res.worker_id, slow_id);
+
+    fast_h.abort();
+    slow_h.abort();
+    let _ = master.shutdown();
 }

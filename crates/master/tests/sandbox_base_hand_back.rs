@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
-use rusty_grid_master::server::{MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 struct TestWorker {
@@ -55,9 +57,15 @@ async fn tasks_refused_for_a_broken_sandbox_base_complete_on_the_other_worker() 
     let good_base = dir.path().join("good");
     let bad_base = dir.path().join("bad");
 
-    let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("spawn master");
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master");
     let addr = master.server_addr().to_string();
     let good = spawn_worker(&addr, "good", &good_base);
     let bad = spawn_worker(&addr, "bad", &bad_base);

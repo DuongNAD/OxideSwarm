@@ -1,0 +1,402 @@
+{
+  "benchmark": "TEST-25 soak endurance suite",
+  "date_utc": "2026-11-24T07:49:50Z",
+  "stopped_utc": "2026-11-25T01:38:43Z",
+  "git": {
+    "commit": "d8cf052ee0aa30fcef4ae99ac3ab25f709802eb8",
+    "branch": "win/test-25-remote-workers (PR #395)",
+    "dirty_tree": false
+  },
+  "binary": {
+    "version": "rusty-grid 0.4.4",
+    "build_profile": "release"
+  },
+  "hardware": {
+    "cpu_model": "Apple M5",
+    "cores": 10,
+    "ram_bytes": 34359738368
+  },
+  "os": {
+    "system": "Darwin",
+    "product_version": "macOS 27.2.1",
+    "build_version": "26B131",
+    "machine": "arm64"
+  },
+  "power": "AC mains (caffeinate -dimsu active; SleepDisabled=0, AC sleep=0)",
+  "python": "3.11.8",
+  "link": "lan-tcp",
+  "remote_workers": [
+    {
+      "name": "win-case",
+      "os": "Windows 11 Pro x86_64",
+      "cores_physical": 14,
+      "cores_logical": 20,
+      "ram_mib": 48941,
+      "binary_version": "rusty-grid 0.4.4",
+      "build_profile": "release",
+      "slots": 2,
+      "blob_cache_mb": 2048,
+      "workspaces": true,
+      "registered_utc": "2026-11-24T07:49:54Z",
+      "stopped_utc": "2026-11-25T01:38:43Z",
+      "stop_reason": "windows_antigravity_host_restart_not_product_fault",
+      "worker_log_files": 28,
+      "worker_log_errors": 0,
+      "worker_panics": 0,
+      "results_logged": {
+        "0": 38951,
+        "130": 839,
+        "total": 39790
+      }
+    },
+    {
+      "name": "win-dell",
+      "os": "Windows 11 AMD64 (13th Gen Intel Core i7-1355U)",
+      "cores_physical": 10,
+      "cores_logical": 12,
+      "ram_mib": 16068,
+      "binary_version": "rusty-grid 0.4.4",
+      "build_profile": "release",
+      "slots": 2,
+      "blob_cache_mb": 2048,
+      "workspaces": true,
+      "registered_utc": "2026-11-24T07:50:00Z",
+      "stopped_utc": "2026-11-24T21:30:33Z",
+      "stop_reason": "planned_owner_leave",
+      "worker_log_files": 21,
+      "worker_log_errors": 0,
+      "worker_panics": 0,
+      "results_logged": {
+        "0": 9339,
+        "130": 226,
+        "total": 9565
+      }
+    }
+  ],
+  "parameters": {
+    "master_only": true,
+    "expect_workers": [
+      "win-case",
+      "win-dell"
+    ],
+    "seed": 20261124,
+    "duration": "24h",
+    "duration_s": 86400.0,
+    "fault_scale": 1.0,
+    "load_scale": 1.0,
+    "sample_interval_s": 60.0,
+    "workers": 2,
+    "slots": 2,
+    "workspaces": true,
+    "max_queue_size": 64,
+    "blob_store_mb": 4096,
+    "blob_cache_mb": 2048
+  },
+  "early_stop": {
+    "stopped_early": true,
+    "reason": "win_case_host_restart_then_owner_ended",
+    "measured_start_utc": "2026-11-24T07:49:50Z",
+    "measured_end_utc": "2026-11-25T01:38:43Z",
+    "actual_duration_s": 64133.0,
+    "actual_duration_hours": 17.81,
+    "target_duration_s": 86400.0,
+    "zero_worker_tail_excluded_utc": [
+      "2026-11-25T01:38:43Z",
+      "2026-11-25T03:07:21Z"
+    ],
+    "harness_exited_utc": "2026-11-25T03:09:06Z",
+    "note": "Master started at 2026-11-24T07:48:45Z; both remote workers registered by 07:50:00Z and first task results landed at 07:50:05Z. win-dell stopped cleanly on schedule at 21:30:33Z (13h 40m). win-case stopped at 2026-11-25T01:38:43Z (17h 48m) when the Windows Antigravity host server restarted (Windows OS did not reboot; not an OxideSwarm fault), leaving 0 workers connected. Owner ended S7 (SIGINT to harness at 03:05:43Z, SIGTERM to master at 03:07:21Z, harness exited at 03:09:06Z with KeyboardInterrupt / aborted_base=True, emitting no s7_24h_record.json). The 0-worker tail (01:38:43Z-03:07:21Z, master-9.log with 0 results and 0 ERRORs) is excluded from the measured run."
+  },
+  "verification_note": "Assembled from preserved master-0..8.log (active 17h48m window), win-case (28 worker logs) and win-dell (21 worker logs) peer records, pre-restart live CLI status and GET /api/tasks snapshot at 2026-11-25T01:48:24Z, periodic Mac/Windows resource observations, and post-shutdown master store/journal inspection. Client-side TaskLedger SHA-256 verification, continuous 60 s BackgroundSampler means, probe_samples p99, fault_events_log, and remote worker idle disk snapshots were in driver memory or unreachable after host stop and are marked not_evaluated_due_to_early_stop.",
+  "note": "3-machine Stage C S7 LAN TCP soak (Mac M5 master + Windows case PC win-case + Windows Dell laptop win-dell). Zero CPU busy loops and zero full workspace builds ran during S7 on the Windows workers.",
+  "all_passed": false,
+  "soak": {
+    "passed": false,
+    "actual_duration_s": 64133.0,
+    "actual_duration_hours": 17.81,
+    "pass_checks": {
+      "1_accounting": {
+        "passed": null,
+        "status": "partial_early_stop_zero_errors",
+        "client_ledger_status": "not_evaluated_due_to_early_stop",
+        "client_sha256_verification": "not_evaluated_due_to_early_stop",
+        "master_evidence_present": true,
+        "master_generations_measured": 9,
+        "worker_log_files": {
+          "win-case": 28,
+          "win-dell": 21,
+          "total": 49
+        },
+        "master_first_ts": "2026-11-24T07:48:45.451834Z",
+        "master_last_result_ts": "2026-11-25T01:38:27.247263Z",
+        "master_result_messages_logged": 49355,
+        "master_unique_result_tasks": 49355,
+        "master_duplicate_executions": 0,
+        "master_exit_codes_logged": {
+          "0": 48290,
+          "130": 1065
+        },
+        "watchdog_timeouts_124": 0,
+        "master_failover_sweeps": 123,
+        "master_failover_sweeps_by_worker": {
+          "win-case": 76,
+          "win-dell": 47
+        },
+        "master_reaper_failovers": 0,
+        "master_superseded_failovers": 0,
+        "master_orphan_requeue_events": 74,
+        "master_orphan_requeued_tasks": 134,
+        "master_queue_record_errors": 0,
+        "master_log_errors": 0,
+        "master_panics": 0,
+        "worker_log_errors": 0,
+        "worker_panics": 0,
+        "stale_late_results_measured": false,
+        "stale_late_results_note": "Ignored stale/late results are logged at DEBUG level in crates/master/src and are not measured under default INFO logging.",
+        "pre_restart_snapshot_014824Z": {
+          "total_tasks": 10029,
+          "completed_tasks": 9783,
+          "cancelled_tasks": 217,
+          "queued_post_disconnect": 29,
+          "running_tasks": 0,
+          "retries_sum": 6,
+          "failovers_sum": 6,
+          "evacuations_sum": 0
+        },
+        "inter_log_gaps_note": "All 20 inter-log timestamp gaps > 15 s in master-0..8.log coincide with initial worker registration (68.99 s), planned 2-hour master restarts (22.4-35.3 s), or scheduled 30 s link_cut / 60 s worker_kill fault windows after win-dell departed at 21:30:33Z (max 60.09 s), with 0 exit_code=124 watchdog timeouts."
+      },
+      "2_resource_plateau": {
+        "passed": null,
+        "status": "not_evaluated_due_to_early_stop",
+        "reason": "Continuous 60 s BackgroundSampler time series were kept only in harness memory and lost on KeyboardInterrupt.",
+        "observational_series": {
+          "mac_master": [
+            {
+              "timestamp_utc": "2026-11-24T13:54:49Z",
+              "elapsed": "+6h05m",
+              "soak_workdir_gib": 4.1
+            },
+            {
+              "timestamp_utc": "2026-11-24T22:01:49Z",
+              "elapsed": "+14h12m",
+              "soak_workdir_gib": 4.2
+            },
+            {
+              "timestamp_utc": "2026-11-25T01:48:24Z",
+              "elapsed": "+17h58m (pre_restart_snapshot, master gen 8)",
+              "master_rss_kib": 54800,
+              "master_rss_mib": 53.52,
+              "master_lsof_lines": 35,
+              "master_cpu_s": 192.07,
+              "driver_rss_kib": 116608,
+              "driver_rss_mib": 113.87,
+              "master_blobs_bytes": 4249880320
+            }
+          ],
+          "win_dell_hourly": [
+            {
+              "check": "H0-att2",
+              "timestamp_utc": "2026-11-24T07:50:19Z",
+              "elapsed": "0h00m",
+              "free_ram_gib": 4.04,
+              "disk_c_free_gb": 57.44
+            },
+            {
+              "check": "H1",
+              "timestamp_utc": "2026-11-24T08:50:51Z",
+              "elapsed": "1h00m",
+              "oxideswarm_rss_mb": 22.0,
+              "python_rss_mb": 47.9,
+              "free_ram_gib": 5.18,
+              "disk_c_free_gb": 55.19
+            },
+            {
+              "check": "H2",
+              "timestamp_utc": "2026-11-24T09:56:38Z",
+              "elapsed": "2h06m",
+              "oxideswarm_rss_mb": 26.5,
+              "python_rss_mb": 51.7,
+              "free_ram_gib": 5.07,
+              "disk_c_free_gb": 55.05
+            },
+            {
+              "check": "H3",
+              "timestamp_utc": "2026-11-24T10:59:09Z",
+              "elapsed": "3h08m",
+              "oxideswarm_rss_mb": 26.1,
+              "python_rss_mb": 51.7,
+              "free_ram_gib": 4.79,
+              "disk_c_free_gb": 54.81
+            },
+            {
+              "check": "H4",
+              "timestamp_utc": "2026-11-24T12:00:48Z",
+              "elapsed": "4h10m",
+              "oxideswarm_rss_mb": 32.7,
+              "python_rss_mb": 51.2,
+              "free_ram_gib": 4.97,
+              "disk_c_free_gb": 54.79
+            },
+            {
+              "check": "H5",
+              "timestamp_utc": "2026-11-24T13:02:27Z",
+              "elapsed": "5h12m",
+              "oxideswarm_rss_mb": 26.8,
+              "python_rss_mb": 52.1,
+              "free_ram_gib": 4.92,
+              "disk_c_free_gb": 54.72
+            },
+            {
+              "check": "H6",
+              "timestamp_utc": "2026-11-24T14:04:40Z",
+              "elapsed": "6h14m",
+              "oxideswarm_rss_mb": 26.4,
+              "python_rss_mb": 50.2,
+              "free_ram_gib": 4.85,
+              "disk_c_free_gb": 55.53
+            },
+            {
+              "check": "H7",
+              "timestamp_utc": "2026-11-24T15:06:11Z",
+              "elapsed": "7h16m",
+              "oxideswarm_rss_mb": 56.5,
+              "python_rss_mb": 52.3,
+              "free_ram_gib": 4.91,
+              "disk_c_free_gb": 55.23
+            },
+            {
+              "check": "H8",
+              "timestamp_utc": "2026-11-24T16:06:30Z",
+              "elapsed": "8h16m",
+              "oxideswarm_rss_mb": 26.2,
+              "python_rss_mb": 49.7,
+              "free_ram_gib": 4.84,
+              "disk_c_free_gb": 55.12
+            },
+            {
+              "check": "H9",
+              "timestamp_utc": "2026-11-24T17:08:57Z",
+              "elapsed": "9h19m",
+              "oxideswarm_rss_mb": 26.4,
+              "python_rss_mb": 48.6,
+              "free_ram_gib": 4.76,
+              "disk_c_free_gb": 52.59
+            },
+            {
+              "check": "H10",
+              "timestamp_utc": "2026-11-24T18:18:03Z",
+              "elapsed": "10h28m",
+              "oxideswarm_rss_mb": 26.3,
+              "python_rss_mb": 50.2,
+              "free_ram_gib": 4.7,
+              "disk_c_free_gb": 55.07
+            },
+            {
+              "check": "H11",
+              "timestamp_utc": "2026-11-24T19:32:50Z",
+              "elapsed": "11h43m",
+              "oxideswarm_rss_mb": 25.5,
+              "python_rss_mb": 50.4,
+              "free_ram_gib": 4.69,
+              "disk_c_free_gb": 55.13
+            },
+            {
+              "check": "H12",
+              "timestamp_utc": "2026-11-24T20:19:14Z",
+              "elapsed": "12h29m",
+              "oxideswarm_rss_mb": 26.1,
+              "python_rss_mb": 38.2,
+              "free_ram_gib": 4.7,
+              "disk_c_free_gb": 55.18
+            },
+            {
+              "check": "H13",
+              "timestamp_utc": "2026-11-24T21:22:04Z",
+              "elapsed": "13h32m",
+              "oxideswarm_rss_mb": 25.9,
+              "python_rss_mb": 34.7,
+              "free_ram_gib": 4.94,
+              "disk_c_free_gb": 55.16
+            },
+            {
+              "check": "H_stop",
+              "timestamp_utc": "2026-11-24T21:30:33Z",
+              "elapsed": "13h40m",
+              "free_ram_gib": 4.95,
+              "disk_c_free_gb": 55.19,
+              "note": "planned owner leave"
+            }
+          ],
+          "win_case_snapshots": [
+            {
+              "timestamp_utc": "2026-11-24T07:49:54Z",
+              "disk_c_free_gib": 42.68,
+              "worker_log_errors": 0
+            },
+            {
+              "timestamp_utc": "2026-11-24T22:01:03Z",
+              "disk_c_free_gib": 38.12,
+              "worker_logs_count": 22,
+              "worker_log_errors": 0
+            },
+            {
+              "timestamp_utc": "2026-11-25T01:38:43Z",
+              "disk_c_free_gib": 37.52,
+              "worker_logs_count": 28,
+              "worker_log_errors": 0
+            }
+          ]
+        }
+      },
+      "3_disk_and_journal": {
+        "passed": null,
+        "status": "partial_master_bounds_and_compaction_verified",
+        "blob_store_limit_bytes": 4294967296,
+        "blob_store_014824Z_bytes": 4249880320,
+        "blob_store_014824Z_files": 101,
+        "blob_store_idle_bytes": 4255124429,
+        "blob_store_idle_files": 121,
+        "blob_store_idle_ok": true,
+        "blob_store_eviction_events": 5689,
+        "blob_store_evicted_blobs_total": 9542,
+        "master_blobs_tmp_leftovers": [],
+        "master_part_tmp_files": 0,
+        "master_state_014824Z_bytes": 15344995,
+        "journal_bin_014824Z_bytes": 1123749,
+        "snapshot_bin_014824Z_bytes": 12629821,
+        "master_state_idle_bytes": 14298644,
+        "journal_bin_idle_bytes": 24,
+        "snapshot_bin_idle_bytes": 12707196,
+        "cold_results_dirs": 256,
+        "shutdown_journal_compaction_verified": true,
+        "remote_worker_idle_snapshots_status": "not_evaluated_due_to_early_stop"
+      },
+      "4_probe_p99": {
+        "passed": null,
+        "status": "not_evaluated_due_to_early_stop",
+        "reason": "Continuous per-minute probe_samples were kept only in harness memory and lost on KeyboardInterrupt."
+      },
+      "5_clean_stop": {
+        "passed": true,
+        "status": "evaluated",
+        "leftover_pids": [],
+        "leftover_task_trees": [],
+        "keep_awake_stopped": true,
+        "note": "All S7 processes on Mac (harness, caffeinate, master) and both Windows workers (win-dell at 21:30:33Z, win-case at 01:38:43Z) exited with 0 leftover processes; Mac workdir preserved with --keep-workdir and backed up locally outside /tmp."
+      },
+      "6_fault_injection": {
+        "passed": null,
+        "status": "not_evaluated_due_to_early_stop",
+        "reason": "Full fault_events_log was kept only in harness memory and lost on KeyboardInterrupt.",
+        "indirect_master_log_evidence": {
+          "master_generations_measured": 9,
+          "failover_sweeps": 123,
+          "orphan_requeue_events": 74,
+          "orphan_requeued_tasks": 134,
+          "win_case_worker_generations": 28,
+          "win_dell_worker_generations": 21
+        }
+      }
+    }
+  }
+}

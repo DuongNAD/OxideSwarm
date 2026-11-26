@@ -129,10 +129,15 @@ pub fn command_in_own_process_group<S: AsRef<std::ffi::OsStr>>(
     cmd
 }
 
-/// Returns `true` if `pid` is present in `sys` and not in `ProcessStatus::Zombie`.
+/// Returns `true` if `pid` is present in `sys` and neither `Zombie` nor `Dead`.
 pub fn is_pid_alive(sys: &sysinfo::System, pid: u32) -> bool {
     sys.process(sysinfo::Pid::from(pid as usize))
-        .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+        .is_some_and(|p| {
+            !matches!(
+                p.status(),
+                sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+            )
+        })
 }
 
 /// Synchronously polls `pids_file` until `expected_count` distinct PIDs have been recorded.
@@ -191,7 +196,7 @@ pub async fn poll_pids_async(
 
 /// Verifies that all given PIDs are actively running (and not zombies) in the OS process table.
 pub fn assert_all_alive(sys: &mut sysinfo::System, pids: &[u32]) {
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     for &pid in pids {
         assert!(
             is_pid_alive(sys, pid),
@@ -204,7 +209,7 @@ pub fn assert_all_alive(sys: &mut sysinfo::System, pids: &[u32]) {
 pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duration) {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let any_alive = pids.iter().any(|&pid| is_pid_alive(sys, pid));
         if !any_alive {
             return;
@@ -212,11 +217,19 @@ pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duratio
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let elapsed = start.elapsed();
     let survivors: Vec<u32> = pids
         .iter()
         .copied()
         .filter(|&pid| is_pid_alive(sys, pid))
+        .collect();
+    let details: Vec<String> = survivors
+        .iter()
+        .map(|&pid| match sys.process(sysinfo::Pid::from(pid as usize)) {
+            Some(p) => format!("({pid}, {:?}, {:?})", p.status(), p.name()),
+            None => format!("({pid}, vanished)"),
+        })
         .collect();
 
     for &pid in &survivors {
@@ -227,8 +240,8 @@ pub fn assert_all_dead(sys: &mut sysinfo::System, pids: &[u32], timeout: Duratio
 
     assert!(
         survivors.is_empty(),
-        "Orphaned descendant processes survived termination: {:?}",
-        survivors
+        "Orphaned descendant processes survived termination after {elapsed:?} (timeout {timeout:?}): {:?}",
+        details
     );
 }
 
@@ -237,7 +250,7 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
     let mut sys = sysinfo::System::new();
     let start = Instant::now();
     while start.elapsed() < timeout {
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let any_alive = pids.iter().any(|&pid| is_pid_alive(&sys, pid));
         if !any_alive {
             return;
@@ -245,11 +258,19 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let elapsed = start.elapsed();
     let survivors: Vec<u32> = pids
         .iter()
         .copied()
         .filter(|&pid| is_pid_alive(&sys, pid))
+        .collect();
+    let details: Vec<String> = survivors
+        .iter()
+        .map(|&pid| match sys.process(sysinfo::Pid::from(pid as usize)) {
+            Some(p) => format!("({pid}, {:?}, {:?})", p.status(), p.name()),
+            None => format!("({pid}, vanished)"),
+        })
         .collect();
 
     for &pid in &survivors {
@@ -260,8 +281,8 @@ pub async fn assert_all_dead_async(pids: &[u32], timeout: Duration) {
 
     assert!(
         survivors.is_empty(),
-        "Orphaned descendant processes survived termination: {:?}",
-        survivors
+        "Orphaned descendant processes survived termination after {elapsed:?} (timeout {timeout:?}): {:?}",
+        details
     );
 }
 

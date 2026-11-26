@@ -533,6 +533,11 @@ def verify_runner_hash(
             f"runner SHA-256 mismatch for {norm_key}: expected {expected.strip().lower()}, got {actual}"
         )
     sandbox_name = workload.get("binary_name") or os.path.basename(runner_abs)
+    if sys_os == "windows" and os.path.splitext(sandbox_name)[1].lower() not in (".exe", ".com"):
+        # A Windows worker starts only `.com`/`.exe`/`.bat`/`.cmd` files
+        # (`is_valid_windows_executable`, design 0025) and resolves `./<name>` to
+        # `<name>.exe`, so the manifest's `./<binary_name>` command stays the same.
+        sandbox_name += ".exe"
     return f"{runner_abs}:{sandbox_name}", actual
 
 

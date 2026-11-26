@@ -1,17 +1,26 @@
 //! Core protocol wire types, framing codecs, capabilities, task schemas, and error hierarchy for `rusty_grid`.
 
+#![deny(unsafe_code)]
+
 pub mod arbitrage;
 pub mod blob;
 pub mod blob_transfer;
+// LV-4: cfg(windows) GetSystemPowerStatus battery/thermal probe and cfg(unix/windows) GPU/device probes.
+#[allow(unsafe_code)]
 pub mod capabilities;
 pub mod cluster_auth;
 pub mod discovery;
 pub mod error;
 pub mod mapreduce;
 pub mod mode;
+// LV-4: zeroize::ZeroizeOnDrop FFI buffer cleanup / secret keypair guard tests and Unix FFI helpers.
+#[allow(unsafe_code)]
 pub mod noise_auth;
 pub mod placement;
+// LV-4: cfg(windows) / cfg(unix) ACL, descriptor, and file-identity syscalls for private key files.
+#[allow(unsafe_code)]
 pub mod private_file;
+pub mod process_spawn;
 pub mod protocol;
 pub mod task;
 pub mod transport;

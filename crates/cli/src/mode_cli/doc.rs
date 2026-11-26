@@ -62,10 +62,11 @@ pub fn run_doc_build(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Doc, "build");
 
-    let cmd_res = Command::new("cargo")
-        .args(["doc", "--workspace", "--no-deps"])
-        .current_dir(workspace_root)
-        .output();
+    let cmd_res = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["doc", "--workspace", "--no-deps"])
+            .current_dir(workspace_root),
+    );
 
     res.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -461,5 +462,46 @@ pub(super) async fn run_doc_menu(workspace_root: &Path) {
             render_execution_result(&res);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_documentation_detects_broken_relative_link() {
+        let dir = tempfile::tempdir().unwrap();
+        for doc in [
+            "CLAUDE.md",
+            "PROJECT.md",
+            "DEPLOYMENT.md",
+            "ANDROID_ARCHITECTURE.md",
+        ] {
+            fs::write(dir.path().join(doc), format!("# {doc}\n")).unwrap();
+        }
+        fs::write(
+            dir.path().join("README.md"),
+            "# OxideSwarm\n\nSee [broken guide](./does-not-exist.md) for details.\n",
+        )
+        .unwrap();
+
+        let res = verify_documentation(dir.path());
+        assert!(
+            !res.success,
+            "verify_documentation must fail on broken relative link"
+        );
+        assert_eq!(res.exit_code, Some(1));
+        assert!(
+            res.stderr
+                .contains("Broken relative link './does-not-exist.md'"),
+            "stderr was: {}",
+            res.stderr
+        );
+        assert!(
+            res.stdout.contains("1 broken"),
+            "stdout was: {}",
+            res.stdout
+        );
     }
 }

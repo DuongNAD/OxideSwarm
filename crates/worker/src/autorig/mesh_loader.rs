@@ -7,24 +7,151 @@ pub const GLB_MAGIC: u32 = 0x46546C67; // "glTF"
 pub const CHUNK_TYPE_JSON: u32 = 0x4E4F534A; // "JSON"
 pub const CHUNK_TYPE_BIN: u32 = 0x004E4942; // "BIN\0"
 
-/// Loads and normalizes a 3D mesh from arbitrary input bytes (GLB or OBJ).
-pub fn load_mesh_from_bytes(data: &[u8]) -> Result<RawMesh, String> {
-    if data.len() < 12 {
-        return Err("Input mesh data is too small to be valid GLB or OBJ".to_string());
+/// Detected 3D mesh container format from magic bytes and content sniffing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshFormat {
+    Glb,
+    Gltf,
+    Obj,
+}
+
+impl MeshFormat {
+    /// File extension corresponding to this mesh format.
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Glb => "glb",
+            Self::Gltf => "gltf",
+            Self::Obj => "obj",
+        }
+    }
+}
+
+/// Strips any leading UTF-8 BOMs (`0xEF 0xBB 0xBF`) and ASCII whitespace repeatedly.
+pub(crate) fn strip_leading_boms_and_ws(mut data: &[u8]) -> &[u8] {
+    loop {
+        let trimmed = data.trim_ascii_start();
+        if let Some(rest) = trimmed.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+            data = rest;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+/// Detects the mesh format from raw bytes without trusting file extensions.
+pub fn detect_mesh_format(data: &[u8]) -> Result<MeshFormat, String> {
+    if data.is_empty() {
+        return Err("Input mesh data is empty".to_string());
     }
 
-    // Check for glTF Binary magic (0x46546C67)
-    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic == GLB_MAGIC {
-        load_glb_mesh(data)
-    } else {
-        // Assume text-based Wavefront OBJ
-        load_obj_mesh(data)
+    if data.starts_with(b"glTF") {
+        if data.len() < 12 {
+            return Err("Truncated or invalid GLB container".to_string());
+        }
+        let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        if version != 2 {
+            return Err(format!("Unsupported glTF version: {version}"));
+        }
+        let total_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if total_len < 12 || data.len() < total_len {
+            return Err("Truncated or invalid GLB container".to_string());
+        }
+        return Ok(MeshFormat::Glb);
+    }
+
+    // Strip optional UTF-8 BOM(s) and leading ASCII whitespace before sniffing `.gltf` or `.obj`.
+    let trimmed = strip_leading_boms_and_ws(data);
+
+    if trimmed.starts_with(b"{") {
+        let json: Value =
+            serde_json::from_slice(trimmed).map_err(|e| format!("Invalid glTF JSON input: {e}"))?;
+        let obj = json
+            .as_object()
+            .ok_or_else(|| "Invalid glTF JSON: root must be an object".to_string())?;
+        if !obj.contains_key("asset") && !obj.contains_key("meshes") {
+            return Err(
+                "Invalid or unsupported glTF JSON: missing 'asset' or 'meshes'".to_string(),
+            );
+        }
+        return Ok(MeshFormat::Gltf);
+    }
+
+    // Otherwise validate ASCII Wavefront OBJ structure.
+    let text = std::str::from_utf8(trimmed).map_err(|_| {
+        "Unsupported or corrupt input mesh format (expected .glb, .gltf, or .obj)".to_string()
+    })?;
+    if trimmed
+        .iter()
+        .any(|&b| (b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t') || b == 0x7F)
+    {
+        return Err(
+            "Unsupported or corrupt input mesh format (unexpected binary control bytes)"
+                .to_string(),
+        );
+    }
+
+    let mut has_vertex = false;
+    let mut has_face = false;
+    for line in text.lines() {
+        let line = line.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("v") => {
+                let coords: Vec<f32> = parts
+                    .take(3)
+                    .filter_map(|s| s.parse::<f32>().ok().filter(|v| v.is_finite()))
+                    .collect();
+                if coords.len() == 3 {
+                    has_vertex = true;
+                }
+            }
+            Some("f") if parts.count() >= 3 => {
+                has_face = true;
+            }
+            _ => {}
+        }
+        if has_vertex && has_face {
+            return Ok(MeshFormat::Obj);
+        }
+    }
+
+    Err(
+        "Unsupported or corrupt input mesh format (expected binary .glb, JSON .gltf, or valid ASCII .obj)"
+            .to_string(),
+    )
+}
+
+/// Loads and normalizes a 3D mesh from arbitrary input bytes (GLB or OBJ).
+pub fn load_mesh_from_bytes(data: &[u8]) -> Result<RawMesh, String> {
+    load_mesh_from_bytes_cancellable(data, &|| false)
+}
+
+/// Loads and normalizes a 3D mesh from raw bytes with cooperative cancellation checks.
+pub fn load_mesh_from_bytes_cancellable(
+    data: &[u8],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<RawMesh, String> {
+    if should_stop() {
+        return Err("Cancelled".to_string());
+    }
+    match detect_mesh_format(data)? {
+        MeshFormat::Glb => load_glb_mesh_cancellable(data, should_stop),
+        MeshFormat::Gltf => Err(
+            "Text .gltf JSON format is not supported by the built-in pure-Rust loader; convert to .glb/.obj or use preferred_provider='blender'"
+                .to_string(),
+        ),
+        MeshFormat::Obj => load_obj_mesh_cancellable(data, should_stop),
     }
 }
 
 /// Parses a binary glTF 2.0 (.glb) container into a `RawMesh`.
-fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
+fn load_glb_mesh_cancellable(
+    data: &[u8],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<RawMesh, String> {
     if data.len() < 20 {
         return Err("Truncated GLB container header".to_string());
     }
@@ -61,14 +188,17 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
     }
     offset += 8;
 
-    if offset + json_len > data.len() {
+    if offset
+        .checked_add(json_len)
+        .is_none_or(|end| end > data.len())
+    {
         return Err("Truncated JSON chunk in GLB".to_string());
     }
     let json_slice = &data[offset..offset + json_len];
     offset += json_len;
 
     // Chunk 1: BIN
-    let bin_slice = if offset + 8 <= data.len() {
+    let bin_slice = if offset.checked_add(8).is_some_and(|end| end <= data.len()) {
         let bin_len = u32::from_le_bytes([
             data[offset],
             data[offset + 1],
@@ -83,8 +213,12 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
         ]);
         if bin_type == CHUNK_TYPE_BIN {
             offset += 8;
-            if offset + bin_len <= data.len() {
-                &data[offset..offset + bin_len]
+            if let Some(bin_end) = offset.checked_add(bin_len) {
+                if bin_end <= data.len() {
+                    &data[offset..bin_end]
+                } else {
+                    &data[offset..]
+                }
             } else {
                 &data[offset..]
             }
@@ -123,7 +257,8 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
     let pos_acc_idx = attributes
         .get("POSITION")
         .and_then(|idx| idx.as_u64())
-        .ok_or("Primitive missing POSITION attribute")? as usize;
+        .and_then(|idx| usize::try_from(idx).ok())
+        .ok_or("Primitive missing POSITION attribute")?;
 
     let accessors = gltf
         .get("accessors")
@@ -135,20 +270,34 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
         .ok_or("No bufferViews found in glTF")?;
 
     // Read positions
-    let positions = read_vec3_accessor(pos_acc_idx, accessors, buffer_views, bin_slice)?;
+    let positions =
+        read_vec3_accessor(pos_acc_idx, accessors, buffer_views, bin_slice, should_stop)?;
 
     // Read optional normals
-    let normals = if let Some(norm_acc_idx) = attributes.get("NORMAL").and_then(|idx| idx.as_u64())
+    let normals = if let Some(norm_acc_idx) = attributes
+        .get("NORMAL")
+        .and_then(|idx| idx.as_u64())
+        .and_then(|idx| usize::try_from(idx).ok())
     {
-        read_vec3_accessor(norm_acc_idx as usize, accessors, buffer_views, bin_slice)
-            .unwrap_or_default()
+        read_vec3_accessor(
+            norm_acc_idx,
+            accessors,
+            buffer_views,
+            bin_slice,
+            should_stop,
+        )
+        .unwrap_or_default()
     } else {
         Vec::new()
     };
 
     // Read optional UVs
-    let uvs = if let Some(uv_acc_idx) = attributes.get("TEXCOORD_0").and_then(|idx| idx.as_u64()) {
-        read_vec2_accessor(uv_acc_idx as usize, accessors, buffer_views, bin_slice)
+    let uvs = if let Some(uv_acc_idx) = attributes
+        .get("TEXCOORD_0")
+        .and_then(|idx| idx.as_u64())
+        .and_then(|idx| usize::try_from(idx).ok())
+    {
+        read_vec2_accessor(uv_acc_idx, accessors, buffer_views, bin_slice, should_stop)
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -156,7 +305,8 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
 
     // Read indices
     let indices = if let Some(idx_acc_val) = prim.get("indices").and_then(|i| i.as_u64()) {
-        read_indices_accessor(idx_acc_val as usize, accessors, buffer_views, bin_slice)?
+        let idx_acc = usize::try_from(idx_acc_val).map_err(|_| "Invalid indices accessor index")?;
+        read_indices_accessor(idx_acc, accessors, buffer_views, bin_slice, should_stop)?
     } else {
         (0..positions.len() as u32).collect()
     };
@@ -170,39 +320,89 @@ fn load_glb_mesh(data: &[u8]) -> Result<RawMesh, String> {
     })
 }
 
+fn validate_accessor_range(
+    total_offset: usize,
+    count: usize,
+    byte_stride: usize,
+    elem_size: usize,
+    bin_len: usize,
+    label: &str,
+) -> Result<(), String> {
+    if byte_stride < elem_size {
+        return Err(format!(
+            "Invalid bufferView byteStride ({byte_stride} < {elem_size}) while reading {label}"
+        ));
+    }
+    if count == 0 {
+        if total_offset > bin_len {
+            return Err(format!("Buffer overrun while reading {label}"));
+        }
+        return Ok(());
+    }
+    let last_offset = (count - 1)
+        .checked_mul(byte_stride)
+        .and_then(|span| total_offset.checked_add(span))
+        .and_then(|end| end.checked_add(elem_size))
+        .ok_or_else(|| format!("Buffer offset overflow while reading {label}"))?;
+    if last_offset > bin_len {
+        return Err(format!("Buffer overrun while reading {label}"));
+    }
+    Ok(())
+}
+
+fn json_u64_to_usize(val: Option<&Value>, default: usize, label: &str) -> Result<usize, String> {
+    match val {
+        None => Ok(default),
+        Some(v) => {
+            let raw = v.as_u64().ok_or_else(|| format!("Invalid {label}"))?;
+            usize::try_from(raw).map_err(|_| format!("{label} exceeds usize range"))
+        }
+    }
+}
+
 fn read_vec3_accessor(
     acc_idx: usize,
     accessors: &[Value],
     buffer_views: &[Value],
     bin: &[u8],
+    should_stop: &dyn Fn() -> bool,
 ) -> Result<Vec<[f32; 3]>, String> {
     let acc = accessors.get(acc_idx).ok_or("Invalid accessor index")?;
-    let count = acc
+    let count_raw = acc
         .get("count")
         .and_then(|c| c.as_u64())
-        .ok_or("Missing count")? as usize;
-    let bv_idx = acc
+        .ok_or("Missing count")?;
+    let count = usize::try_from(count_raw).map_err(|_| "Accessor count exceeds usize range")?;
+    let bv_raw = acc
         .get("bufferView")
         .and_then(|b| b.as_u64())
-        .ok_or("Missing bufferView")? as usize;
-    let acc_byte_offset = acc.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+        .ok_or("Missing bufferView")?;
+    let bv_idx = usize::try_from(bv_raw).map_err(|_| "bufferView index exceeds usize range")?;
+    let acc_byte_offset = json_u64_to_usize(acc.get("byteOffset"), 0, "accessor.byteOffset")?;
 
     let bv = buffer_views.get(bv_idx).ok_or("Invalid bufferView index")?;
-    let bv_byte_offset = bv.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+    let bv_byte_offset = json_u64_to_usize(bv.get("byteOffset"), 0, "bufferView.byteOffset")?;
 
-    let total_offset = bv_byte_offset + acc_byte_offset;
-    let byte_stride = bv
-        .get("byteStride")
-        .and_then(|s| s.as_u64())
-        .map(|s| s as usize)
-        .unwrap_or(12);
+    let total_offset = bv_byte_offset
+        .checked_add(acc_byte_offset)
+        .ok_or("Buffer offset overflow while reading Vec3 accessor")?;
+    let byte_stride = json_u64_to_usize(bv.get("byteStride"), 12, "bufferView.byteStride")?;
+
+    validate_accessor_range(
+        total_offset,
+        count,
+        byte_stride,
+        12,
+        bin.len(),
+        "Vec3 accessor",
+    )?;
 
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let start = total_offset + i * byte_stride;
-        if start + 12 > bin.len() {
-            return Err("Buffer overrun while reading Vec3 accessor".to_string());
+        if i % 8192 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
         }
+        let start = total_offset + i * byte_stride;
         let x = f32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
         let y = f32::from_le_bytes([
             bin[start + 4],
@@ -226,34 +426,44 @@ fn read_vec2_accessor(
     accessors: &[Value],
     buffer_views: &[Value],
     bin: &[u8],
+    should_stop: &dyn Fn() -> bool,
 ) -> Result<Vec<[f32; 2]>, String> {
     let acc = accessors.get(acc_idx).ok_or("Invalid accessor index")?;
-    let count = acc
+    let count_raw = acc
         .get("count")
         .and_then(|c| c.as_u64())
-        .ok_or("Missing count")? as usize;
-    let bv_idx = acc
+        .ok_or("Missing count")?;
+    let count = usize::try_from(count_raw).map_err(|_| "Accessor count exceeds usize range")?;
+    let bv_raw = acc
         .get("bufferView")
         .and_then(|b| b.as_u64())
-        .ok_or("Missing bufferView")? as usize;
-    let acc_byte_offset = acc.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+        .ok_or("Missing bufferView")?;
+    let bv_idx = usize::try_from(bv_raw).map_err(|_| "bufferView index exceeds usize range")?;
+    let acc_byte_offset = json_u64_to_usize(acc.get("byteOffset"), 0, "accessor.byteOffset")?;
 
     let bv = buffer_views.get(bv_idx).ok_or("Invalid bufferView index")?;
-    let bv_byte_offset = bv.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+    let bv_byte_offset = json_u64_to_usize(bv.get("byteOffset"), 0, "bufferView.byteOffset")?;
 
-    let total_offset = bv_byte_offset + acc_byte_offset;
-    let byte_stride = bv
-        .get("byteStride")
-        .and_then(|s| s.as_u64())
-        .map(|s| s as usize)
-        .unwrap_or(8);
+    let total_offset = bv_byte_offset
+        .checked_add(acc_byte_offset)
+        .ok_or("Buffer offset overflow while reading Vec2 accessor")?;
+    let byte_stride = json_u64_to_usize(bv.get("byteStride"), 8, "bufferView.byteStride")?;
+
+    validate_accessor_range(
+        total_offset,
+        count,
+        byte_stride,
+        8,
+        bin.len(),
+        "Vec2 accessor",
+    )?;
 
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let start = total_offset + i * byte_stride;
-        if start + 8 > bin.len() {
-            return Err("Buffer overrun while reading Vec2 accessor".to_string());
+        if i % 8192 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
         }
+        let start = total_offset + i * byte_stride;
         let u = f32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
         let v = f32::from_le_bytes([
             bin[start + 4],
@@ -271,58 +481,70 @@ fn read_indices_accessor(
     accessors: &[Value],
     buffer_views: &[Value],
     bin: &[u8],
+    should_stop: &dyn Fn() -> bool,
 ) -> Result<Vec<u32>, String> {
     let acc = accessors.get(acc_idx).ok_or("Invalid accessor index")?;
-    let count = acc
+    let count_raw = acc
         .get("count")
         .and_then(|c| c.as_u64())
-        .ok_or("Missing count")? as usize;
+        .ok_or("Missing count")?;
+    let count = usize::try_from(count_raw).map_err(|_| "Accessor count exceeds usize range")?;
     let comp_type = acc
         .get("componentType")
         .and_then(|t| t.as_u64())
         .unwrap_or(5123) as u32;
-    let bv_idx = acc
+    let bv_raw = acc
         .get("bufferView")
         .and_then(|b| b.as_u64())
-        .ok_or("Missing bufferView")? as usize;
-    let acc_byte_offset = acc.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+        .ok_or("Missing bufferView")?;
+    let bv_idx = usize::try_from(bv_raw).map_err(|_| "bufferView index exceeds usize range")?;
+    let acc_byte_offset = json_u64_to_usize(acc.get("byteOffset"), 0, "accessor.byteOffset")?;
 
     let bv = buffer_views.get(bv_idx).ok_or("Invalid bufferView index")?;
-    let bv_byte_offset = bv.get("byteOffset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+    let bv_byte_offset = json_u64_to_usize(bv.get("byteOffset"), 0, "bufferView.byteOffset")?;
 
-    let total_offset = bv_byte_offset + acc_byte_offset;
-    let mut out = Vec::with_capacity(count);
+    let total_offset = bv_byte_offset
+        .checked_add(acc_byte_offset)
+        .ok_or("Buffer offset overflow while reading indices accessor")?;
 
     if comp_type == 5123 {
         // UNSIGNED_SHORT (16-bit)
+        validate_accessor_range(total_offset, count, 2, 2, bin.len(), "u16 indices")?;
+        let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            let start = total_offset + i * 2;
-            if start + 2 > bin.len() {
-                return Err("Buffer overrun while reading u16 indices".to_string());
+            if i % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
             }
+            let start = total_offset + i * 2;
             let idx = u16::from_le_bytes([bin[start], bin[start + 1]]) as u32;
             out.push(idx);
         }
+        Ok(out)
     } else if comp_type == 5125 {
         // UNSIGNED_INT (32-bit)
+        validate_accessor_range(total_offset, count, 4, 4, bin.len(), "u32 indices")?;
+        let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            let start = total_offset + i * 4;
-            if start + 4 > bin.len() {
-                return Err("Buffer overrun while reading u32 indices".to_string());
+            if i % 8192 == 0 && should_stop() {
+                return Err("Cancelled".to_string());
             }
+            let start = total_offset + i * 4;
             let idx =
                 u32::from_le_bytes([bin[start], bin[start + 1], bin[start + 2], bin[start + 3]]);
             out.push(idx);
         }
+        Ok(out)
     } else {
-        return Err(format!("Unsupported index component type: {comp_type}"));
+        Err(format!("Unsupported index component type: {comp_type}"))
     }
-
-    Ok(out)
 }
 
 /// Parses a Wavefront OBJ text buffer into a `RawMesh`.
-fn load_obj_mesh(data: &[u8]) -> Result<RawMesh, String> {
+fn load_obj_mesh_cancellable(
+    data: &[u8],
+    should_stop: &dyn Fn() -> bool,
+) -> Result<RawMesh, String> {
+    let data = strip_leading_boms_and_ws(data);
     let text =
         std::str::from_utf8(data).map_err(|e| format!("OBJ data contains invalid UTF-8: {e}"))?;
 
@@ -332,8 +554,11 @@ fn load_obj_mesh(data: &[u8]) -> Result<RawMesh, String> {
     let mut raw_faces: Vec<Vec<String>> = Vec::new();
 
     // Pass 1: Collect raw attributes and face lines
-    for line in text.lines() {
-        let line = line.trim();
+    for (line_idx, line) in text.lines().enumerate() {
+        if line_idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
+        let line = line.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -349,17 +574,35 @@ fn load_obj_mesh(data: &[u8]) -> Result<RawMesh, String> {
                 let x: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 let y: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 let z: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                    return Err(format!(
+                        "Non-finite vertex coordinate on OBJ line {}",
+                        line_idx + 1
+                    ));
+                }
                 raw_positions.push([x, y, z]);
             }
             "vn" => {
                 let x: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 let y: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 let z: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                    return Err(format!(
+                        "Non-finite vertex normal on OBJ line {}",
+                        line_idx + 1
+                    ));
+                }
                 raw_normals.push([x, y, z]);
             }
             "vt" => {
                 let u: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
                 let v: f32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                if !u.is_finite() || !v.is_finite() {
+                    return Err(format!(
+                        "Non-finite UV coordinate on OBJ line {}",
+                        line_idx + 1
+                    ));
+                }
                 raw_uvs.push([u, v]);
             }
             "f" => {
@@ -388,7 +631,10 @@ fn load_obj_mesh(data: &[u8]) -> Result<RawMesh, String> {
         std::collections::HashMap::new();
 
     // Pass 2: Triangulate faces and synchronize attributes
-    for face_tokens in &raw_faces {
+    for (face_idx, face_tokens) in raw_faces.iter().enumerate() {
+        if face_idx % 4096 == 0 && should_stop() {
+            return Err("Cancelled".to_string());
+        }
         let mut face_verts = Vec::with_capacity(face_tokens.len());
         for token in face_tokens {
             let mut subtokens = token.split('/');

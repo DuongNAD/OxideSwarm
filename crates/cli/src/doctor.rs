@@ -428,7 +428,7 @@ async fn collect_with(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<HashMap<TaskId, Collected>, GridError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = crate::matrix::safe_std_deadline(timeout);
     let mut done: HashMap<TaskId, Collected> = HashMap::new();
     let mut last_state: HashMap<TaskId, String> = HashMap::new();
     loop {
@@ -509,7 +509,7 @@ fn judge(probe: &Probe, collected: Option<&Collected>, timeout: Duration) -> (Ou
             return (
                 Outcome::Fail,
                 format!(
-                    "no result within {}s (last state {state}); the worker may be busy or above its CPU limit",
+                    "no result within {}s (last state {state}); the worker may be busy, low on available RAM, or above its CPU limit",
                     timeout.as_secs()
                 ),
             )
@@ -585,7 +585,7 @@ fn probe_task(
     timeout: Duration,
 ) -> Option<Task> {
     let timeout_secs = timeout.as_secs().max(1);
-    let (spec, requirements) = match kind {
+    let (spec, mut requirements) = match kind {
         ProbeKind::InProcess => (
             TaskSpec::builtin_test("hash_compute", 10_000),
             TaskRequirements::generic(1, timeout_secs),
@@ -604,6 +604,9 @@ fn probe_task(
             TaskRequirements::gpu(timeout_secs),
         ),
     };
+    // BUG-37: match `submit`'s default `ram_mb = 0` so lightweight diagnostic probes do not stay
+    // Queued on v0.4.3/v0.4.4 macOS workers when `sysinfo 0.30.13` under-reports available RAM.
+    requirements.ram_mb = 0;
     let pin = Placement {
         worker: Some(worker_id.to_string()),
         ..Placement::default()
@@ -910,12 +913,11 @@ fn throughput_task(worker_id: Uuid, os: &str, inputs: &[TaskInput], timeout: Dur
         worker: Some(worker_id.to_string()),
         ..Placement::default()
     };
-    Task::new(
-        spec,
-        TaskRequirements::generic(1, timeout.as_secs().max(1)).with_max_retries(0),
-    )
-    .with_placement(&pin)
-    .with_inputs(inputs.to_vec())
+    let mut req = TaskRequirements::generic(1, timeout.as_secs().max(1)).with_max_retries(0);
+    req.ram_mb = 0;
+    Task::new(spec, req)
+        .with_placement(&pin)
+        .with_inputs(inputs.to_vec())
 }
 
 /// C8: moves a fixed-size blob to every connected worker and reports MB/s.
@@ -1091,6 +1093,9 @@ async fn spread_check(
     let started = Instant::now();
     let mut tasks = Vec::with_capacity(count);
     for _ in 0..count {
+        let mut req = TaskRequirements::generic(1, options.probe_timeout.as_secs().max(1))
+            .with_max_retries(0);
+        req.ram_mb = 0;
         let task = Task::new(
             TaskSpec::BuiltinTest {
                 test_name: "sleep".into(),
@@ -1099,8 +1104,7 @@ async fn spread_check(
                 should_fail: false,
                 require_gpu: false,
             },
-            TaskRequirements::generic(1, options.probe_timeout.as_secs().max(1))
-                .with_max_retries(0),
+            req,
         );
         match submit(transport, task).await? {
             Ok(task_id) => tasks.push(task_id),
@@ -1507,5 +1511,32 @@ mod tests {
                 Some(id.to_string().as_str())
             );
         }
+    }
+
+    #[test]
+    fn test_bug37_doctor_probes_use_zero_ram_floor_like_submit() {
+        let id = Uuid::new_v4();
+        let timeout = Duration::from_secs(60);
+        for (kind, expect_gpu) in [
+            (ProbeKind::InProcess, false),
+            (ProbeKind::Process, false),
+            (
+                ProbeKind::Gpu {
+                    dim: 512,
+                    simulated: false,
+                },
+                true,
+            ),
+        ] {
+            let task = probe_task(kind, id, Some("macos"), timeout).expect("a probe task");
+            assert_eq!(
+                task.requirements.ram_mb, 0,
+                "doctor probes must match submit's ram_mb=0 so under-reported macOS RAM never strands C5"
+            );
+            assert_eq!(task.requirements.gpu_required, expect_gpu);
+            assert_eq!(task.spec.requires_gpu(), expect_gpu);
+        }
+        let throughput = throughput_task(id, "macos", &[], timeout);
+        assert_eq!(throughput.requirements.ram_mb, 0);
     }
 }

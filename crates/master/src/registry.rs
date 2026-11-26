@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -113,6 +114,10 @@ pub struct WorkerEntry {
     /// Deadline after which a `battery_temperature` / `thermal_tier` carried over from a previous
     /// session expires if the new session never sends `WorkerMessage::MobileTelemetry`.
     pub preserved_thermal_until: Option<Instant>,
+    /// Per-session liveness flag cleared under `WorkerRegistry::inner`'s write lock whenever
+    /// this session ends (disconnect, reap, remove, prune, or supersede), strictly before any
+    /// queue failover sweep runs.
+    pub session_live: Arc<AtomicBool>,
 }
 
 /// Dynamically calculates the Master dead-peer liveness timeout window for a worker ($W_{\text{dead}} = \max(2\text{s}, 4 \times \tau_{\text{worker}})$).
@@ -512,12 +517,14 @@ impl WorkerRegistry {
             if existing.status != WorkerStatus::Disconnected {
                 superseded_session = Some(existing.session_id);
             }
+            existing.session_live.store(false, Ordering::Release);
             // Cancel old connection tasks if still running
             if let Some(old_abort) = existing.abort_handle.take() {
                 abort_unless_current(old_abort);
             }
             let ram = capabilities.ram_mb;
             existing.session_id = session_id;
+            existing.session_live = Arc::new(AtomicBool::new(true));
             existing.capabilities = capabilities;
             existing.features = features;
             existing.status = WorkerStatus::Connected;
@@ -625,6 +632,7 @@ impl WorkerRegistry {
                 mobile_status,
                 peer_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
                 preserved_thermal_until: None,
+                session_live: Arc::new(AtomicBool::new(true)),
             };
             inner.workers.insert(worker_id, entry);
             tracing::info!(worker_id = %worker_id, session_id = session_id, "Registered new worker");
@@ -797,9 +805,11 @@ impl WorkerRegistry {
             }
             // IDEMPOTENCY: If already disconnected, do not trigger failover again
             if entry.status == WorkerStatus::Disconnected {
+                entry.session_live.store(false, Ordering::Release);
                 return Ok(false);
             }
             entry.status = WorkerStatus::Disconnected;
+            entry.session_live.store(false, Ordering::Release);
             entry.active_tasks = 0; // Clear active tasks on eviction
             entry.reported_active_tasks = 0;
             if let Some(abort) = entry.abort_handle.take() {
@@ -823,6 +833,7 @@ impl WorkerRegistry {
             inner.network_types.remove(worker_id);
             inner.owner_member_ids.remove(worker_id);
             if let Some(entry) = inner.workers.remove(worker_id) {
+                entry.session_live.store(false, Ordering::Release);
                 inner.registration_epoch = inner.registration_epoch.wrapping_add(1);
                 if let Some(abort) = entry.abort_handle.clone() {
                     abort_unless_current(abort);
@@ -857,6 +868,7 @@ impl WorkerRegistry {
                 inner.network_types.remove(id);
                 inner.owner_member_ids.remove(id);
                 if let Some(entry) = inner.workers.remove(id) {
+                    entry.session_live.store(false, Ordering::Release);
                     if let Some(abort) = entry.abort_handle {
                         abort_unless_current(abort);
                     }
@@ -895,7 +907,13 @@ impl WorkerRegistry {
                 return Ok(());
             }
         }
+        let was_disconnected = entry.status == WorkerStatus::Disconnected;
         entry.status = status;
+        if status == WorkerStatus::Disconnected {
+            entry.session_live.store(false, Ordering::Release);
+        } else if was_disconnected {
+            entry.session_live = Arc::new(AtomicBool::new(true));
+        }
         Ok(())
     }
 
@@ -976,6 +994,7 @@ impl WorkerRegistry {
             };
         }
         if revive {
+            entry.session_live = Arc::new(AtomicBool::new(true));
             tracing::warn!(
                 worker_id = %worker_id,
                 session_id = entry.session_id,
@@ -1070,7 +1089,8 @@ impl WorkerRegistry {
         Ok(changed)
     }
 
-    /// Atomically reserves a dispatch slot on `session_id`'s connection and returns its channel.
+    /// Atomically reserves a dispatch slot on `session_id`'s connection and returns its channel
+    /// along with the per-session liveness flag.
     ///
     /// Fails with `ConnectionClosed` when the worker has since been disconnected or re-registered
     /// on a newer session, so a task assigned against a stale snapshot is never delivered to (or
@@ -1079,7 +1099,7 @@ impl WorkerRegistry {
         &self,
         worker_id: &Uuid,
         session_id: u64,
-    ) -> GridResult<mpsc::Sender<MasterMessage>> {
+    ) -> GridResult<(mpsc::Sender<MasterMessage>, Arc<AtomicBool>)> {
         let mut inner = self.inner.write().await;
         let entry = inner
             .workers
@@ -1092,7 +1112,24 @@ impl WorkerRegistry {
         if entry.status == WorkerStatus::Connected {
             entry.status = WorkerStatus::Busy;
         }
-        Ok(entry.sender.clone())
+        Ok((entry.sender.clone(), Arc::clone(&entry.session_live)))
+    }
+
+    fn release_dispatch_entry(entry: &mut WorkerEntry) {
+        entry.active_tasks = entry.active_tasks.saturating_sub(1);
+        if let Some(ref status) = entry.mobile_status {
+            let active = entry.visible_active_tasks();
+            if let Some(candidate) = status.adaptive_keepalive_interval(active) {
+                entry.heartbeat_interval = Some(
+                    entry
+                        .heartbeat_interval
+                        .map_or(candidate, |prev| prev.max(candidate)),
+                );
+            }
+        }
+        if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
+            entry.status = WorkerStatus::Connected;
+        }
     }
 
     /// Gives back the slot [`reserve_dispatch`](Self::reserve_dispatch) took on `session_id`
@@ -1102,29 +1139,49 @@ impl WorkerRegistry {
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
             if entry.session_id == session_id {
-                entry.active_tasks = entry.active_tasks.saturating_sub(1);
-                if let Some(ref status) = entry.mobile_status {
-                    let active = entry.visible_active_tasks();
-                    if let Some(candidate) = status.adaptive_keepalive_interval(active) {
-                        entry.heartbeat_interval = Some(
-                            entry
-                                .heartbeat_interval
-                                .map_or(candidate, |prev| prev.max(candidate)),
-                        );
-                    }
-                }
-                if entry.status == WorkerStatus::Busy && entry.visible_active_tasks() == 0 {
-                    entry.status = WorkerStatus::Connected;
-                }
+                Self::release_dispatch_entry(entry);
+            }
+        }
+    }
+
+    /// Gives back the slot [`reserve_dispatch`](Self::reserve_dispatch) took on `session_id`
+    /// only while `entry` still holds the exact same live reservation handle (`session_live`).
+    ///
+    /// When a worker times out (`reap_stale_sessions_at` zeros `active_tasks` and sets
+    /// `session_live = false`) and is later revived on the same `session_id`
+    /// (`HeartbeatOutcome::Revived` replaces `entry.session_live` with a new `Arc`), a stale
+    /// pre-reap reservation handle is rejected so it cannot decrement post-revive `active_tasks`.
+    pub async fn release_dispatch_if_live(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+        session_live: &Arc<AtomicBool>,
+    ) {
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            if entry.session_id == session_id
+                && entry.status != WorkerStatus::Disconnected
+                && Arc::ptr_eq(&entry.session_live, session_live)
+                && session_live.load(Ordering::Acquire)
+            {
+                Self::release_dispatch_entry(entry);
             }
         }
     }
 
     /// Credits `count` adopted tasks (`WorkerMessage::ResumeSession`) to `session_id`'s active task
     /// count and marks the worker `Busy` if it was `Connected`.
-    pub async fn add_adopted_tasks(&self, worker_id: &Uuid, session_id: u64, count: usize) {
+    ///
+    /// Returns the live reservation handle (`session_live`) when credited so the caller can bind
+    /// the adopted `TaskEntry` records to the exact session handle.
+    pub async fn add_adopted_tasks(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+        count: usize,
+    ) -> Option<Arc<AtomicBool>> {
         if count == 0 {
-            return;
+            return None;
         }
         let mut inner = self.inner.write().await;
         if let Some(entry) = inner.workers.get_mut(worker_id) {
@@ -1133,8 +1190,28 @@ impl WorkerRegistry {
                 if entry.status == WorkerStatus::Connected {
                     entry.status = WorkerStatus::Busy;
                 }
+                return Some(Arc::clone(&entry.session_live));
             }
         }
+        None
+    }
+
+    /// Returns `session_id`'s current `session_live` handle without modifying `active_tasks`.
+    ///
+    /// Returns `Some` whenever the worker still tracks `session_id` (even if currently
+    /// `Disconnected`, in which case the returned `AtomicBool` is already `false`) so callers can
+    /// bind an uninitialized `assigned_session_live` field rather than leaving it `None`.
+    pub async fn session_live_handle(
+        &self,
+        worker_id: &Uuid,
+        session_id: u64,
+    ) -> Option<Arc<AtomicBool>> {
+        let inner = self.inner.read().await;
+        inner
+            .workers
+            .get(worker_id)
+            .filter(|entry| entry.session_id == session_id)
+            .map(|entry| Arc::clone(&entry.session_live))
     }
 
     /// Records that `worker_id` handed a task back without running it (battery, capability or
@@ -1278,9 +1355,44 @@ impl WorkerRegistry {
     }
 
     /// Returns snapshots of all registered workers regardless of operational status.
+    ///
+    /// When a [`crate::speed::SpeedBook`] is attached, connected workers with shared-key samples
+    /// receive a computed `speed:<factor>` tag (`0060` D4).
     pub async fn list_all_workers(&self) -> Vec<WorkerInfo> {
-        let inner = self.inner.read().await;
-        inner.workers.values().map(|e| e.to_info()).collect()
+        let (mut workers, active_ids) = {
+            let inner = self.inner.read().await;
+            let mut workers = Vec::with_capacity(inner.workers.len());
+            let mut active_ids = HashSet::with_capacity(inner.workers.len());
+            for e in inner.workers.values() {
+                if e.status != WorkerStatus::Disconnected {
+                    active_ids.insert(e.worker_id);
+                }
+                workers.push(e.to_info());
+            }
+            (workers, active_ids)
+        };
+        if active_ids.len() >= 2 {
+            if let Some(sb) = self.speed_book() {
+                let book = sb.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if !book.is_empty() {
+                    let factors = book.relative_speed_factors(&active_ids);
+                    for w in &mut workers {
+                        if let Some(&factor) = factors.get(&w.worker_id) {
+                            if !w.capabilities.tags.iter().any(|t| {
+                                t.starts_with(rusty_grid_core::placement::SPEED_TAG_PREFIX)
+                            }) {
+                                w.capabilities.tags.push(format!(
+                                    "{}{}",
+                                    rusty_grid_core::placement::SPEED_TAG_PREFIX,
+                                    crate::speed::format_speed_factor(factor)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        workers
     }
 
     /// Alias for `list_all_workers`.
@@ -1388,6 +1500,34 @@ impl WorkerRegistry {
                 .get(worker_id)
                 .ok_or(GridError::WorkerNotFound(*worker_id))?;
             if entry.status == WorkerStatus::Disconnected {
+                return Err(GridError::ConnectionClosed);
+            }
+            entry.sender.clone()
+        };
+
+        sender
+            .send(msg)
+            .await
+            .map_err(|_| GridError::ConnectionClosed)?;
+        Ok(())
+    }
+
+    /// Sends a MasterMessage to `(worker_id, expected_session)` if connected on that session.
+    pub async fn send_to_worker_session(
+        &self,
+        worker_id: &Uuid,
+        expected_session: Option<u64>,
+        msg: MasterMessage,
+    ) -> GridResult<()> {
+        let sender = {
+            let inner = self.inner.read().await;
+            let entry = inner
+                .workers
+                .get(worker_id)
+                .ok_or(GridError::WorkerNotFound(*worker_id))?;
+            if entry.status == WorkerStatus::Disconnected
+                || expected_session.is_some_and(|s| entry.session_id != s)
+            {
                 return Err(GridError::ConnectionClosed);
             }
             entry.sender.clone()
@@ -1515,6 +1655,7 @@ impl WorkerRegistry {
                 if entry.status != WorkerStatus::Disconnected && entry.is_silent(now, timeout) {
                     let elapsed = now.saturating_duration_since(entry.last_heartbeat_instant);
                     entry.status = WorkerStatus::Disconnected;
+                    entry.session_live.store(false, Ordering::Release);
                     entry.active_tasks = 0;
                     entry.reported_active_tasks = 0;
                     if let Some(abort) = entry.abort_handle.take() {
@@ -2183,7 +2324,8 @@ mod tests {
         assert!(registry.reserve_dispatch(&id, old).await.is_err());
         assert_eq!(registry.get_worker(id).await.unwrap().active_tasks, 0);
 
-        let sender = registry.reserve_dispatch(&id, new).await.unwrap();
+        let (sender, session_live) = registry.reserve_dispatch(&id, new).await.unwrap();
+        assert!(session_live.load(Ordering::Acquire));
         assert_eq!(registry.get_worker(id).await.unwrap().active_tasks, 1);
         sender
             .send(MasterMessage::HeartbeatAck { timestamp: 7 })
@@ -2195,6 +2337,7 @@ mod tests {
         ));
 
         registry.unregister(&id, Some(new)).await.unwrap();
+        assert!(!session_live.load(Ordering::Acquire));
         assert!(registry.reserve_dispatch(&id, new).await.is_err());
     }
 
@@ -3041,6 +3184,7 @@ mod tests {
     #[tokio::test]
     async fn test_release_non_live_worker_id_flushes_outside_registry_lock() {
         let dir = tempfile::tempdir().unwrap();
+        let members_dir = dir.path().join("members");
         // The v3 claim below belongs to an enrolled member: a reload drops non-members' claims.
         let v3_kp = rusty_grid_core::noise_auth::NodeKeypair::generate().unwrap();
         let members = crate::server::members::MemberStore::from_entries(vec![
@@ -3050,7 +3194,7 @@ mod tests {
                 vec![crate::server::members::MemberRole::Worker],
             ),
         ])
-        .with_save_path(dir.path().join(crate::server::members::MEMBERS_FILE_NAME))
+        .with_save_path(members_dir.join(crate::server::members::MEMBERS_FILE_NAME))
         .with_auth_mode(crate::server::members::AuthMode::Both);
         let registry = WorkerRegistry::new();
         let wid = Uuid::new_v4();
@@ -3177,7 +3321,7 @@ mod tests {
             .unwrap();
         assert_eq!(members.workers_owned_by(&v3_member_id), vec![wid]);
         let reloaded =
-            crate::server::members::MemberStore::load_from_dir(Some(dir.path())).unwrap();
+            crate::server::members::MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         assert_eq!(reloaded.workers_owned_by(&v3_member_id), vec![wid]);
     }
 
@@ -3278,5 +3422,79 @@ mod tests {
             "M1: failed release must restore v3 owner in WorkerRegistry"
         );
         assert_eq!(members.workers_owned_by(&v3_member_id), vec![wid_v3]);
+    }
+
+    #[tokio::test]
+    async fn test_release_dispatch_if_live_ignores_pre_reap_handle_after_revive() {
+        let registry = WorkerRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(4);
+        let session = registry
+            .register(
+                id,
+                caps("revive-race-worker"),
+                "127.0.0.1:9060".parse().unwrap(),
+                tx,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_sender_pre, pre_live) = registry.reserve_dispatch(&id, session).await.unwrap();
+        assert!(pre_live.load(Ordering::Acquire));
+        let pre_info = registry.get_worker(id).await.unwrap();
+        assert_eq!(pre_info.active_tasks, 1);
+        assert_eq!(pre_info.status, WorkerStatus::Busy);
+
+        // Reaping clears active_tasks and sets pre_live to false without bumping session_id.
+        let reaped = registry
+            .reap_stale_sessions_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(10),
+            )
+            .await;
+        assert_eq!(reaped, vec![(id, session)]);
+        assert!(!pre_live.load(Ordering::Acquire));
+        let reaped_info = registry.get_worker(id).await.unwrap();
+        assert_eq!(reaped_info.status, WorkerStatus::Disconnected);
+        assert_eq!(reaped_info.active_tasks, 0);
+
+        // Calling release_dispatch_if_live while Disconnected is a safe no-op.
+        registry
+            .release_dispatch_if_live(&id, session, &pre_live)
+            .await;
+        let still_reaped = registry.get_worker(id).await.unwrap();
+        assert_eq!(still_reaped.status, WorkerStatus::Disconnected);
+        assert_eq!(still_reaped.active_tasks, 0);
+
+        // Reviving on the same session_id replaces entry.session_live with a fresh Arc.
+        let revived = registry
+            .record_heartbeat_session(&id, 0, 100, 10.0, 4096, Some(session))
+            .await
+            .unwrap();
+        assert_eq!(revived, HeartbeatOutcome::Revived);
+
+        let (_sender_post, post_live) = registry.reserve_dispatch(&id, session).await.unwrap();
+        assert!(post_live.load(Ordering::Acquire));
+        assert!(!Arc::ptr_eq(&pre_live, &post_live));
+        let post_reserved = registry.get_worker(id).await.unwrap();
+        assert_eq!(post_reserved.active_tasks, 1);
+        assert_eq!(post_reserved.status, WorkerStatus::Busy);
+
+        // A stale pre-reap rollback on the same session_id must NOT clobber post-revive state.
+        registry
+            .release_dispatch_if_live(&id, session, &pre_live)
+            .await;
+        let after_stale_release = registry.get_worker(id).await.unwrap();
+        assert_eq!(after_stale_release.active_tasks, 1);
+        assert_eq!(after_stale_release.status, WorkerStatus::Busy);
+
+        // The live post-revive handle releases its own reservation cleanly.
+        registry
+            .release_dispatch_if_live(&id, session, &post_live)
+            .await;
+        let after_live_release = registry.get_worker(id).await.unwrap();
+        assert_eq!(after_live_release.active_tasks, 0);
+        assert_eq!(after_live_release.status, WorkerStatus::Connected);
     }
 }

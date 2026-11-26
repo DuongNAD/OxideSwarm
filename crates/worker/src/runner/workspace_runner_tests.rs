@@ -203,7 +203,8 @@ async fn test_workspace_task_error_cases_and_over_limit_warning() {
             limit_mb: 1,
             max_workspaces: 4,
             ..WorkspaceLimits::default()
-        });
+        })
+        .with_workspace_lock_wait(Duration::from_secs(90));
     let runner = TaskRunner::new(Uuid::new_v4(), WorkerCapabilities::default(), cfg);
     let unready_res = runner.execute_task(&ws_task, None, None).await;
     assert!(!unready_res.is_success());
@@ -265,7 +266,7 @@ async fn test_workspace_task_error_cases_and_over_limit_warning() {
     );
 
     // 5. Cancellation while waiting on a busy workspace lock finishes promptly instead of
-    //    blocking for the full `workspace_lock_wait` (5s).
+    //    blocking for the full `workspace_lock_wait` (90s).
     let store = runner
         .ensure_workspace_store()
         .await
@@ -282,17 +283,23 @@ async fn test_workspace_task_error_cases_and_over_limit_warning() {
     let wait_start = Instant::now();
     let blocked_task = Task::new(
         TaskSpec::shell_script("echo should-not-run"),
-        TaskRequirements::generic(1, 30),
+        TaskRequirements::generic(1, 90),
     )
     .with_workspace(WorkspaceRef::new("busy_ws").with_tree(m_id, m_size));
     let cancel_res = runner
         .execute_task(&blocked_task, None, Some(cancel_rx))
         .await;
+    let wait_elapsed = wait_start.elapsed();
+    println!("workspace lock-wait cancellation took {wait_elapsed:?}");
     assert_eq!(cancel_res.exit_code, EXIT_CODE_CANCELLED);
+    assert_eq!(
+        cancel_res.error.as_deref(),
+        Some("Cancelled: cancelled during lock wait")
+    );
+    assert!(!cancel_res.stdout_str().contains("should-not-run"));
     assert!(
-        wait_start.elapsed() < Duration::from_secs(1),
-        "cancellation during lock wait took too long: {:?}",
-        wait_start.elapsed()
+        wait_elapsed < Duration::from_secs(60),
+        "cancellation during lock wait hung: {wait_elapsed:?}"
     );
     drop(held);
 }

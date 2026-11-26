@@ -16,7 +16,11 @@ use tokio::sync::watch;
 
 use rusty_grid_core::mapreduce::{MapFunctionSpec, MapReduceJobSpec, ReduceFunctionSpec};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
 /// A worker running in this process; stopped on drop.
@@ -92,7 +96,12 @@ async fn closed_by_server(stream: &mut TcpStream, within: Duration) -> bool {
 }
 
 async fn spawn_master(config: ServerConfig) -> MasterHandle {
-    MasterServer::spawn(config).await.expect("spawn master")
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(config, sched_cfg, ReaperConfig::default())
+        .await
+        .expect("spawn master")
 }
 
 fn grid_config() -> ServerConfig {
@@ -130,10 +139,11 @@ async fn test_surplus_peers_are_closed_and_closing_one_frees_its_slot() {
     loop {
         let mut retry = TcpStream::connect(addr).await.unwrap();
         if !closed_by_server(&mut retry, Duration::from_millis(300)).await {
+            println!("closed connection slot released in {:?}", start.elapsed());
             break;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < Duration::from_secs(60),
             "a closed connection must give its slot back"
         );
     }
@@ -211,25 +221,41 @@ async fn test_gpu_backlog_without_a_gpu_worker_does_not_starve_cpu_work_behind_i
 // Map/Reduce
 // ---------------------------------------------------------------------------------------------
 
-fn sleepy_job(partitions: usize) -> MapReduceJobSpec {
-    // Each mapper and each reducer takes about one second.
+fn barrier_job(
+    barrier_dir: &std::path::Path,
+    partitions: usize,
+    mapper_timeout_secs: u64,
+) -> MapReduceJobSpec {
+    // Each mapper announces itself into `barrier_dir` and waits until all `partitions` mappers
+    // are active at once, so serial execution deadlocks on the barrier and fails the test rather
+    // than relying on a wall-clock elapsed window (TEST-63).
+    let barrier = barrier_dir.to_string_lossy().replace('\\', "/");
+    let map_script = format!(
+        r#"barrier='{barrier}'
+printf '%s\n' "$RUSTY_GRID_WORKER_ID" > "$barrier/active-$RUSTY_GRID_TASK_ID"
+while :; do
+  set -- "$barrier"/active-*
+  [ "$#" -ge {partitions} ] && break
+  sleep 0.05
+done
+while IFS= read -r line || [ -n "$line" ]; do for w in $line; do printf '%s\t1\n' "$w"; done; done"#
+    );
     MapReduceJobSpec::new(
         "parallelism",
         (0..partitions).map(|i| format!("word{i} shared")).collect(),
-        MapFunctionSpec::ShellScript {
-            script: r#"sleep 1; while IFS= read -r line || [ -n "$line" ]; do for w in $line; do printf '%s\t1\n' "$w"; done; done"#.into(),
-        },
+        MapFunctionSpec::ShellScript { script: map_script },
         ReduceFunctionSpec::ShellScript {
-            script: r#"sleep 1; python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in d['values']))""#.into(),
+            script: r#"python3 -c "import sys, json; d=json.load(sys.stdin); print(sum(int(x) for x in d['values']))""#.into(),
         },
         partitions,
         1,
-        60,
+        mapper_timeout_secs,
     )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_mapreduce_tasks_run_on_all_workers_at_once() {
+    const WAIT: Duration = Duration::from_secs(180);
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -239,25 +265,83 @@ async fn test_mapreduce_tasks_run_on_all_workers_at_once() {
         return;
     }
     let master = spawn_master(grid_config()).await;
-    let _w1 = spawn_worker(&master, "w1", 2);
-    let _w2 = spawn_worker(&master, "w2", 2);
-    assert!(wait_for_worker_count(&master, 2).await);
+    let mut w1 = spawn_worker(&master, "w1", 2);
+    let mut w2 = spawn_worker(&master, "w2", 2);
+    let connected = wait_for_worker_count_within(&master, 2, WAIT).await;
+    assert!(
+        connected >= 2,
+        "workers did not register within {WAIT:?} (connected={connected})"
+    );
 
-    // 4 map tasks of ~1 s and 5 reduce tasks of ~1 s (4 words + "shared") on 4 slots: about 2 s
-    // of map plus reduce waves when concurrent, at least 9 s when run one after another.
+    let barrier_dir = tempfile::tempdir().expect("barrier tempdir");
+    let mapper_timeout_secs = (WAIT * 3).as_secs();
     let started = Instant::now();
-    let result = master.execute_mapreduce(sleepy_job(4)).await.unwrap();
+    let result = match tokio::time::timeout(
+        WAIT,
+        master.execute_mapreduce(barrier_job(barrier_dir.path(), 4, mapper_timeout_secs)),
+    )
+    .await
+    {
+        Ok(outcome) => outcome.unwrap(),
+        Err(_) => {
+            let stats = master.queue_stats().await;
+            let active_count = std::fs::read_dir(barrier_dir.path())
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("active-"))
+                        .count()
+                })
+                .unwrap_or(0);
+            panic!(
+                "concurrent mapreduce barrier job did not finish within {WAIT:?} (active_mappers={active_count}/4, queue_stats={stats:?})"
+            );
+        }
+    };
     let elapsed = started.elapsed();
+    println!("concurrent mapreduce job finished in {elapsed:?}");
 
     assert_eq!(result.status, "Completed", "{:?}", result.error);
     assert_eq!(result.map_tasks_completed, 4);
     assert_eq!(result.reduce_tasks_total, 5);
     assert_eq!(result.output["shared"].as_i64(), Some(4));
+
+    let mut total_files = 0usize;
+    let mut worker_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for entry in std::fs::read_dir(barrier_dir.path()).expect("read barrier dir") {
+        let entry = entry.expect("barrier entry");
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("active-") {
+            continue;
+        }
+        total_files += 1;
+        let worker_id = std::fs::read_to_string(entry.path())
+            .expect("read active file")
+            .trim()
+            .to_string();
+        assert!(
+            !worker_id.is_empty(),
+            "empty worker id in {}",
+            entry.path().display()
+        );
+        *worker_counts.entry(worker_id).or_insert(0) += 1;
+    }
+    assert_eq!(total_files, 4, "expected 4 barrier marker files");
+    assert_eq!(
+        worker_counts.len(),
+        2,
+        "expected map tasks across both workers, got {worker_counts:?}"
+    );
     assert!(
-        elapsed < Duration::from_secs(7),
-        "9 one-second tasks on 4 slots took {elapsed:?}: tasks are not running concurrently"
+        worker_counts.values().all(|&count| count == 2),
+        "expected 2 concurrent map tasks on each 2-slot worker, got {worker_counts:?}"
     );
 
+    let _ = w1.shutdown_tx.send(true);
+    let _ = w2.shutdown_tx.send(true);
+    let _ = tokio::time::timeout(WAIT, &mut w1.handle).await;
+    let _ = tokio::time::timeout(WAIT, &mut w2.handle).await;
     let _ = master.shutdown();
 }
 

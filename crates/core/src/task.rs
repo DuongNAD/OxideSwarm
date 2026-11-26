@@ -1023,6 +1023,32 @@ impl<'de> Deserialize<'de> for AutoRigSpec {
     }
 }
 
+/// Validated auto-rigging execution provider preference (`3D-3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoRigProvider {
+    Auto,
+    Builtin,
+    Blender,
+}
+
+impl AutoRigProvider {
+    /// Parses a `preferred_provider` string (`"auto"`, `"builtin"`, `"blender"`).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "builtin" => Ok(Self::Builtin),
+            "blender" => Ok(Self::Blender),
+            "" => Err(
+                "AutoRig preferred_provider cannot be empty; valid providers are: auto, builtin, blender"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "Unsupported AutoRig preferred_provider '{other}'; valid providers are: auto, builtin, blender"
+            )),
+        }
+    }
+}
+
 impl AutoRigSpec {
     /// Creates an auto-rig spec with the input mesh and specified rig preset.
     pub fn new(input_mesh: impl Into<Bytes>, rig_preset: impl Into<String>) -> Self {
@@ -1040,10 +1066,62 @@ impl AutoRigSpec {
         self
     }
 
-    /// Sets the preferred auto-rigging provider ("builtin", "blender").
+    /// Sets the preferred auto-rigging provider ("auto", "builtin", "blender").
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.preferred_provider = Some(provider.into());
         self
+    }
+
+    /// Parses `preferred_provider`, defaulting `None` to [`AutoRigProvider::Builtin`].
+    pub fn parse_provider(&self) -> Result<AutoRigProvider, String> {
+        match self.preferred_provider.as_deref() {
+            None => Ok(AutoRigProvider::Builtin),
+            Some(p) => AutoRigProvider::parse(p),
+        }
+    }
+
+    /// Validates a `rig_preset` value (`"biped"`, `"quadruped"`, `"generic"`).
+    pub fn validate_rig_preset(preset: &str) -> Result<&'static str, String> {
+        match preset.trim().to_ascii_lowercase().as_str() {
+            "biped" => Ok("biped"),
+            "quadruped" => Ok("quadruped"),
+            "generic" => Ok("generic"),
+            "" => Err("AutoRig rig_preset cannot be empty".to_string()),
+            other => Err(format!(
+                "Unsupported AutoRig rig_preset '{other}'; valid presets are: biped, quadruped, generic"
+            )),
+        }
+    }
+
+    /// Validates an `embed_animations` entry (`"idle"`, `"walk"`, `"turnaround"`).
+    pub fn validate_animation_clip(clip: &str) -> Result<&'static str, String> {
+        match clip.trim().to_ascii_lowercase().as_str() {
+            "idle" => Ok("idle"),
+            "walk" => Ok("walk"),
+            "turnaround" => Ok("turnaround"),
+            "" => Err(
+                "AutoRig embed_animations entry cannot be empty; valid clips are: idle, walk, turnaround"
+                    .to_string(),
+            ),
+            other => Err(format!(
+                "Unsupported AutoRig animation clip '{other}'; valid clips are: idle, walk, turnaround"
+            )),
+        }
+    }
+
+    /// Validates a full `embed_animations` list, rejecting invalid or duplicate clips.
+    pub fn validate_animation_clips(clips: &[String]) -> Result<Vec<&'static str>, String> {
+        let mut seen = Vec::with_capacity(clips.len());
+        for clip in clips {
+            let norm = Self::validate_animation_clip(clip)?;
+            if seen.contains(&norm) {
+                return Err(format!(
+                    "Duplicate AutoRig animation clip '{norm}' in embed_animations"
+                ));
+            }
+            seen.push(norm);
+        }
+        Ok(seen)
     }
 }
 
@@ -1689,9 +1767,9 @@ impl TaskSpec {
                 if spec.input_mesh.is_empty() {
                     return Err("AutoRig input_mesh cannot be empty".to_string());
                 }
-                if spec.rig_preset.trim().is_empty() {
-                    return Err("AutoRig rig_preset cannot be empty".to_string());
-                }
+                AutoRigSpec::validate_rig_preset(&spec.rig_preset)?;
+                AutoRigSpec::validate_animation_clips(&spec.embed_animations)?;
+                spec.parse_provider()?;
             }
         }
         Ok(())
@@ -2184,6 +2262,11 @@ impl Task {
         !self.inputs.is_empty() || !self.output_globs.is_empty()
     }
 
+    /// True when the task carries `opt:repeatable` for speculative straggler re-run (`0060` D3).
+    pub fn is_repeatable(&self) -> bool {
+        crate::placement::is_repeatable_tags(&self.tags)
+    }
+
     /// Mutates the task to record an updated checkpoint snapshot.
     pub fn update_checkpoint(&mut self, checkpoint: CheckpointData) {
         self.latest_checkpoint = Some(checkpoint);
@@ -2201,6 +2284,7 @@ impl Task {
         }
 
         self.placement()?;
+        crate::placement::validate_task_user_tags(&self.tags)?;
         self.validate_extensions("master")?;
 
         let mut total_staged: u64 = 0;
@@ -2686,7 +2770,9 @@ impl fmt::Display for TaskStatus {
     }
 }
 
+// LV-4: cfg(windows) Windows console API probe in tests (production code in task.rs stays denied).
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -3279,6 +3365,52 @@ mod tests {
         // Invalid: AutoRig empty preset
         let empty_preset = TaskSpec::AutoRig(AutoRigSpec::new(Bytes::from_static(b"mesh"), "  "));
         assert!(empty_preset.validate().is_err());
+
+        // Valid AutoRig presets, clips, and providers (case-insensitive & trimmed)
+        for preset in ["biped", "quadruped", "generic", " Quadruped "] {
+            let spec = AutoRigSpec::new(Bytes::from_static(b"mesh"), preset)
+                .with_animations(vec!["IDLE".into(), " walk ".into(), "turnaround".into()])
+                .with_provider(" Auto ");
+            assert!(TaskSpec::AutoRig(spec).validate().is_ok());
+        }
+        assert!(TaskSpec::AutoRig(
+            AutoRigSpec::new(Bytes::from_static(b"mesh"), "biped").with_animations(vec![])
+        )
+        .validate()
+        .is_ok());
+        for provider in ["auto", "builtin", "blender", "BLENDER"] {
+            let spec =
+                AutoRigSpec::new(Bytes::from_static(b"mesh"), "biped").with_provider(provider);
+            assert!(TaskSpec::AutoRig(spec).validate().is_ok());
+        }
+
+        // Invalid AutoRig preset, clip, and provider
+        assert!(
+            TaskSpec::AutoRig(AutoRigSpec::new(Bytes::from_static(b"mesh"), "dragon"))
+                .validate()
+                .is_err()
+        );
+        assert!(TaskSpec::AutoRig(
+            AutoRigSpec::new(Bytes::from_static(b"mesh"), "biped")
+                .with_animations(vec!["run".into()])
+        )
+        .validate()
+        .is_err());
+        assert!(TaskSpec::AutoRig(
+            AutoRigSpec::new(Bytes::from_static(b"mesh"), "biped").with_animations(vec!["".into()])
+        )
+        .validate()
+        .is_err());
+        assert!(TaskSpec::AutoRig(
+            AutoRigSpec::new(Bytes::from_static(b"mesh"), "biped").with_provider("maya")
+        )
+        .validate()
+        .is_err());
+        assert!(TaskSpec::AutoRig(
+            AutoRigSpec::new(Bytes::from_static(b"mesh"), "biped").with_provider("  ")
+        )
+        .validate()
+        .is_err());
     }
 
     #[test]

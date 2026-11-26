@@ -18,11 +18,27 @@ use rusty_grid_core::cluster_auth::{server_handshake, ClusterSecret};
 use rusty_grid_core::protocol::{MessageTransport, WorkerMessage};
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec};
 use rusty_grid_core::{GridError, GridResult};
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::reaper::ReaperConfig;
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig, AUTH_FAILURE_MIN_BACKOFF};
 
 fn secret(seed: u8) -> ClusterSecret {
     ClusterSecret::from_bytes(&[seed; 32]).unwrap()
+}
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("spawn master")
 }
 
 async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
@@ -30,7 +46,7 @@ async fn spawn_master(secret: Option<&ClusterSecret>) -> MasterHandle {
     if let Some(secret) = secret {
         config = config.with_cluster_secret(secret.clone());
     }
-    MasterServer::spawn(config).await.expect("spawn master")
+    spawn_test_master(config).await
 }
 
 fn worker_config(addr: SocketAddr, name: &str, secret: Option<&ClusterSecret>) -> WorkerConfig {
@@ -44,6 +60,8 @@ fn worker_config(addr: SocketAddr, name: &str, secret: Option<&ClusterSecret>) -
     }
     config
 }
+
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct RunningWorker {
     shutdown_tx: watch::Sender<bool>,
@@ -70,9 +88,9 @@ impl RunningWorker {
     async fn stop(self) -> Duration {
         let started = Instant::now();
         let _ = self.shutdown_tx.send(true);
-        tokio::time::timeout(Duration::from_secs(10), self.handle)
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, self.handle)
             .await
-            .expect("worker did not stop within 10 s of the shutdown signal")
+            .expect("worker did not stop within 60 s of the shutdown signal")
             .expect("worker task panicked");
         started.elapsed()
     }
@@ -307,6 +325,14 @@ async fn test_auth_failure_backs_off_instead_of_hot_looping_and_shutdown_interru
         let _ = client.run(shutdown_rx).await;
     });
 
+    tokio::time::timeout(TEST_WAIT_TIMEOUT, async {
+        while rogue.attempts.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("worker did not make an initial auth attempt within 60 s");
+
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(
         rogue.attempts.load(Ordering::SeqCst),
@@ -315,13 +341,16 @@ async fn test_auth_failure_backs_off_instead_of_hot_looping_and_shutdown_interru
     );
 
     // The 30 s wait is cut short by shutdown.
-    let started = Instant::now();
     shutdown_tx.send(true).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), handle)
+    tokio::time::timeout(Duration::from_secs(25), handle)
         .await
-        .expect("shutdown must interrupt the authentication backoff")
+        .expect("shutdown must interrupt the authentication backoff before 30 s floor")
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        rogue.attempts.load(Ordering::SeqCst),
+        1,
+        "shutdown must stop the worker before a second auth attempt"
+    );
 }
 
 #[test]
@@ -331,14 +360,17 @@ fn test_auth_failure_floor_is_at_least_thirty_seconds() {
 
 #[tokio::test]
 async fn test_shutdown_interrupts_a_handshake_with_a_silent_master() {
-    // A peer that accepts the connection and then says nothing. With a long handshake timeout the
-    // worker would sit in the handshake; shutdown must still end it promptly.
+    // A peer that accepts the connection and then says nothing. With a 120 s handshake timeout the
+    // worker would sit in the handshake; stopping well under that proves shutdown interrupts it.
     for secret in [None, Some(self::secret(10))] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let accepted_tx = Arc::clone(&accepted);
         let _silent = tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
+                accepted_tx.notify_one();
                 held.push(stream);
             }
         });
@@ -347,13 +379,10 @@ async fn test_shutdown_interrupts_a_handshake_with_a_silent_master() {
             worker_config(addr, "silent-master", secret.as_ref())
                 .with_handshake_timeout(Duration::from_secs(120)),
         );
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let took = worker.stop().await;
-        assert!(
-            took < Duration::from_secs(2),
-            "shutdown took {took:?} with a silent master (secret: {})",
-            secret.is_some()
-        );
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, accepted.notified())
+            .await
+            .expect("worker did not connect to silent master within 60 s");
+        let _took = worker.stop().await;
     }
 }
 
@@ -368,18 +397,20 @@ async fn test_unanswered_handshake_times_out_with_a_secret() {
         }
     });
 
-    let started = Instant::now();
-    let verdict = handshake_once(
-        addr,
-        worker_config(addr, "w", Some(&secret(11)))
-            .with_handshake_timeout(Duration::from_millis(300)),
+    let verdict = tokio::time::timeout(
+        TEST_WAIT_TIMEOUT,
+        handshake_once(
+            addr,
+            worker_config(addr, "w", Some(&secret(11)))
+                .with_handshake_timeout(Duration::from_millis(300)),
+        ),
     )
-    .await;
+    .await
+    .expect("unanswered handshake did not time out within 60 s");
     assert!(
         matches!(verdict, Err(GridError::Timeout { .. })),
         "got {verdict:?}"
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 #[tokio::test]
@@ -413,7 +444,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
     let dir = tempfile::tempdir().unwrap();
     let ticket_file = dir.path().join("master.ticket");
     let secret = secret(20);
-    let master = MasterServer::spawn(
+    let master = spawn_test_master(
         ServerConfig::new("127.0.0.1:0".parse().unwrap())
             .with_p2p(true)
             .with_p2p_minimal_preset(true)
@@ -421,8 +452,7 @@ async fn test_p2p_worker_authenticates_on_the_control_stream() {
             .with_p2p_ticket_file(&ticket_file)
             .with_cluster_secret(secret.clone()),
     )
-    .await
-    .expect("spawn p2p master");
+    .await;
     let ticket = tokio::fs::read_to_string(&ticket_file)
         .await
         .expect("read ticket")

@@ -5,7 +5,7 @@ Created: 2026-11-19    Updated: 2026-11-19
 
 ## Summary
 
-Establishes the base of the shared protocol 11 train: bumps `PROTOCOL_VERSION_CURRENT` to `11` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `10`, promotes release `v0.4.4`'s wire layout to `wire_layout_previous.txt`, implements `BUG-22` (`cancelled_tasks` in `ClientResponse::ClusterStatus`, `oxideswarm status`, and MCP `status`) with v10 response folding, and holds as a draft pull request until the `0.4.x` stability release ships and follow-on wire pull requests for `NET-10` and `ECO-9` land on top.
+Establishes the base of the shared protocol 11 train (`0.5.0` per Q101): bumps `PROTOCOL_VERSION_CURRENT` to `11` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `10`, promotes release `v0.4.5`'s wire layout to `wire_layout_previous.txt`, implements `BUG-22` (`cancelled_tasks` in `ClientResponse::ClusterStatus`, `oxideswarm status`, and MCP `status`) with v10 response folding, and holds as a draft pull request until the `0.4.x` stability release ships and follow-on wire pull requests (`NET-10`, `ECO-9`, `TEAM-6`, `AX-3`, `CACHE-1`) land on top.
 
 ## Context
 
@@ -71,7 +71,7 @@ When `NET-10` and `ECO-9` land their wire additions on top of protocol `11`, bot
 3. **`MembersList` v10 legacy mirror and positional indices:** When `ECO-9` (or `NET-10`) modifies `ClientResponse::MembersList` / `MemberEntry`, `LegacyV10BinaryClientResponse` and `HumanLegacyV10ClientResponse` need a `MembersList` variant that lists every preceding variant up to `MembersList`'s positional bincode index, together with a v10 mirror of `MemberEntry` without `participant`, an extended tag check in `deserialize_message_as_v10`, and `MembersList` entries in `DIFFERS_FROM_PREVIOUS` (`crates/core/src/window_tests.rs`).
 4. **Avoid `ClusterStatus.running_tasks` name collision:** `ClientResponse::ClusterStatus` already has a top-level `running_tasks: usize` field. `ECO-9` must nest per-participant quota usage (e.g., `participant_usage: Option<...>`) or rename its fields rather than introducing a duplicate top-level `running_tasks` name.
 5. **Carry `SubmitTask` priority as a task extension ([Design 0082](0082-task-extension-slot.md)):** Do not add a typed priority field to `ClientMessage::SubmitTask`; a typed field would require re-introducing a v10 `SubmitTask` decoder and the stamp-decides-layout logic that this base pull request removed.
-6. **Variant ordering, bincode attribute rule, and frozen baseline:** Append new `ClientMessage` and `ClientResponse` variants strictly last; never use `#[serde(skip_serializing_if)]` on `Option` fields of `Binary*` mirror structs/enums; and keep `crates/core/tests/data/wire_layout_previous.txt` pinned verbatim to `v0.4.4`.
+6. **Variant ordering, bincode attribute rule, and frozen baseline:** Append new `ClientMessage` and `ClientResponse` variants strictly last; never use `#[serde(skip_serializing_if)]` on `Option` fields of `Binary*` mirror structs/enums; and keep `crates/core/tests/data/wire_layout_previous.txt` pinned verbatim to `v0.4.5`.
 
 ### D3 Serving v10 peers across the 10..=11 window
 
@@ -87,8 +87,8 @@ When `NET-10` and `ECO-9` land their wire additions on top of protocol `11`, bot
 
 ### D4 Golden wire layout and cross-version tests
 
-- `crates/core/tests/data/wire_layout_previous.txt` is promoted verbatim (LF line endings) from release `v0.4.4`'s `crates/core/tests/data/wire_layout.txt` (`# protocol_version: 10`, `# protocol_version_min_compatible: 9`).
-- `crates/core/tests/data/wire_layout.txt` is regenerated for `# protocol_version: 11` and `# protocol_version_min_compatible: 10`, with `wire_layout_tests.rs` setting the `ClusterStatus` sample to `failed_tasks: 0, cancelled_tasks: 1` deliberately so the folded v10 sum (`0 + 1 = 1`) equals `v0.4.4`'s recorded `1` (`window_tests.rs` D7.2 can therefore compare the folded v10 bytes directly against `wire_layout_previous.txt`).
+- `crates/core/tests/data/wire_layout_previous.txt` is promoted verbatim (LF line endings) from release `v0.4.5`'s `crates/core/tests/data/wire_layout.txt` (`# protocol_version: 10`, `# protocol_version_min_compatible: 9`).
+- `crates/core/tests/data/wire_layout.txt` is regenerated for `# protocol_version: 11` and `# protocol_version_min_compatible: 10`, with `wire_layout_tests.rs` setting the `ClusterStatus` sample to `failed_tasks: 0, cancelled_tasks: 1` deliberately so the folded v10 sum (`0 + 1 = 1`) equals `v0.4.5`'s recorded `1` (`window_tests.rs` D7.2 can therefore compare the folded v10 bytes directly against `wire_layout_previous.txt`).
 - `crates/core/src/window_tests.rs` sets `PREVIOUS = 10` (`DIFFERS_FROM_PREVIOUS` = `ClusterStatus`, `Hello`) and replays `wire_layout_previous.txt` against `serialize_v10_client_message`, `deserialize_message_as_v10`, and `serialize_message_for_peer`.
 - `tests/window_v10_peers.rs` (registered in `crates/master/Cargo.toml`, replacing `tests/window_v9_peers.rs`) exercises v10 workers, v10 JSON/bincode clients, `(failed: 1, cancelled: 1)` on v11 vs `(failed: 2)` folded on v10, and v9 refusal.
 
@@ -106,7 +106,7 @@ When `NET-10` and `ECO-9` land their wire additions on top of protocol `11`, bot
 - **Window:** `PROTOCOL_VERSION_MIN_COMPATIBLE = 10`, `PROTOCOL_VERSION_CURRENT = 11`.
 - **Upgrading master (v10 -> v11) with v10 workers/clients:** Supported for `10`; `ClusterStatus` folds `cancelled_tasks` into `failed_tasks` for v10 callers; v9 (`v0.3.0`) peers are refused cleanly with `Incompatible protocol version 9 (server accepts 10..=11)`.
 - **Newer peer against older master:** Refused cleanly on `Hello` or `Register` because an un-upgraded v10 master enforces `9..=10` and `is_master_echo_acceptable` rejects mismatched echoes.
-- **Follow-on PR coordination:** Any **Planned** `NET-10` or `ECO-9` additions re-run `UPDATE_WIRE_LAYOUT=1` for `wire_layout.txt` (keeping `wire_layout_previous.txt` pinned at `v0.4.4` unless an incompatible breaking change closes the window).
+- **Follow-on PR coordination:** Any **Planned** `NET-10` or `ECO-9` additions re-run `UPDATE_WIRE_LAYOUT=1` for `wire_layout.txt` (keeping `wire_layout_previous.txt` pinned at `v0.4.5` unless an incompatible breaking change closes the window).
 
 ## Security
 
@@ -134,3 +134,4 @@ When `NET-10` and `ECO-9` land their wire additions on top of protocol `11`, bot
 
 - 2026-11-19: Claimed `design 0098` on the hub and wrote initial draft for the protocol `11` train base on branch `win/protocol-11-train` (`BUG-22` implemented on draft pull request; `NET-10` and `ECO-9` wire additions **Planned** on the same protocol `11` train).
 - 2026-11-19: Applied review fixes for draft PR #386: replaced links to draft-only designs 0096 and 0097 with PR URLs, clarified why `wire_layout_tests.rs` sets `failed_tasks: 0, cancelled_tasks: 1` for D7.2 folded byte comparison with `v0.4.4`, added `D2.1` guardrails for `NET-10` and `ECO-9` (use constants not literal `11`, reset trailing fields in `for_peer(10)`, `MembersList` legacy mirror + positional indices + `DIFFERS_FROM_PREVIOUS`, nest participant usage to avoid `running_tasks` collision, encode `SubmitTask` priority as a design 0082 task extension, append new variants last without `skip_serializing_if` on `Binary*`, keep `wire_layout_previous.txt` pinned at `v0.4.4`), and updated `CHANGELOG.md` for `0.3.0`/protocol 9 refusal and master-first upgrade order.
+- 2026-11-26: Refreshed draft PR #386 on `origin/master` (`1c2b0b94`, `v0.4.5`): promoted `v0.4.5`'s `wire_layout.txt` verbatim to `wire_layout_previous.txt`, regenerated `wire_layout.txt`, updated `0.5.0` target (`Q101`), and ported `without_host_cpu_backpressure()` into `tests/window_v10_peers.rs` (removing `tests/window_v9_peers.rs`).

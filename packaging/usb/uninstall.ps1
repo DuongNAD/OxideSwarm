@@ -137,7 +137,7 @@ if (Test-Path -LiteralPath $WorkspacesDir) {
 }
 $NodeKeyPath = Join-Path $InstallRoot 'home\node.key'
 if (-not $Yes) {
-    $ans = Read-Host "Remove the OxideSwarm install in $InstallRoot? [y/N]"
+    $ans = Read-Host "Remove the OxideSwarm install in ${InstallRoot}? [y/N]"
     if ($ans -notmatch '^(y|yes)$') { Write-Host "Nothing removed."; exit 0 }
     if (-not $KeepKey -and (Test-Path -LiteralPath $NodeKeyPath)) {
         $keepAns = Read-Host "Keep machine identity key ($NodeKeyPath) so rejoining keeps the same identity? [y/N]"

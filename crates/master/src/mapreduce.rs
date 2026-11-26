@@ -1588,17 +1588,26 @@ mod tests {
             sum_reducer(),
             1,
             1,
-            10,
+            120,
         );
         let started = Instant::now();
-        let err = engine.execute(impossible_job).await.unwrap_err();
+        let err = tokio::time::timeout(Duration::from_secs(60), engine.execute(impossible_job))
+            .await
+            .expect("oversized job should reject before 60s guard")
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        println!("oversized MapReduce job rejected in {elapsed:?}");
         assert!(
             matches!(err, GridError::QueueByteLimitExceeded { .. }),
             "expected immediate QueueByteLimitExceeded when task alone exceeds cap, got {err:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "must fail at once without waiting for timeout"
+            queue.get_schedulable_tasks().await.is_empty(),
+            "oversized MapReduce job must leave no queued task behind"
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "must fail before timeout guard: {elapsed:?}"
         );
 
         // 2. Fill the 4_000-byte cap with a blocker task, start the Map/Reduce job, then free

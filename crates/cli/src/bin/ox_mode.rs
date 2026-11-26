@@ -7,6 +7,8 @@
 //! - `ox-mode research`: Research & performance benchmarking
 //! - `ox-mode`: Interactive terminal selection menu
 
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use rusty_grid_cli::mode_cli::{run_mode_cli, ModeCliArgs};
 use std::process::ExitCode;

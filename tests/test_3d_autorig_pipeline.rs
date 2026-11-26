@@ -39,8 +39,24 @@ use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::protocol::WorkerMessage;
 use rusty_grid_core::task::{AutoRigSpec, Generative3DSpec, Task, TaskRequirements, TaskSpec};
 use rusty_grid_master::queue::TaskState;
+use rusty_grid_master::reaper::ReaperConfig;
 use rusty_grid_master::registry::WorkerStatus;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+
+async fn spawn_test_master(config: ServerConfig) -> MasterHandle {
+    MasterServer::spawn_with_config(
+        config,
+        SchedulerConfig::default()
+            .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+            .without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("MasterServer::spawn failed")
+}
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::runner::{
     RunnerConfig, TaskRunner, EXIT_CODE_GENERAL_ERROR, EXIT_CODE_SUCCESS,
@@ -989,9 +1005,7 @@ struct SpawnedWorker {
 impl PipelineCluster {
     pub async fn spawn(num_workers: usize) -> Self {
         // 1. Master Coordinator on ephemeral loopback
-        let master = MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-            .await
-            .expect("MasterServer::spawn failed");
+        let master = spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap())).await;
         let master_addr = master.server_addr();
 
         // 2. Agent Mesh Gateway on ephemeral loopback with attached AgentGridBridge
@@ -1695,9 +1709,8 @@ async fn test_adversarial_single_bit_tamper_detection() {
 #[tokio::test]
 async fn test_adversarial_worker_crash_rescheduling() {
     let master =
-        MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
-            .await
-            .expect("MasterServer::spawn failed");
+        spawn_test_master(ServerConfig::new("127.0.0.1:0".parse().unwrap()).with_max_retries(3))
+            .await;
     let master_addr = master.server_addr().to_string();
 
     let temp1 = TempDir::new().unwrap();
