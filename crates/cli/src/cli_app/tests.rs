@@ -1599,3 +1599,124 @@ fn test_plan_cli_subcommands_parse_cleanly() {
     assert_eq!(base.as_deref(), Some("master"));
     assert!(json);
 }
+
+#[test]
+fn test_plan_lease_and_check_diff_subcommands_parse_cleanly() {
+    let claim_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "claim",
+        "TEAM-2",
+        "--holder",
+        "agent-win-2",
+        "--person",
+        "alice",
+        "--remote",
+        "upstream",
+        "--base",
+        "master",
+        "--plan",
+        ".oxideswarm/plan.toml",
+        "--repo",
+        ".",
+        "--branch",
+        "team/TEAM-2",
+        "--worktree-root",
+        "..",
+        "--no-worktree",
+        "--ttl-minutes",
+        "30",
+        "--json",
+    ])
+    .expect("parse plan claim");
+    let Commands::Plan(claim_args) = claim_cli.command else {
+        panic!("expected Plan");
+    };
+    let crate::plan::PlanSubcommand::Claim {
+        task_id,
+        holder,
+        person,
+        remote,
+        base,
+        branch,
+        no_worktree,
+        ttl_minutes,
+        json,
+        ..
+    } = claim_args.command
+    else {
+        panic!("expected Claim");
+    };
+    assert_eq!(task_id, "TEAM-2");
+    assert_eq!(holder, "agent-win-2");
+    assert_eq!(person.as_deref(), Some("alice"));
+    assert_eq!(remote, "upstream");
+    assert_eq!(base.as_deref(), Some("master"));
+    assert_eq!(branch.as_deref(), Some("team/TEAM-2"));
+    assert!(no_worktree);
+    assert_eq!(ttl_minutes, 30);
+    assert!(json);
+
+    let renew_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "renew",
+        "TEAM-2",
+        "--holder",
+        "agent-win-2",
+        "--expected-oid",
+        "0123456789abcdef0123456789abcdef01234567",
+        "--ttl-minutes",
+        "60",
+    ])
+    .expect("parse plan renew");
+    let Commands::Plan(renew_args) = renew_cli.command else {
+        panic!("expected Plan");
+    };
+    assert!(matches!(
+        renew_args.command,
+        crate::plan::PlanSubcommand::Renew {
+            ttl_minutes: 60,
+            ..
+        }
+    ));
+
+    let release_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "release",
+        "TEAM-2",
+        "--force",
+        "--json",
+    ])
+    .expect("parse plan release");
+    let Commands::Plan(release_args) = release_cli.command else {
+        panic!("expected Plan");
+    };
+    assert!(matches!(
+        release_args.command,
+        crate::plan::PlanSubcommand::Release {
+            force: true,
+            json: true,
+            ..
+        }
+    ));
+
+    let diff_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "check-diff",
+        "origin/master..HEAD",
+        "--task",
+        "TEAM-2",
+        "--json",
+    ])
+    .expect("parse plan check-diff");
+    let Commands::Plan(diff_args) = diff_cli.command else {
+        panic!("expected Plan");
+    };
+    assert!(matches!(
+        diff_args.command,
+        crate::plan::PlanSubcommand::CheckDiff { json: true, .. }
+    ));
+}
