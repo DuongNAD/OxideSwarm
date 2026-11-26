@@ -11,6 +11,7 @@ Run:   python3 tests/test_endurance_harness.py
 
 from __future__ import annotations
 
+import ast
 import copy
 import datetime
 import hashlib
@@ -969,6 +970,97 @@ class SoakHarnessTests(unittest.TestCase):
                     self.assertEqual(mode, 0o700, "expected 0o700 on %s, got %s" % (path, oct(mode)))
         finally:
             os.umask(old_umask)
+
+    def test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract(self):
+        with open(SCRIPT, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=SCRIPT)
+
+        top_defs: dict[str, list[int]] = {}
+        classes: dict[str, ast.ClassDef] = {}
+        funcs: dict[str, ast.FunctionDef] = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                top_defs.setdefault(node.name, []).append(node.lineno)
+                if isinstance(node, ast.ClassDef):
+                    classes[node.name] = node
+                    method_defs: dict[str, list[int]] = {}
+                    for child in node.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            method_defs.setdefault(child.name, []).append(child.lineno)
+                    dups = {m: ls for m, ls in method_defs.items() if len(ls) > 1}
+                    self.assertEqual(dups, {}, f"duplicate methods in {node.name}: {dups}")
+                elif isinstance(node, ast.FunctionDef):
+                    funcs[node.name] = node
+
+        dup_top = {name: lines for name, lines in top_defs.items() if len(lines) > 1}
+        self.assertEqual(dup_top, {}, f"duplicate top-level definitions in endurance.py: {dup_top}")
+
+        def collect_attrs(cls_name: str) -> set[str]:
+            cls_node = classes[cls_name]
+            attrs: set[str] = set()
+            for child in cls_node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    attrs.add(child.name)
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.Attribute)
+                            and isinstance(sub.value, ast.Name)
+                            and sub.value.id == "self"
+                            and isinstance(sub.ctx, ast.Store)
+                        ):
+                            attrs.add(sub.attr)
+            for base in cls_node.bases:
+                if isinstance(base, ast.Name) and base.id in classes:
+                    attrs |= collect_attrs(base.id)
+            return attrs
+
+        soak_attrs = collect_attrs("SoakCluster")
+        # `run_soak` checks these optional RemoteSoakCluster hooks via `hasattr(cluster, ...)`.
+        hasattr_guarded = {
+            "expected_sample_roles",
+            "missing_remote_shutdowns",
+            "remote_evidence_errors",
+        }
+        used_on_cluster: set[str] = set()
+        for fn_name in (
+            "run_soak",
+            "_wait_for_soak_result",
+            "_run_async_soak_task",
+            "_run_cancel_soak_task",
+            "_run_output_soak_task",
+        ):
+            fn_node = funcs[fn_name]
+            for sub in ast.walk(fn_node):
+                if (
+                    isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "cluster"
+                ):
+                    used_on_cluster.add(sub.attr)
+        missing = sorted((used_on_cluster - hasattr_guarded) - soak_attrs)
+        self.assertEqual(missing, [], f"SoakCluster missing attributes called by run_soak: {missing}")
+        self.assertTrue(hasattr(endurance.SoakCluster, "leftover_pids"))
+        self.assertFalse(hasattr(endurance.RemoteEnduranceCluster, "leftover_pids"))
+
+        with tempfile.TemporaryDirectory(prefix="ox_t100_") as td:
+            cluster = endurance.SoakCluster("/usr/bin/true", os.path.join(td, "cluster"), workers=2)
+            live_master = mock.MagicMock()
+            live_master.pid = 2001
+            live_master.poll.return_value = None
+            dead_worker = mock.MagicMock()
+            dead_worker.pid = 2002
+            dead_worker.poll.return_value = 0
+            live_worker = mock.MagicMock()
+            live_worker.pid = 2003
+            live_worker.poll.return_value = None
+            live_client = mock.MagicMock()
+            live_client.pid = 2004
+            live_client.poll.return_value = None
+            cluster._unclean_pids = [2003, 2000]
+            cluster._master_entry = (None, live_master)
+            cluster._worker_entries = {0: (dead_worker, mock.MagicMock()), 1: (live_worker, mock.MagicMock())}
+            cluster._tracked_clients = [live_client]
+            self.assertEqual(cluster.leftover_pids(), [2000, 2001, 2003, 2004])
 
 
 class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
