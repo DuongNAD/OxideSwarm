@@ -12,7 +12,7 @@ machine can take every kind of task the project has. This record adds:
 
 - probes for `python` (new) and stub-safe probes for `cargo`, `rustc`, `git` (TOOL-1);
 - a Windows kit option `--toolset full` that carries pinned, private copies of Python (TOOL-1), a Rust
-  GNU toolchain (TOOL-3) and MinGit (TOOL-4), installed after one question inside the kit's own folder,
+  GNU toolchain (TOOL-3), a MinGW-w64 C toolchain for crates that compile C (TOOL-5) and MinGit (TOOL-4), installed after one question inside the kit's own folder,
   visible to the worker only, and removed by uninstall;
 - tool packs, which deliver any portable tool to any worker as a cached blob without installing it
   (TOOL-2), for machines set up without the kit and for other tool versions.
@@ -52,6 +52,10 @@ machine can take every kind of task the project has. This record adds:
   - MinGit 2.56.1 64-bit (Git for Windows): 39.8 MB.
   - Together about 204 MB on the stick, beside about 100 MB of release archives. The trial sticks hold
     15.7 GB.
+- **`rust-mingw` links but does not compile C.** Its `self-contained\GCC-WARNING.txt` says the bundled
+  `gcc.exe` is only a linker, and T6 (Status log) confirmed it: a crate with a `cc` build script fails with
+  `failed to find tool "gcc.exe"`. The project itself depends on `ring`, which compiles C, so building
+  OxideSwarm or any crate with C parts on a kit machine needs a real MinGW-w64 C compiler (TOOL-5).
 - **Rust with MSVC is out of reach.** `x86_64-pc-windows-msvc` needs the Visual Studio Build Tools
   (several GB, administrator install, a licence that does not allow redistribution), so the kit uses the
   GNU toolchain.
@@ -73,8 +77,7 @@ machine can take every kind of task the project has. This record adds:
 ## Non-goals
 
 - Installing tools system wide, through `winget`, the Store or vendor installers; administrator rights.
-- `pip` packages, virtual environments, or C/C++ toolchains beyond what `rust-mingw` brings (a full
-  MinGW or LLVM pack is a later tool pack, see Test plan T6).
+- `pip` packages and virtual environments.
 - Bundling Rust or Git in the macOS and Linux kits: their linkers come with the system (Command Line
   Tools on macOS, the distribution's `cc` on Linux) and cannot be redistributed with the kit. The probes
   of D1 and tool packs cover those machines.
@@ -102,6 +105,9 @@ machine can take every kind of task the project has. This record adds:
      `static.rust-lang.org/dist/`; their SHA-256 values are in the channel manifest
      `channel-rust-<ver>.toml`. The pinned version is the project's CI toolchain (1.96.0 on 2026-11-26),
      so a kit machine builds the project with the toolchain CI checks.
+   - C toolchain: a MinGW-w64 GCC distribution for `x86_64` with the `x86_64-w64-mingw32` target
+     (candidates: w64devkit, WinLibs, LLVM-MinGW; TOOL-5 picks the smallest one that builds `ring` and the
+     T6 crate, and records its size and licences).
    - MinGit: `MinGit-<ver>-64-bit.zip` from the `git-for-windows/git` GitHub release; its SHA-256 is
      listed in the release notes.
    A pull request changes a pin; nothing downloads an unpinned file.
@@ -130,10 +136,12 @@ machine can take every kind of task the project has. This record adds:
    - `rust-<ver>\` from the four Rust tarballs, merging each component's tree as its `install.sh`
      manifest lists (rustc, cargo, rust-std and rust-mingw into one sysroot), done by PowerShell without
      running the shell script;
+   - `mingw-<ver>\` from the C toolchain archive;
    - `git-<ver>\` from the MinGit zip.
 2. `<InstallRoot>\cargo-home\` becomes `CARGO_HOME` of the worker, so the registry and git caches of
    builds stay inside the install folder. `RUSTUP_HOME` stays unset (no rustup).
-3. `start-worker.vbs` prepends `tools\python-<ver>`, `tools\rust-<ver>\bin` and `tools\git-<ver>\cmd`
+3. `start-worker.vbs` prepends `tools\python-<ver>`, `tools\rust-<ver>\bin`, `tools\mingw-<ver>\bin` and
+   `tools\git-<ver>\cmd`
    to `PATH` and sets `CARGO_HOME`, in the worker's process environment only. Task processes inherit
    them; the user's own `PATH` and environment do not change.
 4. Workspaces: the installer decides `--workspaces` from the private `cargo` it just installed, not only
@@ -156,6 +164,8 @@ After the worker is listed, the installer submits one task per installed tool, p
 - `python -c "import sys; print(sys.version)"`;
 - `rustc --version` and a `RustCompilation` of a one-file program from the kit (`tools\check\hello.rs`)
   whose output it runs;
+- a `cargo build --offline` of a small vendored crate from the kit whose build script compiles C
+  (`tools\check\cc-check\`), which checks the C toolchain;
 - `git --version`.
 
 It prints one line per tool. A failure is reported with the task's stderr and leaves the worker running
@@ -168,6 +178,9 @@ with the tools that passed.
 - Python: PSF License (the package's own `LICENSE.txt` is extracted with it).
 - Rust: MIT or Apache-2.0; `rust-mingw` carries MinGW-w64 runtime files under their licences (included
   in the component).
+- C toolchain: GCC and binutils under the GNU GPL (version 3) with the GCC Runtime Library Exception,
+  MinGW-w64 headers and runtime under their permissive licences; `NOTICE.txt` names the exact source
+  release, as for MinGit.
 - MinGit: GNU GPL version 2. Redistributing the binary requires the corresponding source: `NOTICE.txt`
   names the exact Git for Windows release and links its source archive, and `make_kit.sh` refuses a
   toolset kit without `NOTICE.txt`.
@@ -241,6 +254,7 @@ machine whose owner said No), other versions than the kit's, and tools the kit d
 |---|---|---|---|---|
 | TOOL-1 | Probe `python` (stub-safe probes); pinned private Python in the Windows kit; `tools.lock`, `--toolset`, the one question, `NOTICE.txt` | `crates/core/src/capabilities.rs`, `packaging/usb/{make_kit.sh,install.ps1,uninstall.ps1,tools.lock}`, `tests/test_launcher_scripts.py`, `docs/reference.md` | T1, T2 and the Python part of T3 pass | Planned |
 | TOOL-3 | Private Rust GNU toolchain in the Windows kit, `CARGO_HOME` in the install folder, workspaces from the private `cargo`, isolation grant | `packaging/usb/{install.ps1,uninstall.ps1,tools.lock}`, `tests/test_launcher_scripts.py` | The Rust part of T3, T5 and T6 recorded | Planned |
+| TOOL-5 | Private MinGW-w64 C toolchain in the Windows kit (and as a tool pack), so crates that compile C build | `packaging/usb/{make_kit.sh,install.ps1,tools.lock}` | T6 passes on a kit machine and a `cargo build` of OxideSwarm (it needs `ring`) passes there | Planned |
 | TOOL-4 | Private MinGit in the Windows kit with its GPL source notice | `packaging/usb/{make_kit.sh,install.ps1,tools.lock}` | The Git part of T3 passes and `NOTICE.txt` names the source | Planned |
 | TOOL-2 | Tool packs as cached blobs | `crates/core/src/task/extension.rs`, `crates/worker/src/{blob_cache.rs,staging.rs}`, `crates/cli` | A Python pack and a Rust pack run on a worker that has neither installed, each archive sent once per worker | Planned |
 | Q99 | Owner decision: how Rust reaches kit machines | this record | Decided 2026-11-26: the full toolset (kit and tool packs) | Decided |
@@ -264,3 +278,17 @@ machine whose owner said No), other versions than the kit's, and tools the kit d
   MinGit (TOOL-4) added beside Python; one question with default Yes for a `--toolset` kit; tool packs
   (TOOL-2) moved from Design only to Planned. TOOL-3 and TOOL-4 claimed with `agent_bridge.py claim`.
   Sizes measured from the vendors' servers the same day (Context).
+- 2026-11-26: T5 and T6 run live on the same worker `msi` (owner approved the download). Toolchain: Rust
+  1.96.0 `x86_64-pc-windows-gnu`, the four components downloaded from `static.rust-lang.org/dist/2026-05-28/`
+  (`.tar.xz`, 157 MB together, each SHA-256 equal to `channel-rust-1.96.0.toml`), merged on the Mac into one
+  tree (816 MB, 199 files) and sent as one zip input (231.6 MB). The task (`run.cmd`: `tar -xf` in the sandbox,
+  the tree's `bin` on `PATH`, `CARGO_HOME` in the sandbox, `cargo build --release --offline`) printed
+  `rustc 1.96.0` and `cargo 1.96.0`. The first submission of the zip waited 29.0 s; later ones 4.4 to 7.1 s
+  (the zip came from the worker's cache).
+  - T5: a crate depending on `sha2` 0.10 (vendored) built in 2.47 s and printed the same SHA-256 as on the
+    Mac. A crate depending on `blake3` 1 built in 2.96 s and printed the same hash as on the Mac; `blake3`
+    falls back to Rust code when no C compiler is found, so it proves nothing about C.
+  - T6: a crate whose `build.rs` compiles `c/add.c` with the `cc` crate failed on `msi` with `failed to find
+    tool "gcc.exe": program not found` (it runs on the Mac). `rust-mingw` is a linker only, as its
+    `GCC-WARNING.txt` says. TOOL-5 added (claimed with `agent_bridge.py claim`): the kit also needs a
+    MinGW-w64 C compiler, or OxideSwarm itself (`ring`) cannot be built on a kit machine.

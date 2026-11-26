@@ -128,7 +128,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D9 | Keep the `/api/chat` route, which runs `agy` on the master host, in the master dashboard? | Remove it from the master. If it stays, it needs Admin scope and an opt-in flag | SEC-14 |
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
-| Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-4 |
+| Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-5 |
 
 ## Index
 
@@ -399,6 +399,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | In | (design 0053), 185, 195, 207, 228 |
 | TOOL-1 | Probe `python`; `--toolset` kits and a pinned private Python in the Windows USB kit | P2 | M | USB-1 |  | Planned | Out | (design 0110) |
 | TOOL-3 | Private Rust GNU toolchain in the Windows USB kit | P2 | M | TOOL-1 |  | Planned | Out | (design 0110) |
+| TOOL-5 | Private MinGW-w64 C toolchain in the Windows USB kit, so crates that compile C build | P2 | M | TOOL-3 |  | Planned | Out | (design 0110) |
 | TOOL-4 | Private MinGit in the Windows USB kit | P3 | S | TOOL-1 |  | Planned | Out | (design 0110) |
 | TOOL-2 | Tool packs: portable tools delivered to workers as cached blobs | P2 | L | TOOL-1 |  | Planned | Out | (design 0110) |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented |  | 204 (design 0055) |
@@ -1191,6 +1192,18 @@ then JOIN-2 and USB-1 in parallel.
   `RustCompilation` check of D5.
 - **Done when:** The Rust part of T3 passes, and T5 and T6 are recorded (T6 says whether crates with C build
   scripts need a further MinGW or LLVM pack).
+
+### TOOL-5: Private MinGW-w64 C toolchain in the Windows USB kit
+
+- **Evidence:** 2026-11-26, worker `msi` with Rust 1.96.0 `x86_64-pc-windows-gnu` sent as a zip input: crates with
+  pure Rust dependencies built, but a crate whose `build.rs` compiles C with `cc` failed with `failed to find tool
+  "gcc.exe": program not found`. `rust-mingw` brings a linker only (its `GCC-WARNING.txt`). OxideSwarm depends on
+  `ring`, which compiles C.
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D2, D4 to D6: pick the smallest MinGW-w64 GCC
+  distribution that builds `ring` and the T6 crate, pin it in `tools.lock`, install it under
+  `<InstallRoot>\tools\mingw-<ver>`, put its `bin` on the worker's `PATH`, add the `cc-check` crate to the kit
+  checks, and name its GPL source release in `NOTICE.txt`. The same archive is the first C tool pack of TOOL-2.
+- **Done when:** T6 passes on a kit machine and `cargo build --locked -p rusty_grid_cli` passes there.
 
 ### TOOL-4: Private MinGit in the Windows USB kit
 
