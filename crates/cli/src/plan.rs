@@ -237,6 +237,72 @@ pub enum PlanSubcommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Render a Markdown pull request body from `.oxideswarm/plan.toml` and `.oxideswarm/verify/<id>.json` (D6)
+    PrBody {
+        /// Task id in `.oxideswarm/plan.toml`
+        #[arg(long, value_name = "TASK_ID")]
+        task: String,
+
+        /// Path to the plan TOML file (default: `.oxideswarm/plan.toml`)
+        #[arg(long, value_name = "PATH")]
+        plan: Option<PathBuf>,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Override base branch/ref name from `[project].base`
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Git remote hosting the base branch (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Verify record JSON file(s) (repeatable; defaults to `.oxideswarm/verify/<task>.json`)
+        #[arg(long = "record", value_name = "PATH")]
+        records: Vec<PathBuf>,
+
+        /// PR head branch name (default: current git branch or `team/<task>`)
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+
+        /// Optional short summary included in the rendered PR body
+        #[arg(long, value_name = "TEXT")]
+        summary: Option<String>,
+
+        /// Exit non-zero when the verified base commit is stale relative to the base branch tip
+        #[arg(long)]
+        require_fresh: bool,
+
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Mark a merged task as `done` in `.oxideswarm/plan.toml` and delete its remote lease ref (D6.3)
+    Done {
+        /// Task id in `.oxideswarm/plan.toml`
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+
+        /// Path to the plan TOML file (default: `.oxideswarm/plan.toml`)
+        #[arg(long, value_name = "PATH")]
+        plan: Option<PathBuf>,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Git remote hosting `refs/oxideswarm/lease/*` (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Root document parsed from `.oxideswarm/plan.toml`.
@@ -1612,6 +1678,44 @@ pub fn run_plan_command(args: PlanArgs) -> ExitCode {
                 ttl_minutes: lease::DEFAULT_LEASE_TTL_MINS,
             };
             lease::run_plan_unblock_cli(&opts, repo.as_deref(), json)
+        }
+        PlanSubcommand::PrBody {
+            task,
+            plan,
+            repo,
+            base,
+            remote,
+            records,
+            branch,
+            summary,
+            require_fresh,
+            json,
+        } => {
+            let opts = crate::pr_body::PlanPrBodyOptions {
+                task_id: task,
+                plan_path: plan,
+                base,
+                remote,
+                record_paths: records,
+                branch,
+                summary,
+                require_fresh,
+            };
+            crate::pr_body::run_plan_pr_body_cli(&opts, repo.as_deref(), json)
+        }
+        PlanSubcommand::Done {
+            task_id,
+            plan,
+            repo,
+            remote,
+            json,
+        } => {
+            let opts = crate::pr_body::DoneOptions {
+                task_id,
+                plan_path: plan,
+                remote,
+            };
+            crate::pr_body::run_plan_done_cli(&opts, repo.as_deref(), json)
         }
     }
 }

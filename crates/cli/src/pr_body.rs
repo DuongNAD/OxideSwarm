@@ -6,7 +6,20 @@
 //! `verify_gate::{VerifyGateReport, VerifyRecord}` JSON (where optional fields use `Option<String>`
 //! with `skip_serializing_if = "Option::is_none"`).
 
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::plan::lease::{
+    has_git_remote, lookup_task_lease, release_task, validate_remote_name, ReleaseOptions,
+    DEFAULT_BRANCH_PREFIX,
+};
+use crate::plan::{
+    load_plan, parse_plan, resolve_plan_path, validate_plan, validate_task_id, PlanTask, TaskStatus,
+};
+use crate::verify_gate::VERIFY_RECORD_REL_DIR;
 
 /// One failing test or compiler diagnostic summary from a verify cell (design 0111, D4.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +189,42 @@ fn short_sha(raw: &str) -> String {
     raw.trim().chars().take(12).collect()
 }
 
+/// Returns `true` when `current_base` is known and differs from `verified_base` (case-insensitive,
+/// allowing abbreviated SHA prefix match when at least 7 characters match).
+pub fn is_base_commit_stale(verified_base: &str, current_base: Option<&str>) -> bool {
+    let vb = verified_base.trim();
+    if vb.is_empty() {
+        return false;
+    }
+    let Some(cur) = current_base.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if vb.eq_ignore_ascii_case(cur) {
+        return false;
+    }
+    let min_len = vb.len().min(cur.len());
+    if min_len >= 7 {
+        let vb_low = vb.to_ascii_lowercase();
+        let cur_low = cur.to_ascii_lowercase();
+        if vb_low.starts_with(&cur_low) || cur_low.starts_with(&vb_low) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Returns `true` if `opts.base_commit` or any record's `base_commit` differs from
+/// `opts.current_base_commit`.
+pub fn check_records_stale(opts: &PrBodyOptions, records: &[VerifyRecord]) -> bool {
+    if is_base_commit_stale(&opts.base_commit, opts.current_base_commit.as_deref()) {
+        return true;
+    }
+    records
+        .iter()
+        .filter_map(|r| r.base_commit.as_deref())
+        .any(|b| is_base_commit_stale(b, opts.current_base_commit.as_deref()))
+}
+
 fn validate_non_empty_token(raw: &str, field: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -288,19 +337,18 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
         escape_code_span(&short_verified)
     ));
 
-    if let Some(cur_base) = opts
+    let stale = check_records_stale(opts, records);
+    let cur_base_trimmed = opts
         .current_base_commit
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let short_cur = short_sha(cur_base);
-        if !cur_base.eq_ignore_ascii_case(&base_commit)
-            && !short_cur.eq_ignore_ascii_case(&short_verified)
-        {
+        .filter(|s| !s.is_empty());
+
+    if stale {
+        if let Some(cur_base) = cur_base_trimmed {
             out.push_str(&format!(
                 "- **Stale base warning:** current `{safe_base_branch}` is at `{}`, which differs from verified `{}` — re-verify on the latest base before merging.\n",
-                escape_code_span(&short_cur),
+                escape_code_span(&short_sha(cur_base)),
                 escape_code_span(&short_verified)
             ));
         }
@@ -332,9 +380,22 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
     };
 
     out.push_str("\n## Verification\n\n");
-    out.push_str(&format!(
-        "**Status:** `{overall_status}` ({total_cells} cell(s))\n\n"
-    ));
+    if stale {
+        out.push_str(&format!(
+            "**Status:** `STALE` (verified `{overall_status}`, {total_cells} cell(s))\n\n"
+        ));
+        if let Some(cur_base) = cur_base_trimmed {
+            out.push_str(&format!(
+                "> **STALE:** verified base `{}` does not match current `{safe_base_branch}` tip `{}` — re-verify on the latest base before merging.\n\n",
+                escape_code_span(&short_verified),
+                escape_code_span(&short_sha(cur_base)),
+            ));
+        }
+    } else {
+        out.push_str(&format!(
+            "**Status:** `{overall_status}` ({total_cells} cell(s))\n\n"
+        ));
+    }
     out.push_str(&render_verify_table(records, Some(&base_commit)));
     out.push('\n');
 
@@ -387,6 +448,504 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
     );
 
     Ok(out)
+}
+
+/// Options for generating a PR body from `.oxideswarm/plan.toml` and `.oxideswarm/verify/<id>.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanPrBodyOptions {
+    pub task_id: String,
+    pub plan_path: Option<PathBuf>,
+    pub base: Option<String>,
+    pub remote: String,
+    pub record_paths: Vec<PathBuf>,
+    pub branch: Option<String>,
+    pub summary: Option<String>,
+    pub require_fresh: bool,
+}
+
+/// Output returned by [`build_plan_pr_body`] / `oxideswarm plan pr-body`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanPrBodyOutput {
+    pub task_id: String,
+    pub status: String,
+    pub stale: bool,
+    pub base_branch: String,
+    pub verified_base_commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_base_commit: Option<String>,
+    pub markdown: String,
+}
+
+/// Options for [`mark_task_done`] (`oxideswarm plan done <id>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoneOptions {
+    pub task_id: String,
+    pub plan_path: Option<PathBuf>,
+    pub remote: String,
+}
+
+/// Result returned by [`mark_task_done`] / `oxideswarm plan done`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoneResult {
+    pub task_id: String,
+    pub previous_status: String,
+    pub new_status: String,
+    pub plan_path: String,
+    pub lease_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_oid: Option<String>,
+    pub unblocked_dependents: Vec<String>,
+}
+
+fn sanitize_record_filename(raw: &str) -> String {
+    let mut cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.len() > 64 {
+        cleaned.truncate(64);
+    }
+    let trimmed = cleaned.trim_matches(|c| c == '.' || c == '-');
+    if trimmed.is_empty() {
+        "task".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn run_git_trimmed(repo_dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn resolve_base_tip_sha(repo_dir: &Path, remote: &str, base_ref: &str) -> Option<String> {
+    let trimmed = base_ref.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains('/') && !remote.is_empty() && has_git_remote(repo_dir, remote) {
+        let remote_ref = format!("refs/remotes/{remote}/{trimmed}");
+        if let Some(sha) = run_git_trimmed(repo_dir, &["rev-parse", "--verify", &remote_ref]) {
+            return Some(sha);
+        }
+    }
+    if let Some(sha) = run_git_trimmed(repo_dir, &["rev-parse", "--verify", trimmed]) {
+        return Some(sha);
+    }
+    if !trimmed.contains('/') {
+        let fallback = format!("refs/heads/{trimmed}");
+        if let Some(sha) = run_git_trimmed(repo_dir, &["rev-parse", "--verify", &fallback]) {
+            return Some(sha);
+        }
+    }
+    None
+}
+
+fn read_non_symlink_text(path: &Path, label: &str) -> Result<String, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to read {label} '{}': {e}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("refusing symlinked {label} '{}'", path.display()));
+    }
+    if !meta.is_file() {
+        return Err(format!(
+            "{label} '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {label} '{}': {e}", path.display()))
+}
+
+fn resolve_record_paths(
+    repo_dir: &Path,
+    task_id: &str,
+    explicit: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    if explicit.is_empty() {
+        let dot_ox = repo_dir.join(".oxideswarm");
+        if let Ok(meta) = std::fs::symlink_metadata(&dot_ox) {
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlinked dir {}", dot_ox.display()));
+            }
+        }
+        let verify_dir = repo_dir.join(VERIFY_RECORD_REL_DIR);
+        if let Ok(meta) = std::fs::symlink_metadata(&verify_dir) {
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlinked dir {}", verify_dir.display()));
+            }
+        }
+        let safe = sanitize_record_filename(task_id);
+        return Ok(vec![verify_dir.join(format!("{safe}.json"))]);
+    }
+    Ok(explicit
+        .iter()
+        .map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                repo_dir.join(p)
+            }
+        })
+        .collect())
+}
+
+fn find_task_in_plan<'a>(
+    tasks: &'a [PlanTask],
+    task_id: &str,
+    plan_path: &Path,
+) -> Result<&'a PlanTask, String> {
+    tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .ok_or_else(|| format!("task '{task_id}' not found in {}", plan_path.display()))
+}
+
+/// Builds a PR body and staleness assessment from `.oxideswarm/plan.toml` and verify record JSONs
+/// (design 0111 D6.1 & D6.2).
+pub fn build_plan_pr_body(
+    repo_dir: &Path,
+    opts: &PlanPrBodyOptions,
+) -> Result<PlanPrBodyOutput, String> {
+    let task_id = opts.task_id.trim().to_string();
+    validate_task_id(&task_id)?;
+    let remote = validate_remote_name(&opts.remote)?;
+    let plan_path = resolve_plan_path(repo_dir, opts.plan_path.as_deref());
+    let plan = load_plan(&plan_path)?;
+    let task = find_task_in_plan(&plan.tasks, &task_id, &plan_path)?;
+
+    let record_paths = resolve_record_paths(repo_dir, &task_id, &opts.record_paths)?;
+    let mut records = Vec::new();
+    for path in &record_paths {
+        let raw = read_non_symlink_text(path, "verify record")?;
+        let parsed = parse_verify_records(&raw)
+            .map_err(|e| format!("failed parsing '{}': {e}", path.display()))?;
+        records.extend(parsed);
+    }
+    if records.is_empty() {
+        return Err("no verify records found in input".to_string());
+    }
+
+    let base_branch = opts
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&plan.project.base)
+        .to_string();
+    let current_base_commit = resolve_base_tip_sha(repo_dir, &remote, &base_branch);
+
+    let verified_base_commit = records
+        .iter()
+        .find_map(|r| {
+            r.base_commit
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            let head_commit = records[0].commit.trim();
+            current_base_commit
+                .as_deref()
+                .and_then(|cur| run_git_trimmed(repo_dir, &["merge-base", head_commit, cur]))
+        })
+        .unwrap_or_else(|| records[0].commit.trim().to_string());
+
+    let branch = opts
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            run_git_trimmed(repo_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .filter(|b| b != "HEAD")
+        })
+        .unwrap_or_else(|| format!("{DEFAULT_BRANCH_PREFIX}{task_id}"));
+
+    let render_opts = PrBodyOptions {
+        task_id: task.id.clone(),
+        task_title: Some(task.title.clone()),
+        branch: Some(branch),
+        base_branch: Some(base_branch.clone()),
+        base_commit: verified_base_commit.clone(),
+        summary: opts.summary.clone(),
+        current_base_commit: current_base_commit.clone(),
+    };
+    let markdown = render_pr_body(&render_opts, &records)?;
+    let stale = check_records_stale(&render_opts, &records);
+
+    let total_cells: usize = records.iter().map(|r| r.cells.len()).sum();
+    let all_pass = !records.is_empty()
+        && total_cells > 0
+        && records
+            .iter()
+            .all(|r| r.ok && r.cells.iter().all(|c| c.exit == 0 && c.failures.is_empty()));
+    let status = if stale {
+        "STALE".to_string()
+    } else if total_cells == 0 {
+        "UNVERIFIED".to_string()
+    } else if all_pass {
+        "PASS".to_string()
+    } else {
+        "FAIL".to_string()
+    };
+
+    Ok(PlanPrBodyOutput {
+        task_id,
+        status,
+        stale,
+        base_branch,
+        verified_base_commit,
+        current_base_commit,
+        markdown,
+    })
+}
+
+fn write_plan_atomic(plan_path: &Path, content: &str) -> Result<(), String> {
+    let parent = plan_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if let Ok(meta) = std::fs::symlink_metadata(parent) {
+        if meta.file_type().is_symlink() {
+            return Err(format!("refusing symlinked dir {}", parent.display()));
+        }
+    }
+    let tmp = parent.join(format!(".plan.toml.tmp.{}", Uuid::new_v4()));
+    std::fs::write(&tmp, content.as_bytes())
+        .map_err(|e| format!("write temp plan '{}': {e}", tmp.display()))?;
+    std::fs::rename(&tmp, plan_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replace plan '{}': {e}", plan_path.display())
+    })
+}
+
+/// Sets `task_id`'s status to `done` in `.oxideswarm/plan.toml` (preserving comments/layout via
+/// `toml_edit`) and deletes its remote lease ref `refs/oxideswarm/lease/<task_id>` if present
+/// (design 0111 D6.3).
+pub fn mark_task_done(repo_dir: &Path, opts: &DoneOptions) -> Result<DoneResult, String> {
+    let task_id = opts.task_id.trim().to_string();
+    validate_task_id(&task_id)?;
+    let remote = validate_remote_name(&opts.remote)?;
+    let plan_path = resolve_plan_path(repo_dir, opts.plan_path.as_deref());
+    let raw = read_non_symlink_text(&plan_path, "plan file")?;
+
+    let current_plan = parse_plan(&raw)?;
+    let existing = find_task_in_plan(&current_plan.tasks, &task_id, &plan_path)?;
+    let previous_status = existing.status.as_str().to_string();
+
+    let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        format!(
+            "failed parsing '{}' as TOML document: {e}",
+            plan_path.display()
+        )
+    })?;
+    let tasks_arr = doc
+        .get_mut("task")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .ok_or_else(|| format!("missing [[task]] array in {}", plan_path.display()))?;
+
+    let mut updated_row = false;
+    for tbl in tasks_arr.iter_mut() {
+        if tbl.get("id").and_then(|v| v.as_str()) == Some(task_id.as_str()) {
+            let mut val = toml_edit::Value::from("done");
+            if let Some(decor) = tbl
+                .get("status")
+                .and_then(|item| item.as_value())
+                .map(|existing| existing.decor().clone())
+            {
+                *val.decor_mut() = decor;
+            }
+            tbl.insert("status", toml_edit::Item::Value(val));
+            updated_row = true;
+            break;
+        }
+    }
+    if !updated_row {
+        return Err(format!(
+            "task '{task_id}' not found in {}",
+            plan_path.display()
+        ));
+    }
+
+    let rendered = doc.to_string();
+    let reparsed = parse_plan(&rendered)?;
+    let diags = validate_plan(&reparsed);
+    if let Some(first) = diags.first() {
+        return Err(format!("updated plan fails validation: {}", first.message));
+    }
+
+    if previous_status != TaskStatus::Done.as_str() {
+        write_plan_atomic(&plan_path, &rendered)?;
+    }
+
+    let (lease_deleted, deleted_oid) = if has_git_remote(repo_dir, &remote) {
+        if lookup_task_lease(repo_dir, &remote, &task_id)?.is_some() {
+            let rel = release_task(
+                repo_dir,
+                &ReleaseOptions {
+                    task_id: task_id.clone(),
+                    holder: None,
+                    remote: remote.clone(),
+                    force: true,
+                },
+            )?;
+            (true, Some(rel.deleted_oid))
+        } else {
+            (false, None)
+        }
+    } else {
+        (false, None)
+    };
+
+    let mut done_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for t in &reparsed.tasks {
+        if t.status == TaskStatus::Done {
+            done_ids.insert(t.id.as_str());
+        }
+    }
+    let unblocked_dependents: Vec<String> = reparsed
+        .tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Open)
+        .filter(|t| t.depends_on.iter().any(|d| d == &task_id))
+        .filter(|t| t.depends_on.iter().all(|d| done_ids.contains(d.as_str())))
+        .map(|t| t.id.clone())
+        .collect();
+
+    Ok(DoneResult {
+        task_id,
+        previous_status,
+        new_status: TaskStatus::Done.as_str().to_string(),
+        plan_path: plan_path.display().to_string(),
+        lease_deleted,
+        deleted_oid,
+        unblocked_dependents,
+    })
+}
+
+fn resolve_repo_arg(repo: Option<&Path>) -> Result<PathBuf, String> {
+    match repo {
+        Some(p) => Ok(p.to_path_buf()),
+        None => std::env::current_dir().map_err(|e| format!("cannot read current directory: {e}")),
+    }
+}
+
+fn emit_pr_body_cli_error(json: bool, msg: &str) -> ExitCode {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "ok": false, "error": msg }))
+                .unwrap_or_default()
+        );
+    } else {
+        eprintln!("error: {msg}");
+    }
+    ExitCode::FAILURE
+}
+
+/// CLI handler for `oxideswarm plan pr-body`.
+pub(crate) fn run_plan_pr_body_cli(
+    opts: &PlanPrBodyOptions,
+    repo: Option<&Path>,
+    json: bool,
+) -> ExitCode {
+    let repo_dir = match resolve_repo_arg(repo) {
+        Ok(d) => d,
+        Err(e) => return emit_pr_body_cli_error(json, &e),
+    };
+    let out = match build_plan_pr_body(&repo_dir, opts) {
+        Ok(o) => o,
+        Err(e) => return emit_pr_body_cli_error(json, &e),
+    };
+    let fresh_fail = opts.require_fresh && out.stale;
+    if json {
+        let mut val = serde_json::to_value(&out).unwrap_or_default();
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert("ok".to_string(), serde_json::Value::Bool(!fresh_fail));
+            if fresh_fail {
+                obj.insert(
+                    "error".to_string(),
+                    serde_json::Value::String(format!(
+                        "verify record for '{}' is STALE (verified base {} != current {} tip {})",
+                        out.task_id,
+                        short_sha(&out.verified_base_commit),
+                        out.base_branch,
+                        out.current_base_commit
+                            .as_deref()
+                            .map(short_sha)
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    )),
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+    } else {
+        print!("{}", out.markdown);
+        if fresh_fail {
+            eprintln!(
+                "error: verify record for '{}' is STALE (verified base {} != current {} tip {})",
+                out.task_id,
+                short_sha(&out.verified_base_commit),
+                out.base_branch,
+                out.current_base_commit
+                    .as_deref()
+                    .map(short_sha)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            );
+        }
+    }
+    if fresh_fail {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// CLI handler for `oxideswarm plan done`.
+pub(crate) fn run_plan_done_cli(opts: &DoneOptions, repo: Option<&Path>, json: bool) -> ExitCode {
+    let repo_dir = match resolve_repo_arg(repo) {
+        Ok(d) => d,
+        Err(e) => return emit_pr_body_cli_error(json, &e),
+    };
+    match mark_task_done(&repo_dir, opts) {
+        Ok(res) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "done": res }))
+                        .unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "marked {} done ({} -> {}); lease_deleted={}; unblocked=[{}]",
+                    res.task_id,
+                    res.previous_status,
+                    res.new_status,
+                    res.lease_deleted,
+                    res.unblocked_dependents.join(", ")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => emit_pr_body_cli_error(json, &e),
+    }
 }
 
 #[cfg(test)]
@@ -493,7 +1052,8 @@ mod tests {
         assert!(body.contains(
             "**Task:** `T-12` — Count cancelled tasks apart from failed ones in status --json"
         ));
-        assert!(body.contains("**Status:** `PASS` (3 cell(s))"));
+        assert!(body.contains("**Status:** `STALE` (verified `PASS`, 3 cell(s))"));
+        assert!(body.contains("> **STALE:** verified base `fc95e4c9f6ea` does not match current `master` tip `ddbbf520dead`"));
         assert!(body.contains(
             "| Profile | Worker | OS | Link | Toolchain | Result | Task ID | Base commit |"
         ));
@@ -503,6 +1063,23 @@ mod tests {
         assert!(body.contains("Stale base warning:"));
         assert!(body.contains("`ddbbf520dead`"));
         assert!(!body.contains("### Failures"));
+
+        // Matching base commit tip -> PASS (not STALE).
+        let fresh_body = render_pr_body(
+            &PrBodyOptions {
+                task_id: "T-12".to_string(),
+                task_title: None,
+                branch: Some("team/T-12".to_string()),
+                base_branch: Some("master".to_string()),
+                base_commit: "fc95e4c9f6ea5a23b1be6e10ac902d79baf92163".to_string(),
+                summary: None,
+                current_base_commit: Some("fc95e4c9f6ea5a23b1be6e10ac902d79baf92163".to_string()),
+            },
+            &records,
+        )
+        .expect("render fresh passing PR body");
+        assert!(fresh_body.contains("**Status:** `PASS` (3 cell(s))"));
+        assert!(!fresh_body.contains("STALE"));
     }
 
     #[test]
