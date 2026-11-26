@@ -4346,7 +4346,7 @@ public class Program {
             self._run_windows_toolset_e2e()
 
     def _run_windows_toolset_e2e(self):
-        tmp = tempfile.mkdtemp(prefix="ox_win_toolset_t2_")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_win_toolset_t2_"))
         tmp_home = os.path.join(tmp, "home")
         tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
         tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
