@@ -464,6 +464,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
+| BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -1586,6 +1587,39 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Root cause:** `BlobCache::open` (`crates/worker/src/blob_cache.rs`) only removed files in `<sandbox base>/cache/blobs/tmp/` older than `STALE_TMP_AGE` (24 hours) so a worker starting on a shared `--sandbox-base-dir` would not delete another live worker's in-flight write. Hard-killed workers never run `TempPartFile::drop`, so their `.part` files remained in `tmp/` for 24 hours across restarts.
 - **Fix:** Each `BlobCache` instance now holds an exclusive advisory file lock (`File::try_lock`) on `<sandbox base>/cache/blobs/owners/<owner_uuid>.lock` and names its `temp_path()` files `<owner_uuid>.<part_uuid>.part`, unlinking and calling `unlock()` on clean `Drop`. On `BlobCache::open` and worker startup (`sweep_dead_owner_tmp` via `crates/worker/src/sandbox.rs`, without creating missing cache directories), a worker probes `owners/<owner_uuid>.lock`: if `try_lock()` succeeds (`lock_file_is_still_named`), the owner is gone so its `.part` files and orphan `.lock` are removed; if `WouldBlock`, the live writer's files stay untouched. Legacy unowned `.part` files retain the 24-hour `STALE_TMP_AGE` rule, and Windows/Unix security checks cover `owners/` against symlinks, junctions, and foreign grants.
 - **Done when:** A killed writer's `.part` file is removed at the next worker startup / `BlobCache::open`, while a live writer holding its owner lock in another process keeps its `.part` file untouched, on both Windows and Unix.
+
+### BUG-40: A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails
+
+- **Evidence:** Owner's friend trial, 2026-11-26 04:43 UTC: USB kit 0.4.5 on a Windows 11 laptop (`msi`), worker
+  started from the kit with the P2P ticket of `join` (`[worker] p2p_ticket`), no `--master`; trial master 0.4.4 on a
+  Mac that had just woken from sleep (its network was down until about 04:45:50). The worker log shows
+  `P2P connect 'p2p_connect' timed out after 10s master=127.0.0.1:8088`, then
+  `P2P connect failed; falling back to the Master's TCP address ... master=127.0.0.1:8088` and
+  `connection refused (os error 10061)` against its own loopback, twice, before the installer gave up after 30 s.
+  After the Mac was back on the network the same worker registered over the relay and then direct P2P (no change
+  on the laptop).
+- **Problem (Read, `origin/master` `df06768d`):** `resolve_worker_target_from`
+  (`crates/cli/src/cli_app/worker.rs`, about line 28) returns `DEFAULT_MASTER_ADDR` (`127.0.0.1:8088`) as
+  `master_addr` when no `--master`, `RUSTY_GRID_MASTER` or `[worker].master` is set, also when a ticket is set (the
+  unit test near line 779 asserts exactly that). `WorkerClient::has_tcp_fallback`
+  (`crates/worker/src/client/session.rs`, about line 439) is true for any non-empty `master_addr`, so
+  `establish_stream` falls back to TCP on the default loopback address after every failed P2P dial. On a machine
+  that joined a remote cluster by ticket this fallback can never reach the master: it spends an attempt per
+  backoff step, prints a misleading address (users and the kit's failure screen read "master=127.0.0.1:8088" as
+  the cause), and would dial whatever else listens on local port 8088. The fallback was meant for a TCP address
+  the user gave next to the ticket (the Android app passes both).
+- **Do:**
+  1. Failing check first: a unit test that a worker resolved from a ticket alone has no TCP fallback (and a log
+     line of a failed P2P dial names the ticket's node id, not `127.0.0.1:8088`).
+  2. Keep the fallback only for an address that was given (`--master`, `RUSTY_GRID_MASTER`, `[worker].master`):
+     for example resolve `master_addr` to an empty string, or carry a `tcp_fallback: Option<String>`, when the
+     address comes from the default and a ticket is set. Keep the Android path (ticket and address both given)
+     unchanged. No wire change.
+  3. Update the `master=` field of the P2P log lines so they name the P2P target, and `docs/reference.md` if the
+     documented fallback rule changes.
+- **Done when:** a worker started with only a ticket never dials `127.0.0.1:8088`, its P2P failure lines name the
+  ticket target, the Android-style ticket-plus-address fallback still works (existing tests), and the change is in
+  a 0.4.x patch.
 
 ## Phase 13: the path to finished
 
