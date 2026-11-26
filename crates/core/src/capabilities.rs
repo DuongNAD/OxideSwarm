@@ -4007,6 +4007,31 @@ Now drawing from 'AC Power'
         }
     }
 
+    fn write_bare_test_script(
+        dir: &std::path::Path,
+        name: &str,
+        unix_body: &str,
+        win_body: &str,
+    ) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = win_body;
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{unix_body}\n")).expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+            path
+        }
+        #[cfg(windows)]
+        {
+            let _ = unix_body;
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, format!("@echo off\r\n{win_body}\r\n")).expect("write script");
+            path
+        }
+    }
+
     fn assert_pid_file_process_dead(pid_file: &std::path::Path) {
         let raw = std::fs::read_to_string(pid_file).unwrap_or_else(|e| {
             panic!(
@@ -4397,7 +4422,7 @@ Now drawing from 'AC Power'
         // 1. `python` prints `Python 3.12.0` -> `tool:python`.
         let py3_dir = dir.path().join("py3");
         std::fs::create_dir_all(&py3_dir).unwrap();
-        write_test_script(
+        write_bare_test_script(
             &py3_dir,
             "python",
             "echo 'Python 3.12.0'",
@@ -4418,7 +4443,7 @@ Now drawing from 'AC Power'
         // 2. `python` prints `Python 2.7.18` (and no `python3`) -> no `tool:python`.
         let py2_dir = dir.path().join("py2");
         std::fs::create_dir_all(&py2_dir).unwrap();
-        write_test_script(
+        write_bare_test_script(
             &py2_dir,
             "python",
             "echo 'Python 2.7.18'",
@@ -4437,7 +4462,7 @@ Now drawing from 'AC Power'
         // 3. `python` exits 9009 (and no `python3`) -> no `tool:python`.
         let py_err_dir = dir.path().join("py_err");
         std::fs::create_dir_all(&py_err_dir).unwrap();
-        write_test_script(&py_err_dir, "python", "exit 9009", "exit /b 9009");
+        write_bare_test_script(&py_err_dir, "python", "exit 9009", "exit /b 9009");
         assert!(detect_host_tools_with_env(
             probe_timeout,
             &join_path(&[&py_err_dir]),
@@ -4451,8 +4476,8 @@ Now drawing from 'AC Power'
         // 4. `python` exits 9009 (or prints Python 2) and `python3` prints `Python 3.12.0` -> `tool:python`.
         let py3_fallback_dir = dir.path().join("py3_fallback");
         std::fs::create_dir_all(&py3_fallback_dir).unwrap();
-        write_test_script(&py3_fallback_dir, "python", "exit 9009", "exit /b 9009");
-        write_test_script(
+        write_bare_test_script(&py3_fallback_dir, "python", "exit 9009", "exit /b 9009");
+        write_bare_test_script(
             &py3_fallback_dir,
             "python3",
             "echo 'Python 3.12.0'",
@@ -4475,7 +4500,7 @@ Now drawing from 'AC Power'
         let win_apps = fake_local.join("Microsoft").join("WindowsApps");
         std::fs::create_dir_all(&win_apps).unwrap();
         let winapps_sentinel = dir.path().join("winapps_ran.txt");
-        let winapps_py = write_test_script(
+        let winapps_py = write_bare_test_script(
             &win_apps,
             "python",
             &format!(
@@ -4532,7 +4557,7 @@ Now drawing from 'AC Power'
         std::fs::create_dir_all(&fake_usr_bin).unwrap();
         let py_stub_sentinel = dir.path().join("clt_py_ran.txt");
         let git_stub_sentinel = dir.path().join("clt_git_ran.txt");
-        let py_stub = write_test_script(
+        let py_stub = write_bare_test_script(
             &fake_usr_bin,
             "python3",
             &format!(
@@ -4544,7 +4569,7 @@ Now drawing from 'AC Power'
                 py_stub_sentinel.display()
             ),
         );
-        let git_stub = write_test_script(
+        let git_stub = write_bare_test_script(
             &fake_usr_bin,
             "git",
             &format!(
@@ -4582,7 +4607,7 @@ Now drawing from 'AC Power'
 
         let real_first = dir.path().join("homebrew_bin");
         std::fs::create_dir_all(&real_first).unwrap();
-        write_test_script(
+        write_bare_test_script(
             &real_first,
             "python3",
             "echo 'Python 3.13.1'",
