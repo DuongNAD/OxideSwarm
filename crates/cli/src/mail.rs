@@ -228,6 +228,11 @@ pub struct MailWatchArgs {
     pub once: bool,
     #[arg(
         long,
+        help = "Acknowledge each delivered batch up to its highest message ID for --consumer"
+    )]
+    pub ack: bool,
+    #[arg(
+        long,
         value_name = "CMD",
         help = "Command executed per arriving message with OXIDESWARM_MAIL_* metadata in environment (never shells mail text)"
     )]
@@ -1116,6 +1121,44 @@ async fn run_mail_watch(
                         }
                     }
 
+                    if args.ack {
+                        let max_id = messages.iter().map(|m| m.id).max().unwrap_or(0);
+                        if max_id > 0 {
+                            let ack_req = ClientMessage::MailAck {
+                                consumer: args.consumer.clone(),
+                                up_to_id: max_id,
+                            };
+                            match exchange(
+                                &mut transport,
+                                &master_addr,
+                                had_secret,
+                                &ack_req,
+                                "Failed to acknowledge delivered mail",
+                            )
+                            .await
+                            {
+                                Ok(ClientResponse::MailAcked { cursor: ack_cursor }) => {
+                                    after = after.max(ack_cursor);
+                                    last_cursor = last_cursor.max(ack_cursor);
+                                }
+                                Ok(ClientResponse::Error { message }) => {
+                                    eprintln!("Error: {message}");
+                                    transport.close().await;
+                                    return ExitCode::FAILURE;
+                                }
+                                Ok(other) => {
+                                    eprintln!("Unexpected ack response: {other:?}");
+                                    transport.close().await;
+                                    return ExitCode::FAILURE;
+                                }
+                                Err(code) => {
+                                    transport.close().await;
+                                    return code;
+                                }
+                            }
+                        }
+                    }
+
                     if args.hook {
                         transport.close().await;
                         return ExitCode::from(HOOK_WAKE_EXIT_CODE);
@@ -1282,6 +1325,7 @@ mod tests {
             "120",
             "--hook",
             "--once",
+            "--ack",
             "--exec",
             "echo woken",
             "--json",

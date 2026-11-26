@@ -537,5 +537,30 @@ async fn t5_agent_bridge_grid_backend_roundtrip_and_hook_against_live_master() {
     assert!(peek_after.status.success());
     assert!(peek_after.stdout.is_empty());
 
+    // Re-arming watch --consumer agy --hook after wake + inbox --ack must NOT re-wake.
+    let watch_rearm = run_bridge(vec![
+        "--backend",
+        "grid",
+        "--master",
+        &addr,
+        "watch",
+        "--agent-id",
+        "agent-win-2",
+        "--consumer",
+        "agy",
+        "--hook",
+        "--max-wait",
+        "1",
+    ])
+    .output()
+    .await
+    .expect("run re-armed bridge watch --hook");
+    assert_eq!(
+        watch_rearm.status.code(),
+        Some(0),
+        "re-armed watch --hook must exit 0 with no infinite re-wake loop; stderr={}",
+        String::from_utf8_lossy(&watch_rearm.stderr)
+    );
+
     let _ = master.shutdown();
 }

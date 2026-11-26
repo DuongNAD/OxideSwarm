@@ -256,10 +256,21 @@ def is_grid_protocol_version_error(stderr_text):
     )
 
 
+def truncate_utf8_bytes(text, max_bytes):
+    out = []
+    used = 0
+    for ch in text:
+        size = len(ch.encode("utf-8"))
+        if used + size > max_bytes:
+            break
+        out.append(ch)
+        used += size
+    return "".join(out)
+
+
 def grid_consumer_and_topics(self_short, consumer_group):
-    if not consumer_group or consumer_group == "agent":
-        return f"agent-{self_short}", []
-    return f"agent-{self_short}:{consumer_group}", [f"agent-{self_short}"]
+    group = consumer_group or "agent"
+    return f"agent-{self_short}:{group}", [f"agent-{self_short}"]
 
 
 def run_grid_mail_json(args, subcmd, extra_args):
@@ -1363,7 +1374,10 @@ def cmd_send(args):
     self_short = resolve_self_short(args)
     peer_short = resolve_peer_short(discover_hub_dir(args.hub_dir), self_short, args)
     recipient = f"agent-{peer_short}"
-    topic = "".join(c if ord(c) >= 32 and ord(c) != 127 else " " for c in args.title).strip()[:120]
+    topic = truncate_utf8_bytes(
+        "".join(c if ord(c) >= 32 and ord(c) != 127 else " " for c in args.title).strip()[:120],
+        256,
+    )
     markdown_body = (
         f"# [{args.priority.upper()}] {args.title}\n\n"
         f"- **From**: `agent-{self_short}`\n"
@@ -1913,7 +1927,7 @@ def cmd_watch(args):
         return 0
 
     mail_consumer, topics = grid_consumer_and_topics(self_short, args.consumer)
-    extra = ["--consumer", mail_consumer]
+    extra = ["--consumer", mail_consumer, "--ack"]
     for topic in topics:
         extra.extend(["--topic", topic])
     if args.hook:
@@ -1930,7 +1944,27 @@ def cmd_watch(args):
         print("[WATCH ERROR] oxideswarm binary not found (set --oxideswarm-bin or OXIDESWARM_BIN)", file=sys.stderr)
         return 127
 
-    proc = subprocess.run(
+    if args.hook or args.once_on_message:
+        proc = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode not in (0, HOOK_WAKE_EXIT_CODE) and is_grid_protocol_version_error(proc.stderr):
+            print(
+                f"[BRIDGE] Master refused protocol 11 MailWait ({proc.stderr.strip()}); falling back to Drive backend.",
+                file=sys.stderr,
+            )
+            return _cmd_watch_drive(args)
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+            sys.stderr.flush()
+        return proc.returncode
+
+    proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -1938,16 +1972,22 @@ def cmd_watch(args):
         encoding="utf-8",
         errors="replace",
     )
-    if proc.returncode not in (0, HOOK_WAKE_EXIT_CODE) and is_grid_protocol_version_error(proc.stderr):
+    err_lines = []
+    if proc.stderr is not None:
+        for line in proc.stderr:
+            err_lines.append(line)
+            if not is_grid_protocol_version_error(line):
+                sys.stderr.write(line)
+                sys.stderr.flush()
+    rc = proc.wait()
+    stderr_text = "".join(err_lines)
+    if rc not in (0, HOOK_WAKE_EXIT_CODE) and is_grid_protocol_version_error(stderr_text):
         print(
-            f"[BRIDGE] Master refused protocol 11 MailWait ({proc.stderr.strip()}); falling back to Drive backend.",
+            f"[BRIDGE] Master refused protocol 11 MailWait ({stderr_text.strip()}); falling back to Drive backend.",
             file=sys.stderr,
         )
         return _cmd_watch_drive(args)
-    if proc.stderr:
-        sys.stderr.write(proc.stderr)
-        sys.stderr.flush()
-    return proc.returncode
+    return rc
 
 
 def add_identity_args(subparser, include_peer=False):

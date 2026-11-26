@@ -1468,6 +1468,22 @@ sys.exit(2)
         self.assertIn(f"agent-{SELF}:agy", watch_call)
         self.assertIn("--topic", watch_call)
         self.assertIn(f"agent-{SELF}", watch_call)
+        self.assertIn("--ack", watch_call)
+
+        # Multi-byte UTF-8 title must stay <= 256 encoded bytes (`MAX_MAIL_TOPIC_BYTES`).
+        res_utf8 = self.run_bridge(
+            "send",
+            "--title",
+            "🔥" * 100,
+            "--body",
+            "utf8",
+            use_hub=False,
+            env=env,
+        )
+        self.assertEqual(res_utf8.returncode, 0, res_utf8.stderr.decode("utf-8", "replace"))
+        send_call = self.read_calls(log_path)[-1]
+        topic_val = send_call[send_call.index("--topic") + 1]
+        self.assertLessEqual(len(topic_val.encode("utf-8")), 256)
 
     def test_grid_backend_falls_back_to_drive_when_master_is_v10(self):
         shim, _ = self.make_fake_oxideswarm("v10")
