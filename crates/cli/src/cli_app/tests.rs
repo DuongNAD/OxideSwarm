@@ -1719,4 +1719,55 @@ fn test_plan_lease_and_check_diff_subcommands_parse_cleanly() {
         diff_args.command,
         crate::plan::PlanSubcommand::CheckDiff { json: true, .. }
     ));
+
+    let unblock_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "unblock",
+        "TEAM-4",
+        "--by",
+        "alice",
+        "--note",
+        "fixed flaky env",
+        "--remote",
+        "origin",
+        "--json",
+    ])
+    .expect("parse plan unblock");
+    let Commands::Plan(unblock_args) = unblock_cli.command else {
+        panic!("expected Plan");
+    };
+    assert!(matches!(
+        unblock_args.command,
+        crate::plan::PlanSubcommand::Unblock { json: true, .. }
+    ));
+
+    let verify_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "verify",
+        "--task",
+        "TEAM-4",
+        "--remote",
+        "origin",
+        "--agent",
+        "agent-mac-ag",
+        "--max-verifies-per-hour",
+        "10",
+        "--hub-dir",
+        "/tmp/hub",
+        "--json",
+    ])
+    .expect("parse verify with breaker flags");
+    let Commands::Verify(vargs) = verify_cli.command else {
+        panic!("expected Verify");
+    };
+    assert_eq!(vargs.task, "TEAM-4");
+    assert_eq!(vargs.remote, "origin");
+    assert_eq!(vargs.agent.as_deref(), Some("agent-mac-ag"));
+    assert_eq!(vargs.max_verifies_per_hour, Some(10));
+    assert_eq!(
+        vargs.hub_dir.as_deref(),
+        Some(std::path::Path::new("/tmp/hub"))
+    );
+    assert!(vargs.json);
 }

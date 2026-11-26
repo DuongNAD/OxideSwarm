@@ -5,7 +5,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::verify_gate::{run_verify_gate, DEFAULT_VERIFY_TIMEOUT_SECS};
+use crate::plan::lease::{CIRCUIT_BREAKER_THRESHOLD, DEFAULT_REMOTE};
+use crate::verify_gate::{
+    resolve_hub_dir, resolve_max_verifies_per_hour, run_verify_gate_with_options,
+    VerifyGateOptions, DEFAULT_VERIFY_TIMEOUT_SECS,
+};
 
 use super::plan::confine_mcp_path;
 use super::{McpState, ToolCallContext, ToolCallResult};
@@ -84,8 +88,34 @@ pub(crate) async fn tool_verify_in_dir(
     };
 
     let workspace_limits = state.workspace_limits;
+    let remote = args
+        .get("remote")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_REMOTE)
+        .to_string();
+    let agent_id = args
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    // Hourly cap and hub_dir come strictly from server env (an agent cannot raise its own cap
+    // or redirect mailbox writes via MCP tool arguments).
+    let max_verifies_per_hour = match resolve_max_verifies_per_hour(None) {
+        Ok(v) => v,
+        Err(e) => return ToolCallResult::error(e),
+    };
+    let options = VerifyGateOptions {
+        remote,
+        agent_id,
+        max_verifies_per_hour,
+        hub_dir: resolve_hub_dir(None),
+        breaker_threshold: CIRCUIT_BREAKER_THRESHOLD,
+    };
 
-    match run_verify_gate(
+    match run_verify_gate_with_options(
         &repo_dir,
         plan_path.as_deref(),
         task_id,
@@ -95,6 +125,7 @@ pub(crate) async fn tool_verify_in_dir(
         state.secret.clone(),
         Duration::from_secs(timeout_secs),
         workspace_limits,
+        options,
     )
     .await
     {

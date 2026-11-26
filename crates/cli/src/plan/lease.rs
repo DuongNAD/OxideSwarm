@@ -24,6 +24,8 @@ use super::{
 pub const DEFAULT_LEASE_TTL_MINS: i64 = 45;
 /// Maximum allowed lease TTL (24 hours) to keep abandoned claims bounded.
 pub const MAX_LEASE_TTL_MINS: i64 = 1440;
+/// Number of consecutive identical failing verifies before the circuit breaker blocks a task (design 0111 D5.2 / TEAM-4).
+pub const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 /// Default git remote used for lease refs and base refs.
 pub const DEFAULT_REMOTE: &str = "origin";
 /// Default branch prefix created for claimed tasks (`team/<task-id>`).
@@ -388,10 +390,11 @@ pub fn sync_remote_leases(
     read_lease_ref_prefix(repo_dir, &track_prefix)
 }
 
-fn create_lease_commit(
+fn create_lease_commit_as(
     repo_dir: &Path,
     record: &LeaseRecord,
     parent_oid: Option<&str>,
+    author_name: &str,
 ) -> Result<String, String> {
     let empty_tree = run_git_with_stdin(repo_dir, &["mktree"], b"", &[])?;
     let body = toml::to_string_pretty(record)
@@ -401,13 +404,27 @@ fn create_lease_commit(
         args.push("-p");
         args.push(p);
     }
+    let clean_author = author_name.trim();
+    let actor = if clean_author.is_empty() {
+        record.holder.as_str()
+    } else {
+        clean_author
+    };
     let env = [
-        ("GIT_AUTHOR_NAME", record.holder.as_str()),
+        ("GIT_AUTHOR_NAME", actor),
         ("GIT_AUTHOR_EMAIL", LEASE_AUTHOR_EMAIL),
-        ("GIT_COMMITTER_NAME", record.holder.as_str()),
+        ("GIT_COMMITTER_NAME", actor),
         ("GIT_COMMITTER_EMAIL", LEASE_AUTHOR_EMAIL),
     ];
     run_git_with_stdin(repo_dir, &args, body.as_bytes(), &env)
+}
+
+fn create_lease_commit(
+    repo_dir: &Path,
+    record: &LeaseRecord,
+    parent_oid: Option<&str>,
+) -> Result<String, String> {
+    create_lease_commit_as(repo_dir, record, parent_oid, &record.holder)
 }
 
 fn load_plan_for_lease_ops(
@@ -1029,6 +1046,474 @@ pub(crate) fn run_plan_release_cli(
     }
 }
 
+/// Options for recording a verify outcome against a task's remote lease ref (TEAM-4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordVerifyOptions {
+    pub task_id: String,
+    pub remote: String,
+    pub holder: Option<String>,
+    pub ok: bool,
+    pub fingerprint: Option<String>,
+    pub failure_summary: Option<String>,
+    pub threshold: u32,
+    pub ttl_minutes: i64,
+}
+
+/// Summary of an updated lease ref after recording a verify run (TEAM-4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyLeaseOutcome {
+    pub task_id: String,
+    pub holder: String,
+    pub person: Option<String>,
+    pub branch: Option<String>,
+    pub refname: String,
+    pub old_oid: String,
+    pub new_oid: String,
+    pub blocked: bool,
+    pub newly_blocked: bool,
+    pub verify_attempts: u32,
+    pub verify_failures: u32,
+    pub last_fingerprint: Option<String>,
+    pub last_failure: Option<String>,
+}
+
+/// Result of attempting to update a lease ref after `oxideswarm verify`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyLeaseUpdate {
+    /// No remote or no active lease exists for the task (verify gate stays standalone-usable).
+    NoLease,
+    Updated(Box<VerifyLeaseOutcome>),
+}
+
+/// Options for clearing a circuit-breaker block on a task lease (`oxideswarm plan unblock`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnblockOptions {
+    pub task_id: String,
+    pub remote: String,
+    pub by: Option<String>,
+    pub note: Option<String>,
+    pub ttl_minutes: i64,
+}
+
+/// Result returned by [`unblock_task_at`] / [`unblock_task`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnblockResult {
+    pub task_id: String,
+    pub holder: String,
+    pub unblocked_by: String,
+    pub refname: String,
+    pub old_oid: String,
+    pub new_oid: String,
+    pub lease: LeaseRecord,
+}
+
+/// Returns `true` when `remote` is a valid configured git remote in `repo_dir`.
+pub fn has_git_remote(repo_dir: &Path, remote: &str) -> bool {
+    let Ok(clean_remote) = validate_remote_name(remote) else {
+        return false;
+    };
+    Command::new("git")
+        .args(["remote", "get-url", "--", &clean_remote])
+        .current_dir(repo_dir)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Fetches remote lease refs when `remote` exists and returns the entry for `task_id`.
+pub fn lookup_task_lease(
+    repo_dir: &Path,
+    remote: &str,
+    task_id: &str,
+) -> Result<Option<LeaseRefEntry>, String> {
+    validate_task_id(task_id)?;
+    let remote = validate_remote_name(remote)?;
+    if !has_git_remote(repo_dir, &remote) {
+        return Ok(None);
+    }
+    let leases = sync_remote_leases(repo_dir, &remote)?;
+    Ok(leases.get(task_id).cloned())
+}
+
+fn sanitize_failure_summary(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    if cleaned.chars().count() <= 200 {
+        return Some(cleaned);
+    }
+    let mut out: String = cleaned.chars().take(197).collect();
+    out.push_str("...");
+    Some(out)
+}
+
+fn extended_expiry(
+    current: &LeaseRecord,
+    now_utc: DateTime<Utc>,
+    ttl_minutes: i64,
+) -> DateTime<Utc> {
+    let candidate = now_utc + Duration::minutes(ttl_minutes);
+    match current.expires_at_utc() {
+        Some(existing) if existing > candidate => existing,
+        _ => candidate,
+    }
+}
+
+/// Records the result of a verify run in the task's remote lease commit and trips the circuit
+/// breaker (`blocked = true`) on `threshold` consecutive identical failure fingerprints.
+pub fn record_verify_outcome_at(
+    repo_dir: &Path,
+    opts: &RecordVerifyOptions,
+    now_utc: DateTime<Utc>,
+) -> Result<VerifyLeaseUpdate, String> {
+    validate_task_id(&opts.task_id)?;
+    let remote = validate_remote_name(&opts.remote)?;
+    let ttl_minutes = validate_ttl_minutes(opts.ttl_minutes)?;
+    let holder_filter = opts.holder.as_deref().map(validate_holder).transpose()?;
+
+    if !has_git_remote(repo_dir, &remote) {
+        return Ok(VerifyLeaseUpdate::NoLease);
+    }
+
+    let remote_leases = sync_remote_leases(repo_dir, &remote)?;
+    let Some(current) = remote_leases.get(&opts.task_id) else {
+        return Ok(VerifyLeaseUpdate::NoLease);
+    };
+
+    if current.record.blocked {
+        let fp = current
+            .record
+            .last_fingerprint
+            .as_deref()
+            .unwrap_or("unknown");
+        return Err(format!(
+            "task '{}' is blocked by the circuit breaker after {} identical failure(s) (fingerprint {fp}); a person must run `oxideswarm plan unblock {}`",
+            opts.task_id, current.record.verify_failures, opts.task_id
+        ));
+    }
+
+    if let Some(ref h) = holder_filter {
+        if *h != current.record.holder {
+            return Err(format!(
+                "cannot record verify outcome for '{}': lease is held by '{}', not '{h}'",
+                opts.task_id, current.record.holder
+            ));
+        }
+    }
+
+    let refname = lease_refname(&opts.task_id);
+    let mut next_record = current.record.clone();
+    next_record.expires_at = extended_expiry(&current.record, now_utc, ttl_minutes).to_rfc3339();
+    next_record.verify_attempts = current.record.verify_attempts.saturating_add(1);
+
+    if opts.ok {
+        next_record.verify_failures = 0;
+        next_record.last_fingerprint = None;
+        next_record.last_failure = None;
+        next_record.blocked = false;
+    } else {
+        let fp_clean = opts
+            .fingerprint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let same_fp = fp_clean.is_some() && current.record.last_fingerprint == fp_clean;
+        next_record.verify_failures = if same_fp {
+            current.record.verify_failures.saturating_add(1)
+        } else {
+            1
+        };
+        next_record.last_fingerprint = fp_clean;
+        next_record.last_failure = opts
+            .failure_summary
+            .as_deref()
+            .and_then(sanitize_failure_summary);
+        next_record.blocked = next_record.verify_failures >= opts.threshold.max(1);
+    }
+
+    let new_oid = create_lease_commit_as(
+        repo_dir,
+        &next_record,
+        Some(&current.oid),
+        &next_record.holder,
+    )?;
+    let push_spec = format!("{new_oid}:{refname}");
+    run_git_checked(repo_dir, &["push", &remote, &push_spec]).map_err(|e| {
+        format!(
+            "verify lease update fast-forward rejected for '{}': {e}",
+            opts.task_id
+        )
+    })?;
+    run_git_checked(repo_dir, &["update-ref", &refname, &new_oid])?;
+
+    let newly_blocked = !current.record.blocked && next_record.blocked;
+    Ok(VerifyLeaseUpdate::Updated(Box::new(VerifyLeaseOutcome {
+        task_id: opts.task_id.clone(),
+        holder: next_record.holder.clone(),
+        person: next_record.person.clone(),
+        branch: next_record.branch.clone(),
+        refname,
+        old_oid: current.oid.clone(),
+        new_oid,
+        blocked: next_record.blocked,
+        newly_blocked,
+        verify_attempts: next_record.verify_attempts,
+        verify_failures: next_record.verify_failures,
+        last_fingerprint: next_record.last_fingerprint.clone(),
+        last_failure: next_record.last_failure.clone(),
+    })))
+}
+
+/// Convenience wrapper around [`record_verify_outcome_at`] using `Utc::now()`.
+pub fn record_verify_outcome(
+    repo_dir: &Path,
+    opts: &RecordVerifyOptions,
+) -> Result<VerifyLeaseUpdate, String> {
+    record_verify_outcome_at(repo_dir, opts, Utc::now())
+}
+
+/// Clears a circuit-breaker block on an active task lease (`oxideswarm plan unblock <id>`).
+pub fn unblock_task_at(
+    repo_dir: &Path,
+    opts: &UnblockOptions,
+    now_utc: DateTime<Utc>,
+) -> Result<UnblockResult, String> {
+    validate_task_id(&opts.task_id)?;
+    let remote = validate_remote_name(&opts.remote)?;
+    let ttl_minutes = validate_ttl_minutes(opts.ttl_minutes)?;
+    let actor = match opts.by.as_deref() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(|c| c.is_control())
+            {
+                return Err(
+                    "unblock --by must be 1..=128 characters without control characters"
+                        .to_string(),
+                );
+            }
+            trimmed.to_string()
+        }
+        None => "person".to_string(),
+    };
+    if let Some(ref note) = opts.note {
+        if note.chars().any(|c| c.is_control()) {
+            return Err("unblock --note must not contain control characters".to_string());
+        }
+    }
+
+    let remote_leases = sync_remote_leases(repo_dir, &remote)?;
+    let current = remote_leases
+        .get(&opts.task_id)
+        .ok_or_else(|| format!("no remote lease exists for task '{}'", opts.task_id))?;
+
+    if !current.record.blocked {
+        return Err(format!(
+            "cannot unblock task '{}': lease is not currently blocked",
+            opts.task_id
+        ));
+    }
+
+    let refname = lease_refname(&opts.task_id);
+    let mut next_record = current.record.clone();
+    next_record.blocked = false;
+    next_record.verify_failures = 0;
+    next_record.last_failure = None;
+    next_record.last_fingerprint = None;
+    next_record.expires_at = extended_expiry(&current.record, now_utc, ttl_minutes).to_rfc3339();
+
+    let new_oid = create_lease_commit_as(repo_dir, &next_record, Some(&current.oid), &actor)?;
+    let push_spec = format!("{new_oid}:{refname}");
+    run_git_checked(repo_dir, &["push", &remote, &push_spec]).map_err(|e| {
+        format!(
+            "lease unblock fast-forward rejected for '{}': {e}",
+            opts.task_id
+        )
+    })?;
+    run_git_checked(repo_dir, &["update-ref", &refname, &new_oid])?;
+
+    Ok(UnblockResult {
+        task_id: opts.task_id.clone(),
+        holder: next_record.holder.clone(),
+        unblocked_by: actor,
+        refname,
+        old_oid: current.oid.clone(),
+        new_oid,
+        lease: next_record,
+    })
+}
+
+/// Convenience wrapper around [`unblock_task_at`] using `Utc::now()`.
+pub fn unblock_task(repo_dir: &Path, opts: &UnblockOptions) -> Result<UnblockResult, String> {
+    unblock_task_at(repo_dir, opts, Utc::now())
+}
+
+fn sanitize_mailbox_slug(raw: &str, field: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return Err(format!("invalid {field} '{raw}' for mailbox delivery"));
+    }
+    let stripped = trimmed.strip_prefix("agent-").unwrap_or(trimmed);
+    let slug: String = stripped
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('_').to_string();
+    if slug.is_empty() {
+        return Err(format!("invalid {field} '{raw}' for mailbox delivery"));
+    }
+    Ok(slug)
+}
+
+fn ensure_dir_no_symlink(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!("refusing symlinked mailbox path {}", dir.display()));
+            }
+            if !meta.is_dir() {
+                return Err(format!(
+                    "mailbox path {} exists and is not a directory",
+                    dir.display()
+                ));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(dir)
+                .map_err(|ce| format!("create mailbox dir {}: {ce}", dir.display()))?;
+        }
+        Err(e) => {
+            return Err(format!("inspect mailbox dir {}: {e}", dir.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Writes an atomic markdown notice to `<hub_dir>/mailbox/to_<person>/` when the circuit breaker
+/// blocks a task (`design 0111` D5.2 / TEAM-4).
+pub fn notify_person_blocked(
+    hub_dir: &Path,
+    outcome: &VerifyLeaseOutcome,
+    now_utc: DateTime<Utc>,
+) -> Result<PathBuf, String> {
+    let hub_meta = std::fs::symlink_metadata(hub_dir)
+        .map_err(|e| format!("inspect hub dir {}: {e}", hub_dir.display()))?;
+    if hub_meta.file_type().is_symlink() || !hub_meta.is_dir() {
+        return Err(format!(
+            "hub path {} must be an existing real directory",
+            hub_dir.display()
+        ));
+    }
+
+    let person_raw = outcome.person.as_deref().unwrap_or("owner");
+    let person_slug = sanitize_mailbox_slug(person_raw, "person")?;
+    let holder_slug = sanitize_mailbox_slug(&outcome.holder, "holder")?;
+    let task_slug = sanitize_mailbox_slug(&outcome.task_id, "task_id")?;
+
+    let mailbox_dir = hub_dir.join("mailbox");
+    ensure_dir_no_symlink(&mailbox_dir)?;
+    let dest_dir = mailbox_dir.join(format!("to_{person_slug}"));
+    ensure_dir_no_symlink(&dest_dir)?;
+
+    let canon_hub = std::fs::canonicalize(hub_dir)
+        .map_err(|e| format!("resolve hub dir {}: {e}", hub_dir.display()))?;
+    let canon_dest = std::fs::canonicalize(&dest_dir)
+        .map_err(|e| format!("resolve mailbox dir {}: {e}", dest_dir.display()))?;
+    if !canon_dest.starts_with(&canon_hub) {
+        return Err("mailbox destination escapes hub directory".to_string());
+    }
+
+    let ts_slug = now_utc.format("%Y%m%d_%H%M%S");
+    let ts_iso = now_utc.format("%Y-%m-%dT%H:%M:%SZ");
+    let fp = outcome.last_fingerprint.as_deref().unwrap_or("unknown");
+    let summary = outcome
+        .last_failure
+        .as_deref()
+        .unwrap_or("(no summary recorded)");
+    let branch = outcome.branch.as_deref().unwrap_or("-");
+
+    let base_name = format!("MSG_{ts_slug}_from_{holder_slug}_blocked_{task_slug}");
+    let mut dest = dest_dir.join(format!("{base_name}.md"));
+    if std::fs::symlink_metadata(&dest).is_ok() {
+        let suffix = &uuid::Uuid::new_v4().to_string()[..6];
+        dest = dest_dir.join(format!("{base_name}_{suffix}.md"));
+    }
+
+    let body = format!(
+        "# [HIGH] Task {} blocked by circuit breaker\n\n\
+- **From**: `{}`\n\
+- **To**: `{person_slug}`\n\
+- **Timestamp (UTC)**: `{ts_iso}`\n\
+- **Priority**: `high`\n\n\
+---\n\n\
+## Blocked Task Details\n\n\
+- **Task**: `{}`\n\
+- **Branch**: `{branch}`\n\
+- **Consecutive Identical Failures**: `{}`\n\
+- **Failure Fingerprint**: `{fp}`\n\
+- **Last Failure**: {summary}\n\n\
+Run `oxideswarm plan unblock {}` after resolving or overriding the blocker.\n",
+        outcome.task_id, outcome.holder, outcome.task_id, outcome.verify_failures, outcome.task_id,
+    );
+
+    let tmp = dest_dir.join(format!(".tmp.{}.md", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, body).map_err(|e| format!("write mailbox temp file: {e}"))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("commit mailbox notice {}: {e}", dest.display())
+    })?;
+    Ok(dest)
+}
+
+/// CLI handler for `oxideswarm plan unblock`.
+pub(crate) fn run_plan_unblock_cli(
+    opts: &UnblockOptions,
+    repo: Option<&Path>,
+    json: bool,
+) -> ExitCode {
+    let repo_dir = match resolve_cli_repo_dir(repo) {
+        Ok(d) => d,
+        Err(e) => return emit_cli_error(json, &e),
+    };
+    match unblock_task(&repo_dir, opts) {
+        Ok(res) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "ok": true, "unblock": res })
+                    )
+                    .unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "unblocked {} by {} ({} -> {}, holder {})",
+                    res.task_id, res.unblocked_by, res.old_oid, res.new_oid, res.holder
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => emit_cli_error(json, &e),
+    }
+}
+
 /// CLI handler for `oxideswarm plan check-diff`.
 pub(crate) fn run_plan_check_diff_cli(
     range: &str,
@@ -1101,5 +1586,54 @@ mod tests {
         assert!(validate_ttl_minutes(45).is_ok());
         assert!(validate_ttl_minutes(0).is_err());
         assert!(validate_ttl_minutes(MAX_LEASE_TTL_MINS + 1).is_err());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri: filesystem/process test")]
+    fn test_notify_person_blocked_writes_notice_and_refuses_symlinks_and_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        std::fs::create_dir_all(&hub).unwrap();
+        let now = Utc::now();
+        let outcome = VerifyLeaseOutcome {
+            task_id: "TEAM-4".to_string(),
+            holder: "agent-mac-ag".to_string(),
+            person: Some("Alice".to_string()),
+            branch: Some("team/TEAM-4".to_string()),
+            refname: "refs/oxideswarm/lease/TEAM-4".to_string(),
+            old_oid: "0".repeat(40),
+            new_oid: "1".repeat(40),
+            blocked: true,
+            newly_blocked: true,
+            verify_attempts: 3,
+            verify_failures: 3,
+            last_fingerprint: Some("deadbeef1234".to_string()),
+            last_failure: Some("assertion failed in queue.rs:42".to_string()),
+        };
+
+        let notice = notify_person_blocked(&hub, &outcome, now).expect("write notice");
+        assert!(notice.is_file());
+        assert_eq!(notice.parent().unwrap().file_name().unwrap(), "to_alice");
+        let text = std::fs::read_to_string(&notice).unwrap();
+        assert!(text.contains("deadbeef1234"), "{text}");
+        assert!(text.contains("oxideswarm plan unblock TEAM-4"), "{text}");
+        assert!(text.contains("`3`"), "{text}");
+
+        // Reject path traversal in person recipient.
+        let mut bad = outcome.clone();
+        bad.person = Some("../escape".to_string());
+        assert!(notify_person_blocked(&hub, &bad, now).is_err());
+
+        // Refuse symlinked mailbox subdirectory on Unix.
+        #[cfg(unix)]
+        {
+            let linked_hub = tmp.path().join("linked_hub");
+            std::fs::create_dir_all(&linked_hub).unwrap();
+            let outside = tmp.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, linked_hub.join("mailbox")).unwrap();
+            let err = notify_person_blocked(&linked_hub, &outcome, now).unwrap_err();
+            assert!(err.contains("symlink"), "{err}");
+        }
     }
 }

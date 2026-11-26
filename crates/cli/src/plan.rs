@@ -210,6 +210,33 @@ pub enum PlanSubcommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Clear a circuit-breaker block on a task lease (human action after 3 identical failures)
+    Unblock {
+        /// Task id whose lease block should be cleared
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+
+        /// Human owner/reviewer identifier recorded on the unblock lease commit
+        #[arg(long, value_name = "PERSON")]
+        by: Option<String>,
+
+        /// Optional note explaining why the task was unblocked
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+
+        /// Git remote hosting `refs/oxideswarm/lease/*` (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Root document parsed from `.oxideswarm/plan.toml`.
@@ -1569,6 +1596,23 @@ pub fn run_plan_command(args: PlanArgs) -> ExitCode {
             base.as_deref(),
             json,
         ),
+        PlanSubcommand::Unblock {
+            task_id,
+            by,
+            note,
+            remote,
+            repo,
+            json,
+        } => {
+            let opts = lease::UnblockOptions {
+                task_id,
+                remote,
+                by,
+                note,
+                ttl_minutes: lease::DEFAULT_LEASE_TTL_MINS,
+            };
+            lease::run_plan_unblock_cli(&opts, repo.as_deref(), json)
+        }
     }
 }
 

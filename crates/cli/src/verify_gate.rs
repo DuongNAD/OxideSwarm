@@ -12,7 +12,7 @@ use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +39,11 @@ use crate::matrix::{
     check_placeability, execute_matrix, expand_cells, listed_as_connected, safe_deadline,
     MatrixAxis, MatrixAxisKind, MatrixCell, MatrixSpec,
 };
+use crate::plan::lease::{
+    lookup_task_lease, notify_person_blocked, record_verify_outcome, validate_holder,
+    validate_remote_name, RecordVerifyOptions, VerifyLeaseUpdate, CIRCUIT_BREAKER_THRESHOLD,
+    DEFAULT_LEASE_TTL_MINS, DEFAULT_REMOTE,
+};
 use crate::plan::{
     load_plan, path_matches_pattern, resolve_plan_path, validate_plan, VerifyProfile,
 };
@@ -64,6 +69,21 @@ const RELAY_ESTIMATE_BYTES_PER_SEC: f64 = 0.12 * 1024.0 * 1024.0;
 
 /// Relative directory under repo root where latest verify records are persisted (D4.4).
 pub const VERIFY_RECORD_REL_DIR: &str = ".oxideswarm/verify";
+
+/// Default maximum verifies per agent per rolling hour (`design 0111` D5.3 / TEAM-4).
+pub const DEFAULT_MAX_VERIFIES_PER_HOUR: usize = 20;
+
+/// Rolling window duration (seconds) for the per-agent verify rate limit.
+pub const VERIFY_RATE_WINDOW_SECS: i64 = 3600;
+
+/// File name under `.oxideswarm/verify/` storing per-agent verify timestamps.
+pub const VERIFY_RATE_LIMIT_FILE: &str = "rate_limit.json";
+
+/// Environment variable overriding [`DEFAULT_MAX_VERIFIES_PER_HOUR`].
+pub const MAX_VERIFIES_PER_HOUR_ENV: &str = "OXIDESWARM_MAX_VERIFIES_PER_HOUR";
+
+/// Environment variable identifying the Agent Hub root for blocked-task notices.
+pub const AGENT_HUB_ENV: &str = "OXIDESWARM_AGENT_HUB";
 
 /// CLI arguments for `oxideswarm verify`.
 #[derive(Args, Debug, Clone)]
@@ -136,6 +156,35 @@ pub struct VerifyGateArgs {
     )]
     pub workspace_max_mb: Option<u64>,
 
+    #[arg(
+        long,
+        value_name = "REMOTE",
+        default_value = DEFAULT_REMOTE,
+        help = "Git remote hosting refs/oxideswarm/lease/* for circuit-breaker updates"
+    )]
+    pub remote: String,
+
+    #[arg(
+        long,
+        value_name = "AGENT_ID",
+        help = "Calling agent identifier used for hourly rate limiting and lease checks"
+    )]
+    pub agent: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum verify runs per agent per rolling hour (default 20, or OXIDESWARM_MAX_VERIFIES_PER_HOUR)"
+    )]
+    pub max_verifies_per_hour: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Agent Hub directory for blocked-task notices (defaults to OXIDESWARM_AGENT_HUB if set)"
+    )]
+    pub hub_dir: Option<PathBuf>,
+
     #[arg(long, help = "Print only the compact <= 4 KiB verify JSON report")]
     pub json: bool,
 }
@@ -206,6 +255,8 @@ pub struct VerifyGateReport {
     pub task: String,
     pub commit: String,
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked: bool,
     pub untrusted_data: bool,
     pub cells: Vec<VerifyCellReport>,
     pub omitted: usize,
@@ -219,6 +270,8 @@ pub struct VerifyRecord {
     pub task: String,
     pub commit: String,
     pub ok: bool,
+    #[serde(default)]
+    pub blocked: bool,
     pub timestamp_utc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_fingerprint: Option<String>,
@@ -1175,10 +1228,48 @@ fn cell_axis_val(cell: &MatrixCell, key: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
+fn ensure_verify_dir(repo_dir: &Path) -> Result<PathBuf, String> {
+    let dot_ox = repo_dir.join(".oxideswarm");
+    match std::fs::symlink_metadata(&dot_ox) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!("refusing symlinked dir {}", dot_ox.display()));
+        }
+        Ok(m) if !m.is_dir() => {
+            return Err(format!(
+                "path {} exists and is not a directory",
+                dot_ox.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&dot_ox)
+                .map_err(|ce| format!("create dir {}: {ce}", dot_ox.display()))?;
+        }
+        Err(e) => return Err(format!("inspect dir {}: {e}", dot_ox.display())),
+    }
+    let dir = dot_ox.join("verify");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!("refusing symlinked verify dir {}", dir.display()));
+        }
+        Ok(m) if !m.is_dir() => {
+            return Err(format!(
+                "verify path {} exists and is not a directory",
+                dir.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&dir)
+                .map_err(|ce| format!("create verify dir {}: {ce}", dir.display()))?;
+        }
+        Err(e) => return Err(format!("inspect verify dir {}: {e}", dir.display())),
+    }
+    Ok(dir)
+}
+
 fn write_verify_record(repo_dir: &Path, record: &VerifyRecord) -> Result<(), String> {
-    let dir = repo_dir.join(VERIFY_RECORD_REL_DIR);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create verify record dir {}: {e}", dir.display()))?;
+    let dir = ensure_verify_dir(repo_dir)?;
     let safe_task = sanitize_record_filename(&record.task);
     let dest = dir.join(format!("{safe_task}.json"));
     if let Ok(meta) = std::fs::symlink_metadata(&dest) {
@@ -1199,6 +1290,238 @@ fn write_verify_record(repo_dir: &Path, record: &VerifyRecord) -> Result<(), Str
     })
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct VerifyRateLedger {
+    #[serde(default)]
+    agents: BTreeMap<String, Vec<i64>>,
+}
+
+/// Snapshot returned after recording an allowed verify run in the rolling 1-hour ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyRateStatus {
+    pub agent_id: String,
+    pub used_in_window: usize,
+    pub limit: usize,
+}
+
+/// Checks and records an agent's verify invocation against the rolling 1-hour cap
+/// stored under `.oxideswarm/verify/rate_limit.json` (`design 0111` D5.3 / TEAM-4).
+pub fn check_and_record_verify_rate_at(
+    repo_dir: &Path,
+    agent_id: &str,
+    max_per_hour: usize,
+    now_utc: DateTime<Utc>,
+) -> Result<VerifyRateStatus, String> {
+    if max_per_hour == 0 {
+        return Err("max_verifies_per_hour must be at least 1".to_string());
+    }
+    let clean_agent = agent_id.trim();
+    let agent = if clean_agent.is_empty() {
+        "default"
+    } else {
+        clean_agent
+    };
+
+    let dir = ensure_verify_dir(repo_dir)?;
+    let path = dir.join(VERIFY_RATE_LIMIT_FILE);
+    let mut ledger = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing symlinked verify rate ledger {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read verify rate ledger {}: {e}", path.display()))?;
+            serde_json::from_str::<VerifyRateLedger>(&raw).unwrap_or_default()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => VerifyRateLedger::default(),
+        Err(e) => {
+            return Err(format!(
+                "inspect verify rate ledger {}: {e}",
+                path.display()
+            ))
+        }
+    };
+
+    let now_ts = now_utc.timestamp();
+    let cutoff = now_ts - VERIFY_RATE_WINDOW_SECS;
+    for timestamps in ledger.agents.values_mut() {
+        timestamps.retain(|&ts| ts > cutoff && ts <= now_ts);
+    }
+    ledger.agents.retain(|_, v| !v.is_empty());
+
+    let entries = ledger.agents.entry(agent.to_string()).or_default();
+    if entries.len() >= max_per_hour {
+        let oldest = *entries.iter().min().unwrap_or(&now_ts);
+        let retry_secs = (oldest + VERIFY_RATE_WINDOW_SECS - now_ts).max(1);
+        return Err(format!(
+            "verify rate limit exceeded for agent '{agent}' ({}/{} in the last hour); retry in {retry_secs}s",
+            entries.len(),
+            max_per_hour
+        ));
+    }
+    entries.push(now_ts);
+    let used_in_window = entries.len();
+
+    let tmp = dir.join(format!(".rate_limit.json.tmp.{}", Uuid::new_v4()));
+    let body = serde_json::to_string_pretty(&ledger)
+        .map_err(|e| format!("serialize verify rate ledger: {e}"))?;
+    std::fs::write(&tmp, body).map_err(|e| format!("write temp rate ledger: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replace verify rate ledger {}: {e}", path.display())
+    })?;
+
+    Ok(VerifyRateStatus {
+        agent_id: agent.to_string(),
+        used_in_window,
+        limit: max_per_hour,
+    })
+}
+
+/// Optional circuit-breaker and hourly rate-limit settings for [`run_verify_gate_with_options`].
+#[derive(Debug, Clone)]
+pub struct VerifyGateOptions {
+    pub remote: String,
+    pub agent_id: Option<String>,
+    pub max_verifies_per_hour: usize,
+    pub hub_dir: Option<PathBuf>,
+    pub breaker_threshold: u32,
+}
+
+impl Default for VerifyGateOptions {
+    fn default() -> Self {
+        Self {
+            remote: DEFAULT_REMOTE.to_string(),
+            agent_id: None,
+            max_verifies_per_hour: DEFAULT_MAX_VERIFIES_PER_HOUR,
+            hub_dir: None,
+            breaker_threshold: CIRCUIT_BREAKER_THRESHOLD,
+        }
+    }
+}
+
+/// Resolves the hourly verify cap across CLI/direct override and `OXIDESWARM_MAX_VERIFIES_PER_HOUR`.
+pub fn resolve_max_verifies_per_hour(override_val: Option<usize>) -> Result<usize, String> {
+    let val = match override_val {
+        Some(v) => v,
+        None => match std::env::var(MAX_VERIFIES_PER_HOUR_ENV) {
+            Ok(raw) if !raw.trim().is_empty() => raw
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid integer '{raw}' for {MAX_VERIFIES_PER_HOUR_ENV}"))?,
+            _ => DEFAULT_MAX_VERIFIES_PER_HOUR,
+        },
+    };
+    if val == 0 {
+        return Err("max_verifies_per_hour must be at least 1".to_string());
+    }
+    Ok(val)
+}
+
+/// Resolves the Agent Hub root from an explicit override or `OXIDESWARM_AGENT_HUB`.
+pub fn resolve_hub_dir(override_dir: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(d) = override_dir {
+        return Some(d);
+    }
+    std::env::var_os(AGENT_HUB_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn summarize_failure(cell: &VerifyCellReport) -> Option<String> {
+    let f = cell.failures.first()?;
+    let line = f.message.lines().next().unwrap_or("").trim();
+    let mut parts = Vec::new();
+    if let Some(ref name) = f.name {
+        parts.push(name.clone());
+    } else if let Some(ref file) = f.file {
+        if let Some(ln) = f.line {
+            parts.push(format!("{file}:{ln}"));
+        } else {
+            parts.push(file.clone());
+        }
+    }
+    if !line.is_empty() {
+        parts.push(line.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(": "))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_verify_gate(
+    repo_dir: &Path,
+    options: &VerifyGateOptions,
+    task_id: &str,
+    mut report: VerifyGateReport,
+    first_fingerprint: Option<String>,
+    failure_summary: Option<String>,
+) -> Result<(VerifyGateReport, String), String> {
+    let lease_update = record_verify_outcome(
+        repo_dir,
+        &RecordVerifyOptions {
+            task_id: task_id.to_string(),
+            remote: options.remote.clone(),
+            holder: options.agent_id.clone(),
+            ok: report.ok,
+            fingerprint: first_fingerprint.clone(),
+            failure_summary,
+            threshold: options.breaker_threshold,
+            ttl_minutes: DEFAULT_LEASE_TTL_MINS,
+        },
+    )?;
+
+    if let VerifyLeaseUpdate::Updated(outcome) = lease_update {
+        if outcome.newly_blocked {
+            report.blocked = true;
+            let fp = outcome.last_fingerprint.as_deref().unwrap_or("unknown");
+            report.warnings.push(format!(
+                "circuit breaker tripped for task '{}' after {} identical failures ({fp}); run `oxideswarm plan unblock {}` to clear",
+                outcome.task_id, outcome.verify_failures, outcome.task_id
+            ));
+            match resolve_hub_dir(options.hub_dir.clone()) {
+                Some(hub_dir) => match notify_person_blocked(&hub_dir, &outcome, Utc::now()) {
+                    Ok(notice_path) => {
+                        report.warnings.push(format!(
+                            "notified person '{}' at {}",
+                            outcome.person.as_deref().unwrap_or("owner"),
+                            notice_path.display()
+                        ));
+                    }
+                    Err(e) => {
+                        report
+                            .warnings
+                            .push(format!("failed sending circuit-breaker person notice: {e}"));
+                    }
+                },
+                None => {
+                    report.warnings.push(format!(
+                        "circuit breaker blocked '{}', but no hub dir is configured (--hub-dir or {AGENT_HUB_ENV}); person notice skipped",
+                        outcome.task_id
+                    ));
+                }
+            }
+        }
+    }
+
+    let compact_json = fit_report_to_budget(&mut report, MAX_VERIFY_JSON_BYTES);
+    write_verify_record(
+        repo_dir,
+        &VerifyRecord {
+            task: report.task.clone(),
+            commit: report.commit.clone(),
+            ok: report.ok,
+            blocked: report.blocked,
+            timestamp_utc: Utc::now().to_rfc3339(),
+            first_fingerprint,
+            cells: report.cells.clone(),
+        },
+    )?;
+    Ok((report, compact_json))
+}
+
 /// Executes the verify gate for `--task <id>` in `repo_dir` against `master_addr`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_verify_gate(
@@ -1212,6 +1535,43 @@ pub async fn run_verify_gate(
     timeout: Duration,
     workspace_limits: WorkspaceLimits,
 ) -> Result<(VerifyGateReport, String), String> {
+    run_verify_gate_with_options(
+        repo_dir,
+        plan_override,
+        task_id,
+        profile_filter,
+        base_override,
+        master_addr,
+        secret,
+        timeout,
+        workspace_limits,
+        VerifyGateOptions::default(),
+    )
+    .await
+}
+
+/// Executes the verify gate with explicit circuit-breaker and hourly rate-limit options (TEAM-4).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_verify_gate_with_options(
+    repo_dir: &Path,
+    plan_override: Option<&Path>,
+    task_id: &str,
+    profile_filter: &[String],
+    base_override: Option<&str>,
+    master_addr: &str,
+    secret: Option<ClusterSecret>,
+    timeout: Duration,
+    workspace_limits: WorkspaceLimits,
+    options: VerifyGateOptions,
+) -> Result<(VerifyGateReport, String), String> {
+    validate_remote_name(&options.remote)?;
+    if let Some(ref agent) = options.agent_id {
+        validate_holder(agent)?;
+    }
+    if options.max_verifies_per_hour == 0 {
+        return Err("max_verifies_per_hour must be at least 1".to_string());
+    }
+
     let plan_path = resolve_plan_path(repo_dir, plan_override);
     let plan = load_plan(&plan_path)?;
     let diags = validate_plan(&plan);
@@ -1231,6 +1591,48 @@ pub async fn run_verify_gate(
 
     let base_ref = base_override.unwrap_or(&plan.project.base);
     check_owned_paths_discipline(repo_dir, base_ref, &task.owned_paths)?;
+
+    let lease = lookup_task_lease(repo_dir, &options.remote, task_id)?;
+    if let Some(ref entry) = lease {
+        if entry.record.blocked {
+            let fp = entry
+                .record
+                .last_fingerprint
+                .as_deref()
+                .unwrap_or("unknown");
+            return Err(format!(
+                "task '{}' is blocked by the circuit breaker after {} identical failure(s) (fingerprint {fp}); a person must run `oxideswarm plan unblock {}`",
+                task.id, entry.record.verify_failures, task.id
+            ));
+        }
+        if let Some(ref agent) = options.agent_id {
+            if agent != &entry.record.holder {
+                return Err(format!(
+                    "cannot verify task '{}': active lease is held by '{}', not '{agent}'",
+                    task.id, entry.record.holder
+                ));
+            }
+        }
+    }
+
+    let effective_agent = options
+        .agent_id
+        .clone()
+        .or_else(|| lease.as_ref().map(|l| l.record.holder.clone()))
+        .or_else(|| {
+            std::env::var("OXIDESWARM_AGENT_ID")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "default".to_string());
+    check_and_record_verify_rate_at(
+        repo_dir,
+        &effective_agent,
+        options.max_verifies_per_hour,
+        Utc::now(),
+    )?;
+
     let commit = compute_worktree_commit(repo_dir)?;
 
     let selected_profiles: Vec<String> = if profile_filter.is_empty() {
@@ -1248,28 +1650,17 @@ pub async fn run_verify_gate(
     };
 
     if selected_profiles.is_empty() {
-        let mut report = VerifyGateReport {
+        let report = VerifyGateReport {
             task: task.id.clone(),
             commit: commit.clone(),
             ok: true,
+            blocked: false,
             untrusted_data: true,
             cells: Vec::new(),
             omitted: 0,
             warnings: vec!["task has no verify profiles configured".to_string()],
         };
-        let json = fit_report_to_budget(&mut report, MAX_VERIFY_JSON_BYTES);
-        write_verify_record(
-            repo_dir,
-            &VerifyRecord {
-                task: report.task.clone(),
-                commit: report.commit.clone(),
-                ok: report.ok,
-                timestamp_utc: Utc::now().to_rfc3339(),
-                first_fingerprint: None,
-                cells: report.cells.clone(),
-            },
-        )?;
-        return Ok((report, json));
+        return finalize_verify_gate(repo_dir, &options, &task.id, report, None, None);
     }
 
     let scan = scan_workspace_source(repo_dir, workspace_limits)?;
@@ -1459,6 +1850,7 @@ pub async fn run_verify_gate(
     let mut all_ok = true;
     let mut omitted = 0usize;
     let mut first_fingerprint = None;
+    let mut first_failure_summary = None;
 
     for BatchOutcome {
         profile_name,
@@ -1501,36 +1893,31 @@ pub async fn run_verify_gate(
                 all_ok = false;
                 if first_fingerprint.is_none() {
                     first_fingerprint = cell_report.failures.first().map(failure_fingerprint);
+                    first_failure_summary = summarize_failure(&cell_report);
                 }
             }
             report_cells.push(cell_report);
         }
     }
 
-    let mut report = VerifyGateReport {
+    let report = VerifyGateReport {
         task: task.id.clone(),
         commit,
         ok: all_ok,
+        blocked: false,
         untrusted_data: true,
         cells: report_cells,
         omitted,
         warnings,
     };
-    let compact_json = fit_report_to_budget(&mut report, MAX_VERIFY_JSON_BYTES);
-
-    write_verify_record(
+    finalize_verify_gate(
         repo_dir,
-        &VerifyRecord {
-            task: report.task.clone(),
-            commit: report.commit.clone(),
-            ok: report.ok,
-            timestamp_utc: Utc::now().to_rfc3339(),
-            first_fingerprint,
-            cells: report.cells.clone(),
-        },
-    )?;
-
-    Ok((report, compact_json))
+        &options,
+        &task.id,
+        report,
+        first_fingerprint,
+        first_failure_summary,
+    )
 }
 
 fn build_cell_report(
@@ -1697,7 +2084,31 @@ async fn run_verify_command_inner(
         max_bytes: max_mb.saturating_mul(1024 * 1024),
     };
 
-    match run_verify_gate(
+    let max_verifies_per_hour = match resolve_max_verifies_per_hour(args.max_verifies_per_hour) {
+        Ok(v) => v,
+        Err(e) => {
+            if args.json {
+                let err_json = serde_json::json!({
+                    "task": args.task,
+                    "ok": false,
+                    "error": e,
+                });
+                println!("{err_json}");
+            } else {
+                eprintln!("verify failed: {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let options = VerifyGateOptions {
+        remote: args.remote.clone(),
+        agent_id: args.agent.clone(),
+        max_verifies_per_hour,
+        hub_dir: args.hub_dir.clone(),
+        breaker_threshold: CIRCUIT_BREAKER_THRESHOLD,
+    };
+
+    match run_verify_gate_with_options(
         &repo_dir,
         args.plan.as_deref(),
         &args.task,
@@ -1707,6 +2118,7 @@ async fn run_verify_command_inner(
         secret,
         Duration::from_secs(args.timeout_secs),
         workspace_limits,
+        options,
     )
     .await
     {
@@ -1876,6 +2288,7 @@ boom expected true
             task: "T-12".into(),
             commit: "abc123def456".into(),
             ok: false,
+            blocked: false,
             untrusted_data: true,
             cells,
             omitted: 0,
@@ -2027,5 +2440,68 @@ boom expected true
         let (pref2, warn2) = select_link_preference(&cell, &[w_relay], &reqs, false, 10_000_000);
         assert!(pref2.is_none());
         assert!(warn2.unwrap().contains("0.12 MB/s"));
+    }
+
+    #[test]
+    fn verify_rate_limit_enforces_hourly_cap_expires_old_entries_and_refuses_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let t0 = DateTime::parse_from_rfc3339("2026-11-26T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert!(check_and_record_verify_rate_at(&repo, "agent-a", 0, t0).is_err());
+
+        let s1 = check_and_record_verify_rate_at(&repo, "agent-a", 2, t0).unwrap();
+        assert_eq!(s1.used_in_window, 1);
+        let s2 = check_and_record_verify_rate_at(
+            &repo,
+            "agent-a",
+            2,
+            t0 + chrono::Duration::minutes(10),
+        )
+        .unwrap();
+        assert_eq!(s2.used_in_window, 2);
+
+        // 3rd call inside 1h is rejected without affecting another agent.
+        let err = check_and_record_verify_rate_at(
+            &repo,
+            "agent-a",
+            2,
+            t0 + chrono::Duration::minutes(20),
+        )
+        .unwrap_err();
+        assert!(err.contains("rate limit exceeded"), "{err}");
+        assert!(err.contains("retry in"), "{err}");
+        assert!(check_and_record_verify_rate_at(
+            &repo,
+            "agent-b",
+            2,
+            t0 + chrono::Duration::minutes(20),
+        )
+        .is_ok());
+
+        // Oldest entry at t0 expires at t0 + 3600s.
+        let s3 = check_and_record_verify_rate_at(
+            &repo,
+            "agent-a",
+            2,
+            t0 + chrono::Duration::seconds(3600),
+        )
+        .unwrap();
+        assert_eq!(s3.used_in_window, 2);
+
+        #[cfg(unix)]
+        {
+            let linked = tmp.path().join("linked_repo");
+            std::fs::create_dir_all(linked.join(".oxideswarm/verify")).unwrap();
+            let outside = tmp.path().join("outside_rate.json");
+            std::fs::write(&outside, "{}").unwrap();
+            std::os::unix::fs::symlink(&outside, linked.join(".oxideswarm/verify/rate_limit.json"))
+                .unwrap();
+            let err = check_and_record_verify_rate_at(&linked, "agent-a", 5, t0).unwrap_err();
+            assert!(err.contains("symlink"), "{err}");
+        }
     }
 }

@@ -976,6 +976,14 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Optional git base ref overriding [project].base for owned_paths diff check"
                     },
+                    "remote": {
+                        "type": "string",
+                        "description": "Optional git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional calling agent identifier for hourly verify cap and lease holder check"
+                    },
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
@@ -1777,6 +1785,14 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
                         "Property 'base' ('{base}') must be a non-empty git ref without whitespace"
                     ));
                 }
+            }
+            if let Some(remote) = check_opt_str(obj, "remote")? {
+                crate::plan::lease::validate_remote_name(remote)
+                    .map_err(|e| format!("Invalid property 'remote': {e}"))?;
+            }
+            if let Some(agent) = check_opt_str(obj, "agent")? {
+                crate::plan::lease::validate_holder(agent)
+                    .map_err(|e| format!("Invalid property 'agent': {e}"))?;
             }
             let _ = check_opt_str_array(obj, "profiles")?;
             if let Some(t) = check_opt_u64(obj, "timeout_secs")? {
