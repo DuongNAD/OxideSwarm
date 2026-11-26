@@ -224,6 +224,7 @@ Recounted on 2026-11-24 from the rows with pull request 468: 307 items, 204 Impl
 Recounted on 2026-11-24 from the rows with pull request 471: 307 items, 205 Implemented, 21 Partial and 81 Planned; 21 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 470: 307 items, 206 Implemented, 20 Partial and 81 Planned; 20 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 476: 307 items, 207 Implemented, 20 Partial and 80 Planned; 19 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 474: 307 items, 208 Implemented, 20 Partial and 79 Planned; 18 open items are In and 81 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -488,7 +489,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
-| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Planned | In |  |
+| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Implemented |  |  |
 | BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Implemented |  |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
@@ -1707,6 +1708,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   link (a smaller payload) or report the measured rate as a warning when the task is still running and has made
   progress; keep FAIL for a worker without blob support or with no progress.
 - **Done when:** A relayed worker that moves data slowly gets a WARN with its rate, and the existing C8 tests pass.
+- **Update (2026-11-26, `mac/bug-41-doctor-c8-relay-warn`):**
+  1. Failing check first: `doctor::tests::test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate`
+     failed before the fix (`left: Pass`, `right: Warn`, sending `8 MiB` to a relayed worker).
+  2. Added `THROUGHPUT_PROBE_RELAY_BYTES` (`1 MiB`) and `throughput_probe_bytes_for_worker` /
+     `format_throughput_mbps` (`{:.2}` below `1.0 MB/s`) / `judge_throughput` in `crates/cli/src/doctor.rs` so
+     relayed workers (`worker.relayed()`) fetch a `1 MiB` probe and report `Outcome::Warn` with their measured
+     rate (`!report.failed()`), while timeouts, refusals, and non-zero exits stay `Outcome::Fail` and direct/TCP
+     workers keep the `8 MiB` `Outcome::Pass` probe; updated `docs/design/0001-two-node-readiness.md` and
+     `docs/reference.md`.
+  3. Verified `doctor::tests` (`11/11`), `cli_doctor_e2e` (`7/7`), `f2_t2_backlog_no_duplicate_ids_and_valid_lines`
+     (`1/1`), `tests/test_m1_challenger_hygiene.py` (`5/5`), `fmt`, workspace `clippy` (`0` warnings), and
+     `ox-mode test size`.
 
 ### BUG-40: A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails
 
@@ -3503,6 +3516,7 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: BUG-41 Implemented (`mac/bug-41-doctor-c8-relay-warn`): added `THROUGHPUT_PROBE_RELAY_BYTES` (`1 MiB`), `throughput_probe_bytes_for_worker`, `format_throughput_mbps` (`{:.2}` below `1.0 MB/s`), and `judge_throughput` in `crates/cli/src/doctor.rs` (plus `docs/design/0001-two-node-readiness.md` and `docs/reference.md`) so relayed workers fetch `1 MiB` and report `WARN` with their measured rate instead of timing out at `60 s` on `8 MiB`, while timeouts/refusals/failures stay `FAIL` and direct/TCP probes stay `8 MiB` `PASS`; verified failing-first resolved: `test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate` -> `doctor::tests` (`11/11`), `cli_doctor_e2e` (`7/7`), `f2_t2_backlog_no_duplicate_ids_and_valid_lines` (`1/1`), `test_m1_challenger_hygiene.py` (`5/5`), `fmt`, workspace `clippy` (`0` warnings), and `ox-mode test size`.
 - 2026-11-26: BUG-40 Implemented (`win/bug-40-ticket-only-no-tcp-fallback`): `resolve_worker_target_from` (`crates/cli/src/cli_app/worker.rs`) now resolves `master_addr` to `""` when a P2P ticket is set without an explicit `--master` / `RUSTY_GRID_MASTER[_ADDR]` / `[worker].master` (keeping explicit master+ticket fallback and Android unchanged, and passing `iroh://<node_id>` to `announce_peer_secret`); `WorkerClient::establish_stream` and `establish_p2p_with_ticket` (`crates/worker/src/client/session.rs`) now log `master=iroh://<node_id>` on P2P attempts, stale errors, ticket-only failure warnings, and explicit TCP fallback warnings (`tcp_fallback=<addr>`); updated `docs/reference.md`. Verified failing-first tests before fix and post-fix Windows 11 passes (`rusty_grid_cli --lib` `231/231`, `rusty_grid_worker --lib client::tests` `85/85`, `worker_connection_lifecycle` `12/12`, `rusty_grid_android_bridge --lib` `16/16`, workspace `clippy` `0` warnings, `fmt`, live `oxideswarm.exe` smoke check, `test_m1_challenger_hygiene.py`, `f2_t2_backlog_no_duplicate_ids_and_valid_lines`).
 - 2026-11-26: TEST-95 Implemented (`mac/test-95-loaded-loop`): verified `20/20` sequential loaded runs of `python3 -B -m unittest tests/test_wave3_e2e.py -v` on clean `origin/master` `fc95e4c9` (`macOS arm64`, `nice -n 10`, `4` Python CPU busy loops, private per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR`, `OXIDESWARM_PROFILE=debug`, `OXIDESWARM_E2E_TIER=all`): `65/65` tests passed per run (including both `--fail-fast` tests `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` and `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards`), `0` failures (`min 113.933 s`, `median 119.161 s`, `max 126.237 s`, `total 2,398.919 s`).
 - 2026-11-26: TEST-93 Implemented and TEST-86 updated (`mac/test-93-macos-loaded-loop`): verified `20/20` sequential loaded macOS runs of `cargo test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture` on clean `origin/master` `b253f601` (`nice -n 10`, `6` Python CPU busy loops, isolated per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR`): `12 passed; 0 failed` per run (`min 0.516 s`, `median 0.569 s`, `max 1.184 s`, `total 12.042 s`; `[timing] QUIC 5MB saturation` `avg_latency 498.505 µs–750.279 µs`, `max_latency 2.4885 ms–7.825583 ms`); updated `TEST-86` (`Partial | In`) with `33/33` passing `workspace tests (macos-latest)` jobs across all `master` push CI runs since `2026-11-24T00:00:00Z` (`45297098266` through `45781445276`, `0` `test_ax2_shard`/`test_ax1_matrix` stalls).
