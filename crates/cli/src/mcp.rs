@@ -52,6 +52,7 @@ use crate::secret_cmd::SecretOpts;
 
 mod cancel;
 mod doctor;
+mod mail;
 mod shard;
 mod status;
 pub(crate) mod submit;
@@ -918,6 +919,33 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 "required": []
             }),
         },
+        ToolDefinition {
+            name: "mail_wait",
+            description: "Long-poll the master grid mailbox for unread messages addressed to 'consumer' or matching subscribed 'topics'. Returns empty 'messages' with timed_out=true when none arrive before timeout_secs.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "consumer": {
+                        "type": "string",
+                        "description": "Consumer identity whose ack cursor filters unread mail"
+                    },
+                    "topics": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional additional subscribed topics or topic:<name> filters"
+                    },
+                    "after": {
+                        "type": "integer",
+                        "description": "Minimum message ID floor (default: 0)"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Long-poll duration in seconds (0..=300, default: 30)"
+                    }
+                },
+                "required": ["consumer"]
+            }),
+        },
     ]
 }
 
@@ -1514,6 +1542,22 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             Ok(())
         }
         "workspaces" => Ok(()),
+        "mail_wait" => {
+            let consumer = check_opt_str(obj, "consumer")?
+                .ok_or_else(|| "Missing required property 'consumer'".to_string())?;
+            let topics = check_opt_str_array(obj, "topics")?.unwrap_or_default();
+            rusty_grid_core::mail::validate_mail_consumer(consumer, &topics)?;
+            check_opt_u64(obj, "after")?;
+            if let Some(secs) = check_opt_u64(obj, "timeout_secs")? {
+                if secs > rusty_grid_core::mail::MAX_MAIL_WAIT_TIMEOUT_SECS {
+                    return Err(format!(
+                        "Property 'timeout_secs' must be at most {}",
+                        rusty_grid_core::mail::MAX_MAIL_WAIT_TIMEOUT_SECS
+                    ));
+                }
+            }
+            Ok(())
+        }
         other => Err(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1541,6 +1585,7 @@ pub async fn call_tool_with_context(
         "cancel" => cancel::tool_cancel(state, args).await,
         "doctor" => doctor::tool_doctor(state, args).await,
         "workspaces" => workspaces::tool_workspaces(state).await,
+        "mail_wait" => mail::tool_mail_wait(state, args, ctx).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -2504,7 +2549,14 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
+        assert!(validate_tool_arguments("mail_wait", &json!({})).is_err());
+        assert!(validate_tool_arguments("mail_wait", &json!({"consumer": "agent-win-2"})).is_ok());
+        assert!(validate_tool_arguments(
+            "mail_wait",
+            &json!({"consumer": "agent-win-2", "timeout_secs": 301})
+        )
+        .is_err());
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),

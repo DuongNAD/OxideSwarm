@@ -1376,5 +1376,107 @@ class ActivityFilesAndOverlap(CoordCase):
         self.assertIn("No hub found", self.out(result))
 
 
+class GridBackendTests(BridgeCase):
+    def make_fake_oxideswarm(self, mode="ok"):
+        log_path = os.path.join(self.tmp, "fake_ox_calls.jsonl")
+        script_path = os.path.join(self.tmp, "fake_oxideswarm.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"""import json, os, sys
+log_path = {log_path!r}
+mode = {mode!r}
+argv = sys.argv[1:]
+with open(log_path, "a", encoding="utf-8") as log:
+    log.write(json.dumps(argv) + "\\n")
+if len(argv) < 2 or argv[0] != "mail":
+    sys.stderr.write(f"unexpected argv: {{argv}}\\n")
+    sys.exit(2)
+sub = argv[1]
+if mode == "v10":
+    sys.stderr.write("Error: peer protocol version 10 does not support client message MailSend (requires version 11)\\n")
+    sys.exit(1)
+if sub == "send":
+    print(json.dumps({{"id": 7, "to": ["agent-mac"], "topic": "hello", "attachments": [], "recipient_links": {{}}}}))
+    sys.exit(0)
+if sub == "fetch":
+    msgs = [{{
+        "id": 7,
+        "from": "agent-mac",
+        "to": [f"agent-{SELF}"],
+        "topic": "Review request",
+        "body": "Please review #487",
+        "attachments": [],
+        "created_at_utc": 1700000000,
+    }}] if mode != "empty" else []
+    print(json.dumps({{"cursor": 0, "messages": msgs, "saved_files": []}}))
+    sys.exit(0)
+if sub == "ack":
+    print(json.dumps({{"consumer": f"agent-{SELF}", "cursor": 7}}))
+    sys.exit(0)
+if sub == "watch":
+    if "--hook" in argv:
+        sys.stderr.write("[oxideswarm mail] #7 from=agent-mac topic=Wakeup attachments=0\\n")
+        sys.exit(2)
+    print("#7 from=agent-mac topic=Wakeup attachments=0")
+    sys.exit(0)
+sys.exit(2)
+"""
+            )
+        if os.name == "nt":
+            shim = os.path.join(self.tmp, "fake_oxideswarm.cmd")
+            with open(shim, "w", encoding="utf-8") as f:
+                f.write(f'@echo off\r\n"{sys.executable}" "{script_path}" %*\r\n')
+        else:
+            shim = os.path.join(self.tmp, "fake_oxideswarm.sh")
+            with open(shim, "w", encoding="utf-8") as f:
+                f.write(f'#!/bin/sh\nexec "{sys.executable}" "{script_path}" "$@"\n')
+            os.chmod(shim, 0o755)
+        return shim, log_path
+
+    def read_calls(self, log_path):
+        if not os.path.exists(log_path):
+            return []
+        with open(log_path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_grid_backend_send_inbox_peek_ack_and_watch_via_env(self):
+        shim, log_path = self.make_fake_oxideswarm("ok")
+        env = dict(self.env, OXIDESWARM_BRIDGE_BACKEND="grid", OXIDESWARM_BIN=shim)
+
+        res_send = self.run_bridge("send", "--title", "Hello", "--body", "Body", use_hub=False, env=env)
+        self.assertEqual(res_send.returncode, 0, res_send.stderr.decode("utf-8", "replace"))
+        self.assertIn("#7", res_send.stdout.decode("utf-8", "replace"))
+
+        res_peek = self.run_bridge("peek", use_hub=False, env=env)
+        self.assertEqual(res_peek.returncode, 0)
+        self.assertIn("1 unread", res_peek.stdout.decode("utf-8", "replace"))
+
+        res_inbox = self.run_bridge("inbox", use_hub=False, env=env)
+        self.assertEqual(res_inbox.returncode, 0)
+        self.assertIn("Please review #487", res_inbox.stdout.decode("utf-8", "replace"))
+
+        res_ack = self.run_bridge("inbox", "--ack", "all", use_hub=False, env=env)
+        self.assertEqual(res_ack.returncode, 0, res_ack.stderr.decode("utf-8", "replace"))
+
+        res_hook = self.run_bridge("watch", "--hook", "--consumer", "agy", use_hub=False, env=env)
+        self.assertEqual(res_hook.returncode, 2)
+
+        calls = self.read_calls(log_path)
+        self.assertEqual([c[1] for c in calls], ["send", "fetch", "fetch", "fetch", "ack", "watch"])
+        watch_call = calls[-1]
+        self.assertIn("--consumer", watch_call)
+        self.assertIn(f"agent-{SELF}:agy", watch_call)
+        self.assertIn("--topic", watch_call)
+        self.assertIn(f"agent-{SELF}", watch_call)
+
+    def test_grid_backend_falls_back_to_drive_when_master_is_v10(self):
+        shim, _ = self.make_fake_oxideswarm("v10")
+        self.write_message(title="Drive fallback", body="From Drive hub")
+        res = self.run_bridge("--backend", "grid", "--oxideswarm-bin", shim, "inbox")
+        self.assertEqual(res.returncode, 0, res.stderr.decode("utf-8", "replace"))
+        self.assertIn("Drive fallback", res.stdout.decode("utf-8", "replace"))
+        self.assertIn("falling back to Drive", res.stderr.decode("utf-8", "replace"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

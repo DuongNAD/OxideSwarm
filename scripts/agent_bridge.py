@@ -190,6 +190,97 @@ LOCAL_PORTS_ENV = "OXIDESWARM_BRIDGE_ASSUME_LISTENING"
 # Test seam: when set (non-empty), `hub_candidates` skips the hardcoded Windows drive-letter scan
 # (`G:\`, `H:\`, `D:\`), so isolated `use_hub=False` tests do not pick up a mounted Google Drive.
 DISABLE_DRIVE_SCAN_ENV = "OXIDESWARM_BRIDGE_DISABLE_DRIVE_SCAN"
+BACKEND_ENV = "OXIDESWARM_BRIDGE_BACKEND"
+BACKENDS = ("drive", "grid")
+OXIDESWARM_BIN_ENV = "OXIDESWARM_BIN"
+
+
+def resolve_backend(args=None):
+    raw = None
+    if args is not None:
+        raw = getattr(args, "sub_backend", None) or getattr(args, "backend", None)
+    if not raw:
+        raw = os.environ.get(BACKEND_ENV)
+    norm = (raw or "drive").strip().lower()
+    return norm if norm in BACKENDS else "drive"
+
+
+def resolve_oxideswarm_bin(args=None):
+    explicit = None
+    if args is not None:
+        explicit = getattr(args, "sub_oxideswarm_bin", None) or getattr(args, "oxideswarm_bin", None)
+    for cand in (explicit, os.environ.get(OXIDESWARM_BIN_ENV)):
+        if cand and os.path.exists(cand):
+            return cand
+    found = shutil.which("oxideswarm")
+    if found:
+        return found
+    repo_dir = find_repo_dir(resolve_repo_arg(args))
+    if repo_dir:
+        ext = ".exe" if SELF_SHORT == "win" else ""
+        for profile in ("release", "debug"):
+            cand = os.path.join(repo_dir, "target", profile, f"oxideswarm{ext}")
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
+def grid_mail_cmd(args, subcmd, extra_args):
+    ox_bin = resolve_oxideswarm_bin(args)
+    if not ox_bin:
+        return None
+    cmd = [ox_bin]
+    secret_file = getattr(args, "sub_secret_file", None) or getattr(args, "secret_file", None)
+    if secret_file:
+        cmd.extend(["--secret-file", secret_file])
+    cmd.extend(["mail", subcmd])
+    master = getattr(args, "sub_master", None) or getattr(args, "master", None)
+    if master:
+        cmd.extend(["--master", master])
+    cmd.extend(extra_args)
+    return cmd
+
+
+def is_grid_protocol_version_error(stderr_text):
+    lower = (stderr_text or "").lower()
+    return any(
+        needle in lower
+        for needle in (
+            "protocol version",
+            "requires version",
+            "does not support client message",
+            "unsupported client message",
+            "unknown client message",
+            "expected variant",
+        )
+    )
+
+
+def grid_consumer_and_topics(self_short, consumer_group):
+    if not consumer_group or consumer_group == "agent":
+        return f"agent-{self_short}", []
+    return f"agent-{self_short}:{consumer_group}", [f"agent-{self_short}"]
+
+
+def run_grid_mail_json(args, subcmd, extra_args):
+    cmd = grid_mail_cmd(args, subcmd, [*extra_args, "--json"])
+    if cmd is None:
+        return None, 127, "oxideswarm binary not found (set --oxideswarm-bin or OXIDESWARM_BIN)"
+    proc = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        return None, proc.returncode, proc.stderr.strip() or proc.stdout.strip()
+    try:
+        return json.loads(proc.stdout), 0, proc.stderr.strip()
+    except ValueError as exc:
+        return None, 1, f"invalid JSON from oxideswarm mail {subcmd}: {exc}"
 
 
 def resolve_self_short(args=None):
@@ -1238,7 +1329,7 @@ def describe_peer_freshness(hub_dir, peer_short=None):
     return f"[INFO] agent-{peer_short} was last seen {minutes} min ago."
 
 
-def cmd_send(args):
+def _cmd_send_drive(args):
     hub_dir = find_hub_dir(args.hub_dir)
     self_short = resolve_self_short(args)
     peer_short = resolve_peer_short(hub_dir, self_short, args)
@@ -1266,7 +1357,40 @@ def cmd_send(args):
     print(describe_peer_freshness(hub_dir, peer_short))
 
 
-def cmd_inbox(args):
+def cmd_send(args):
+    if resolve_backend(args) != "grid":
+        return _cmd_send_drive(args)
+    self_short = resolve_self_short(args)
+    peer_short = resolve_peer_short(discover_hub_dir(args.hub_dir), self_short, args)
+    recipient = f"agent-{peer_short}"
+    topic = "".join(c if ord(c) >= 32 and ord(c) != 127 else " " for c in args.title).strip()[:120]
+    markdown_body = (
+        f"# [{args.priority.upper()}] {args.title}\n\n"
+        f"- **From**: `agent-{self_short}`\n"
+        f"- **To**: `{recipient}`\n"
+        f"- **Timestamp (UTC)**: `{utc_now_iso()}`\n"
+        f"- **Priority**: `{args.priority}`\n\n---\n\n{args.body}\n"
+    )
+    data, rc, err = run_grid_mail_json(
+        args,
+        "send",
+        ["--to", recipient, "--topic", topic, "--body", markdown_body],
+    )
+    if rc != 0:
+        if is_grid_protocol_version_error(err):
+            print(
+                f"[BRIDGE] Master refused protocol 11 MailSend ({err}); falling back to Drive backend.",
+                file=sys.stderr,
+            )
+            return _cmd_send_drive(args)
+        print(f"[SEND ERROR] {err}", file=sys.stderr)
+        return rc
+    msg_id = (data or {}).get("id", "?")
+    print(f"[OK] Sent grid mail #{msg_id} to {recipient}")
+    return 0
+
+
+def _cmd_inbox_drive(args):
     hub_dir = find_hub_dir(args.hub_dir)
     self_short = resolve_self_short(args)
     inbox_dir = os.path.join(hub_dir, "mailbox", f"to_{self_short}")
@@ -1298,6 +1422,64 @@ def cmd_inbox(args):
         with open(f, "r", encoding="utf-8-sig") as fp:
             print(fp.read().strip())
         print("=" * 78)
+
+
+def cmd_inbox(args):
+    if resolve_backend(args) != "grid":
+        return _cmd_inbox_drive(args)
+    self_short = resolve_self_short(args)
+    consumer = f"agent-{self_short}"
+    data, rc, err = run_grid_mail_json(args, "fetch", ["--consumer", consumer])
+    if rc != 0:
+        if is_grid_protocol_version_error(err):
+            print(
+                f"[BRIDGE] Master refused protocol 11 MailFetch ({err}); falling back to Drive backend.",
+                file=sys.stderr,
+            )
+            return _cmd_inbox_drive(args)
+        print(f"[INBOX ERROR] {err}", file=sys.stderr)
+        return rc
+
+    messages = (data or {}).get("messages") or []
+    if args.ack:
+        if args.ack.lower() == "all":
+            ids = [m["id"] for m in messages if isinstance(m, dict) and isinstance(m.get("id"), int)]
+            if not ids:
+                print(f"[OK] No unread grid messages to acknowledge for {consumer}.")
+                return 0
+            ack_id = str(max(ids))
+        else:
+            raw_id = args.ack.strip().lstrip("#")
+            if not raw_id.isdigit():
+                print(f"[INBOX ERROR] --ack expects 'all' or a numeric mail id on grid backend, got {args.ack!r}", file=sys.stderr)
+                return 2
+            ack_id = raw_id
+        ack_data, ack_rc, ack_err = run_grid_mail_json(
+            args, "ack", ["--consumer", consumer, "--id", ack_id]
+        )
+        if ack_rc != 0:
+            print(f"[INBOX ACK ERROR] {ack_err}", file=sys.stderr)
+            return ack_rc
+        cursor = (ack_data or {}).get("cursor", ack_id)
+        print(f"[OK] Acknowledged grid mail through #{cursor} for {consumer}")
+        return 0
+
+    if not messages:
+        print(f"[INBOX] No unread grid messages for {consumer}")
+        return 0
+
+    for m in messages:
+        print("=" * 78)
+        print(
+            f"MAIL #{m.get('id')} from={m.get('from')} to={','.join(m.get('to') or [])} "
+            f"topic={m.get('topic', '')} attachments={len(m.get('attachments') or [])}"
+        )
+        print("-" * 78)
+        body = (m.get("body") or "").strip()
+        if body:
+            print(body)
+        print("=" * 78)
+    return 0
 
 
 def cmd_incident(args):
@@ -1605,7 +1787,7 @@ def refresh_heartbeat(hub_dir, repo_dir, args, last_peer_head):
     return peer_head
 
 
-def cmd_peek(args):
+def _cmd_peek_drive(args):
     """Prints one line about unread peer messages, and nothing otherwise. Writes nothing, for hooks."""
     hub_dir = discover_hub_dir(args.hub_dir)
     if hub_dir is None:
@@ -1626,7 +1808,30 @@ def cmd_peek(args):
     return 0
 
 
-def cmd_watch(args):
+def cmd_peek(args):
+    if resolve_backend(args) != "grid":
+        return _cmd_peek_drive(args)
+    self_short = resolve_self_short(args)
+    consumer = f"agent-{self_short}"
+    data, rc, err = run_grid_mail_json(args, "fetch", ["--consumer", consumer])
+    if rc != 0:
+        if is_grid_protocol_version_error(err):
+            print(
+                f"[BRIDGE] Master refused protocol 11 MailFetch ({err}); falling back to Drive backend.",
+                file=sys.stderr,
+            )
+            return _cmd_peek_drive(args)
+        print(f"[PEEK ERROR] {err}", file=sys.stderr)
+        return rc
+    messages = (data or {}).get("messages") or []
+    if messages:
+        print(f"[agent_bridge] {len(messages)} unread grid message(s) for {consumer}.")
+        print(f"Read them with: {PYTHON_CMD} scripts/agent_bridge.py --backend grid inbox --agent-id {consumer}")
+        print(PEER_DATA_NOTE)
+    return 0
+
+
+def _cmd_watch_drive(args):
     """Waits for peer messages and incident updates, and delivers each one once per consumer."""
     session_id = read_hook_session_id() if args.hook else None
     hub_dir = discover_hub_dir(args.hub_dir) if args.hook else find_hub_dir(args.hub_dir)
@@ -1697,6 +1902,54 @@ def cmd_watch(args):
         time.sleep(max(1, args.interval))
 
 
+def cmd_watch(args):
+    if resolve_backend(args) != "grid":
+        return _cmd_watch_drive(args)
+    self_short = resolve_self_short(args)
+    session_id = read_hook_session_id() if args.hook else None
+    consumer_label = args.consumer if self_short == SELF_SHORT else f"{args.consumer}-{self_short}"
+    lock = acquire_watch_lock(f"grid-{consumer_label}", session_id or "default") if args.hook else None
+    if args.hook and lock is None:
+        return 0
+
+    mail_consumer, topics = grid_consumer_and_topics(self_short, args.consumer)
+    extra = ["--consumer", mail_consumer]
+    for topic in topics:
+        extra.extend(["--topic", topic])
+    if args.hook:
+        extra.append("--hook")
+    elif args.once_on_message:
+        extra.append("--once")
+    if args.max_wait:
+        extra.extend(["--max-wait", str(args.max_wait)])
+    if args.on_event:
+        extra.extend(["--exec", args.on_event])
+
+    cmd = grid_mail_cmd(args, "watch", extra)
+    if cmd is None:
+        print("[WATCH ERROR] oxideswarm binary not found (set --oxideswarm-bin or OXIDESWARM_BIN)", file=sys.stderr)
+        return 127
+
+    proc = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode not in (0, HOOK_WAKE_EXIT_CODE) and is_grid_protocol_version_error(proc.stderr):
+        print(
+            f"[BRIDGE] Master refused protocol 11 MailWait ({proc.stderr.strip()}); falling back to Drive backend.",
+            file=sys.stderr,
+        )
+        return _cmd_watch_drive(args)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+        sys.stderr.flush()
+    return proc.returncode
+
+
 def add_identity_args(subparser, include_peer=False):
     subparser.add_argument(
         "--agent-id",
@@ -1713,8 +1966,36 @@ def add_identity_args(subparser, include_peer=False):
         )
 
 
+def add_grid_args(subparser):
+    subparser.add_argument(
+        "--backend",
+        dest="sub_backend",
+        choices=BACKENDS,
+        default=None,
+        help="Mailbox backend ('drive' default or 'grid' over master mailbox; env OXIDESWARM_BRIDGE_BACKEND)",
+    )
+    subparser.add_argument(
+        "--master",
+        dest="sub_master",
+        default=None,
+        help="Master address/ticket forwarded to `oxideswarm mail` when using --backend grid",
+    )
+    subparser.add_argument(
+        "--secret-file",
+        dest="sub_secret_file",
+        default=None,
+        help="Cluster secret file forwarded to `oxideswarm mail` when using --backend grid",
+    )
+    subparser.add_argument(
+        "--oxideswarm-bin",
+        dest="sub_oxideswarm_bin",
+        default=None,
+        help="Path to `oxideswarm` executable for --backend grid (defaults to OXIDESWARM_BIN or PATH)",
+    )
+
+
 def main():
-    parser = argparse.ArgumentParser(description="OxideSwarm Multi-Agent Google Drive Bridge")
+    parser = argparse.ArgumentParser(description="OxideSwarm Multi-Agent Bridge (Drive & Grid)")
     parser.add_argument("--hub-dir", help="Explicit path to OxideSwarm_Agent_Hub", default=None)
     parser.add_argument("--repo", help="Path to OxideSwarm repository", default=None)
     parser.add_argument(
@@ -1726,6 +2007,27 @@ def main():
         "--peer-id",
         help="Peer agent identifier (e.g. win or mac-2); defaults to peer in nodes/",
         default=None,
+    )
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default=None,
+        help="Mailbox backend ('drive' default or 'grid' over master mailbox; env OXIDESWARM_BRIDGE_BACKEND)",
+    )
+    parser.add_argument(
+        "--master",
+        default=None,
+        help="Master address/ticket forwarded to `oxideswarm mail` when using --backend grid",
+    )
+    parser.add_argument(
+        "--secret-file",
+        default=None,
+        help="Cluster secret file forwarded to `oxideswarm mail` when using --backend grid",
+    )
+    parser.add_argument(
+        "--oxideswarm-bin",
+        default=None,
+        help="Path to `oxideswarm` executable for --backend grid (defaults to OXIDESWARM_BIN or PATH)",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -1741,6 +2043,7 @@ def main():
 
     p_send = sub.add_parser("send", help="Send a message to the peer Coding Agent")
     add_identity_args(p_send, include_peer=True)
+    add_grid_args(p_send)
     p_send.add_argument("--title", required=True, help="Message title")
     p_send.add_argument("--body", required=True, help="Message markdown body")
     p_send.add_argument("--priority", default="normal", choices=["normal", "high", "critical"])
@@ -1748,7 +2051,8 @@ def main():
 
     p_inbox = sub.add_parser("inbox", help="Read or archive messages in mailbox/to_<self>/")
     add_identity_args(p_inbox)
-    p_inbox.add_argument("--ack", help="Filename to archive, or 'all'", default=None)
+    add_grid_args(p_inbox)
+    p_inbox.add_argument("--ack", help="Filename (or message ID / 'all')", default=None)
     p_inbox.set_defaults(func=cmd_inbox)
 
     p_inc = sub.add_parser("incident", help="Create or update a root-cause incident report")
@@ -1764,6 +2068,7 @@ def main():
 
     p_peek = sub.add_parser("peek", help="Print one line about unread messages; silent when there are none")
     add_identity_args(p_peek, include_peer=True)
+    add_grid_args(p_peek)
     p_peek.set_defaults(func=cmd_peek)
 
     p_act = sub.add_parser(
@@ -1820,6 +2125,7 @@ def main():
         help="Wait for peer messages and incident updates, and deliver each one once per consumer",
     )
     add_identity_args(p_watch, include_peer=True)
+    add_grid_args(p_watch)
     p_watch.add_argument("--repo", dest="sub_repo", help="Path to OxideSwarm repository", default=None)
     p_watch.add_argument("--interval", type=int, default=10, help="Polling interval in seconds (default: 10)")
     p_watch.add_argument(
