@@ -215,40 +215,66 @@ verify = ["unit"]
     assert!(stale.markdown.contains("> **STALE:**"));
 
     // Verify real CLI exit code is non-zero under `--require-fresh` when stale.
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent()?.parent()?.join("oxideswarm.exe").into())
-        .filter(|p| p.is_file())
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent()?.parent()?.join("oxideswarm").into())
-                .filter(|p| p.is_file())
-        });
-    if let Some(bin) = exe {
-        let out = Command::new(&bin)
-            .args([
-                "plan",
-                "pr-body",
-                "--task",
-                "T-1",
-                "--repo",
-                wt_t1.to_str().unwrap(),
-                "--require-fresh",
-            ])
-            .output()
-            .expect("run oxideswarm plan pr-body --require-fresh");
-        assert!(
-            !out.status.success(),
-            "expected non-zero exit when stale under --require-fresh"
-        );
-        assert!(String::from_utf8_lossy(&out.stdout).contains("STALE"));
-    }
+    let bin = env!("CARGO_BIN_EXE_oxideswarm");
+    let out = Command::new(bin)
+        .args([
+            "plan",
+            "pr-body",
+            "--task",
+            "T-1",
+            "--repo",
+            wt_t1.to_str().unwrap(),
+            "--require-fresh",
+        ])
+        .output()
+        .expect("run oxideswarm plan pr-body --require-fresh");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit when stale under --require-fresh"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("STALE"));
+
+    // Mixed-base multi-record stream: even when record[0] is on latest `main` and record[1] is from
+    // an older base without explicit `base_commit`, per-record merge-base resolution flags STALE.
+    git(&clone_a, &["pull", "--ff-only", "origin", "main"]);
+    let new_main_sha = git(&clone_a, &["rev-parse", "HEAD"]);
+    let fresh_then_stale_path = wt_t1.join(".oxideswarm/verify/mixed.json");
+    let fresh_rec = format!(
+        r#"{{
+  "task": "T-1",
+  "commit": "{new_main_sha}",
+  "ok": true,
+  "cells": [{{ "profile": "lint", "worker": "mac-1", "exit": 0, "secs": 0.5 }}]
+}}"#
+    );
+    std::fs::write(
+        &fresh_then_stale_path,
+        format!("{fresh_rec}\n{pretty_t1}\n"),
+    )
+    .unwrap();
+    let mixed = build_plan_pr_body(
+        wt_t1,
+        &PlanPrBodyOptions {
+            task_id: "T-1".to_string(),
+            plan_path: None,
+            base: None,
+            remote: "origin".to_string(),
+            record_paths: vec![fresh_then_stale_path],
+            branch: None,
+            summary: None,
+            require_fresh: true,
+        },
+    )
+    .expect("build mixed-base PR body");
+    assert!(
+        mixed.stale,
+        "mixed fresh+stale multi-record stream must be marked stale"
+    );
+    assert_eq!(mixed.status, "STALE");
 
     // D6.3: `plan done T-1` on updated base branch sets status="done" (preserving comments),
     // deletes remote lease, makes T-2 claimable in `plan status`, and allows `claim_task("T-2")`
     // once the updated `.oxideswarm/plan.toml` is pushed to the base branch.
-    git(&clone_a, &["pull", "--ff-only", "origin", "main"]);
     let done = mark_task_done(
         &clone_a,
         &DoneOptions {

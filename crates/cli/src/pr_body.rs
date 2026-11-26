@@ -649,6 +649,22 @@ pub fn build_plan_pr_body(
         .to_string();
     let current_base_commit = resolve_base_tip_sha(repo_dir, &remote, &base_branch);
 
+    if let Some(cur) = current_base_commit.as_deref() {
+        for rec in &mut records {
+            let has_explicit = rec
+                .base_commit
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            if !has_explicit {
+                if let Some(mb) = run_git_trimmed(repo_dir, &["merge-base", rec.commit.trim(), cur])
+                {
+                    rec.base_commit = Some(mb);
+                }
+            }
+        }
+    }
+
     let verified_base_commit = records
         .iter()
         .find_map(|r| {
@@ -657,12 +673,6 @@ pub fn build_plan_pr_body(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
-        })
-        .or_else(|| {
-            let head_commit = records[0].commit.trim();
-            current_base_commit
-                .as_deref()
-                .and_then(|cur| run_git_trimmed(repo_dir, &["merge-base", head_commit, cur]))
         })
         .unwrap_or_else(|| records[0].commit.trim().to_string());
 
