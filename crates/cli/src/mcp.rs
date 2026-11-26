@@ -21,6 +21,12 @@
 //! 5. `cancel`: Cancel a queued or running task by its UUID.
 //! 6. `doctor`: Run cluster diagnostics (checks C1-C8) and return a structured report.
 //! 7. `workspaces`: List persistent agent workspaces and their worker affinities.
+//! 8. `shard`: Run commands or `cargo nextest` build-once suites across parallel shards.
+//! 9. `plan_snapshot`: Render the compact `<= 30`-line shared plan snapshot.
+//! 10. `task_claim`: Atomically claim a task lease ref (`refs/oxideswarm/lease/<task-id>`) and worktree.
+//! 11. `task_renew`: Renew an active task lease ref via fast-forward push.
+//! 12. `task_release`: Delete a task lease ref on the remote.
+//! 13. `verify`: Sync worktree into worker workspaces and run task verify profiles (<= 4 KiB JSON).
 //!
 //! # Stdout Hygiene
 //!
@@ -52,12 +58,15 @@ use crate::secret_cmd::SecretOpts;
 
 mod cancel;
 mod doctor;
+mod lease;
+mod plan;
 mod shard;
 mod status;
 pub(crate) mod submit;
 mod submit_matrix;
 mod submit_support;
 mod task_result;
+mod verify;
 mod workers;
 mod workspaces;
 
@@ -918,6 +927,210 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 "required": []
             }),
         },
+        ToolDefinition {
+            name: "plan_snapshot",
+            description: "Render a compact snapshot (at most 30 lines) of .oxideswarm/plan.toml combined with git lease refs (refs/oxideswarm/lease/<task>), contract hashes, and recent base commits.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Optional path inside the server working directory to the plan TOML file (default: .oxideswarm/plan.toml)"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory (default: current directory)"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional base git branch or ref overriding [project].base"
+                    }
+                },
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "verify",
+            description: "Sync the current worktree into worker workspaces, run the task's configured verify profiles across the grid, and return compact (<= 4 KiB) failure JSON.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Task id declared in .oxideswarm/plan.toml"
+                    },
+                    "profiles": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional subset of task verify profile names to run"
+                    },
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Optional path inside the repository to .oxideswarm/plan.toml"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the working directory"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional git base ref overriding [project].base for owned_paths diff check"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Optional git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional calling agent identifier for hourly verify cap and lease holder check"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Execution timeout per verify batch in seconds (default 1800)"
+                    }
+                },
+                "required": ["task"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_claim",
+            description: "Atomically claim a task lease ref (refs/oxideswarm/lease/<task_id>) via create-only git push and create an isolated worktree.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id in .oxideswarm/plan.toml"
+                    },
+                    "holder": {
+                        "type": "string",
+                        "description": "Claiming agent identifier"
+                    },
+                    "person": {
+                        "type": "string",
+                        "description": "Optional human owner override"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional base branch/ref overriding [project].base"
+                    },
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Optional path inside repo_dir to the plan TOML file"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional worktree branch name (default: team/<task_id>)"
+                    },
+                    "worktree_root": {
+                        "type": "string",
+                        "description": "Optional directory inside cwd where wt-<task_id> is created (default: <repo_dir>/.oxideswarm/worktrees)"
+                    },
+                    "create_worktree": {
+                        "type": "boolean",
+                        "description": "Create git worktree for the claimed task (default: true)"
+                    },
+                    "ttl_minutes": {
+                        "type": "integer",
+                        "description": "Lease lifetime in minutes (default: 45, range: 1..=1440)"
+                    }
+                },
+                "required": ["task_id", "holder"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_renew",
+            description: "Renew an active task lease ref via strictly fast-forward git push.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id in .oxideswarm/plan.toml"
+                    },
+                    "holder": {
+                        "type": "string",
+                        "description": "Current lease holder identifier"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory"
+                    },
+                    "expected_oid": {
+                        "type": "string",
+                        "description": "Optional expected remote lease commit OID"
+                    },
+                    "ttl_minutes": {
+                        "type": "integer",
+                        "description": "Extended lease lifetime in minutes (default: 45, range: 1..=1440)"
+                    },
+                    "blocked": {
+                        "type": "boolean",
+                        "description": "Optional blocked flag update"
+                    },
+                    "verify_attempts": {
+                        "type": "integer",
+                        "description": "Optional verify attempt counter update"
+                    },
+                    "verify_failures": {
+                        "type": "integer",
+                        "description": "Optional verify failure counter update"
+                    },
+                    "last_failure": {
+                        "type": "string",
+                        "description": "Optional short last failure summary"
+                    },
+                    "last_fingerprint": {
+                        "type": "string",
+                        "description": "Optional normalized failure fingerprint"
+                    }
+                },
+                "required": ["task_id", "holder"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_release",
+            description: "Delete a task lease ref (refs/oxideswarm/lease/<task_id>) on the git remote.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id whose lease ref should be released"
+                    },
+                    "holder": {
+                        "type": "string",
+                        "description": "Expected lease holder (required unless force is true)"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force deletion even if holder is omitted or does not match (default: false)"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
     ]
 }
 
@@ -1514,6 +1727,84 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             Ok(())
         }
         "workspaces" => Ok(()),
+        "plan_snapshot" => {
+            for field in ["plan_path", "repo_dir"] {
+                if let Some(p) = check_opt_str(obj, field)? {
+                    if p.trim().is_empty()
+                        || std::path::Path::new(p)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return Err(format!(
+                            "Property '{field}' ('{p}') must be non-empty and must not contain '..'"
+                        ));
+                    }
+                }
+            }
+            if let Some(base) = check_opt_str(obj, "base")? {
+                if base.trim().is_empty()
+                    || base.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(format!(
+                        "Property 'base' ('{base}') must be a non-empty git ref without whitespace"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "verify" => {
+            let task = check_opt_str(obj, "task")?
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "Missing or invalid required property 'task' (string)".to_string()
+                })?;
+            if task.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "Property 'task' ('{task}') must not contain whitespace"
+                ));
+            }
+            for field in ["plan_path", "repo_dir"] {
+                if let Some(p) = check_opt_str(obj, field)? {
+                    if p.trim().is_empty()
+                        || std::path::Path::new(p)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return Err(format!(
+                            "Property '{field}' ('{p}') must be non-empty and must not contain '..'"
+                        ));
+                    }
+                }
+            }
+            if let Some(base) = check_opt_str(obj, "base")? {
+                if base.trim().is_empty()
+                    || base.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(format!(
+                        "Property 'base' ('{base}') must be a non-empty git ref without whitespace"
+                    ));
+                }
+            }
+            if let Some(remote) = check_opt_str(obj, "remote")? {
+                crate::plan::lease::validate_remote_name(remote)
+                    .map_err(|e| format!("Invalid property 'remote': {e}"))?;
+            }
+            if let Some(agent) = check_opt_str(obj, "agent")? {
+                crate::plan::lease::validate_holder(agent)
+                    .map_err(|e| format!("Invalid property 'agent': {e}"))?;
+            }
+            let _ = check_opt_str_array(obj, "profiles")?;
+            if let Some(t) = check_opt_u64(obj, "timeout_secs")? {
+                if t == 0 {
+                    return Err("Property 'timeout_secs' must be at least 1".to_string());
+                }
+            }
+            Ok(())
+        }
+        "task_claim" => lease::validate_task_claim_args(obj),
+        "task_renew" => lease::validate_task_renew_args(obj),
+        "task_release" => lease::validate_task_release_args(obj),
         other => Err(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1533,14 +1824,19 @@ pub async fn call_tool_with_context(
         return ToolCallResult::error(err);
     }
     match name {
-        "status" => status::tool_status(state, args).await,
-        "workers" => workers::tool_workers(state, args).await,
-        "submit" => submit::tool_submit(state, args, ctx).await,
-        "shard" => shard::tool_shard(state, args, ctx).await,
-        "task_result" => task_result::tool_task_result(state, args, ctx).await,
-        "cancel" => cancel::tool_cancel(state, args).await,
-        "doctor" => doctor::tool_doctor(state, args).await,
-        "workspaces" => workspaces::tool_workspaces(state).await,
+        "status" => Box::pin(status::tool_status(state, args)).await,
+        "workers" => Box::pin(workers::tool_workers(state, args)).await,
+        "submit" => Box::pin(submit::tool_submit(state, args, ctx)).await,
+        "shard" => Box::pin(shard::tool_shard(state, args, ctx)).await,
+        "task_result" => Box::pin(task_result::tool_task_result(state, args, ctx)).await,
+        "cancel" => Box::pin(cancel::tool_cancel(state, args)).await,
+        "doctor" => Box::pin(doctor::tool_doctor(state, args)).await,
+        "workspaces" => Box::pin(workspaces::tool_workspaces(state)).await,
+        "plan_snapshot" => Box::pin(plan::tool_plan_snapshot(args)).await,
+        "verify" => Box::pin(verify::tool_verify(state, args, ctx)).await,
+        "task_claim" => Box::pin(lease::tool_task_claim(args)).await,
+        "task_renew" => Box::pin(lease::tool_task_renew(args)).await,
+        "task_release" => Box::pin(lease::tool_task_release(args)).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -2504,7 +2800,7 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 13);
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),
@@ -3144,5 +3440,17 @@ mod tests {
             ToolContent::Text { text } => text.as_str(),
         };
         assert!(msg_files.contains("files"), "{msg_files}");
+    }
+
+    #[test]
+    fn test_call_tool_future_size_stays_bounded() {
+        let state = McpState::new("127.0.0.1:0".to_string(), None);
+        let args = json!({});
+        let fut = call_tool(&state, "submit", &args);
+        let fut_size = std::mem::size_of_val(&fut);
+        assert!(
+            fut_size <= 16 * 1024,
+            "call_tool future must stay small enough for 2 MiB Linux test stacks, got {fut_size} bytes"
+        );
     }
 }

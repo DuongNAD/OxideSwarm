@@ -1266,6 +1266,70 @@ def cmd_send(args):
     print(describe_peer_freshness(hub_dir, peer_short))
 
 
+def _sanitize_mailbox_slug(raw, field):
+    text = (raw or "").strip()
+    if (
+        not text
+        or ".." in text
+        or "/" in text
+        or "\\" in text
+        or any(ord(ch) < 32 for ch in text)
+    ):
+        raise ValueError(f"invalid {field} '{raw}' for mailbox delivery")
+    if text.startswith("agent-") and len(text) > len("agent-"):
+        text = text[len("agent-") :]
+    slug = re.sub(r"[^a-z0-9_-]", "_", text.lower()).strip("_")
+    if not slug:
+        raise ValueError(f"invalid {field} '{raw}' for mailbox delivery")
+    return slug
+
+
+def cmd_notify_blocked(args):
+    try:
+        person_slug = _sanitize_mailbox_slug(args.person or "owner", "person")
+        holder_slug = _sanitize_mailbox_slug(
+            args.holder or f"agent-{resolve_self_short(args)}", "holder"
+        )
+        task_slug = _sanitize_mailbox_slug(args.task, "task")
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    hub_dir = find_hub_dir(args.hub_dir)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    holder_label = (args.holder or f"agent-{holder_slug}").strip()
+    target_dir = os.path.join(hub_dir, "mailbox", f"to_{person_slug}")
+    filepath = os.path.join(
+        target_dir, f"MSG_{ts}_from_{holder_slug}_blocked_{task_slug}.md"
+    )
+    summary = (args.summary or "(no summary recorded)").strip()
+    branch = (args.branch or "-").strip()
+    fingerprint = (args.fingerprint or "unknown").strip()
+
+    content = f"""# [HIGH] Task {args.task} blocked by circuit breaker
+
+- **From**: `{holder_label}` (`{socket.gethostname()}`)
+- **To**: `{person_slug}`
+- **Timestamp (UTC)**: `{utc_now_iso()}`
+- **Priority**: `high`
+
+---
+
+## Blocked Task Details
+
+- **Task**: `{args.task}`
+- **Branch**: `{branch}`
+- **Consecutive Identical Failures**: `{args.failures}`
+- **Failure Fingerprint**: `{fingerprint}`
+- **Last Failure**: {summary}
+
+Run `oxideswarm plan unblock {args.task}` after resolving or overriding the blocker.
+"""
+    atomic_write(filepath, content, holder_slug)
+    print(f"[OK] Sent circuit-breaker notice to {person_slug}: {filepath}")
+    return 0
+
+
 def cmd_inbox(args):
     hub_dir = find_hub_dir(args.hub_dir)
     self_short = resolve_self_short(args)
@@ -1856,6 +1920,20 @@ def main():
         help="Run 'git pull --ff-only' when the peer reports a new commit and the working tree is clean",
     )
     p_watch.set_defaults(func=cmd_watch)
+
+    p_blocked = sub.add_parser(
+        "notify-blocked",
+        help="Send a high-priority mailbox notice to a task's person when the verify circuit breaker trips",
+    )
+    add_identity_args(p_blocked)
+    p_blocked.add_argument("--task", required=True, help="Task id from .oxideswarm/plan.toml")
+    p_blocked.add_argument("--person", default="owner", help="Recipient person name (default: owner)")
+    p_blocked.add_argument("--holder", default=None, help="Lease holder agent identifier")
+    p_blocked.add_argument("--fingerprint", default="unknown", help="Failure fingerprint hex")
+    p_blocked.add_argument("--failures", type=int, default=3, help="Consecutive identical failures count")
+    p_blocked.add_argument("--summary", default="", help="Concise failure summary")
+    p_blocked.add_argument("--branch", default="-", help="Task branch name")
+    p_blocked.set_defaults(func=cmd_notify_blocked)
 
     # Message bodies are UTF-8. A Windows code page must neither crash the bridge nor garble a pipe.
     for stream in (sys.stdout, sys.stderr):

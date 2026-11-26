@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod members_cmd;
 pub mod mode_cli;
 pub mod pair;
+pub mod plan;
 pub mod pr_body;
 pub mod rendezvous_cmd;
 pub mod run_summary;
@@ -23,6 +24,7 @@ pub mod shard;
 pub mod size_check;
 pub mod usb_kit;
 pub mod verify;
+pub mod verify_gate;
 pub mod wordlist;
 
 pub use cli_app::run_cli;
