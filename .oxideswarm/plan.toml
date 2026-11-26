@@ -1,0 +1,223 @@
+# First-wave 0.4.7 / 0.4.8 shared team plan (design 0111, D7).
+# Generated from open draft PRs in merge order: 477, 479, 478, 481, 475, 480, 482, 484, 483.
+
+[project]
+base = "master"
+contracts = [
+    "crates/core/src/protocol.rs",
+    "docs/reference.md",
+]
+
+# One verify profile per OS that CI runs (.github/workflows/ci.yml).
+[profile.ci-linux]
+command = ["cargo", "test", "--workspace", "--lib", "--locked"]
+require = ["os:linux", "tool:cargo"]
+
+[profile.ci-macos]
+command = ["cargo", "test", "--workspace", "--lib", "--locked"]
+require = ["os:macos", "tool:cargo"]
+
+[profile.ci-windows]
+command = ["cargo", "test", "--workspace", "--lib", "--locked"]
+require = ["os:windows", "tool:cargo"]
+
+[[task]]
+id = "TOOL-1-D1"
+title = "feat(core): probe python and skip WindowsApps / macOS CLT stubs (TOOL-1 D1, draft)"
+status = "review"
+depends_on = []
+owned_paths = [
+    "crates/core/src/capabilities.rs",
+    "crates/core/src/placement.rs",
+    "docs/reference.md",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-win-2. Draft PR #477 (win2/tool-1-d1-python-probe)."
+
+[[task]]
+id = "TOOL-1-USB"
+title = "feat(usb): Windows USB kit developer toolset (TOOL-1 D2-D6, TOOL-3, TOOL-5, TOOL-4)"
+status = "review"
+depends_on = ["TOOL-1-D1"]
+owned_paths = [
+    ".gitattributes",
+    "docs/design/0110-tools-on-kit-machines.md",
+    "docs/reference.md",
+    "packaging/usb/KIT_README.txt",
+    "packaging/usb/README.md",
+    "packaging/usb/install.ps1",
+    "packaging/usb/install.sh",
+    "packaging/usb/make_kit.sh",
+    "packaging/usb/tools.lock",
+    "packaging/usb/tools/check/cc-check/Cargo.toml",
+    "packaging/usb/tools/check/cc-check/build.rs",
+    "packaging/usb/tools/check/cc-check/c/add.c",
+    "packaging/usb/tools/check/cc-check/src/main.rs",
+    "packaging/usb/tools/check/hello.rs",
+    "packaging/usb/uninstall.ps1",
+    "tests/test_launcher_scripts.py",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-win. Draft PR #479 (win/toolset-windows-usb-kit)."
+
+[[task]]
+id = "NET-9a"
+title = "feat(net-9a): contributor pause, 5s hand-back, local control channel, and master hold-back (0.4.7 Draft)"
+status = "review"
+depends_on = ["TOOL-1-USB"]
+owned_paths = [
+    "crates/cli/Cargo.toml",
+    "crates/cli/src/cli_app.rs",
+    "crates/cli/src/cli_app/tasks.rs",
+    "crates/cli/src/cli_app/tests.rs",
+    "crates/cli/src/cli_app/worker.rs",
+    "crates/cli/src/doctor.rs",
+    "crates/master/src/lib.rs",
+    "crates/master/src/queue.rs",
+    "crates/master/src/queue/lifecycle.rs",
+    "crates/master/src/queue/recovery_tests.rs",
+    "crates/master/src/queue/tests.rs",
+    "crates/master/src/registry.rs",
+    "crates/master/src/scheduler.rs",
+    "crates/master/src/server/client_and_members.rs",
+    "crates/master/src/server/tasks_and_blobs.rs",
+    "crates/master/src/worker_index.rs",
+    "crates/worker/src/client.rs",
+    "crates/worker/src/client/session.rs",
+    "crates/worker/src/client/tasks.rs",
+    "crates/worker/src/control.rs",
+    "crates/worker/src/lib.rs",
+    "docs/reference.md",
+    "tests/m2_challenger_1_stress.rs",
+    "tests/m4_challenger_1_stress.rs",
+    "tests/m5a_challenger_1_stress.rs",
+    "tests/m6_challenger_2_stress.rs",
+    "tests/mobile_coordination_test.rs",
+    "tests/net9a_contributor_controls.rs",
+    "tests/test_challenger_m4_scheduler_runner.rs",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-mac-ag. Draft PR #478 (mac/net-9a-contributor-controls)."
+
+[[task]]
+id = "NET-9b"
+title = "feat(worker,cli): NET-9b contributor resource limits (design 0113 D1, 0.4.7 draft)"
+status = "review"
+depends_on = ["NET-9a"]
+owned_paths = [
+    "crates/cli/src/config.rs",
+    "crates/worker/Cargo.toml",
+    "crates/worker/src/lib.rs",
+    "crates/worker/src/limits.rs",
+    "docs/reference.md",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-win. Draft PR #481 (win/net-9b-contributor-limits)."
+
+[[task]]
+id = "TEAM-1"
+title = "TEAM-1: shared .oxideswarm/plan.toml parser, plan check/status and MCP plan_snapshot (0.4.8 draft)"
+status = "review"
+depends_on = ["NET-9b"]
+owned_paths = [
+    "crates/cli/src/cli_app.rs",
+    "crates/cli/src/cli_app/tests.rs",
+    "crates/cli/src/lib.rs",
+    "crates/cli/src/mcp.rs",
+    "crates/cli/src/mcp/plan.rs",
+    "crates/cli/src/plan.rs",
+    "docs/reference.md",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-mac-ag. Draft PR #475 (mac/team-1-shared-plan)."
+
+[[task]]
+id = "TEAM-2"
+title = "feat(plan): git ref task claims, path leases, worktrees, and check-diff (TEAM-2, 0.4.8 draft)"
+status = "review"
+depends_on = ["TEAM-1"]
+owned_paths = [
+    "crates/cli/src/cli_app/tests.rs",
+    "crates/cli/src/mcp.rs",
+    "crates/cli/src/mcp/lease.rs",
+    "crates/cli/src/plan.rs",
+    "crates/cli/src/plan/lease.rs",
+    "crates/cli/tests/test_team2_leases.rs",
+    "docs/reference.md",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-win-2. Draft PR #480 (win2/team-2-git-ref-leases)."
+
+[[task]]
+id = "TEAM-3"
+title = "TEAM-3: oxideswarm verify gate & MCP verify tool (0.4.8 draft)"
+status = "review"
+depends_on = ["TEAM-2"]
+owned_paths = [
+    "crates/cli/Cargo.toml",
+    "crates/cli/src/cli_app.rs",
+    "crates/cli/src/lib.rs",
+    "crates/cli/src/mcp.rs",
+    "crates/cli/src/mcp/verify.rs",
+    "crates/cli/src/verify_gate.rs",
+    "docs/reference.md",
+    "tests/team3_verify_gate_e2e.rs",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-mac-ag. Draft PR #482 (mac/team-3-verify-gate)."
+
+[[task]]
+id = "TEAM-4"
+title = "TEAM-4: circuit breaker, plan unblock, and hourly verify cap (0.4.8 draft)"
+status = "review"
+depends_on = ["TEAM-3"]
+owned_paths = [
+    "crates/cli/src/cli_app/tests.rs",
+    "crates/cli/src/mcp.rs",
+    "crates/cli/src/mcp/lease.rs",
+    "crates/cli/src/mcp/verify.rs",
+    "crates/cli/src/plan.rs",
+    "crates/cli/src/plan/lease.rs",
+    "crates/cli/src/verify_gate.rs",
+    "crates/cli/tests/team4_circuit_breaker_e2e.rs",
+    "crates/cli/tests/test_team2_leases.rs",
+    "docs/reference.md",
+    "scripts/agent_bridge.py",
+    "tests/test_agent_bridge.py",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-mac-ag. Draft PR #484 (mac/team-4-circuit-breaker)."
+
+[[task]]
+id = "TEAM-5"
+title = "feat(cli): PR body verify table generator (TEAM-5 groundwork, 0.4.8 draft)"
+status = "review"
+depends_on = ["TEAM-4"]
+owned_paths = [
+    "crates/cli/src/cli_app/tests.rs",
+    "crates/cli/src/lib.rs",
+    "crates/cli/src/plan.rs",
+    "crates/cli/src/pr_body.rs",
+    "crates/cli/tests/test_team5_merge_flow.rs",
+    "docs/reference.md",
+]
+verify = ["ci-linux", "ci-macos", "ci-windows"]
+hours = 2
+person = "DuongNAD"
+notes = "Owner agent: agent-win-2. Draft PR #483 (win2/team-5-pr-body-generator)."
