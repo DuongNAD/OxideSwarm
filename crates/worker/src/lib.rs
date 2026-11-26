@@ -22,6 +22,9 @@ pub mod identity;
 // LV-4: OS sandbox primitives (Windows AppContainer/ACLs/Desktop/CreateProcessW, Linux namespaces/seccomp, macOS sandbox_init).
 #[allow(unsafe_code)]
 pub mod isolation;
+// LV-4: cfg(windows) INetworkCostManager COM and GetSystemPowerStatus queries for contributor limits (design 0113 D1).
+#[allow(unsafe_code)]
+pub mod limits;
 // LV-4: cfg(windows) Job Objects / snapshots and cfg(unix) setsid/killpg/proc_pidinfo process-tree supervision.
 #[allow(unsafe_code)]
 pub mod process_tree;
@@ -47,6 +50,13 @@ pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
 pub use isolation::{
     validate_extra_read_only_dirs, verify_isolation_support, verify_isolation_support_with_config,
     HostDirs, IsolationLevel, ISOLATION_READ_DIRS_ENV,
+};
+pub use limits::{
+    classify_windows_nlm_cost, format_limit_rejection, parse_linux_nm_metered_output,
+    parse_macos_path_flags, BatteryProbe, BatteryStatus, CpuAverager, DailyTaskBudget,
+    HoldEvaluation, HoursSchedule, LimitSample, LimitsEvaluator, MeteredNetworkProbe,
+    MeteredStatus, SystemBatteryProbe, SystemMeteredNetworkProbe, WorkerLimits, CPU_AVERAGE_WINDOW,
+    LIMITS_EVAL_INTERVAL, NO_GPU_TASKS_REJECTION_MESSAGE, PAUSE_REJECTION_PREFIX,
 };
 pub use process_tree::{terminate_all_task_process_trees, ProcessPriority};
 pub use runner::{

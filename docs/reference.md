@@ -748,6 +748,19 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
 | `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | `http://HOST[:PORT][/PATH]` URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery (`https://` is refused upfront; use a reverse proxy for TLS) |
 
+##### Contributor Resource Limits (NET-9b, design 0113 D1)
+| Flag / Config Key | Default / Env / `[worker]` Key | Description |
+| :--- | :--- | :--- |
+| `--local-max-cpu-pct <P>` | unset (`RUSTY_GRID_LOCAL_MAX_CPU_PCT`, `[worker].local_max_cpu_pct`) | Hold new tasks while host CPU utilization averaged over 30 s exceeds `P` (`1..=100`); complements the master's host CPU threshold |
+| `--hours "<SPEC>"` | unset (`RUSTY_GRID_HOURS`, `[worker].hours`) | Weekly execution schedule in local wall-clock time (e.g. `"mon-fri 18:00-08:00; sat-sun 00:00-24:00"`, comma days, wrap-around ranges like `fri-mon`, or bare `HH:MM-HH:MM`); outside the schedule the worker holds new tasks |
+| `--max-task-hours-per-day <H>` | unset (`RUSTY_GRID_MAX_TASK_HOURS_PER_DAY`, `[worker].max_task_hours_per_day`) | Maximum cumulative task run time per local calendar day in hours (`(0, 24]`), reset at local midnight |
+| `--no-tasks-on-battery` | `false` (`RUSTY_GRID_NO_TASKS_ON_BATTERY`, `[worker].no_tasks_on_battery`) | Hold new tasks while running on battery power (`GetSystemPowerStatus` on Windows; `/sys/class/power_supply` or `pmset` on Unix) |
+| `--no-tasks-on-metered` | `false` (`RUSTY_GRID_NO_TASKS_ON_METERED`, `[worker].no_tasks_on_metered`) | Hold new tasks while the OS reports a metered connection (Windows `INetworkCostManager` via COM, Linux NetworkManager `Metered`; where unavailable, logs once at start that it cannot tell and treats the network as unmetered) |
+| `--no-gpu-tasks` | `false` (`RUSTY_GRID_NO_GPU_TASKS`, `[worker].no_gpu_tasks`) | Refuse GPU tasks (`Task rejected by worker: no gpu tasks`) while continuing to accept CPU tasks |
+| `--hold-ends-tasks` | `false` (`RUSTY_GRID_HOLD_ENDS_TASKS`, `[worker].hold_ends_tasks`) | Also hand back already-running tasks when an automatic limit triggers a hold |
+
+Note: Refusal strings sent back to the master use generic category reasons only (`"on battery"`, `"metered network"`, `"outside allowed hours"`, `"daily task-hours cap reached"`, `"host cpu above limit"`) and never expose the contributor's schedule or location.
+
 #### `oxideswarm submit` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |

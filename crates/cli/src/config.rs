@@ -197,6 +197,27 @@ pub struct WorkerFileConfig {
     pub master_key: Option<String>,
     /// Allow connecting to a remote / `auto` / P2P master without a cluster secret.
     pub insecure: Option<bool>,
+    /// Hold new tasks when 30 s average host CPU % exceeds this threshold (`worker --local-max-cpu-pct`).
+    #[serde(default)]
+    pub local_max_cpu_pct: Option<u8>,
+    /// Local weekly allowed execution hours (`worker --hours`).
+    #[serde(default)]
+    pub hours: Option<String>,
+    /// Maximum summed task run time per local day in hours (`worker --max-task-hours-per-day`).
+    #[serde(default)]
+    pub max_task_hours_per_day: Option<f64>,
+    /// Hold new tasks while operating on battery power (`worker --no-tasks-on-battery`).
+    #[serde(default)]
+    pub no_tasks_on_battery: Option<bool>,
+    /// Hold new tasks while on a metered network connection (`worker --no-tasks-on-metered`).
+    #[serde(default)]
+    pub no_tasks_on_metered: Option<bool>,
+    /// Refuse GPU tasks while still accepting CPU tasks (`worker --no-gpu-tasks`).
+    #[serde(default)]
+    pub no_gpu_tasks: Option<bool>,
+    /// Also hand back running tasks when an automatic contributor limit holds (`worker --hold-ends-tasks`).
+    #[serde(default)]
+    pub hold_ends_tasks: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -703,6 +724,156 @@ pub fn resolve_bool(
     })
 }
 
+/// CLI overrides for contributor resource limits (`design 0113` D1, NET-9b).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkerLimitsCliOverrides {
+    pub local_max_cpu_pct: Option<u8>,
+    pub hours: Option<String>,
+    pub max_task_hours_per_day: Option<f64>,
+    pub no_tasks_on_battery: Option<bool>,
+    pub no_tasks_on_metered: Option<bool>,
+    pub no_gpu_tasks: Option<bool>,
+    pub hold_ends_tasks: Option<bool>,
+}
+
+fn parse_env_bool_strict(raw: &str, name: &str) -> GridResult<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(GridError::Config(format!(
+            "invalid boolean '{raw}' for {name}"
+        ))),
+    }
+}
+
+fn resolve_opt_with_env<T, F>(
+    cli_val: Option<T>,
+    env_name: &str,
+    file_val: Option<T>,
+    env_get: &impl Fn(&str) -> Option<String>,
+    parse: F,
+) -> GridResult<Option<T>>
+where
+    F: FnOnce(&str) -> GridResult<T>,
+{
+    if let Some(v) = cli_val {
+        return Ok(Some(v));
+    }
+    if let Some(raw) = env_get(env_name) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return parse(trimmed).map(Some);
+        }
+    }
+    Ok(file_val)
+}
+
+fn resolve_bool_with_env(
+    cli_val: Option<bool>,
+    env_name: &str,
+    file_val: Option<bool>,
+    env_get: &impl Fn(&str) -> Option<String>,
+) -> GridResult<bool> {
+    if let Some(v) = cli_val {
+        return Ok(v);
+    }
+    if let Some(raw) = env_get(env_name) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return parse_env_bool_strict(trimmed, env_name);
+        }
+    }
+    Ok(file_val.unwrap_or(false))
+}
+
+/// Resolves and validates `[worker]` D1 contributor limits across CLI > `RUSTY_GRID_*` env >
+/// `[worker]` config file > defaults (`design 0113` D1).
+pub fn resolve_worker_limits_from(
+    cli: &WorkerLimitsCliOverrides,
+    file_cfg: Option<&WorkerFileConfig>,
+    env_get: impl Fn(&str) -> Option<String>,
+) -> GridResult<rusty_grid_worker::WorkerLimits> {
+    let local_max_cpu_pct = resolve_opt_with_env(
+        cli.local_max_cpu_pct,
+        "RUSTY_GRID_LOCAL_MAX_CPU_PCT",
+        file_cfg.and_then(|w| w.local_max_cpu_pct),
+        &env_get,
+        |s| {
+            s.parse::<u8>().map_err(|_| {
+                GridError::Config(format!(
+                    "invalid integer '{s}' for RUSTY_GRID_LOCAL_MAX_CPU_PCT"
+                ))
+            })
+        },
+    )?;
+
+    let hours = resolve_opt_with_env(
+        cli.hours.clone(),
+        "RUSTY_GRID_HOURS",
+        file_cfg
+            .and_then(|w| w.hours.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        &env_get,
+        |s| Ok(s.to_string()),
+    )?;
+
+    let max_task_hours_per_day = resolve_opt_with_env(
+        cli.max_task_hours_per_day,
+        "RUSTY_GRID_MAX_TASK_HOURS_PER_DAY",
+        file_cfg.and_then(|w| w.max_task_hours_per_day),
+        &env_get,
+        |s| {
+            s.parse::<f64>().map_err(|_| {
+                GridError::Config(format!(
+                    "invalid number '{s}' for RUSTY_GRID_MAX_TASK_HOURS_PER_DAY"
+                ))
+            })
+        },
+    )?;
+
+    let no_tasks_on_battery = resolve_bool_with_env(
+        cli.no_tasks_on_battery,
+        "RUSTY_GRID_NO_TASKS_ON_BATTERY",
+        file_cfg.and_then(|w| w.no_tasks_on_battery),
+        &env_get,
+    )?;
+
+    let no_tasks_on_metered = resolve_bool_with_env(
+        cli.no_tasks_on_metered,
+        "RUSTY_GRID_NO_TASKS_ON_METERED",
+        file_cfg.and_then(|w| w.no_tasks_on_metered),
+        &env_get,
+    )?;
+
+    let no_gpu_tasks = resolve_bool_with_env(
+        cli.no_gpu_tasks,
+        "RUSTY_GRID_NO_GPU_TASKS",
+        file_cfg.and_then(|w| w.no_gpu_tasks),
+        &env_get,
+    )?;
+
+    let hold_ends_tasks = resolve_bool_with_env(
+        cli.hold_ends_tasks,
+        "RUSTY_GRID_HOLD_ENDS_TASKS",
+        file_cfg.and_then(|w| w.hold_ends_tasks),
+        &env_get,
+    )?;
+
+    let limits = rusty_grid_worker::WorkerLimits {
+        local_max_cpu_pct,
+        hours,
+        max_task_hours_per_day,
+        no_tasks_on_battery,
+        no_tasks_on_metered,
+        no_gpu_tasks,
+        hold_ends_tasks,
+    };
+    limits.validate().map_err(GridError::Config)?;
+    Ok(limits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,5 +1259,77 @@ isolation_read_dirs = ["/opt/cuda", "/opt/pyenv/versions/3.11.8"]
                 "/opt/pyenv/versions/3.11.8".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn test_worker_limits_toml_json_and_4_tier_precedence() {
+        let parsed_toml: ConfigFile = toml::from_str(
+            r#"
+[worker]
+local_max_cpu_pct = 75
+hours = "mon-fri 18:00-08:00; sat-sun 00:00-24:00"
+max_task_hours_per_day = 4.5
+no_tasks_on_battery = true
+no_tasks_on_metered = true
+no_gpu_tasks = false
+hold_ends_tasks = true
+"#,
+        )
+        .expect("parse limits toml");
+        let w = parsed_toml.worker.as_ref().unwrap();
+        assert_eq!(w.local_max_cpu_pct, Some(75));
+        assert_eq!(
+            w.hours.as_deref(),
+            Some("mon-fri 18:00-08:00; sat-sun 00:00-24:00")
+        );
+        assert_eq!(w.max_task_hours_per_day, Some(4.5));
+        assert_eq!(w.no_tasks_on_battery, Some(true));
+        assert_eq!(w.no_tasks_on_metered, Some(true));
+        assert_eq!(w.no_gpu_tasks, Some(false));
+        assert_eq!(w.hold_ends_tasks, Some(true));
+
+        let parsed_json: ConfigFile =
+            serde_json::from_str(r#"{"worker":{"local_max_cpu_pct":60,"no_gpu_tasks":true}}"#)
+                .expect("parse limits json");
+        assert_eq!(
+            parsed_json.worker.as_ref().unwrap().local_max_cpu_pct,
+            Some(60)
+        );
+        assert_eq!(
+            parsed_json.worker.as_ref().unwrap().no_gpu_tasks,
+            Some(true)
+        );
+
+        // 4-tier resolution: CLI > env > config > default
+        let env_map = std::collections::HashMap::from([
+            ("RUSTY_GRID_LOCAL_MAX_CPU_PCT", "60".to_string()),
+            ("RUSTY_GRID_NO_TASKS_ON_BATTERY", "false".to_string()),
+            ("RUSTY_GRID_NO_GPU_TASKS", "1".to_string()),
+        ]);
+        let cli = WorkerLimitsCliOverrides {
+            local_max_cpu_pct: Some(55),
+            ..Default::default()
+        };
+        let resolved =
+            resolve_worker_limits_from(&cli, Some(w), |k| env_map.get(k).cloned()).unwrap();
+        assert_eq!(resolved.local_max_cpu_pct, Some(55)); // CLI wins over env (60) and file (75)
+        assert!(!resolved.no_tasks_on_battery); // env (false) wins over file (true)
+        assert!(resolved.no_tasks_on_metered); // file (true) wins over default (false)
+        assert!(resolved.no_gpu_tasks); // env (1) wins over file (false)
+        assert!(resolved.hold_ends_tasks); // file (true) wins over default (false)
+        assert_eq!(resolved.max_task_hours_per_day, Some(4.5));
+
+        // Invalid values rejected upfront.
+        let bad_cli = WorkerLimitsCliOverrides {
+            local_max_cpu_pct: Some(0),
+            ..Default::default()
+        };
+        assert!(resolve_worker_limits_from(&bad_cli, None, |_| None).is_err());
+
+        let bad_hours = WorkerLimitsCliOverrides {
+            hours: Some("funday 09:00-17:00".into()),
+            ..Default::default()
+        };
+        assert!(resolve_worker_limits_from(&bad_hours, None, |_| None).is_err());
     }
 }
