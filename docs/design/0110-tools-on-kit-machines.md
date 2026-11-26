@@ -199,3 +199,12 @@ install on the machines whose owners asked for the least.
 - 2026-11-26: Draft, from the owner's question during the friend trial ("install and check Rust and
   Python on the other machine when installing from USB"). Design number, TOOL-1, TOOL-2 and Q99
   claimed with `agent_bridge.py claim`.
+- 2026-11-26: T4 run live on the trial cluster (master 0.4.4 on an Apple M5 Mac, worker `msi`: Windows 11
+  10.0.26200, kit 0.4.5, `--isolation off`, no Python installed, direct P2P link). Inputs:
+  `python-3.15.2-embed-amd64.zip` (13,740,486 bytes, SHA-256 `d012f3aa…b9ad1f62`, equal to the value on
+  the python.org release page), a 30-line `analyze.py` and the `crates/` tree of `origin/master`. The task
+  (`cmd /c run.cmd`: `Expand-Archive` into the sandbox, then `py\python.exe analyze.py`) printed Python
+  3.15.2 on host `MSI` and returned `out/report.json`, whose tree SHA-256 and per-crate counts equal those
+  of the same script run on the Mac. Run 1 waited 2.884 s, run 2 1.572 s (task time 1.40 s both): the
+  inputs were not sent again. Nothing was installed on the laptop; the zip stays only in the worker's blob
+  cache.
