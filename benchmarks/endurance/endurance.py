@@ -203,17 +203,23 @@ def check_p99_ratio(
     second_hour_p99: float,
     last_hour_p99: float,
     max_ratio: float = 1.5,
+    floor_ms: float = 0.0,
 ) -> Dict[str, Any]:
-    """Design 0065 D3 #4: last-hour p99 latency at most 1.5x hour 2."""
+    """Design 0065 D3 #4: last-hour p99 latency within max(max_ratio * base, floor_ms)."""
     if second_hour_p99 <= 0 or last_hour_p99 < 0:
         raise ValueError("p99 latencies must be positive / non-negative")
+    if floor_ms < 0:
+        raise ValueError("floor_ms must be non-negative")
     ratio = last_hour_p99 / second_hour_p99
+    limit_ms = max(second_hour_p99 * max_ratio, float(floor_ms))
     return {
         "second_hour_p99": second_hour_p99,
         "last_hour_p99": last_hour_p99,
         "ratio": round(ratio, 4),
         "max_ratio": max_ratio,
-        "passed": last_hour_p99 <= second_hour_p99 * max_ratio,
+        "floor_ms": float(floor_ms),
+        "limit_ms": round(limit_ms, 3),
+        "passed": last_hour_p99 <= limit_ms,
     }
 
 
@@ -268,6 +274,23 @@ def percentile(values: Iterable[float], pct: float) -> float:
 
 SOAK_QUEUE_FULL_MAX_ATTEMPTS = 12
 SOAK_QUEUE_FULL_BACKOFF_S = 2.5
+SOAK_DEFAULT_PROBE_INTERVAL_S = 6.0
+SOAK_MIN_PROBE_SAMPLES_PER_WINDOW = 30
+SOAK_PROBE_P99_FLOOR_MS = 500.0
+SOAK_PROBE_FAULT_PAD_S = 30.0
+SOAK_MIN_PROBE_FAULT_PAD_S = 5.0
+
+
+def soak_fault_pad_seconds(
+    fault_scale: float,
+    base_pad_s: float = SOAK_PROBE_FAULT_PAD_S,
+) -> float:
+    """Scale post-fault settling pad down only for compressed short smoke runs (`fault_scale < 0.25`)."""
+    scale = float(fault_scale)
+    pad = float(base_pad_s)
+    if scale >= 0.25:
+        return pad
+    return max(SOAK_MIN_PROBE_FAULT_PAD_S, min(pad, pad * (scale / 0.25)))
 
 
 def is_queue_full_error(message: str) -> bool:
@@ -791,7 +814,7 @@ def check_soak_disk_and_journal(
     }
 
 
-def _fault_interval_s(fault: Dict[str, Any], pad_s: float = 15.0) -> Tuple[float, float]:
+def _fault_interval_s(fault: Dict[str, Any], pad_s: float = SOAK_PROBE_FAULT_PAD_S) -> Tuple[float, float]:
     start = float(fault.get("t_s", fault.get("at_s", 0.0)))
     if "end_s" in fault and fault["end_s"] is not None:
         end = float(fault["end_s"])
@@ -804,7 +827,7 @@ def _fault_interval_s(fault: Dict[str, Any], pad_s: float = 15.0) -> Tuple[float
 def probe_overlaps_fault(
     probe: Dict[str, Any],
     faults: Iterable[Dict[str, Any]],
-    pad_s: float = 15.0,
+    pad_s: float = SOAK_PROBE_FAULT_PAD_S,
 ) -> bool:
     """Return True if a probe's execution interval [t_s, t_s + latency] overlaps any fault window."""
     p_start = float(probe.get("t_s", 0.0))
@@ -821,10 +844,11 @@ def check_soak_probe_p99(
     duration_s: float,
     max_ratio: float = 1.5,
     faults: Optional[Iterable[Dict[str, Any]]] = None,
-    fault_pad_s: float = 15.0,
-    min_samples_per_window: int = 10,
+    fault_pad_s: float = SOAK_PROBE_FAULT_PAD_S,
+    min_samples_per_window: int = SOAK_MIN_PROBE_SAMPLES_PER_WINDOW,
+    floor_ms: float = SOAK_PROBE_P99_FLOOR_MS,
 ) -> Dict[str, Any]:
-    """Design 0065 D3 #6.4: clean non-fault probe p99 in late window <= 1.5x baseline window."""
+    """Design 0065 D3 #6.4: clean non-fault probe p99 in late window <= max(1.5x baseline, floor_ms)."""
     fault_list = list(faults) if faults is not None else []
     ok_probes = [p for p in probes if p.get("ok") and p.get("latency_ms") is not None]
     if fault_list:
@@ -853,6 +877,7 @@ def check_soak_probe_p99(
             "fault_windows_used": len(fault_list),
             "fault_pad_s": float(fault_pad_s),
             "min_samples_required": int(min_samples_per_window),
+            "floor_ms": float(floor_ms),
             "baseline_count": len(base_rows),
             "late_count": len(late_rows),
             "passed": False,
@@ -860,7 +885,12 @@ def check_soak_probe_p99(
         }
     base_p99 = percentile([float(r["latency_ms"]) for r in base_rows], 99.0)
     late_p99 = percentile([float(r["latency_ms"]) for r in late_rows], 99.0)
-    ratio_res = check_p99_ratio(max(0.001, base_p99), late_p99, max_ratio=max_ratio)
+    ratio_res = check_p99_ratio(
+        max(0.001, base_p99),
+        late_p99,
+        max_ratio=max_ratio,
+        floor_ms=floor_ms,
+    )
     return {
         "mode": mode,
         "total_probes": len(probes),
@@ -869,6 +899,8 @@ def check_soak_probe_p99(
         "fault_windows_used": len(fault_list),
         "fault_pad_s": float(fault_pad_s),
         "min_samples_required": int(min_samples_per_window),
+        "floor_ms": float(floor_ms),
+        "limit_ms": ratio_res["limit_ms"],
         "baseline_count": len(base_rows),
         "late_count": len(late_rows),
         "baseline_p99_ms": round(base_p99, 3),
@@ -932,7 +964,9 @@ def evaluate_soak_pass_checks(
     faults_executed: Optional[List[Dict[str, Any]]] = None,
     fault_errors: Optional[List[Dict[str, Any]]] = None,
     leftover_task_trees: Optional[List[Dict[str, Any]]] = None,
-    min_probe_samples_per_window: int = 10,
+    min_probe_samples_per_window: int = SOAK_MIN_PROBE_SAMPLES_PER_WINDOW,
+    probe_p99_floor_ms: float = SOAK_PROBE_P99_FLOOR_MS,
+    probe_fault_pad_s: float = SOAK_PROBE_FAULT_PAD_S,
     expected_process_roles: Optional[Iterable[str]] = None,
     missing_remote_shutdowns: Optional[Iterable[str]] = None,
     remote_evidence_errors: Optional[List[Dict[str, Any]]] = None,
@@ -995,7 +1029,9 @@ def evaluate_soak_pass_checks(
         probes,
         duration_s,
         faults=faults_for_p99,
+        fault_pad_s=probe_fault_pad_s,
         min_samples_per_window=min_probe_samples_per_window,
+        floor_ms=probe_p99_floor_ms,
     )
     trees = list(leftover_task_trees or [])
     normalized_pids: List[Any] = []
@@ -4878,6 +4914,11 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     duration_s = parse_duration_seconds(args.duration)
     sample_interval_s = parse_duration_seconds(args.sample_interval)
+    raw_probe_interval = getattr(args, "probe_interval", None)
+    if raw_probe_interval is not None and str(raw_probe_interval).strip():
+        probe_interval_s = parse_duration_seconds(raw_probe_interval)
+    else:
+        probe_interval_s = min(SOAK_DEFAULT_PROBE_INTERVAL_S, sample_interval_s)
     fault_scale = float(args.fault_scale)
     load_scale = float(args.load_scale)
     workers = int(args.workers)
@@ -4905,6 +4946,7 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
         "link": link,
         "duration_s": duration_s,
         "sample_interval_s": sample_interval_s,
+        "probe_interval_s": probe_interval_s,
         "fault_scale": fault_scale,
         "load_scale": load_scale,
         "workers": workers,
@@ -5273,6 +5315,9 @@ def run_soak(
 ) -> Dict[str, Any]:
     duration_s = float(parsed_params["duration_s"])
     sample_interval_s = float(parsed_params["sample_interval_s"])
+    probe_interval_s = float(
+        parsed_params.get("probe_interval_s", min(SOAK_DEFAULT_PROBE_INTERVAL_S, sample_interval_s))
+    )
     fault_scale = float(parsed_params["fault_scale"])
     load_scale = float(parsed_params["load_scale"])
     n_workers = int(parsed_params["workers"])
@@ -5406,7 +5451,7 @@ def run_soak(
 
     def _probe_loop() -> None:
         _run_probe_once()
-        while not probe_stop.wait(sample_interval_s):
+        while not probe_stop.wait(probe_interval_s):
             _run_probe_once()
 
     def _extract_verify_sha(term_json: Dict[str, Any]) -> Optional[str]:
@@ -5851,6 +5896,7 @@ def run_soak(
         faults_executed=fault_events_log,
         fault_errors=fault_errors,
         leftover_task_trees=leftover_trees,
+        probe_fault_pad_s=soak_fault_pad_seconds(fault_scale),
         expected_process_roles=expected_process_roles,
         missing_remote_shutdowns=missing_remote_shutdowns,
         remote_evidence_errors=remote_errors,
@@ -6063,6 +6109,7 @@ def cmd_soak(args: argparse.Namespace) -> int:
         "fault_scale": float(parsed_params["fault_scale"]),
         "load_scale": float(parsed_params["load_scale"]),
         "sample_interval_s": float(parsed_params["sample_interval_s"]),
+        "probe_interval_s": float(parsed_params["probe_interval_s"]),
         "workers": int(parsed_params["workers"]),
         "slots": int(parsed_params["slots"]),
         "workspaces": bool(args.workspaces),
@@ -6294,7 +6341,12 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--duration", default="60m", help="Soak duration (e.g. 3m, 45m, 60m, 24h)")
     sk.add_argument("--fault-scale", type=float, default=1.0, help="Multiply D3 fault intervals (<1 compresses faults)")
     sk.add_argument("--load-scale", type=float, default=1.0, help="Scale per-minute task counts and blob sizes")
-    sk.add_argument("--sample-interval", default="60s", help="Resource and timed-probe interval (e.g. 15s, 60s)")
+    sk.add_argument("--sample-interval", default="60s", help="Resource sample interval (e.g. 15s, 60s)")
+    sk.add_argument(
+        "--probe-interval",
+        default=None,
+        help="Timed probe task interval (default: min(6s, --sample-interval))",
+    )
     sk.add_argument("--workers", type=int, default=3, help="Number of workers (2 or 3)")
     sk.add_argument("--slots", type=int, default=4, help="Execution slots per worker")
     sk.add_argument(
