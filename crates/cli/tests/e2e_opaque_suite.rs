@@ -1601,10 +1601,10 @@ fn f3_t1_release_skew_writes_github_step_summary() {
 }
 
 #[test]
-fn f3_t1_protocol_rs_defines_9_to_10_window() {
+fn f3_t1_protocol_rs_defines_10_to_11_window() {
     let p = fs::read_to_string(root().join("crates/core/src/protocol.rs")).unwrap();
-    assert_eq!(const_u32(&p, "PROTOCOL_VERSION_CURRENT"), Some(10));
-    assert_eq!(const_u32(&p, "PROTOCOL_VERSION_MIN_COMPATIBLE"), Some(9));
+    assert_eq!(const_u32(&p, "PROTOCOL_VERSION_CURRENT"), Some(11));
+    assert_eq!(const_u32(&p, "PROTOCOL_VERSION_MIN_COMPATIBLE"), Some(10));
 }
 
 #[test]
