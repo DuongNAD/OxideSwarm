@@ -1749,7 +1749,16 @@ pub async fn run_verify_gate_with_options(
                     warnings.push(w);
                 }
             }
-            let pref = link_pref.or(shard_pref);
+            let shard_is_direct = shard_pref.is_some_and(|sid| {
+                workers.iter().any(|w| {
+                    listed_worker_id(w) == Some(sid) && is_direct_like_link(&extract_link_kind(w))
+                })
+            });
+            let pref = if shard_is_direct {
+                shard_pref
+            } else {
+                link_pref.or(shard_pref)
+            };
             let entry = grouped.entry(pref).or_default();
             cell.index = entry.cells.len();
             entry.cells.push(cell);
