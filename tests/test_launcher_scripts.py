@@ -2331,6 +2331,7 @@ public class Program {
         self.assertTrue(os.path.isfile(path), ".gitattributes is missing")
         rules = read(path)
         self.assertRegex(rules, r"(?m)^\*\.sh\s+text\s+eol=lf")
+        self.assertRegex(rules, r"(?m)^packaging/usb/tools\.lock\s+text\s+eol=lf")
         for ext in ("cmd", "ps1", "vbs"):
             self.assertRegex(rules, r"(?m)^\*\.%s\s+text\s+eol=crlf" % ext)
 
