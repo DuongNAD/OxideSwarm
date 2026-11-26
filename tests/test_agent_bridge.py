@@ -1375,6 +1375,37 @@ class ActivityFilesAndOverlap(CoordCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("No hub found", self.out(result))
 
+    def test_notify_blocked_writes_person_notice_and_rejects_traversal(self):
+        result = self.run_bridge(
+            "notify-blocked",
+            "--task",
+            "TEAM-4",
+            "--person",
+            "Alice",
+            "--holder",
+            "agent-mac-ag",
+            "--fingerprint",
+            "cafebabe1234",
+            "--failures",
+            "3",
+            "--summary",
+            "assertion failed",
+            "--branch",
+            "team/TEAM-4",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        alice_box = os.path.join(self.hub, "mailbox", "to_alice")
+        files = sorted(glob.glob(os.path.join(alice_box, "MSG_*_blocked_team-4.md")))
+        self.assertEqual(len(files), 1, os.listdir(alice_box))
+        with open(files[0], "r", encoding="utf-8") as fp:
+            body = fp.read()
+        self.assertIn("cafebabe1234", body)
+        self.assertIn("oxideswarm plan unblock TEAM-4", body)
+        self.assertIn("`3`", body)
+
+        bad = self.run_bridge("notify-blocked", "--task", "TEAM-4", "--person", "../escape")
+        self.assertNotEqual(bad.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

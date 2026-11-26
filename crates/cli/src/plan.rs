@@ -19,6 +19,8 @@ use rusty_grid_core::placement::{
 
 use crate::shard::HARD_MAX_SHARDS;
 
+pub mod lease;
+
 /// Default path of the shared team plan relative to the repository root.
 pub const DEFAULT_PLAN_PATH: &str = ".oxideswarm/plan.toml";
 /// Hard upper bound on rendered snapshot lines (design 0111, D2).
@@ -69,6 +71,169 @@ pub enum PlanSubcommand {
         base: Option<String>,
 
         /// Print structured JSON snapshot alongside line metrics
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Claim a task lease (`refs/oxideswarm/lease/<task-id>`) and create an isolated worktree
+    Claim {
+        /// Task id in `.oxideswarm/plan.toml`
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+
+        /// Claiming agent identifier stored in the lease record
+        #[arg(long, value_name = "AGENT_ID")]
+        holder: String,
+
+        /// Optional human owner override for the lease record
+        #[arg(long, value_name = "PERSON")]
+        person: Option<String>,
+
+        /// Git remote hosting `refs/oxideswarm/lease/*` (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Override base branch/ref name from `[project].base`
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Path to the plan TOML file (default: `.oxideswarm/plan.toml`)
+        #[arg(long, value_name = "PATH")]
+        plan: Option<PathBuf>,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Branch name to create for the worktree (default: `team/<task-id>`)
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+
+        /// Parent directory under which `wt-<task-id>` is created (default: parent of repo)
+        #[arg(long, value_name = "DIR")]
+        worktree_root: Option<PathBuf>,
+
+        /// Claim the lease ref without creating a git worktree
+        #[arg(long)]
+        no_worktree: bool,
+
+        /// Lease TTL in minutes (default: 45, max: 1440)
+        #[arg(long, value_name = "MINS", default_value_t = lease::DEFAULT_LEASE_TTL_MINS)]
+        ttl_minutes: i64,
+
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Renew an active task lease via a strictly fast-forward push
+    Renew {
+        /// Task id whose lease should be extended
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+
+        /// Holder agent identifier (must match the current lease holder)
+        #[arg(long, value_name = "AGENT_ID")]
+        holder: String,
+
+        /// Git remote hosting `refs/oxideswarm/lease/*` (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Expected current remote lease commit OID for compare-and-swap check
+        #[arg(long, value_name = "OID")]
+        expected_oid: Option<String>,
+
+        /// Extended lease TTL in minutes from now (default: 45, max: 1440)
+        #[arg(long, value_name = "MINS", default_value_t = lease::DEFAULT_LEASE_TTL_MINS)]
+        ttl_minutes: i64,
+
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Release a task lease by deleting `refs/oxideswarm/lease/<task-id>` on the remote
+    Release {
+        /// Task id whose lease ref should be deleted
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+
+        /// Expected current lease holder (required unless `--force` is passed)
+        #[arg(long, value_name = "AGENT_ID")]
+        holder: Option<String>,
+
+        /// Git remote hosting `refs/oxideswarm/lease/*` (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Release even if `holder` is omitted or held by another agent
+        #[arg(long)]
+        force: bool,
+
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify that every path changed in `<range>` lies within the task's `owned_paths`
+    CheckDiff {
+        /// Git diff range such as `origin/master..HEAD`
+        #[arg(value_name = "RANGE")]
+        range: String,
+
+        /// Task id in `.oxideswarm/plan.toml` (inferred from `team/<id>` branch if omitted)
+        #[arg(long, value_name = "TASK_ID")]
+        task: Option<String>,
+
+        /// Path to the plan TOML file (default: `.oxideswarm/plan.toml`)
+        #[arg(long, value_name = "PATH")]
+        plan: Option<PathBuf>,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Override base branch/ref name when loading `.oxideswarm/plan.toml` from git
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Print machine-readable JSON diagnostics
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Clear a circuit-breaker block on a task lease (human action after 3 identical failures)
+    Unblock {
+        /// Task id whose lease block should be cleared
+        #[arg(value_name = "TASK_ID")]
+        task_id: String,
+
+        /// Human owner/reviewer identifier recorded on the unblock lease commit
+        #[arg(long, value_name = "PERSON")]
+        by: Option<String>,
+
+        /// Optional note explaining why the task was unblocked
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+
+        /// Git remote hosting `refs/oxideswarm/lease/*` (default: `origin`)
+        #[arg(long, value_name = "REMOTE", default_value = lease::DEFAULT_REMOTE)]
+        remote: String,
+
+        /// Git repository directory (default: current directory)
+        #[arg(long, value_name = "DIR")]
+        repo: Option<PathBuf>,
+
+        /// Print machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -476,7 +641,7 @@ pub fn path_matches_pattern(path: &str, pattern: &str) -> bool {
     segment_sequences_overlap(&sp, &spat)
 }
 
-fn validate_task_id(id: &str) -> Result<(), String> {
+pub(crate) fn validate_task_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 64 {
         return Err(format!(
             "task id '{id}' must be between 1 and 64 ASCII characters"
@@ -944,7 +1109,7 @@ fn run_git(repo_dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn resolve_git_base_ref(repo_dir: &Path, base: &str) -> Option<String> {
+pub(crate) fn resolve_git_base_ref(repo_dir: &Path, base: &str) -> Option<String> {
     [
         base.to_string(),
         format!("origin/{base}"),
@@ -954,7 +1119,7 @@ fn resolve_git_base_ref(repo_dir: &Path, base: &str) -> Option<String> {
     .find(|candidate| run_git(repo_dir, &["rev-parse", "--verify", "--quiet", candidate]).is_some())
 }
 
-fn load_plan_for_snapshot(
+pub(crate) fn load_plan_for_snapshot(
     repo_dir: &Path,
     plan_path: Option<&Path>,
     base_ref: Option<&str>,
@@ -1349,6 +1514,105 @@ pub fn run_plan_command(args: PlanArgs) -> ExitCode {
             base,
             json,
         } => run_plan_status_cli(plan.as_deref(), repo.as_deref(), base.as_deref(), json),
+        PlanSubcommand::Claim {
+            task_id,
+            holder,
+            person,
+            remote,
+            base,
+            plan,
+            repo,
+            branch,
+            worktree_root,
+            no_worktree,
+            ttl_minutes,
+            json,
+        } => {
+            let opts = lease::ClaimOptions {
+                task_id,
+                holder,
+                person,
+                remote,
+                base,
+                plan_path: plan,
+                branch,
+                worktree_root,
+                create_worktree: !no_worktree,
+                ttl_minutes,
+            };
+            lease::run_plan_claim_cli(&opts, repo.as_deref(), json)
+        }
+        PlanSubcommand::Renew {
+            task_id,
+            holder,
+            remote,
+            repo,
+            expected_oid,
+            ttl_minutes,
+            json,
+        } => {
+            let opts = lease::RenewOptions {
+                task_id,
+                holder,
+                remote,
+                expected_oid,
+                ttl_minutes,
+                blocked: None,
+                verify_attempts: None,
+                verify_failures: None,
+                last_failure: None,
+                last_fingerprint: None,
+            };
+            lease::run_plan_renew_cli(&opts, repo.as_deref(), json)
+        }
+        PlanSubcommand::Release {
+            task_id,
+            holder,
+            remote,
+            repo,
+            force,
+            json,
+        } => {
+            let opts = lease::ReleaseOptions {
+                task_id,
+                holder,
+                remote,
+                force,
+            };
+            lease::run_plan_release_cli(&opts, repo.as_deref(), json)
+        }
+        PlanSubcommand::CheckDiff {
+            range,
+            task,
+            plan,
+            repo,
+            base,
+            json,
+        } => lease::run_plan_check_diff_cli(
+            &range,
+            task.as_deref(),
+            plan.as_deref(),
+            repo.as_deref(),
+            base.as_deref(),
+            json,
+        ),
+        PlanSubcommand::Unblock {
+            task_id,
+            by,
+            note,
+            remote,
+            repo,
+            json,
+        } => {
+            let opts = lease::UnblockOptions {
+                task_id,
+                remote,
+                by,
+                note,
+                ttl_minutes: lease::DEFAULT_LEASE_TTL_MINS,
+            };
+            lease::run_plan_unblock_cli(&opts, repo.as_deref(), json)
+        }
     }
 }
 
