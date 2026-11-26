@@ -33,10 +33,11 @@ pub fn run_fast_check(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Dev, "fast");
 
-    let cmd_res = Command::new("cargo")
-        .args(["check", "--workspace"])
-        .current_dir(workspace_root)
-        .output();
+    let cmd_res = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["check", "--workspace"])
+            .current_dir(workspace_root),
+    );
 
     res.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -458,7 +459,7 @@ fn reap_all_exited_cluster_children() {
 fn query_process_start_time(pid: u32) -> Option<u64> {
     let mut sys = System::new();
     let sys_pid = sysinfo::Pid::from_u32(pid);
-    if sys.refresh_process(sys_pid) {
+    if sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true) > 0 {
         if let Some(proc) = sys.process(sys_pid) {
             let st = proc.start_time();
             if st > 0 {
@@ -594,11 +595,11 @@ pub async fn launch_local_dev_cluster_with_ports(
         if fallback_bin.exists() {
             target_bin = fallback_bin;
         } else {
-            match Command::new("cargo")
-                .args(["build", "--bin", "rusty-grid"])
-                .current_dir(&fallback_root)
-                .output()
-            {
+            match rusty_grid_core::process_spawn::output_std(
+                Command::new("cargo")
+                    .args(["build", "--bin", "rusty-grid"])
+                    .current_dir(&fallback_root),
+            ) {
                 Ok(out) if out.status.success() => {
                     if fallback_bin.exists() {
                         target_bin = fallback_bin;
@@ -661,12 +662,13 @@ pub async fn launch_local_dev_cluster_with_ports(
     }
     let master_log = master_log_path(workspace_root);
     let (master_out, master_err) = master_log_stdio(&master_log);
-    let master_res = master_cmd
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(master_out)
-        .stderr(master_err)
-        .spawn();
+    let master_res = rusty_grid_core::process_spawn::spawn_std(
+        master_cmd
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(master_out)
+            .stderr(master_err),
+    );
 
     let mut master_child = match master_res {
         Ok(child) => {
@@ -858,12 +860,13 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--no-portal",
         ]);
     }
-    let w1_res = w1_cmd
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let w1_res = rusty_grid_core::process_spawn::spawn_std(
+        w1_cmd
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 
     let mut w1_child = match w1_res {
         Ok(child) => {
@@ -962,12 +965,13 @@ pub async fn launch_local_dev_cluster_with_ports(
             "--no-portal",
         ]);
     }
-    let w2_res = w2_cmd
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let w2_res = rusty_grid_core::process_spawn::spawn_std(
+        w2_cmd
+            .current_dir(workspace_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
 
     let mut w2_child = match w2_res {
         Ok(child) => {
@@ -1189,7 +1193,7 @@ fn is_oxideswarm_cluster_process(proc: &sysinfo::Process) -> bool {
             .unwrap_or(raw.trim());
         stem.eq_ignore_ascii_case("rusty-grid") || stem.eq_ignore_ascii_case("oxideswarm")
     };
-    if matches_stem(proc.name()) {
+    if matches_stem(&proc.name().to_string_lossy()) {
         return true;
     }
     if let Some(exe_name) = proc
@@ -1209,12 +1213,12 @@ fn has_dev_cluster_cmdline_signature(proc: &sysinfo::Process, workspace_root: &P
     let home_path = workspace_root.join(".dev_cluster_home");
     let dash_str = dash_port_path.to_string_lossy();
     let home_str = home_path.to_string_lossy();
-    let has_workspace_path = proc
-        .cmd()
-        .iter()
-        .any(|arg| arg.contains(dash_str.as_ref()) || arg.contains(home_str.as_ref()))
-        || proc.cwd().map(|cwd| cwd == workspace_root).unwrap_or(false);
+    let has_workspace_path = proc.cmd().iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.contains(dash_str.as_ref()) || arg.contains(home_str.as_ref())
+    }) || proc.cwd().map(|cwd| cwd == workspace_root).unwrap_or(false);
     let has_cluster_role = proc.cmd().iter().any(|arg| {
+        let arg = arg.to_string_lossy();
         arg == "--dashboard-port-file" || arg == "dev-worker-cpu-1" || arg == "dev-worker-sim-gpu-2"
     });
     has_workspace_path && has_cluster_role
@@ -1224,11 +1228,11 @@ fn signal_verified_process(sys: &System, pid: u32) -> bool {
     #[cfg(unix)]
     {
         let _ = sys;
-        Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        rusty_grid_core::process_spawn::output_std(
+            Command::new("kill").args(["-TERM", &pid.to_string()]),
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
     }
     #[cfg(windows)]
     {
@@ -1240,10 +1244,12 @@ fn signal_verified_process(sys: &System, pid: u32) -> bool {
 
 #[cfg(unix)]
 fn is_unix_process_zombie_or_gone(pid: u32) -> bool {
-    match Command::new("ps")
-        .args(["-o", "stat=", "-p", &pid.to_string()])
-        .output()
-    {
+    match rusty_grid_core::process_spawn::output_std(Command::new("ps").args([
+        "-o",
+        "stat=",
+        "-p",
+        &pid.to_string(),
+    ])) {
         Ok(out) => {
             if !out.status.success() {
                 return true;
@@ -1268,7 +1274,7 @@ fn is_process_exited_or_zombie(sys: &mut System, pid: u32) -> bool {
         // (`GetExitCodeProcess` != `STILL_ACTIVE`) and drops the handle once the process exits,
         // whereas a fresh `System::new().refresh_process(sys_pid)` would go through `new_from_pid`
         // (`OpenProcess` without checking the exit code) and report the dead process as still alive.
-        if !sys.refresh_process(sys_pid) {
+        if sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true) == 0 {
             reap_spawned_cluster_child_after_exit(pid);
             return true;
         }
@@ -1280,7 +1286,7 @@ fn is_process_exited_or_zombie(sys: &mut System, pid: u32) -> bool {
         // on an existing `System` in `sysinfo` 0.30 does not update `ProcessStatus` when a process
         // transitions to `Zombie`, and also check `ps -o stat=`.
         let mut fresh_sys = System::new();
-        if !fresh_sys.refresh_process(sys_pid) {
+        if fresh_sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sys_pid]), true) == 0 {
             reap_spawned_cluster_child_after_exit(pid);
             return true;
         }
@@ -1415,7 +1421,7 @@ where
     }
 
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
     let self_pid = std::process::id();
     let mut signalled = 0usize;

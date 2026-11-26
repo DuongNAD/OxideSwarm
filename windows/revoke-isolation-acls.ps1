@@ -183,6 +183,13 @@ try {
 } catch {
     $cimQueryFailed = $true
 }
+if (-not $cimQueryFailed -and -not [string]::IsNullOrWhiteSpace($env:OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT)) {
+    $scopePrefix = [IO.Path]::GetFullPath($env:OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT).TrimEnd('\', '/') + '\'
+    $runningWorkers = @($runningWorkers | Where-Object {
+        (-not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($scopePrefix, [StringComparison]::OrdinalIgnoreCase)) -or
+        (-not [string]::IsNullOrWhiteSpace($_.CommandLine) -and $_.CommandLine.IndexOf($scopePrefix, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+    })
+}
 $lockHeld = $false
 if (-not [string]::IsNullOrWhiteSpace($env:TEMP) -and (Test-Path -LiteralPath $env:TEMP)) {
     foreach ($lf in Get-ChildItem -LiteralPath $env:TEMP -Filter "oxideswarm.task.*.lock" -File -Force -ErrorAction SilentlyContinue) {

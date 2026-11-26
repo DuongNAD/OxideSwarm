@@ -33,10 +33,11 @@ pub fn run_quick_tests(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Test, "quick");
 
-    let cmd_res = Command::new("cargo")
-        .args(["test", "--workspace", "--lib", "--", "--nocapture"])
-        .current_dir(workspace_root)
-        .output();
+    let cmd_res = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["test", "--workspace", "--lib", "--", "--nocapture"])
+            .current_dir(workspace_root),
+    );
 
     res.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -65,10 +66,11 @@ pub fn run_full_tests(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
     let mut res = ModeExecutionResult::new(WorkflowMode::Test, "full");
 
-    let cmd_res = Command::new("cargo")
-        .args(["test", "--workspace", "--", "--nocapture"])
-        .current_dir(workspace_root)
-        .output();
+    let cmd_res = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["test", "--workspace", "--", "--nocapture"])
+            .current_dir(workspace_root),
+    );
 
     res.duration_ms = start.elapsed().as_millis() as u64;
 
@@ -130,22 +132,24 @@ pub fn evaluate_lint_outcomes(
 pub fn run_lints(workspace_root: &Path) -> ModeExecutionResult {
     let start = Instant::now();
 
-    let clippy_out = Command::new("cargo")
-        .args([
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ])
-        .current_dir(workspace_root)
-        .output();
+    let clippy_out = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args([
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ])
+            .current_dir(workspace_root),
+    );
 
-    let fmt_out = Command::new("cargo")
-        .args(["fmt", "--all", "--", "--check"])
-        .current_dir(workspace_root)
-        .output();
+    let fmt_out = rusty_grid_core::process_spawn::output_std(
+        Command::new("cargo")
+            .args(["fmt", "--all", "--", "--check"])
+            .current_dir(workspace_root),
+    );
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -253,10 +257,11 @@ where
 pub fn run_flaky_detection(workspace_root: &Path, iterations: usize) -> ModeExecutionResult {
     run_flaky_detection_with(iterations, |_i| {
         let iter_start = Instant::now();
-        let cmd = Command::new("cargo")
-            .args(["test", "--workspace", "--lib", "--quiet"])
-            .current_dir(workspace_root)
-            .output();
+        let cmd = rusty_grid_core::process_spawn::output_std(
+            Command::new("cargo")
+                .args(["test", "--workspace", "--lib", "--quiet"])
+                .current_dir(workspace_root),
+        );
         let elapsed = iter_start.elapsed().as_millis() as u64;
         let ok = cmd.as_ref().map(|o| o.status.success()).unwrap_or(false);
         (ok, elapsed)

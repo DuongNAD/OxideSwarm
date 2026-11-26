@@ -313,8 +313,9 @@ impl ConfiguredCommand {
         self.app_container = Some(guard);
     }
 
-    /// Spawns `cmd` (holding `SPAWN_LOCK` on macOS so no concurrent `fork` observes an
-    /// un-`CLOEXEC`ed lifeline descriptor) and closes the parent's copy of the lifeline read end.
+    /// Spawns `cmd` (holding the shared macOS spawn lock in `rusty_grid_core::process_spawn` so no
+    /// concurrent `fork` observes an un-`CLOEXEC`ed lifeline descriptor) and closes the parent's
+    /// copy of the lifeline read end.
     pub(crate) fn spawn(
         &mut self,
         cmd: &mut tokio::process::Command,
@@ -389,8 +390,6 @@ pub(crate) fn configure_command(
 #[cfg(unix)]
 mod imp {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    use std::sync::Mutex;
     use tokio::process::Child;
 
     #[cfg(target_os = "macos")]
@@ -400,12 +399,6 @@ mod imp {
     use super::{build_task_env_needle, ProcessPriority, TaskEnvNeedle};
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use super::{env_block_contains_needle_chunk, format_u32_decimal};
-
-    /// Serialises `pipe` + `fcntl(FD_CLOEXEC)` and `cmd.spawn()` on platforms without `pipe2`
-    /// (macOS) so no concurrent task `fork` can inherit a lifeline pipe descriptor before
-    /// `FD_CLOEXEC` is set on it.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(target_os = "linux")]
     pub(super) const CGROUP_PATH_CAP: usize = 256;
@@ -509,11 +502,6 @@ mod imp {
 
     /// Creates an anonymous lifeline pipe `(read_fd, write_fd)` with `FD_CLOEXEC` set on both ends.
     pub(super) fn create_lifeline_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let _guard = SPAWN_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
         let mut fds: [libc::c_int; 2] = [-1, -1];
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -524,7 +512,7 @@ mod imp {
             }
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        {
+        rusty_grid_core::process_spawn::with_macos_spawn_lock(|| -> std::io::Result<()> {
             // SAFETY: `fds` is a live array of two `c_int`, exactly what `pipe` writes.
             let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
             if rc != 0 {
@@ -548,7 +536,8 @@ mod imp {
                     return Err(err);
                 }
             }
-        }
+            Ok(())
+        })?;
         // SAFETY: the pipe call succeeded, so `fds[0]` and `fds[1]` are two distinct open
         // descriptors that nothing else owns; each gets exactly one `OwnedFd`.
         let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
@@ -1394,12 +1383,9 @@ mod imp {
         prepared: &mut PreparedUnix,
         cmd: &mut tokio::process::Command,
     ) -> std::io::Result<Child> {
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let _guard = SPAWN_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let res = cmd.spawn();
+        // Hold the shared macOS spawn lock across `cmd.spawn()` so no other thread's concurrent
+        // `pipe()` + `FD_CLOEXEC` window can leak into this task child or lifeline setup (BUG-35).
+        let res = rusty_grid_core::process_spawn::spawn_tokio(cmd);
         // Drop the worker's copy of the lifeline read end immediately so only the detached
         // supervisor holds it open.
         drop(prepared.lifeline_read.take());

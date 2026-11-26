@@ -1,6 +1,6 @@
 # Contributing to OxideSwarm
 
-Thank you for contributing to OxideSwarm. Before making changes, read [`CLAUDE.md`](CLAUDE.md), [`docs/README.md`](docs/README.md), and [`docs/SECURITY.md`](docs/SECURITY.md).
+Thank you for contributing to OxideSwarm. Before making changes, read [`CLAUDE.md`](CLAUDE.md), [`docs/README.md`](docs/README.md), [`docs/SECURITY.md`](docs/SECURITY.md), [`GOVERNANCE.md`](GOVERNANCE.md), and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ## 1. Prerequisites
 

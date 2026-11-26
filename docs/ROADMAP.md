@@ -9,8 +9,9 @@ Q48 (two directions are followed in parallel, design 0063) on 2026-11-12, and Q8
 release before `0.5.0`), Q81 (`0.6.0` carries bet A of design 0056), Q82 (the ten exit checks of
 design 0088 are what "finished" means) and Q83 (bet A may start before `0.5.0` ships) on 2026-11-17,
 and Q94 to Q97 (the road to a shared research grid, design 0094; Q96 closes Q14 and Q43) on
-2026-11-19.
-Created: 2026-11-07    Updated: 2026-11-19
+2026-11-19, and Q101 (`0.5.0` carries coding agents and machines on one project, with protocol 11;
+language model serving moves to `0.6.0`) on 2026-11-26.
+Created: 2026-11-07    Updated: 2026-11-26
 
 This document sets the direction of OxideSwarm after the completion backlog. It states what the
 project is for, the order of the work, and what waits. Item IDs refer to [BACKLOG.md](BACKLOG.md)
@@ -66,7 +67,8 @@ stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.
 - A first application for the model track (Draft, 2026-11-11): LIVA, the owner's desktop
   assistant. A trial comes first (Q40, decided), then a client tunnel to a model server, usage
   records and a balance per member, all proposals. The plan is in
-  [design 0061](design/0061-first-application-model-tunnel.md). Q41 to Q43 are open.
+  [design 0061](design/0061-first-application-model-tunnel.md). Q41 was decided on 2026-11-24, Q43 on
+  2026-11-19 (Q96); Q42 is open.
 - Model weights into the memory of another machine (Draft, 2026-11-11): a worker that holds no
   model file runs a model whose file is on another machine, with no copy written to its disk
   first (Q44, decided). Four spikes come first (R15 to R18). A model server that takes its
@@ -88,13 +90,17 @@ stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.
   0.2.0 and before the model items of design 0062. The plan is in
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 were decided by the owner on 2026-11-19; TEST-24 step 1 (harness and loopback record) is in pull request 374.
-- Releases (2026-11-19): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
+- Releases (2026-11-25): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
   released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, `0.4.2` adds
   `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes, `0.4.3` closes every lane of a
-  revoked member (ENROLL-1c), and `0.4.4` fixes the Windows USB kit (BUG-29 to BUG-32) and hardens the
-  Windows workspace root (SEC-17). Stability releases with no wire change
-  continue as `0.4.x` (Q80). `0.5.0`, language model serving across machines, is Design only. `0.6.0` is compute for
-  coding agents, bet A of design 0056 (Q81). The table is in [Releases](#releases).
+  revoked member (ENROLL-1c), `0.4.4` fixes the Windows USB kit (BUG-29 to BUG-32) and hardens the
+  Windows workspace root (SEC-17), and `0.4.5` fixes the USB kit update on Windows (BUG-38), the macOS
+  RAM reading (BUG-37) and the macOS spawn stall (BUG-35), with the test campaign of TEST-57 to TEST-99
+  (TEST-70 to TEST-72, TEST-75 and TEST-76 did not land). Stability releases with no wire change
+  continue as `0.4.x` (Q80). `0.5.0` is the protocol 11 release for coding agents and machines working on one
+  project: bet A of design 0056 with the shared plan, path leases, verify gate and grid mailbox of design 0111
+  (Q101, which replaces the order of Q81). `0.6.0`, language model serving across machines, is Design only. The
+  table is in [Releases](#releases).
 - What finished means (Accepted, 2026-11-17): an evaluation on ten criteria, a stop line, and one
   exit check per criterion. The project is finished when the ten checks hold (Q82). Scale out, the
   ecosystem, the open network, language models, the Android app and 3D are outside the line. Eight
@@ -156,7 +162,7 @@ Each row is a limit a user meets today, and the item that removes it.
 | Compatibility spans one protocol version | A peer more than one protocol version behind the master is refused until it is upgraded, and a rollback of the master needs the copy of `--state-dir` taken before the upgrade | By design ([design 0083](design/0083-one-version-window.md)). PROTO-5 keeps a test against the release one protocol back |
 | The Android app does not compile | There is no Android worker app to install; phones join through Termux. The bridge library compiles in CI (AND-5, pull request 240) | AND-1 |
 | GPU work is command tasks, with no user kernel | PyTorch, Blender and CUDA programs run as command tasks, with a guide ([guides/gpu-workloads.md](guides/gpu-workloads.md)), VRAM accounting (FEAT-9a) and a runtime allowlist under isolation (FEAT-3e). The built-in `GpuCompute` task is a benchmark (decision D6). No rule for a GPU inside the Linux sandbox is recorded, and the two-machine GPU run under `--isolation fs` is not recorded | FEAT-9, R20 (Linux) |
-| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only, Q60 to Q63) |
+| No language model serving path | Nothing routes a prompt to a worker that holds a model, and no gateway exists | [design 0067](design/0067-multi-node-llm-serving-and-admission.md) (Design only; Q60 to Q63 decided on 2026-11-24) |
 
 ## Releases
 
@@ -172,9 +178,13 @@ number does not fix its content in advance.
 | `0.4.2` | `submit --verify` on the same system by default (VERIFY-1, VERIFY-2, Q89), BUG-25 (a worker hands back a task when its sandbox base is unusable), BUG-26, the mesh hub fix of TEST-27, two worker recovery races (TEST-23, partial) and test fixes (TEST-42 to TEST-52) | Released on 2026-11-18, no wire change | Nothing |
 | `0.4.3` | Revocation closes every connection lane of a member (ENROLL-1c), fuzz targets for every untrusted parser (LV-1, LV-18), SAFETY comments for every `unsafe` site (LV-4), BUG-27, BUG-28, the launcher start race (TEST-35) and test fixes (TEST-50 to TEST-54) | Released on 2026-11-18, no wire change | Nothing |
 | `0.4.4` | The Windows USB kit: the folder menu, uninstall of older kits, the worker check, and `-Isolation fs` with `--workspaces` (BUG-29 to BUG-32); the Windows workspace root refuses junctions and symbolic links in every folder from home down and hard-linked marker or lock files (SEC-17); the run summary of `submit --wait` (ADOPT-2); build provenance for every archive (LV-5); `ox-mode dev cluster` on OS-picked ports (TEST-52) and test fixes (TEST-29, TEST-31, TEST-55, TEST-56) | Released on 2026-11-19, no wire change | Nothing |
-| `0.4.x`, with no wire change | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md) | Planned. It comes before any item of `0.5.0` is built (Q80) | The exit check under "Stability" |
-| `0.5.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | The stability release, and the steps under "Before 0.5.0 has items" |
-| `0.6.0` | Compute for coding agents, bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81) | Planned. CACHE-1 and, since 2026-11-17, AX-1 to AX-3 are in the BACKLOG Index (Phase 13) | The first round of ADOPT-1 (Q37) |
+| `0.4.5` | The Windows USB kit update replaces a running worker's binary and the uninstall prompt names the folder (BUG-38); macOS available RAM read correctly with `sysinfo` 0.38 and `doctor` probes without a RAM floor (BUG-37); macOS task spawns serialised (BUG-35) and the worker supervisor fixes BUG-33 and BUG-34; the printed Windows `icacls` remedy (BUG-39); Windows tasks without console windows (TEST-88); install scripts (ADOPT-3); client-side `submit --matrix` and `shard` (AX-1, AX-2 Partial), process-task checkpoints (FEAT-5), Agent Mesh verified delivery (MESH-2, MESH-3), 3D routing (3D-2, 3D-3); endurance harness and records (TEST-24 to TEST-26) and test fixes (TEST-57 to TEST-99; TEST-70 to TEST-72, TEST-75 and TEST-76 did not land) | Released on 2026-11-25, no wire change | Nothing |
+| `0.4.6` | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md): the open test items (TEST-86, TEST-90, TEST-93, TEST-95, TEST-100, TEST-101), TEST-26 green, the TEST-24 and TEST-25 records, BUG-40 and BUG-41 | Planned for about 2026-12-01. The owner kept the seven days of clean `master` runs on 2026-11-26 | The exit check under "Stability" (Q80) |
+| `0.4.7` | Machines set up from a USB kit take every task kind, and their owners control them: the developer toolset of [design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1, TOOL-3, TOOL-4, TOOL-5) and the contributor controls of design 0113 (pull request 472) (NET-9a, NET-9b) | Planned for about 2026-12-08. Prepared as draft pull requests while `0.4.6` waits; merged after its tag | `0.4.6` |
+| `0.4.8` | Several coding agents on one project without a wire change: TEAM-1 to TEAM-5 of [design 0111](design/0111-team-plan-leases-and-verify-gate.md) (shared plan and snapshot, path leases, verify gate, circuit breaker, merge flow) and the rest of AX-2; this project runs one wave on the plan | Planned for about 2026-12-15. Prepared as draft pull requests while `0.4.6` waits | `0.4.7` |
+| `0.4.9` | The tray app of design 0112 (TRAY-1 to TRAY-3, and TRAY-4 when it needs no wire change): the worker in the background with its state in view, Pause, limits, first-run join and updates | Planned for about 2026-12-22; it may merge into `0.4.8` if both are ready | `0.4.8` and NET-9a |
+| `0.5.0` | Coding agents and machines on one project (Q101): AX-1 to AX-3 and CACHE-1 of design 0056, TEAM-1 to TEAM-7 of [design 0111](design/0111-team-plan-leases-and-verify-gate.md), with protocol 11 for the grid mailbox (TEAM-6). The toolset of [design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1 to TOOL-5) and TEAM-1 to TEAM-5 need no wire change and may ship in `0.4.x` first | Planned. AX-1 and the client part of AX-2 shipped in `0.4.5`; the TEAM and TOOL items are in the BACKLOG Index | The stability release (Q80) |
+| `0.6.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | `0.5.0`, and the steps under "Before 0.6.0 has items" |
 
 The wave table of [design 0056](design/0056-frontier-program.md) (D8) planned other content for
 `0.3.0` and `0.4.0`. Its order of waves stands, and its release numbers do not.
@@ -225,7 +235,7 @@ make no statement about stability.
 items is Implemented with its loop of runs recorded; TEST-24 and TEST-25 each have one dated record;
 and `master` has seven days of runs for pushes in which no test fails.
 
-### Before 0.5.0 has items
+### Before 0.6.0 has items
 
 Design 0067 is research and a plan. Its own work items are spike R22 and LLM-14. R22 has one record
 of 2026-11-16, with the model server and the load generator on the same GPU machine. LLM-14 is
@@ -236,25 +246,31 @@ report that design 0067 names.
 
 In order:
 
-1. The owner answers Q60 to Q63 (design 0067), Q54
-   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q41 (design 0061).
-2. Spike R21, a reading of what Mesh-LLM already does, has no record. Q54 recommends that no model
-   item is built before it has one.
-3. Trial APP-1 (Q40, decided): LIVA on a Mac with the model on another machine. No trial has run.
+1. Done on 2026-11-24: the owner decided Q41 (design 0061), Q54
+   ([design 0064](design/0064-research-of-2026-11-13-and-route.md)) and Q60 to Q63 (design 0067) at the
+   recommended defaults.
+2. Spike R21, a reading of what Mesh-LLM already does, has no record. By Q54 no model item is built
+   before it has one.
+3. Trial APP-1 (Q40, decided): a coding agent on a Mac with the model on another machine (Q98; LIVA
+   follows later). No trial has run.
 4. The items that the answers keep enter [BACKLOG.md](BACKLOG.md) as a phase of their own, each
    with files and a check.
 
 Steps 2 and 3 build nothing in the product.
 
-### 0.6.0
+### 0.5.0
 
-Release `0.6.0` carries bet A of design 0056: AX-1, AX-2, AX-3 and CACHE-1 (Q81). It serves the
-purpose of Q1, design 0056 planned it as the first wave, and no release has shipped it. AX-1 waits
-for the first round of the study of first use (ADOPT-1, Q37), and no session has run. The texts of
-AX-1 to AX-3 are in design 0056, and since 2026-11-17 they are in [BACKLOG.md](BACKLOG.md) with
-files and a check (Phase 13). A wire change that merges earlier still ships within 48 hours (design 0076,
-D1), so the number can move while the order stays. The items of bet A may start as soon as the
-first round of ADOPT-1 is recorded, whether or not `0.5.0` has shipped (Q83).
+Release `0.5.0` serves coding agents and machines that work on one project (Q101, decided by the owner on
+2026-11-26; it replaces the order of Q81, which had put language model serving first). It carries bet A of
+design 0056 (AX-1, AX-2, AX-3 and CACHE-1) and the coordination layer of
+[design 0111](design/0111-team-plan-leases-and-verify-gate.md): a shared plan with a short snapshot, path
+leases as git refs, a verify gate, a circuit breaker, a person-merged pull request flow, and a grid mailbox
+with wake-ups that replaces the Google Drive hub (TEAM-1 to TEAM-7). The mailbox and AX-3 add client
+messages, so `0.5.0` is the first release with protocol 11. The developer toolset of
+[design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1 to TOOL-5) lets machines set up from a USB kit
+take every task kind. Items without a wire change (TOOL-1 to TOOL-5, TEAM-1 to TEAM-5, AX-2) may ship in
+`0.4.x` after the stability release; a wire change that merges still ships within 48 hours (design 0076,
+D1).
 
 ## Purpose
 
@@ -630,10 +646,11 @@ AX-2, install scripts with a scripted time to first result (ADOPT-3), guides for
 [BACKLOG.md](BACKLOG.md) since 2026-11-17 (Phase 13).
 
 [Design 0061](design/0061-first-application-model-tunnel.md) (Draft, 2026-11-11) takes the third
-row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): LIVA on a Mac
-with the model on another machine, over SSH, with nothing built here. A client tunnel to a model
+row further for one application, LIVA. A trial comes first (APP-1, decided as Q40): an application
+on a Mac with the model on another machine, over SSH, with nothing built here. Since 2026-11-24 (Q98)
+that application is a coding agent, and LIVA, on hold, follows as the second one. A client tunnel to a model
 server (LLM-9), usage records (LLM-10) and a balance per member (LLM-11) are proposals that wait
-for the trial records. Q41 to Q43 are open.
+for the trial records. Q41 (decided on 2026-11-24) and Q43 are decided; Q42 is open.
 
 [Design 0062](design/0062-model-weights-into-remote-memory.md) (Draft, 2026-11-11) plans how a
 worker gets a model whose file is on another machine, with no copy on its disk first (Q44,
@@ -679,8 +696,8 @@ The owner accepted Q1 to Q5 on 2026-11-07, and Q6 and Q7 on 2026-11-08. Q8 to Q1
 right column is a recommended default, not a decision, and no work depends on it until the owner
 answers.
 
-Q60 to Q63 are open in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and join
-this table once the owner answers them. Q64 to Q79 are decided and recorded where they were asked:
+Q60 to Q63 were asked in [design 0067](design/0067-multi-node-llm-serving-and-admission.md) and
+decided on 2026-11-24; they are in this table. Q64 to Q79 are decided and recorded where they were asked:
 Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train.md), Q68 to Q72 in
 [design 0082](design/0082-task-extension-slot.md) and Q73 to Q79 in
 [design 0083](design/0083-one-version-window.md).
@@ -726,7 +743,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q38 | Which items of design 0059 enter the backlog first? | Open. Recommended: ADOPT-2 for one task now; ADOPT-3 and ADOPT-4 after the first round of ADOPT-1 |
 | Q39 | Keep the rule that the binaries send no usage data, so that numbers about users come only from the study and from public counts? | Open. Recommended: yes |
 | Q40 | Does a trial of LIVA on the owner's Mac, with the language model on another machine, come before any build item of design 0061? | Yes, decided by the owner on 2026-11-11. No trial has run yet |
-| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Open. Recommended: yes, if the trial records show that the remote model is worth using |
+| Q41 | After that trial: build the client tunnel (LLM-9 of design 0061) before the gateway (LLM-6), and let LLM-4 reuse it? | Yes, decided by the owner on 2026-11-24, if the trial records show that the remote model is worth using |
 | Q42 | Is encryption per hop enough for the tunnel of design 0061, so that the master can read the model traffic it relays? | Open. Recommended: yes while every machine has one owner; end to end, with ENROLL-1, before a cluster of several owners uses it |
 | Q43 | Does the balance of design 0061 (LLM-11) only display, or does it refuse a member whose balance is below zero? | Display only; it refuses nobody. Decided by the owner on 2026-11-19 through Q96 (design 0094) |
 | Q44 | Is the path to develop the one where model weights go from the file on one machine into the memory of another, with no file written there first (design 0062)? | Yes, decided by the owner on 2026-11-11. Nothing is measured or built yet |
@@ -739,12 +756,16 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q51 | For the workload of design 0045 D6, which grades edits to the weights of a small model: does the first step use only edits that others have published, with no paid model that writes them? | Open. Recommended: yes; spike R19 needs no paid model |
 | Q52 | Does Anima Engine, the owner's simulation project, become the public showcase of the grid: a world that the machines of several people evolve together (design 0063, D5)? | Open. Recommended: not yet; after trial APP-4 and after Anima Engine has a release of its own |
 | Q53 | Which of the owner's workloads is FEAT-9 (GPU workloads beyond the benchmark) designed for first: 3D assets through Blender, or the grading and training of models (design 0063, D6)? | Open. Recommended: 3D assets through Blender, after trial APP-4; workers already report Blender |
-| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Open. Recommended: yes; no model item is built before R21 has a record |
+| Q54 | Do the model items (LLM-1, LLM-6, LLM-12, LLM-13) wait for spike R21 of design 0064, and close where Mesh-LLM already does the work? | Yes, decided by the owner on 2026-11-24: no model item is built before R21 has a record |
 | Q55 | Does AX-3 get a long-running MCP call that works without the tasks extension (design 0064, D2), with the extension used when a client has it? | Open. Recommended: yes; two coding agents do not support the extension yet |
 | Q56 | Does a task get a field for the video memory it needs, as part of FEAT-9 (design 0064)? | Yes, approved by the owner and implemented in `FEAT-9a` ([design 0068](design/0068-task-vram-accounting.md)) |
 | Q57 | Does the 24-hour run of TEST-25 use the owner's three machines (a Mac and two Windows machines, awake on mains power), apart from the trial cluster (design 0065)? | Yes, decided by the owner on 2026-11-19: the 24-hour soak runs on the owner's three machines, now (apart from the trial cluster) |
 | Q58 | If TEST-24 shows that a dropped transfer sends the whole blob again, do uploads resume from the last chunk (design 0065)? | Decided by the owner on 2026-11-19: decide from the T5 and T9 records over a relay; nothing changes before them |
 | Q59 | Is 8 GiB the largest file of TEST-24, or the size of a model the owner plans to run (design 0065)? | Decided by the owner on 2026-11-19: 8 GiB first; add a model's size when design 0062 names one |
+| Q60 | Does trial APP-1 grow with spike R22, which measures throughput against the number of concurrent requests (1 to 32), before the concurrency limits of LLM-9 or EDU-1 are fixed (design 0067)? | Yes, decided by the owner on 2026-11-24. The R22 record of 2026-11-16 is the first; each GPU machine that serves a model gets one |
+| Q61 | Do LLM-6 and LLM-9 place requests by the requests in flight and the measured knee point instead of the fewest open tunnels, with an `interactive` band (LIVA) ahead of a `batch` band (agents, a class) (LLM-14, design 0067)? | Yes, decided by the owner on 2026-11-24. The cap also counts prompt plus answer tokens against the server's pool, because the R22 record shows answers cut short with no deferred request |
+| Q62 | When FEAT-9b reports live GPU memory, does a worker report the memory the OS lets it use (DXGI budget minus usage on Windows, `recommendedMaxWorkingSetSize` on Metal, NVML free with a safety margin on Linux) rather than the physical VRAM (design 0067)? | Yes, decided by the owner on 2026-11-24 |
+| Q63 | Do direct fast links between machines (Thunderbolt bridge, direct 2.5G/10G Ethernet) carry worker-to-worker and client-to-worker data with session tickets minted by the master and a fallback to LAN, QUIC or the master (Q47, SCALE-3, design 0067)? | Yes, decided by the owner on 2026-11-24, after single-hop LLM-9 works; not part of the first 0.5.0 |
 | Q80 | Is stability a release of its own after `0.4.0`, with no wire change, that ends with the exit check of "Stability" in [Releases](#releases), before any item of `0.5.0` is built? | Yes, at the recommended default, on the owner's go-ahead in chat on 2026-11-17. Ten of the 28 runs for pushes that finished on `master` on 2026-11-16 failed, and two failing tests have no item |
 | Q81 | What does `0.6.0` carry? | Bet A of design 0056 (AX-1, AX-2, AX-3 and CACHE-1), after the first round of ADOPT-1 (Q37). The recommended default, on the owner's go-ahead in chat on 2026-11-17. It serves the purpose of Q1, and no release has shipped it |
 | Q82 | Are the ten exit checks of [design 0088](design/0088-evaluation-of-2026-11-17-and-what-finished-means.md) the meaning of "finished", so that the items it names enter the backlog and the work outside its stop line is not counted as open work for completion? | Yes, decided by the owner on 2026-11-17. The items are Phase 13 of [BACKLOG.md](BACKLOG.md) |
@@ -761,6 +782,8 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q95 | Who takes part in the Stage 1 pilot (design 0094)? | Decided by the owner on 2026-11-19 at the recommended answer: the owner and three to five people the owner already knows, with about ten machines on at least two home networks and at least two machines of each system in use, each agreeing to the campaign sheet before joining |
 | Q96 | Are credits display only: not transferable, never spent or sold, with no cash value, in every stage of design 0094? | Yes, decided by the owner on 2026-11-19 at the recommended answer. It closes Q14 for the research grid and Q43 |
 | Q97 | Does Stage 1 of design 0094 run in parallel with release `0.5.0`? | Yes, decided by the owner on 2026-11-19 at the recommended answer: one lane at most beside `0.5.0` and bet A, with implementation merged after the stability release (Q80) and docs-only or test-only work before it |
+| Q98 | Does trial APP-1 run with another application while LIVA is on hold (design 0061)? | Yes, decided by the owner on 2026-11-24: a coding agent that uses an OpenAI-compatible endpoint (for example aider or opencode); LIVA follows as the second application once it starts on macOS and has its Cloud provider |
+| Q101 | What does `0.5.0` carry: language model serving (design 0067), or coding agents and machines on one project (bet A and design 0111)? | Coding agents and machines on one project, with protocol 11; language model serving moves to `0.6.0`. Decided by the owner on 2026-11-26 ("Là 0.5.0"). It replaces the release order of Q81 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -937,3 +960,15 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 - 2026-11-19: The owner decided Q94 to Q97 at the recommended answers ("Approve as recommended").
   Design 0094 is Accepted. Q96 closes Q14 and Q43: credits only display, and no money, tokens or
   payments.
+- 2026-11-26: The owner decided Q101: release `0.5.0` carries bet A of design 0056 and the coordination layer
+  of design 0111 (shared plan, path leases, verify gate, circuit breaker, merge flow, grid mailbox with
+  wake-ups), with protocol 11; language model serving (design 0067) moves to `0.6.0`. Q101 replaces the order
+  of Q81. Design 0110 (a developer toolset on USB kit machines, Q99 decided the same day) feeds it. The
+  Releases table, "Before 0.6.0 has items" and the section `0.5.0` changed.
+- 2026-11-26: The owner kept the seven days of clean `master` runs of Q80 (so `0.4.6` comes around
+  2026-12-01) and approved a plan for the `0.4.x` releases that follow, all without a wire change: `0.4.7`
+  the developer toolset on USB kit machines (design 0110) and contributor controls (NET-9, design 0113),
+  `0.4.8` the coordination layer for coding agents without the mailbox (TEAM-1 to TEAM-5, design 0111),
+  `0.4.9` the tray app (design 0112). Their work is prepared as draft pull requests while `0.4.6` waits.
+  The dates are estimates; a release still takes what is merged (design 0076, D1), and every tag needs
+  the owner.

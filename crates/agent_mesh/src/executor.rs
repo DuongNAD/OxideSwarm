@@ -244,8 +244,9 @@ impl CommandExecutor {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        // Spawn process
-        let mut child = match cmd.spawn() {
+        // Spawn process under the shared macOS spawn lock (BUG-35) so concurrent `process_group(0)`
+        // + `Stdio::piped()` calls never inherit another thread's pre-CLOEXEC pipes.
+        let mut child = match rusty_grid_core::process_spawn::spawn_tokio(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -401,7 +402,7 @@ impl CommandExecutor {
 
         if !escaped.is_empty() {
             let mut sys = System::new();
-            sys.refresh_processes();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             for pid in escaped {
                 if let Some(proc) = sys.process(pid) {
                     let _ = proc.kill();
@@ -418,7 +419,7 @@ impl CommandExecutor {
     /// `root` is a live (unreaped) child of ours, so the PID cannot belong to someone else.
     fn collect_descendants(root: u32) -> Vec<sysinfo::Pid> {
         let mut sys = System::new();
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
         let mut found = Vec::new();
         let mut queue = vec![sysinfo::Pid::from(root as usize)];
@@ -585,7 +586,7 @@ mod tests {
     #[cfg(unix)]
     fn process_is_alive(pid: u32) -> bool {
         let mut sys = System::new();
-        sys.refresh_processes();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         sys.process(sysinfo::Pid::from(pid as usize))
             .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
     }

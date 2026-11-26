@@ -199,6 +199,26 @@ impl IsolatedEnv {
         )
         .expect("join PATH");
 
+        let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+        if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+            real_home
+                .as_ref()
+                .map(|h| std::path::PathBuf::from(h).join(".rustup"))
+                .filter(|d| d.is_dir())
+                .map(|d| d.into_os_string())
+        }) {
+            cmd.env("RUSTUP_HOME", p);
+        }
+        if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+            real_home
+                .as_ref()
+                .map(|h| std::path::PathBuf::from(h).join(".cargo"))
+                .filter(|d| d.is_dir())
+                .map(|d| d.into_os_string())
+        }) {
+            cmd.env("CARGO_HOME", p);
+        }
+
         cmd.env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("OXIDESWARM_HOME", self.home.join(".oxideswarm"))

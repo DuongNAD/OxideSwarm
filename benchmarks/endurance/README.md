@@ -151,3 +151,71 @@ All 6 checks passed (`6/6`, 5 D3 item 6 checks plus fault completeness, actual e
 | `4_probe_p99` | `PASS` | `45/45` probes ok; `8` probes overlapping fault windows excluded (`[t_s, end_s + 15 s]`), leaving `14` baseline (`p99 = 130.852 ms`) and `16` late (`p99 = 146.509 ms`) clean probes (`ratio = 1.1197 <= 1.5`) |
 | `5_clean_stop` | `PASS` | `leftover_pids = []`, `leftover_task_trees = []` |
 | `6_fault_injection` | `PASS` | `16/16` planned faults executed cleanly, `0` fault errors |
+
+## Remote-worker soak mode (`soak --master-only` and `worker-agent`, D4.3)
+
+For the three-machine 24-hour soak (design 0065 D4.3: one Mac master plus two Windows workers),
+`endurance.py` splits cluster coordination across an authenticated master/worker split:
+
+- **`soak --master-only` (master machine):** starts the master with `--secret-file`, hosts the
+  HMAC-SHA256 control HTTP server (`--control-listen`), waits for `N` named `worker-agent` nodes to
+  register on the control server and connect to the master (`--expect-workers`,
+  `--register-timeout`), runs the D3 task load, timed probe loop, master sampling, and fault
+  schedule (`queue_burst`, `master_restart` rebinding the fixed master port, and remote
+  `worker_kill` / `link_cut`), then pulls each remote worker's samples and idle disk snapshot
+  before writing the merged JSON record.
+- **`worker-agent` (each remote machine):** runs inside a private `--work-dir` outside `AppData`
+  and `~/.oxideswarm` (with `tmp` as a sibling of `home`), opens a local `127.0.0.1` `ThrottleProxy`
+  pointed at `--master` so `link_cut` works identically across machines, launches
+  `oxideswarm worker --name <NAME> --secret-file <PATH>`, samples `worker_<name>` RSS/handles/threads/CPU
+  and worker cache/sandbox bytes aligned to the master's soak start clock, executes authenticated
+  faults (`kill_restart`, `link_cut`), and returns idle disk and process-tree clean-stop telemetry.
+
+### Control-channel security model
+
+1. **Out-of-band run secret only:** generate a fresh run secret (`oxideswarm secret generate --out <RUN_SECRET_FILE>`) and copy that file by hand to each remote worker machine. Because holders of this secret can also submit and execute tasks on the connected Windows workers, restrict the file permissions (`chmod 600` on macOS/Linux; owner-only NTFS DACL on Windows) and delete `<RUN_SECRET_FILE>` from every machine once the run finishes. The secret never travels over the hub, in a PR, in a commit, or in CLI arguments; the harness accepts `--secret-file <PATH>` only (parsed like Rust `ClusterSecret::load_file`: first non-empty non-`#` hex line).
+2. **Domain-separated mutual HMAC-SHA256 authentication:** both sides derive a dedicated key via `HMAC-SHA256(secret, "oxideswarm-endurance-control-v1")`. Every request (`X-Soak-Worker`, `X-Soak-Ts`, `X-Soak-Nonce`, `X-Soak-Sig`) and every server response (`X-Soak-Ts`, `X-Soak-Nonce`, `X-Soak-Req-Nonce`, `X-Soak-Run-Id`, `X-Soak-Sig`) is verified over canonical bytes (`method` / `status`, `path`, `worker`, timestamp, nonce, request nonce, `run_id`, and raw body bytes) with `hmac.compare_digest` before JSON parsing, and `worker-agent` deduplicates executed `cmd_id` values so a retried/replayed command is re-acked without executing twice.
+3. **Replay protection, clock skew, and DoS bounds:** requests whose timestamp differs from the server's clock by more than `300 s` or carry a reused nonce are rejected (`401`), so the clocks of the master and worker machines **must agree within `300 s`** (otherwise `401` causes the agent to skip polls until `--orphan-timeout` fires and exits non-zero). HMAC verification runs before recording nonces (preventing unauthenticated replay-cache poisoning). The control server enforces a cumulative `30 s` total deadline per request (across headers and body together), caps concurrent connections at `8` total and `2` per source address (answering `503`), validates auth headers and timestamps before reading request bodies (bounded at `32 MiB`, `413`), and `SignedControlClient` rejects replies above `1 MiB` before verification. For multi-hour runs, keep `--sample-interval` at `10 s` or above unless the control link sustains `> 5 Mbit/s` so `idle_snapshot` and `shutdown` acks fit within the `30 s` request/ack budget.
+4. **Fixed 4-op command allowlist & orphan safety:** `worker-agent` accepts only verified responses bound to its request nonce and `run_id` from `SoakControlServer`, checks settings/instance identity at registration (any second registration for the same worker name with a new `instance_id`, including an agent restarted mid-run, is rejected `403` for the remainder of the run), and executes only `kill_restart`, `link_cut`, `idle_snapshot`, and `shutdown` — never arbitrary shell commands or unauthenticated requests. If the agent goes `--orphan-timeout` (default `15m`) without an authenticated `200` control poll (or receives `400 run_id mismatch` / `403 not registered`), it stops its child worker cleanly and exits. Any skipped poll verification failure (`skipped_polls_verify > 0`) fails `all_passed`.
+5. **Privacy scrubbing:** the secret text, derived dashboard bearer token, `--secret-file` path, local work directories, hostnames, user names, and non-loopback IPv4 addresses are redacted before error logging or writing any JSON record.
+
+### Three-machine 24-hour commands (design 0065 D4.3)
+
+Use your own non-trial ports (never `8080`, `8087`, `8088`, `8089`), bind `--master-listen` and `--control-listen` directly to the master's LAN or Tailscale IP address rather than `0.0.0.0` so no extra interfaces are exposed, use a dedicated `<RUN_SECRET_FILE>`, ensure host clocks agree within `300 s`, and pass `--worker-python python` when the master OS (`python3`) differs from Windows workers (`python`):
+
+Master machine (macOS):
+
+```bash
+python3 benchmarks/endurance/endurance.py soak \
+  --bin <MAC_OXIDESWARM_BIN> \
+  --worker-python python \
+  --master-only \
+  --master-listen <MAC_LAN_OR_TAILSCALE_IP>:18500 \
+  --control-listen <MAC_LAN_OR_TAILSCALE_IP>:18501 \
+  --secret-file <RUN_SECRET_FILE> \
+  --expect-workers win-a,win-b \
+  --workers 2 --slots 4 --max-queue-size 64 \
+  --link lan-tcp --duration 24h --fault-scale 1.0 --load-scale 1.0 --sample-interval 60s \
+  --work-dir <PRIVATE_MAC_WORKDIR>
+```
+
+Each remote worker machine (Windows PowerShell, private NTFS folder outside `AppData`):
+
+```powershell
+python benchmarks\endurance\endurance.py worker-agent `
+  --bin <WIN_OXIDESWARM_EXE> `
+  --master <MAC_LAN_OR_TAILSCALE_IP>:18500 `
+  --control <MAC_LAN_OR_TAILSCALE_IP>:18501 `
+  --secret-file <RUN_SECRET_FILE> `
+  --name win-a --slots 4 --sample-interval 60s `
+  --work-dir <PRIVATE_WIN_WORKDIR>
+```
+
+### Loopback two-worker-agent verification (no cross-machine traffic)
+
+Run the Python harness test suite (mocked + optional real-binary two-`worker-agent` loopback test):
+
+```powershell
+python tests\test_endurance_harness.py
+$env:OXIDESWARM_TEST_BIN = '<PATH_TO_OXIDESWARM_EXE>'; python tests\test_endurance_harness.py
+```

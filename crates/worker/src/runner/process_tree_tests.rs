@@ -30,7 +30,7 @@ fn script_task(script: String, timeout_secs: u64) -> Task {
 /// Alive means running: a zombie (killed, not yet reaped by its new parent) does not count.
 fn alive(pid: u32) -> bool {
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     sys.process(sysinfo::Pid::from(pid as usize))
         .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie)
 }

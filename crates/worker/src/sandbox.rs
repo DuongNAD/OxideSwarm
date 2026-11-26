@@ -822,8 +822,8 @@ fn check_windows_ancestor(
     user_sid: &str,
 ) -> Result<(), SandboxError> {
     use rusty_grid_core::private_file::{
-        ancestor_unsafe_grants, icacls_private_dir_command, is_trusted_ancestor_owner_sid,
-        sid_label, ANCESTOR_RENAME_MASK, DRIVE_ROOT_UNSAFE_MASK,
+        ancestor_unsafe_grants, icacls_private_dir_command_for_aces, is_trusted_ancestor_owner_sid,
+        sid_is_resolvable, sid_label, ANCESTOR_RENAME_MASK, DRIVE_ROOT_UNSAFE_MASK,
     };
 
     let remove_remedy = "Remove it (this may need its owner or an Administrator)".to_string();
@@ -919,7 +919,13 @@ fn check_windows_ancestor(
                         ),
                         format!(
                             "To make the ancestor private run: {}",
-                            icacls_private_dir_command(anc, &offenders, user_sid)
+                            icacls_private_dir_command_for_aces(
+                                anc,
+                                &aces,
+                                &offenders,
+                                user_sid,
+                                sid_is_resolvable
+                            )
                         ),
                     )
                 };
@@ -962,8 +968,8 @@ pub(crate) fn ensure_private_dir_windows_with(
 ) -> Result<(), SandboxError> {
     use rusty_grid_core::private_file::{
         claim_warning_for_path, dir_open_grants, dir_read_grants, dir_write_grants,
-        icacls_private_dir_command, is_trusted_owner_sid, open_dir_acl_warning, sid_label,
-        PrivateDirOutcome,
+        icacls_private_dir_command_for_aces, is_trusted_owner_sid, open_dir_acl_warning_for_aces,
+        sid_is_resolvable, sid_label, PrivateDirOutcome,
     };
 
     let unusable = |source: std::io::Error| SandboxError::BaseDirUnusable {
@@ -1089,7 +1095,13 @@ pub(crate) fn ensure_private_dir_windows_with(
                         let who: Vec<String> =
                             write_offenders.iter().map(|s| sid_label(s)).collect();
                         let all_offenders = dir_open_grants(&aces, &user_sid);
-                        let cmd = icacls_private_dir_command(root, &all_offenders, &user_sid);
+                        let cmd = icacls_private_dir_command_for_aces(
+                            root,
+                            &aces,
+                            &all_offenders,
+                            &user_sid,
+                            sid_is_resolvable,
+                        );
                         return Err(SandboxError::BaseDirUnsafe {
                             path: root.to_path_buf(),
                             reason: format!(
@@ -1101,7 +1113,13 @@ pub(crate) fn ensure_private_dir_windows_with(
                     }
                     let read_offenders = dir_read_grants(&aces, &user_sid);
                     if emit_warnings && !read_offenders.is_empty() && claim_warning_for_path(root) {
-                        if let Some(msg) = open_dir_acl_warning(root, &read_offenders, &user_sid) {
+                        if let Some(msg) = open_dir_acl_warning_for_aces(
+                            root,
+                            &aces,
+                            &read_offenders,
+                            &user_sid,
+                            sid_is_resolvable,
+                        ) {
                             tracing::warn!("{msg}");
                         }
                     }
