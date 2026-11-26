@@ -337,6 +337,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
 | TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Implemented |  |  |
+| TEST-101 | Make `rusty_grid_core` `cluster_auth::tests::default_path_lives_under_home` independent of caller `OXIDESWARM_HOME` | P2 | S |  |  | Implemented |  |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -951,6 +952,16 @@ The full suite must pass on a clean machine before CI can require it.
      and CI.
 - **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
   --lib` passes `436/436` locally) and CI stays green.
+
+### TEST-101: Make `rusty_grid_core` `cluster_auth::tests::default_path_lives_under_home` independent of caller `OXIDESWARM_HOME`
+
+- **Status (2026-11-26):** Implemented (`win2/test-101-default-path-oxideswarm-home`).
+- **Evidence:** Discovered during `E-D2` on Windows 11 (`d88083f2`, `test_runs/win-2_e-d2_2026-11-25.md`) and reproduced on `origin/master` `fc95e4c9` (claim `claims/item/TEST-101__win__20261126T080448414890Z__9d72ebc8.json`): running `cargo test --locked -j 2 -p rusty_grid_core --lib cluster_auth::tests::default_path_lives_under_home -- --exact` with `OXIDESWARM_HOME` set failed (`rc=101`) at `crates/core/src/cluster_auth.rs:1217:13`, while running with `OXIDESWARM_HOME` unset passed (`rc=0`).
+- **Problem:** `ClusterSecret::default_path()` returns `<OXIDESWARM_HOME>/cluster.secret` when `OXIDESWARM_HOME` is non-empty, whereas `cluster_auth::tests::default_path_lives_under_home` asserted `.oxideswarm/cluster.secret` against `ClusterSecret::default_path()` directly, causing deterministic failures in isolated test harnesses that export `OXIDESWARM_HOME`.
+- **Do:**
+  1. Factor `ClusterSecret::default_path()` in `crates/core/src/cluster_auth.rs` through a private injectable `default_path_with(env)` helper with zero change to product behaviour and no `std::env::set_var` in tests.
+  2. Update `default_path_lives_under_home` to test the `HOME` / `USERPROFILE` branch via `default_path_with`, and test the `OXIDESWARM_HOME` override branch separately in `default_path_honours_oxideswarm_home_override`.
+- **Done when:** `cluster_auth::tests::default_path_lives_under_home` (and `default_path_honours_oxideswarm_home_override`) pass `20/20` both with and without `OXIDESWARM_HOME` set on Windows, and CI stays green.
 
 ## Phase 3: make the documents true
 
@@ -3362,3 +3373,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: TEST-101 Implemented (`win2/test-101-default-path-oxideswarm-home`, claim `claims/item/TEST-101__win__20261126T080448414890Z__9d72ebc8.json`): refactored `ClusterSecret::default_path()` in `crates/core/src/cluster_auth.rs` to delegate to private `default_path_with(env)` without changing product behaviour or calling `std::env::set_var`, updated `default_path_lives_under_home` to test the `HOME`/`USERPROFILE` branch deterministically, and added `default_path_honours_oxideswarm_home_override`; verified `20/20` with `OXIDESWARM_HOME` set and `20/20` without `OXIDESWARM_HOME` on Windows.

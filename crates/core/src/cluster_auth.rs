@@ -355,15 +355,21 @@ impl ClusterSecret {
     }
 
     /// Default secret file: `<home>/.oxideswarm/cluster.secret` (home is `HOME`, or
-    /// `USERPROFILE` on Windows).
+    /// `USERPROFILE` on Windows), or `<OXIDESWARM_HOME>/cluster.secret` when `OXIDESWARM_HOME` is
+    /// set and non-empty.
     pub fn default_path() -> Option<PathBuf> {
-        if let Some(custom) = std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
+        Self::default_path_with(|name| std::env::var_os(name))
+    }
+
+    /// [`ClusterSecret::default_path`] with the environment lookup injected for unit testing.
+    fn default_path_with(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+        if let Some(custom) = env("OXIDESWARM_HOME").filter(|s| !s.is_empty()) {
             return Some(PathBuf::from(custom).join(DEFAULT_SECRET_FILE_NAME));
         }
         #[cfg(windows)]
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        let home = env("USERPROFILE").or_else(|| env("HOME"));
         #[cfg(not(windows))]
-        let home = std::env::var_os("HOME");
+        let home = env("HOME");
         home.filter(|h| !h.is_empty()).map(|h| {
             PathBuf::from(h)
                 .join(".oxideswarm")
@@ -1211,13 +1217,98 @@ mod tests {
         assert!(ClusterSecret::resolve_with(None, None, no_env, Some(broken_default)).is_err());
     }
 
+    fn test_env_lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let map: Vec<(String, std::ffi::OsString)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(v)))
+            .collect();
+        move |name: &str| map.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    }
+
     #[test]
     fn default_path_lives_under_home() {
-        if let Some(path) = ClusterSecret::default_path() {
-            assert!(
-                path.ends_with(".oxideswarm/cluster.secret")
-                    || path.ends_with(".oxideswarm\\cluster.secret")
-            );
+        let expected_suffix = Path::new(".oxideswarm").join(DEFAULT_SECRET_FILE_NAME);
+        let home_dir = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\example"
+        } else {
+            "/home/example"
+        });
+        let home_str = home_dir.to_string_lossy().into_owned();
+
+        // When OXIDESWARM_HOME is unset or empty, default_path_with places cluster.secret under
+        // <home>/.oxideswarm/cluster.secret (USERPROFILE preferred over HOME on Windows).
+        for ox_home in [None, Some("")] {
+            let mut vars: Vec<(&str, &str)> = vec![("HOME", &home_str)];
+            if let Some(v) = ox_home {
+                vars.push(("OXIDESWARM_HOME", v));
+            }
+            let path = ClusterSecret::default_path_with(test_env_lookup(&vars))
+                .expect("home path when HOME is set");
+            assert_eq!(path, home_dir.join(&expected_suffix));
+            assert!(path.ends_with(&expected_suffix));
+        }
+
+        #[cfg(windows)]
+        {
+            let profile_dir = PathBuf::from(r"C:\Users\profile-preferred");
+            let profile_str = profile_dir.to_string_lossy().into_owned();
+            let path = ClusterSecret::default_path_with(test_env_lookup(&[
+                ("USERPROFILE", &profile_str),
+                ("HOME", &home_str),
+            ]))
+            .expect("USERPROFILE preferred over HOME on Windows");
+            assert_eq!(path, profile_dir.join(&expected_suffix));
+            assert!(path.ends_with(&expected_suffix));
+        }
+
+        assert_eq!(
+            ClusterSecret::default_path_with(test_env_lookup(&[
+                ("OXIDESWARM_HOME", ""),
+                ("HOME", "")
+            ])),
+            None
+        );
+        assert_eq!(ClusterSecret::default_path_with(test_env_lookup(&[])), None);
+    }
+
+    #[test]
+    fn default_path_honours_oxideswarm_home_override() {
+        let custom_dir = PathBuf::from(if cfg!(windows) {
+            r"C:\Temp\ox-custom-home"
+        } else {
+            "/tmp/ox-custom-home"
+        });
+        let custom_str = custom_dir.to_string_lossy().into_owned();
+        let home_str = if cfg!(windows) {
+            r"C:\Users\example"
+        } else {
+            "/home/example"
+        };
+
+        // Non-empty OXIDESWARM_HOME overrides USERPROFILE/HOME directly without `.oxideswarm`.
+        let path = ClusterSecret::default_path_with(test_env_lookup(&[
+            ("OXIDESWARM_HOME", &custom_str),
+            ("USERPROFILE", home_str),
+            ("HOME", home_str),
+        ]))
+        .expect("custom path when OXIDESWARM_HOME is set");
+        assert_eq!(path, custom_dir.join(DEFAULT_SECRET_FILE_NAME));
+
+        // Live env check remains valid whether or not the caller harness sets OXIDESWARM_HOME.
+        match (
+            std::env::var_os("OXIDESWARM_HOME").filter(|s| !s.is_empty()),
+            ClusterSecret::default_path(),
+        ) {
+            (Some(custom), live) => {
+                assert_eq!(
+                    live,
+                    Some(PathBuf::from(custom).join(DEFAULT_SECRET_FILE_NAME))
+                );
+            }
+            (None, Some(live)) => {
+                assert!(live.ends_with(Path::new(".oxideswarm").join(DEFAULT_SECRET_FILE_NAME)));
+            }
+            (None, None) => {}
         }
     }
 
