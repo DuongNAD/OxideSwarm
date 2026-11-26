@@ -669,12 +669,13 @@ impl AgentGridBridge {
                         "total_workers": cs.total_workers,
                     });
                     let stdout = format!(
-                        "Grid Cluster Status:\nActive Workers: {}\nQueued Tasks: {}\nRunning Tasks: {}\nCompleted Tasks: {}\nFailed Tasks: {}\n",
+                        "Grid Cluster Status:\nActive Workers: {}\nQueued Tasks: {}\nRunning Tasks: {}\nCompleted Tasks: {}\nFailed Tasks: {}\nCancelled Tasks: {}\n",
                         cs.active_workers,
                         cs.queued_tasks,
                         cs.running_tasks,
                         cs.completed_tasks,
-                        cs.failed_tasks
+                        cs.failed_tasks,
+                        cs.cancelled_tasks
                     );
                     let mut resp = AgentMeshEnvelope::new_command_response(
                         "grid",

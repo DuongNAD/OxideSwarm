@@ -505,19 +505,20 @@ pub struct QueueStats {
 }
 
 impl QueueStats {
-    /// Collapses the eight FSM states into the four buckets of `ClientResponse::ClusterStatus`
-    /// as `(pending, running, completed, failed)`; every task lands in exactly one, so the sum
-    /// equals `total`.
+    /// Collapses the eight FSM states into the five buckets of `ClientResponse::ClusterStatus`
+    /// as `(pending, running, completed, failed, cancelled)`; every task lands in exactly one, so
+    /// the sum equals `total`.
     ///
     /// `pending` also holds tasks waiting out a retry backoff; `running` also holds tasks already
-    /// assigned to a worker but not yet reported running; `failed` also holds cancelled tasks
-    /// (the wire message has no separate cancelled counter).
-    pub fn cluster_buckets(&self) -> (usize, usize, usize, usize) {
+    /// assigned to a worker but not yet reported running (BUG-22 separates `cancelled` from
+    /// `failed`).
+    pub fn cluster_buckets(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.queued + self.retrying,
             self.scheduled + self.running,
             self.completed,
-            self.failed + self.cancelled,
+            self.failed,
+            self.cancelled,
         )
     }
 }

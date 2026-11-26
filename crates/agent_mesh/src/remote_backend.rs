@@ -954,6 +954,7 @@ impl GridBackend for RemoteMasterBackend {
                     running_tasks,
                     completed_tasks,
                     failed_tasks,
+                    cancelled_tasks,
                     workers,
                     active_bytes,
                     max_active_bytes,
@@ -969,6 +970,7 @@ impl GridBackend for RemoteMasterBackend {
                         "running": running_tasks,
                         "completed": completed_tasks,
                         "failed": failed_tasks,
+                        "cancelled": cancelled_tasks,
                         "active_bytes": active_bytes,
                         "max_active_bytes": max_active_bytes,
                         "store_error": store_error,
@@ -981,6 +983,7 @@ impl GridBackend for RemoteMasterBackend {
                         running_tasks,
                         completed_tasks,
                         failed_tasks,
+                        cancelled_tasks,
                         queue_json,
                         workers_json,
                     })

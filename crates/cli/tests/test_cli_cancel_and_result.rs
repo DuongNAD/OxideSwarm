@@ -683,6 +683,7 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
                                 running_tasks: 0,
                                 completed_tasks: 0,
                                 failed_tasks: 0,
+                                cancelled_tasks: 0,
                                 active_bytes: 0,
                                 max_active_bytes: 0,
                                 store_error: None,

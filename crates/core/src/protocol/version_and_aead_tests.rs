@@ -5,7 +5,9 @@ use crate::capabilities::WorkerCapabilities;
 use crate::task::{Task, TaskId, TaskRequirements, TaskSpec, TaskStatus};
 
 use super::client_msg_mirrors::{serialize_client_message_with_version, BinaryClientMessage};
-use super::client_resp_mirrors::serialize_client_response_with_version;
+use super::client_resp_mirrors::{
+    serialize_client_response_with_version, LegacyV10BinaryClientResponse,
+};
 use super::codec::{
     bincode_exact_deserialize, AEAD_ERR_CLOSED, AEAD_ERR_INTEGRITY, AEAD_ERR_NOT_ENCRYPTED,
     AEAD_ERR_OVERFLOW, AEAD_ERR_SEQUENCE, AEAD_ERR_TOO_SHORT,
@@ -454,6 +456,7 @@ fn test_cluster_status_trailing_budget_fields_decode_into_legacy_bincode_client(
         running_tasks: 1,
         completed_tasks: 0,
         failed_tasks: 0,
+        cancelled_tasks: 0,
         workers: vec![worker_cap],
         active_bytes: 601_029,
         max_active_bytes: 1_048_576,
@@ -725,7 +728,7 @@ fn v5_submit_task_frame(wait: bool) -> Vec<u8> {
 
 #[test]
 fn test_protocol_6_hello_round_trips_in_both_codecs_and_is_appended_last() {
-    assert_eq!(PROTOCOL_VERSION_CURRENT, 10);
+    assert_eq!(PROTOCOL_VERSION_CURRENT, 11);
     assert_eq!(
         PROTOCOL_VERSION_MIN_COMPATIBLE,
         PROTOCOL_VERSION_CURRENT - 1
@@ -936,6 +939,7 @@ fn test_v5_responses_at_a_v6_client_are_refused_as_version_5() {
             running_tasks: 0,
             completed_tasks: 1,
             failed_tasks: 0,
+            cancelled_tasks: 0,
             workers: Vec::new(),
             active_bytes: 0,
             max_active_bytes: 1,
@@ -1046,6 +1050,7 @@ fn test_v6_responses_at_a_v7_client_are_refused_as_version_6() {
             running_tasks: 0,
             completed_tasks: 1,
             failed_tasks: 0,
+            cancelled_tasks: 0,
             workers: Vec::new(),
             active_bytes: 0,
             max_active_bytes: 1,
@@ -1229,97 +1234,132 @@ fn test_extension_json_form_is_hex_and_extensions_may_be_omitted() {
     assert!(back.extensions.is_empty() && back.requirements.extensions.is_empty());
 }
 
-/// A v9 client's `SubmitTask` has no `extensions` lists: a v10 Master reads it through the frozen
-/// v9 layout (design 0083 D4), with both lists empty and every other field equal, and reports the
-/// stamp 9 of the sender.
+/// A v9 client's `SubmitTask` is now below `PROTOCOL_VERSION_MIN_COMPATIBLE` (10) in protocol 11
+/// and is refused cleanly as `IncompatibleVersion(9)` via [`LegacyV9BinaryClientMessage`]. A v10
+/// `SubmitTask` shares the protocol 11 layout and decodes with stamp 10.
 #[test]
-fn decode_v9_submit_task_is_accepted_and_has_empty_lists() {
+fn decode_v9_submit_task_is_refused_and_v10_is_accepted() {
     let task = sample_workspace_task();
     for wait in [false, true] {
         let frame = v9_submit_task_frame(&task, 9, wait);
         assert!(bincode_exact_deserialize::<BinaryClientMessage>(&frame[1..]).is_err());
-        let (msg, codec, stamp) =
-            deserialize_message_with_version::<ClientMessage>(&frame).unwrap();
-        assert_eq!(codec, WireCodec::Bincode);
-        assert_eq!(stamp, Some(9));
-        assert_eq!(
-            msg,
-            ClientMessage::SubmitTask {
-                task: task.clone(),
-                wait
+        match deserialize_message::<ClientMessage>(&frame) {
+            Err(ProtocolError::IncompatibleVersion {
+                peer_version,
+                current_version,
+                min_compatible_version,
+            }) => {
+                assert_eq!(peer_version, 9);
+                assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+                assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
             }
-        );
+            other => panic!("expected IncompatibleVersion(9), got {other:?}"),
+        }
+        match deserialize_message::<InboundMessage>(&frame) {
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                assert_eq!(peer_version, 9);
+            }
+            other => panic!("expected InboundMessage IncompatibleVersion(9), got {other:?}"),
+        }
+
+        // A v10 `SubmitTask` carries extensions and is decoded directly with stamp 10.
+        let v10_task = sample_extensions_task();
+        let v10_msg = ClientMessage::SubmitTask {
+            task: v10_task.clone(),
+            wait,
+        };
+        let encoded = serialize_v10_client_message(&v10_msg, WireCodec::Bincode).unwrap();
+        let (msg, codec, stamp) =
+            deserialize_message_with_version::<ClientMessage>(&encoded).unwrap();
+        assert_eq!(codec, WireCodec::Bincode);
+        assert_eq!(stamp, Some(10));
+        assert_eq!(msg, v10_msg);
         let (inbound, _, stamp) =
-            deserialize_message_with_version::<InboundMessage>(&frame).unwrap();
-        assert_eq!(stamp, Some(9));
-        assert_eq!(
-            inbound,
-            InboundMessage::Client(ClientMessage::SubmitTask {
-                task: task.clone(),
-                wait
-            })
-        );
-        // The same bytes come out of the v9 encoder that tests use.
-        let encoded = serialize_v9_client_message(
-            &ClientMessage::SubmitTask {
-                task: task.clone(),
-                wait,
-            },
-            WireCodec::Bincode,
-        )
-        .unwrap();
-        assert_eq!(&encoded[..], &frame[..]);
+            deserialize_message_with_version::<InboundMessage>(&encoded).unwrap();
+        assert_eq!(stamp, Some(10));
+        assert_eq!(inbound, InboundMessage::Client(v10_msg));
     }
 }
 
-/// Design 0083 D2: a v9 frame whose `created_at_utc` is 0 can parse as a v10 `SubmitTask` by
-/// accident (the first extra field is a `u64` list length taken from `created_at_utc`); the layout
-/// of the stamp decides, so it is still a v9 frame.
+/// Even when `created_at_utc = 0` lets a v9 `SubmitTask` frame accidentally parse under the v10/v11
+/// layout, the stamp check refuses `9` (`10..=11`).
 #[test]
-fn v9_submit_task_with_created_at_zero_still_decodes_as_v9() {
+fn v9_submit_task_with_created_at_zero_is_refused_as_version_9() {
     let mut task = sample_workspace_task();
     task.created_at_utc = 0;
     let frame = v9_submit_task_frame(&task, 9, true);
-    // Documents the hazard: the v10 layout alone would accept some such frames.
-    let (msg, _, stamp) = deserialize_message_with_version::<ClientMessage>(&frame).unwrap();
-    assert_eq!(stamp, Some(9));
-    assert_eq!(msg, ClientMessage::SubmitTask { task, wait: true });
+    match deserialize_message_with_version::<ClientMessage>(&frame) {
+        Err(ProtocolError::IncompatibleVersion {
+            peer_version,
+            current_version,
+            min_compatible_version,
+        }) => {
+            assert_eq!(peer_version, 9);
+            assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+            assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+        }
+        other => panic!("expected IncompatibleVersion(9), got {other:?}"),
+    }
 }
 
-/// A v9 frame stamped 8, or a v10 frame stamped 9, is refused: a frame is never accepted under a
-/// layout its stamp contradicts.
+/// A v9 frame stamped 8 or 9 is refused as `IncompatibleVersion`, while a v9 body stamped 10 or
+/// 11 (claiming a newer layout it does not match) is rejected as a bincode decode error.
 #[test]
 fn submit_task_frames_contradicting_their_stamp_are_refused() {
     let task = sample_workspace_task();
-    // v9 layout, stamp 8: below the window.
-    let frame = v9_submit_task_frame(&task, 8, false);
-    match deserialize_message::<ClientMessage>(&frame) {
-        Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
-            assert_eq!(peer_version, 8)
+    for bad_ver in [8u32, 9u32] {
+        let frame = v9_submit_task_frame(&task, bad_ver, false);
+        match deserialize_message::<ClientMessage>(&frame) {
+            Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+                assert_eq!(peer_version, bad_ver);
+            }
+            other => panic!("expected IncompatibleVersion({bad_ver}), got {other:?}"),
         }
-        other => panic!("expected IncompatibleVersion(8), got {other:?}"),
     }
-    // v10 layout, stamp 9: the stamp says v9, the bytes say v10.
     let msg = ClientMessage::SubmitTask {
         task: task.clone(),
         wait: false,
     };
-    let v10_stamped_9 = serialize_client_message_with_version(&msg, 9, WireCodec::Bincode).unwrap();
-    assert!(deserialize_message::<ClientMessage>(&v10_stamped_9).is_err());
-    assert!(deserialize_message::<InboundMessage>(&v10_stamped_9).is_err());
-    // v10 layout, stamp 10, and a v9 layout stamped 10 (a v9 body in a v10 frame).
-    let ok = serialize_client_message_with_version(&msg, 10, WireCodec::Bincode).unwrap();
-    assert!(deserialize_message::<ClientMessage>(&ok).is_ok());
-    let v9_stamped_10 = v9_submit_task_frame(&task, 10, false);
-    assert!(deserialize_message::<ClientMessage>(&v9_stamped_10).is_err());
+    let ok_v10 = serialize_client_message_with_version(&msg, 10, WireCodec::Bincode).unwrap();
+    assert!(deserialize_message::<ClientMessage>(&ok_v10).is_ok());
+    let ok_v11 = serialize_client_message_with_version(&msg, 11, WireCodec::Bincode).unwrap();
+    assert!(deserialize_message::<ClientMessage>(&ok_v11).is_ok());
+    for lying_stamp in [10u32, 11u32] {
+        let v9_lying = v9_submit_task_frame(&task, lying_stamp, false);
+        assert!(matches!(
+            deserialize_message::<ClientMessage>(&v9_lying),
+            Err(ProtocolError::Bincode(_))
+        ));
+    }
 }
 
-/// A v9 JSON client's `SubmitTask` has no `extensions` field at all and is read with the stamp 9
-/// (design 0083, Q79).
+/// A v9 JSON client's `SubmitTask` (without `extensions`) is refused as `IncompatibleVersion(9)`,
+/// while a v10 JSON client's `SubmitTask` is accepted with stamp 10.
 #[test]
-fn v9_json_submit_task_is_accepted() {
+fn v9_json_submit_task_is_refused_and_v10_is_accepted() {
     let task = sample_workspace_task();
-    let frame = serialize_v9_client_message(
+    let mut task_val = serde_json::to_value(&task).unwrap();
+    task_val.as_object_mut().unwrap().remove("extensions");
+    task_val["requirements"]
+        .as_object_mut()
+        .unwrap()
+        .remove("extensions");
+    let frame = serde_json::json!({
+        "type": "SubmitTask",
+        "task": task_val,
+        "wait": true,
+        "protocol_version": 9,
+    });
+    let mut raw = vec![WIRE_FORMAT_JSON];
+    raw.extend_from_slice(frame.to_string().as_bytes());
+    match deserialize_message_with_version::<ClientMessage>(&raw) {
+        Err(ProtocolError::IncompatibleVersion { peer_version, .. }) => {
+            assert_eq!(peer_version, 9);
+        }
+        other => panic!("expected IncompatibleVersion(9), got {other:?}"),
+    }
+
+    let v10_frame = serialize_v10_client_message(
         &ClientMessage::SubmitTask {
             task: task.clone(),
             wait: true,
@@ -1327,9 +1367,10 @@ fn v9_json_submit_task_is_accepted() {
         WireCodec::Json,
     )
     .unwrap();
-    let (msg, codec, stamp) = deserialize_message_with_version::<ClientMessage>(&frame).unwrap();
+    let (msg, codec, stamp) =
+        deserialize_message_with_version::<ClientMessage>(&v10_frame).unwrap();
     assert_eq!(codec, WireCodec::Json);
-    assert_eq!(stamp, Some(9));
+    assert_eq!(stamp, Some(10));
     assert_eq!(msg, ClientMessage::SubmitTask { task, wait: true });
 }
 
@@ -1357,5 +1398,149 @@ fn client_responses_are_accepted_only_with_the_clients_own_stamp() {
     ));
     assert!(!crate::protocol::is_master_echo_acceptable(
         PROTOCOL_VERSION_CURRENT - 1
+    ));
+}
+
+// --- Protocol version 11: ClientResponse::ClusterStatus::cancelled_tasks (BUG-22) ---------------
+
+#[test]
+fn test_protocol_11_cluster_status_cancelled_tasks_round_trips_in_both_codecs() {
+    let resp = ClientResponse::ClusterStatus {
+        total_tasks: 7,
+        pending_tasks: 2,
+        running_tasks: 1,
+        completed_tasks: 2,
+        failed_tasks: 1,
+        cancelled_tasks: 1,
+        workers: Vec::new(),
+        active_bytes: 512,
+        max_active_bytes: 4096,
+        store_error: None,
+    };
+    for codec in [WireCodec::Bincode, WireCodec::Json] {
+        let raw = serialize_message(&resp, codec).unwrap();
+        let (back, detected) = deserialize_message::<ClientResponse>(&raw).unwrap();
+        assert_eq!(detected, codec);
+        assert_eq!(back, resp, "{codec:?}");
+    }
+
+    // A JSON peer omitting `cancelled_tasks` defaults it to 0.
+    let raw_json = serialize_message(&resp, WireCodec::Json).unwrap();
+    let mut val: serde_json::Value = serde_json::from_slice(&raw_json[1..]).unwrap();
+    val.as_object_mut().unwrap().remove("cancelled_tasks");
+    let mut without_field = vec![WIRE_FORMAT_JSON];
+    without_field.extend_from_slice(val.to_string().as_bytes());
+    let (decoded, _) = deserialize_message::<ClientResponse>(&without_field).unwrap();
+    match decoded {
+        ClientResponse::ClusterStatus {
+            failed_tasks,
+            cancelled_tasks,
+            ..
+        } => {
+            assert_eq!(failed_tasks, 1);
+            assert_eq!(cancelled_tasks, 0);
+        }
+        other => panic!("expected ClusterStatus, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_protocol_11_cluster_status_for_v10_peer_folds_cancelled_into_failed() {
+    let resp = ClientResponse::ClusterStatus {
+        total_tasks: 4,
+        pending_tasks: 0,
+        running_tasks: 0,
+        completed_tasks: 2,
+        failed_tasks: 1,
+        cancelled_tasks: 1,
+        workers: Vec::new(),
+        active_bytes: 0,
+        max_active_bytes: 1024,
+        store_error: None,
+    };
+
+    for codec in [WireCodec::Bincode, WireCodec::Json] {
+        let frame = serialize_message_for_peer(&resp, codec, 10).unwrap();
+        if codec == WireCodec::Json {
+            let val: serde_json::Value = serde_json::from_slice(&frame[1..]).unwrap();
+            assert!(
+                val.as_object()
+                    .is_some_and(|m| !m.contains_key("cancelled_tasks")),
+                "v10 JSON payload must omit cancelled_tasks: {val}"
+            );
+            assert_eq!(val["failed_tasks"], 2);
+            assert_eq!(val["protocol_version"], 10);
+        }
+        let (v10_decoded, detected) = deserialize_message_as_v10::<ClientResponse>(&frame).unwrap();
+        assert_eq!(detected, codec);
+        assert_eq!(v10_decoded, resp.for_peer(10));
+        match v10_decoded {
+            ClientResponse::ClusterStatus {
+                failed_tasks,
+                cancelled_tasks,
+                ..
+            } => {
+                assert_eq!(failed_tasks, 2, "{codec:?}: v10 sees failed + cancelled");
+                assert_eq!(cancelled_tasks, 0);
+            }
+            other => panic!("expected ClusterStatus, got {other:?}"),
+        }
+        // A v11 client refuses the stamp-10 frame cleanly as IncompatibleVersion(10).
+        assert!(matches!(
+            deserialize_message::<ClientResponse>(&frame),
+            Err(ProtocolError::IncompatibleVersion {
+                peer_version: 10,
+                current_version: 11,
+                min_compatible_version: 10,
+            })
+        ));
+    }
+}
+
+#[test]
+fn test_v10_cluster_status_at_v11_client_is_refused_as_version_10() {
+    let legacy = LegacyV10BinaryClientResponse::ClusterStatus {
+        total_tasks: 2,
+        pending_tasks: 0,
+        running_tasks: 0,
+        completed_tasks: 1,
+        failed_tasks: 1,
+        workers: Vec::new(),
+        active_bytes: 0,
+        max_active_bytes: 1024,
+        store_error: None,
+        protocol_version: 10,
+    };
+    let v10_bincode = serialize_message(&legacy, WireCodec::Bincode).unwrap();
+    match deserialize_message::<ClientResponse>(&v10_bincode) {
+        Err(ProtocolError::IncompatibleVersion {
+            peer_version,
+            current_version,
+            min_compatible_version,
+        }) => {
+            assert_eq!(peer_version, 10);
+            assert_eq!(current_version, PROTOCOL_VERSION_CURRENT);
+            assert_eq!(min_compatible_version, PROTOCOL_VERSION_MIN_COMPATIBLE);
+        }
+        other => panic!("expected IncompatibleVersion(10), got {other:?}"),
+    }
+
+    // A truncated v10-shaped ClusterStatus claiming stamp 11 is rejected as malformed bincode.
+    let bad_v10_stamped_11 = LegacyV10BinaryClientResponse::ClusterStatus {
+        total_tasks: 2,
+        pending_tasks: 0,
+        running_tasks: 0,
+        completed_tasks: 1,
+        failed_tasks: 1,
+        workers: Vec::new(),
+        active_bytes: 0,
+        max_active_bytes: 1024,
+        store_error: None,
+        protocol_version: PROTOCOL_VERSION_CURRENT,
+    };
+    let malformed = serialize_message(&bad_v10_stamped_11, WireCodec::Bincode).unwrap();
+    assert!(matches!(
+        deserialize_message::<ClientResponse>(&malformed),
+        Err(ProtocolError::Bincode(_))
     ));
 }

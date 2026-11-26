@@ -2196,13 +2196,14 @@ mod tests {
         session_task.abort();
     }
 
-    /// Design 0083 D2/D3: a worker that registers with protocol 9 on a two-lane (QUIC-shaped)
-    /// session gets the same peer version on both lanes: the accepted `RegisterAck` on the control
-    /// lane echoes 9, and an `AssignTask` on the data lane takes the v9 task layout without the
-    /// extension lists (the stored task keeps them).
+    /// Design 0083 D2/D3, design 0098: a worker that registers with protocol 10 on a two-lane
+    /// (QUIC-shaped) session gets the same peer version on both lanes: the accepted `RegisterAck`
+    /// on the control lane echoes 10, and an `AssignTask` on the data lane goes through
+    /// `for_peer(10)` (removing `Master`-scope extensions while keeping non-critical ones and the
+    /// stored task whole).
     #[tokio::test]
-    async fn test_multiplexed_v9_worker_gets_v9_on_both_lanes() {
-        use rusty_grid_core::protocol::deserialize_message_as_v9;
+    async fn test_multiplexed_v10_worker_gets_v10_on_both_lanes() {
+        use rusty_grid_core::protocol::deserialize_message_as_v10;
         use rusty_grid_core::task::Extension;
 
         let registry = WorkerRegistry::new();
@@ -2230,8 +2231,15 @@ mod tests {
         mux_ctrl
             .send_msg(&WorkerMessage::Register {
                 worker_id,
-                capabilities: WorkerCapabilities::new("mux-v9-worker", 2, 4096, false, false, None),
-                protocol_version: 9,
+                capabilities: WorkerCapabilities::new(
+                    "mux-v10-worker",
+                    2,
+                    4096,
+                    false,
+                    false,
+                    None,
+                ),
+                protocol_version: 10,
                 features: ProtocolCapabilities::all_supported(),
             })
             .await
@@ -2241,17 +2249,27 @@ mod tests {
             .await
             .unwrap()
             .expect("RegisterAck");
-        match deserialize_message_as_v9::<MasterMessage>(&ack).unwrap().0 {
+        match deserialize_message_as_v10::<MasterMessage>(&ack).unwrap().0 {
             MasterMessage::RegisterAck {
                 accepted: true,
-                protocol_version: 9,
+                protocol_version: 10,
                 ..
             } => {}
-            other => panic!("expected a RegisterAck stamped 9, got {other:?}"),
+            other => panic!("expected a RegisterAck stamped 10, got {other:?}"),
         }
+        // Only the peer's own version (10) was echoed, not PROTOCOL_VERSION_CURRENT (11).
+        let (raw_ack, _) =
+            rusty_grid_core::protocol::deserialize_message::<MasterMessage>(&ack).unwrap();
+        assert!(matches!(
+            raw_ack,
+            MasterMessage::RegisterAck {
+                protocol_version: 10,
+                ..
+            }
+        ));
         let info = registry.get_worker(worker_id).await.unwrap();
         assert!(
-            info.capabilities.tags.contains(&"proto:9".to_string()),
+            info.capabilities.tags.contains(&"proto:10".to_string()),
             "{:?}",
             info.capabilities.tags
         );
@@ -2264,18 +2282,25 @@ mod tests {
         let mut task = Task::new(
             TaskSpec::Command {
                 program: "echo".into(),
-                args: vec!["v9".into()],
+                args: vec!["v10".into()],
                 env: HashMap::new(),
                 working_dir: None,
                 stdin: None,
             },
             TaskRequirements::generic(1, 64),
         );
-        task.extensions = vec![Extension {
-            id: 0x8001,
-            critical: false,
-            bytes: vec![1],
-        }];
+        task.extensions = vec![
+            Extension {
+                id: 0x8001,
+                critical: false,
+                bytes: vec![1],
+            },
+            Extension {
+                id: 0x8003,
+                critical: true,
+                bytes: vec![2],
+            },
+        ];
         outbound_tx
             .send(MasterMessage::AssignTask { task: task.clone() })
             .await
@@ -2286,20 +2311,17 @@ mod tests {
             .expect("AssignTask must arrive on the data lane")
             .unwrap()
             .expect("a frame");
-        match deserialize_message_as_v9::<MasterMessage>(&frame)
+        match deserialize_message_as_v10::<MasterMessage>(&frame)
             .unwrap()
             .0
         {
             MasterMessage::AssignTask { task: received } => {
                 assert_eq!(received.id, task.id);
-                assert!(received.extensions.is_empty());
+                assert_eq!(received.extensions.len(), 1);
+                assert_eq!(received.extensions[0].id, 0x8001);
             }
             other => panic!("expected AssignTask, got {other:?}"),
         }
-        assert!(
-            rusty_grid_core::protocol::deserialize_message::<MasterMessage>(&frame).is_err(),
-            "the data lane carries the v9 task layout"
-        );
 
         let _ = stop_tx.send(true);
         session_task.abort();
@@ -3425,13 +3447,16 @@ mod tests {
         let _ = stop_tx.send(true);
         let _ = handle.await;
 
-        // 2. v9 peer: also strips ext:* in addition to all other master-owned prefixes.
-        let (ctrl_master_v9, ctrl_worker_v9) = tokio::io::duplex(64 * 1024);
-        let (data_master_v9, _data_worker_v9) = tokio::io::duplex(64 * 1024);
-        let (stop_tx_v9, stop_rx_v9) = watch::channel(false);
-        let pre_auth_v9 = PreAuthSession::new_multiplexed(
-            ctrl_master_v9,
-            data_master_v9,
+        // 2. Minimum compatible peer (`PROTOCOL_VERSION_MIN_COMPATIBLE` = v10): strips
+        //    `opt:*`, `speed:*`, `proto:*`, `state:*`, `id:*`, `link:*`, `feat:*`, while
+        //    preserving `ext:32770` (since v10 >= EXTENSION_PROTOCOL_VERSION), `slots:4`, and
+        //    `user:legit`, and stamps `proto:<min_compatible>`.
+        let (ctrl_master_min, ctrl_worker_min) = tokio::io::duplex(64 * 1024);
+        let (data_master_min, _data_worker_min) = tokio::io::duplex(64 * 1024);
+        let (stop_tx_min, stop_rx_min) = watch::channel(false);
+        let pre_auth_min = PreAuthSession::new_multiplexed(
+            ctrl_master_min,
+            data_master_min,
             SocketAddr::from(([127, 0, 0, 1], 55_001)),
             WireCodec::Json,
             #[cfg(feature = "p2p")]
@@ -3439,76 +3464,86 @@ mod tests {
             #[cfg(feature = "p2p")]
             None,
         );
-        let reg_v9 = registry.clone();
-        let q_v9 = queue.clone();
-        let n_v9 = notify.clone();
-        let w_v9 = waiters.clone();
-        let b_v9 = Arc::clone(&blob_store);
-        let handle_v9 = tokio::spawn(async move {
+        let reg_min = registry.clone();
+        let q_min = queue.clone();
+        let n_min = notify.clone();
+        let w_min = waiters.clone();
+        let b_min = Arc::clone(&blob_store);
+        let handle_min = tokio::spawn(async move {
             WorkerSession::run_connection(
-                pre_auth_v9,
-                reg_v9,
-                q_v9,
-                n_v9,
-                w_v9,
+                pre_auth_min,
+                reg_min,
+                q_min,
+                n_min,
+                w_min,
                 10,
                 Duration::from_secs(5),
-                stop_rx_v9,
+                stop_rx_min,
                 None,
                 WireCodec::Json,
                 None,
                 MasterAuthContext::default(),
                 None,
-                Some(b_v9),
+                Some(b_min),
                 #[cfg(feature = "dashboard")]
                 None,
             )
             .await
         });
 
-        let wid_v9 = Uuid::new_v4();
-        let mut wt_v9 = MessageTransport::with_codec(ctrl_worker_v9, WireCodec::Json);
-        wt_v9
+        let wid_min = Uuid::new_v4();
+        let mut wt_min = MessageTransport::with_codec(ctrl_worker_min, WireCodec::Json);
+        wt_min
             .send_msg(&WorkerMessage::Register {
-                worker_id: wid_v9,
+                worker_id: wid_min,
                 capabilities: caps,
                 protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
                 features: ProtocolCapabilities::empty(),
             })
             .await
             .unwrap();
-        let ack_v9 = wt_v9.recv_msg::<MasterMessage>().await.unwrap();
+        let ack_min = wt_min.recv_msg::<MasterMessage>().await.unwrap();
         assert!(matches!(
-            ack_v9,
+            ack_min,
             Some(MasterMessage::RegisterAck { accepted: true, .. })
         ));
-        let stored_v9 = registry
-            .get_worker(wid_v9)
+        let stored_min = registry
+            .get_worker(wid_min)
             .await
-            .expect("v9 worker registered");
+            .expect("min compatible worker registered");
         for forbidden in [
-            "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:", "ext:",
+            "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:",
         ] {
             assert!(
-                !stored_v9
+                !stored_min
                     .capabilities
                     .tags
                     .iter()
                     .any(|t| t.starts_with(forbidden)),
-                "v9 forged prefix `{forbidden}` survived Register sanitization: {:?}",
-                stored_v9.capabilities.tags
+                "min-compatible forged prefix `{forbidden}` survived Register sanitization: {:?}",
+                stored_min.capabilities.tags
             );
         }
-        assert!(stored_v9.capabilities.tags.iter().any(|t| t == "slots:4"));
-        assert!(stored_v9
+        assert!(stored_min
+            .capabilities
+            .tags
+            .iter()
+            .any(|t| t == "ext:32770"));
+        assert!(stored_min.capabilities.tags.iter().any(|t| t == "slots:4"));
+        assert!(stored_min
             .capabilities
             .tags
             .iter()
             .any(|t| t == "user:legit"));
-        assert!(stored_v9.capabilities.tags.iter().any(|t| t == "proto:9"));
+        assert!(stored_min.capabilities.tags.iter().any(|t| {
+            t == &format!(
+                "proto:{}",
+                rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE
+            )
+        }));
 
-        let _ = stop_tx_v9.send(true);
-        let _ = handle_v9.await;
+        let _ = stop_tx_min.send(true);
+        let _ = handle_min.await;
     }
 
     #[tokio::test]

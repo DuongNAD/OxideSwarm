@@ -1,16 +1,16 @@
-//! Cross-version tests of the compatibility window (design 0083 D7).
+//! Cross-version tests of the compatibility window (design 0083 D7, design 0098).
 //!
 //! `tests/data/wire_layout_previous.txt` is the `wire_layout.txt` of the latest release that speaks
-//! `PROTOCOL_VERSION_CURRENT - 1` (v0.3.0, protocol 9), copied from its tag. It is the oracle:
-//! the bytes a v9 peer really sent and really read, so no encoder written here can drift from
-//! them. The stamp of a `ClientMessage` / `ClientResponse` entry is its last four bytes; the
-//! current file records it as `0`, the previous one still holds the stamp 9.
+//! `PROTOCOL_VERSION_CURRENT - 1` (`v0.4.5`, protocol 10), copied from its tag. It is the oracle:
+//! the bytes a v10 peer really sent and really read, so no encoder written here can drift from
+//! them. Both the previous file and the current file record the trailing four-byte stamp of
+//! `ClientMessage` and `ClientResponse` as `0`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::protocol::{
-    deserialize_message, deserialize_message_as_v9, deserialize_message_with_version,
+    deserialize_message, deserialize_message_as_v10, deserialize_message_with_version,
     serialize_message_for_peer, ClientMessage, ClientResponse, MasterMessage, WireCodec,
     WorkerMessage, PROTOCOL_VERSION_CURRENT, PROTOCOL_VERSION_MIN_COMPATIBLE, WIRE_FORMAT_BINCODE,
 };
@@ -22,27 +22,19 @@ use crate::wire_layout_tests::{
 };
 
 /// The version the previous file records.
-const PREVIOUS: u32 = 9;
+const PREVIOUS: u32 = 10;
 
 /// Entries of the current layout that differ from the previous release's, with the reason. A
-/// fourth entry that changes without being listed fails the test, and so does a listed one that no
+/// new entry that changes without being listed fails the test, and so does a listed one that no
 /// longer differs (design 0083 D7.3).
 const DIFFERS_FROM_PREVIOUS: &[(&str, &str)] = &[
     (
-        "ClientMessage::SubmitTask",
-        "carries a Task, which gained the `extensions` lists in protocol 10",
+        "ClientResponse::ClusterStatus",
+        "gained `cancelled_tasks: usize` in protocol 11 (BUG-22)",
     ),
     (
-        "MasterMessage::AssignTask",
-        "carries a Task, which gained the `extensions` lists in protocol 10",
-    ),
-    (
-        "MasterMessage::AssignTaskWithCheckpoint",
-        "carries a Task, which gained the `extensions` lists in protocol 10",
-    ),
-    (
-        "MasterMessage::RoleHandoverAck",
-        "holds a Vec<Task>, and Task gained the `extensions` lists in protocol 10",
+        "ClientResponse::Hello",
+        "canonical sample carries PROTOCOL_VERSION_MIN_COMPATIBLE (10 in protocol 11 vs 9 in protocol 10); wire layout is unchanged",
     ),
 ];
 
@@ -73,12 +65,6 @@ fn is_stamped(key: &str) -> bool {
     key.starts_with("ClientMessage::") || key.starts_with("ClientResponse::")
 }
 
-/// A canonical sample as a v9 peer would have received it: no extensions.
-fn clear_extensions(task: &mut Task) {
-    task.extensions.clear();
-    task.requirements.extensions.clear();
-}
-
 #[test]
 fn previous_file_is_the_release_the_window_reaches_back_to() {
     let text = previous_text();
@@ -91,8 +77,8 @@ fn previous_file_is_the_release_the_window_reaches_back_to() {
     assert_eq!(PROTOCOL_VERSION_MIN_COMPATIBLE, PREVIOUS);
 }
 
-/// D7.1: every message a v9 peer sends is read by the current decoder, and what comes out is the
-/// canonical sample (with no extensions for the `Task` carrier).
+/// D7.1: every message a v10 peer sends is read by the current decoder, and what comes out is the
+/// canonical sample.
 #[test]
 fn peer_to_master_previous_bytes_decode_to_the_canonical_samples() {
     let previous = previous_layout();
@@ -100,9 +86,9 @@ fn peer_to_master_previous_bytes_decode_to_the_canonical_samples() {
 
     for (variant, expected) in worker_messages() {
         let key = format!("WorkerMessage::{variant}");
-        let Some(hex) = previous.get(&key) else {
-            continue;
-        };
+        let hex = previous
+            .get(&key)
+            .unwrap_or_else(|| panic!("{key} is not in the previous file"));
         let (decoded, codec) = deserialize_message::<WorkerMessage>(&frame_of(hex))
             .unwrap_or_else(|e| panic!("{key}: {e}"));
         assert_eq!(codec, WireCodec::Bincode);
@@ -110,26 +96,31 @@ fn peer_to_master_previous_bytes_decode_to_the_canonical_samples() {
         checked += 1;
     }
 
-    for (variant, mut expected) in client_messages() {
+    for (variant, expected) in client_messages() {
         let key = format!("ClientMessage::{variant}");
         let hex = previous
             .get(&key)
             .unwrap_or_else(|| panic!("{key} is not in the previous file"));
+        assert!(
+            hex.ends_with(&to_hex(&RECORDED_STAMP.to_le_bytes())),
+            "{key}: previous release file records stamp {RECORDED_STAMP}"
+        );
+        // A live v10 client stamps 10 at the end of the frame instead of RECORDED_STAMP (0).
+        let wire_hex = format!("{}{}", without_stamp(hex), to_hex(&PREVIOUS.to_le_bytes()));
         let (decoded, codec, stamp) =
-            deserialize_message_with_version::<ClientMessage>(&frame_of(hex))
+            deserialize_message_with_version::<ClientMessage>(&frame_of(&wire_hex))
                 .unwrap_or_else(|e| panic!("{key}: {e}"));
         assert_eq!(codec, WireCodec::Bincode);
-        assert_eq!(stamp, Some(PREVIOUS), "{key}: the stamp of the v9 peer");
-        if let ClientMessage::SubmitTask { task, .. } = &mut expected {
-            clear_extensions(task);
-        }
+        assert_eq!(stamp, Some(PREVIOUS), "{key}: the stamp of the v10 peer");
         assert_eq!(decoded, expected, "{key}");
         checked += 1;
     }
-    assert!(checked > 20, "only {checked} previous entries were decoded");
+    assert!(checked > 25, "only {checked} previous entries were decoded");
 }
 
-/// D7.2: what the master sends a v9 peer is exactly what v0.3.0 recorded, byte for byte.
+/// D7.2: what the master sends a v10 peer is exactly what v0.4.5 recorded (with `ClusterStatus`
+/// folding `cancelled_tasks` into `failed_tasks` and `Hello` reporting the master's current
+/// `PROTOCOL_VERSION_MIN_COMPATIBLE`), byte for byte.
 #[test]
 fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
     let previous = previous_layout();
@@ -137,9 +128,9 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
 
     for (variant, msg) in master_messages() {
         let key = format!("MasterMessage::{variant}");
-        let Some(recorded) = previous.get(&key) else {
-            continue;
-        };
+        let recorded = previous
+            .get(&key)
+            .unwrap_or_else(|| panic!("{key} is not in the previous file"));
         let frame = serialize_message_for_peer(&msg, WireCodec::Bincode, PREVIOUS).unwrap();
         let mut expected = recorded.clone();
         if let MasterMessage::RegisterAck {
@@ -159,8 +150,8 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
         }
         assert_eq!(to_hex(&frame[1..]), expected, "{key}");
 
-        // The frozen v9 reader reads it back as the message with its task for a v9 peer.
-        let (read, _) = deserialize_message_as_v9::<MasterMessage>(&frame).unwrap();
+        // The frozen v10 reader reads it back with the echoed peer version.
+        let (read, _) = deserialize_message_as_v10::<MasterMessage>(&frame).unwrap();
         let mut want = msg.clone();
         match &mut want {
             MasterMessage::RegisterAck {
@@ -182,7 +173,7 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
             }
             _ => {}
         }
-        assert_eq!(read, want, "{key}: the v9 reader");
+        assert_eq!(read, want, "{key}: the v10 reader");
         checked += 1;
     }
 
@@ -191,20 +182,40 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
         let recorded = previous
             .get(&key)
             .unwrap_or_else(|| panic!("{key} is not in the previous file"));
+        assert!(
+            recorded.ends_with(&to_hex(&RECORDED_STAMP.to_le_bytes())),
+            "{key}: previous release file records stamp {RECORDED_STAMP}"
+        );
         let frame = serialize_message_for_peer(&resp, WireCodec::Bincode, PREVIOUS).unwrap();
-        let mut expected = recorded.clone();
-        if matches!(resp, ClientResponse::Error { .. }) {
-            // `Error` keeps stamping the current version, which a v9 peer reads without a check.
-            expected = format!(
+        let stamp_hex = if matches!(resp, ClientResponse::Error { .. }) {
+            // `Error` keeps stamping the current version, which a v10 peer reads without a check.
+            to_hex(&PROTOCOL_VERSION_CURRENT.to_le_bytes())
+        } else {
+            to_hex(&PREVIOUS.to_le_bytes())
+        };
+        let body = if let ClientResponse::Hello {
+            min_compatible_version,
+        } = &resp
+        {
+            // v0.4.5's canonical `Hello` carried `min_compatible_version = 9`; protocol 11's master
+            // reports its own `min_compatible_version = 10` in the unchanged field slot.
+            let prev_body = without_stamp(recorded);
+            let old_min = to_hex(&9u32.to_le_bytes());
+            assert!(prev_body.ends_with(&old_min), "{key}: v0.4.5 Hello min");
+            format!(
                 "{}{}",
-                without_stamp(&expected),
-                to_hex(&PROTOCOL_VERSION_CURRENT.to_le_bytes())
-            );
-        }
+                &prev_body[..prev_body.len() - 8],
+                to_hex(&min_compatible_version.to_le_bytes())
+            )
+        } else {
+            without_stamp(recorded).to_string()
+        };
+        let expected = format!("{body}{stamp_hex}");
         assert_eq!(to_hex(&frame[1..]), expected, "{key}");
-        let (read, _) = deserialize_message_as_v9::<ClientResponse>(&frame)
-            .unwrap_or_else(|e| panic!("{key}: the v9 reader: {e}"));
-        assert_eq!(read, resp, "{key}: the v9 reader");
+
+        let (read, _) = deserialize_message_as_v10::<ClientResponse>(&frame)
+            .unwrap_or_else(|e| panic!("{key}: the v10 reader: {e}"));
+        assert_eq!(read, resp.for_peer(PREVIOUS), "{key}: the v10 reader");
         checked += 1;
     }
     assert!(checked > 25, "only {checked} previous entries were encoded");
@@ -214,7 +225,6 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
 #[test]
 fn only_the_listed_entries_differ_from_the_previous_release() {
     let previous = previous_layout();
-    // The stamps are normalised: the previous file records 9, the current one 0.
     let normalise = |layout: &BTreeMap<String, String>| -> BTreeMap<String, String> {
         layout
             .iter()
@@ -231,8 +241,8 @@ fn only_the_listed_entries_differ_from_the_previous_release() {
     for (key, hex) in &previous {
         if is_stamped(key) {
             assert!(
-                hex.ends_with(&to_hex(&PREVIOUS.to_le_bytes())),
-                "{key}: the previous file stamps {PREVIOUS}"
+                hex.ends_with(&to_hex(&RECORDED_STAMP.to_le_bytes())),
+                "{key}: the previous file records the stamp {RECORDED_STAMP}"
             );
         }
     }
@@ -270,25 +280,25 @@ fn only_the_listed_entries_differ_from_the_previous_release() {
 #[test]
 fn window_rule_and_previous_file_rule() {
     let previous = previous_text();
-    let closed_current = format!("# protocol_version: {PREVIOUS}\n");
+    let closed_current = "# protocol_version: 9\n".to_string();
 
     // Window open (MIN = CURRENT - 1) with the previous file: fine.
-    verify_previous_layout_file(10, 9, Some(&previous)).unwrap();
+    verify_previous_layout_file(11, 10, Some(&previous)).unwrap();
     // Window open without a previous file: refused, and the message says what to copy.
-    let err = verify_previous_layout_file(10, 9, None).unwrap_err();
+    let err = verify_previous_layout_file(11, 10, None).unwrap_err();
     assert!(err.contains("git show"), "{err}");
     // Window closed with a previous file left over: refused.
-    let err = verify_previous_layout_file(10, 10, Some(&previous)).unwrap_err();
+    let err = verify_previous_layout_file(11, 11, Some(&previous)).unwrap_err();
     assert!(err.contains("must be deleted"), "{err}");
     // Window closed without one: fine.
-    verify_previous_layout_file(10, 10, None).unwrap();
+    verify_previous_layout_file(11, 11, None).unwrap();
     // A previous file for the wrong version: refused.
     assert!(verify_previous_layout_file(11, 10, Some(&closed_current)).is_err());
     // More than one version back: refused.
     assert!(verify_window_range(11, 9).is_err());
     assert!(verify_previous_layout_file(11, 9, Some(&previous)).is_err());
     // MIN above CURRENT: refused.
-    assert!(verify_window_range(10, 11).is_err());
+    assert!(verify_window_range(11, 12).is_err());
 }
 
 /// Defense in depth (design 0083, M1): a task with a critical `Worker`/`Both` extension is

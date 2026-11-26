@@ -1101,13 +1101,15 @@ async fn test_cluster_buckets_cover_every_state() {
         (stats.queued, stats.scheduled, stats.running, stats.retrying),
         (1, 1, 1, 1)
     );
-    let (pending, running_bucket, completed_bucket, failed_bucket) = stats.cluster_buckets();
+    let (pending, running_bucket, completed_bucket, failed_bucket, cancelled_bucket) =
+        stats.cluster_buckets();
     assert_eq!(pending, 2, "queued + retrying");
     assert_eq!(running_bucket, 2, "scheduled + running");
     assert_eq!(completed_bucket, 1);
-    assert_eq!(failed_bucket, 2, "failed + cancelled");
+    assert_eq!(failed_bucket, 1);
+    assert_eq!(cancelled_bucket, 1);
     assert_eq!(
-        pending + running_bucket + completed_bucket + failed_bucket,
+        pending + running_bucket + completed_bucket + failed_bucket + cancelled_bucket,
         stats.total
     );
 }

@@ -5,6 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Wire change (protocol 11)
+- Bumped `PROTOCOL_VERSION_CURRENT` to `11` and `PROTOCOL_VERSION_MIN_COMPATIBLE` to `10` ([design 0098](docs/design/0098-protocol-11-train.md)), promoting release `v0.4.5`'s wire layout to `crates/core/tests/data/wire_layout_previous.txt` and preparing the shared protocol `11` train for Planned `NET-10` and `ECO-9` follow-on wire pull requests (`0.5.0`, `Q101`). `0.3.0` (`protocol 9`) workers and clients are now refused outside the `10..=11` window; operators must upgrade any remaining `proto:9` peers to `0.4.x` (`proto:10`) first, then upgrade and restart the master before rolling `proto:10` workers and clients (`DEPLOYMENT.md` section 3.5).
+- `BUG-22`: Added `cancelled_tasks: usize` to `ClientResponse::ClusterStatus`, `oxideswarm status`, `oxideswarm status --json`, and MCP `status` so cancelled tasks are counted apart from `failed_tasks` (while folding `cancelled_tasks` into `failed_tasks` for protocol `10` peers).
+
 ## [0.4.5] - 2026-11-25
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` to `0.4.4`. It fixes the update of a running Windows USB kit worker and the uninstall prompt (`BUG-38`), the available RAM that macOS workers under-reported and the `doctor` GPU probe it left queued (`BUG-37`), the macOS spawn stall under concurrent tasks (`BUG-35`), the printed Windows `icacls` remedy (`BUG-39`) and console windows of Windows tasks (`TEST-88`); it adds the user-local install scripts (`ADOPT-3`), client-side `submit --matrix` and `shard` runs (`AX-1`, `AX-2`), process-task checkpoints (`FEAT-5`), verified Agent Mesh delivery and the remote master bridge (`MESH-2`, `MESH-3`), 3D routing fixes (`3D-2`, `3D-3`), the endurance harness and its records (`TEST-24` to `TEST-26`), and removes wall-clock windows from the test suites (`TEST-57` to `TEST-99`; `TEST-70` to `TEST-72`, `TEST-75` and `TEST-76` did not land).

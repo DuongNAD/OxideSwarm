@@ -565,6 +565,7 @@ async fn sched2_max_queue_size_scheduler_policy_wire_codec_timeout_and_p2p_ticke
                             running_tasks: 0,
                             completed_tasks: 0,
                             failed_tasks: 0,
+                            cancelled_tasks: 0,
                             active_bytes: 0,
                             max_active_bytes: 0,
                             store_error: None,

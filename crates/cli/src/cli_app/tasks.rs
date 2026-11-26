@@ -229,6 +229,7 @@ async fn run_status_inner(
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                cancelled_tasks,
                 active_bytes,
                 max_active_bytes,
                 store_error,
@@ -263,6 +264,7 @@ async fn run_status_inner(
                         "running_tasks": running_tasks,
                         "completed_tasks": completed_tasks,
                         "failed_tasks": failed_tasks,
+                        "cancelled_tasks": cancelled_tasks,
                         "active_bytes": active_bytes,
                         "max_active_bytes": max_active_bytes,
                         "worker_count": workers.len(),
@@ -284,6 +286,7 @@ async fn run_status_inner(
                     println!("Running Tasks:    {}", running_tasks);
                     println!("Completed Tasks:  {}", completed_tasks);
                     println!("Failed Tasks:     {}", failed_tasks);
+                    println!("Cancelled Tasks:  {}", cancelled_tasks);
                     println!(
                         "Active Budget:    {} / {} bytes ({:.2} / {:.2} MiB)",
                         active_bytes,

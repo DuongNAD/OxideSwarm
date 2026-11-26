@@ -767,7 +767,7 @@ async fn api_status(
             worker_id: t.assigned_worker_id.map(|u| u.to_string()),
         })
         .collect();
-    let (pending, running, _, _) = stats.cluster_buckets();
+    let (pending, running, _, _, _) = stats.cluster_buckets();
 
     let store_error = stats.store_error.clone();
     let tasks = DashboardTasks {
