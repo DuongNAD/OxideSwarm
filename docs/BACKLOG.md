@@ -129,6 +129,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
 | Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-5 |
+| Q100 | Where do task path leases live first: git refs on the project's remote, or the master? | Git refs: no wire change, visible to people, survive a master restart ([design 0111](design/0111-team-plan-leases-and-verify-gate.md) D3) | TEAM-2 |
 
 ## Index
 
@@ -217,6 +218,7 @@ Recounted on 2026-11-24 from the rows with pull request 462: 291 items, 202 Impl
 Recounted on 2026-11-24 from the rows with pull request 411: 291 items, 202 Implemented, 22 Partial and 67 Planned; 20 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 464: 292 items, 202 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 465: 298 items, 202 Implemented, 22 Partial and 74 Planned; 22 open items are In and 74 are Out.
+Recounted on 2026-11-24 from the rows with pull request 466: 305 items, 202 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -468,6 +470,13 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Implemented |  | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
+| TEAM-1 | Shared plan file `.oxideswarm/plan.toml`, `plan check` and a 30-line snapshot | P2 | M | AX-1 |  | Planned | Out | (design 0111) |
+| TEAM-2 | Task claims and path leases as git refs, worktrees, `plan check-diff` | P2 | M | TEAM-1 | Q100 | Planned | Out | (design 0111) |
+| TEAM-3 | Verify gate: sync a worktree, run the task's profiles, return compact failure JSON | P2 | M | TEAM-1, AX-2 |  | Planned | Out | (design 0111) |
+| TEAM-4 | Circuit breaker after three identical failures, notice to the person | P2 | S | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
+| TEAM-5 | Merge flow with a verify table; this project's first wave on the plan | P2 | M | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
+| TEAM-6 | Grid mailbox in the master: messages, events and files between machines, long-poll wait (protocol 11, release 0.5.0, Q101) | P2 | L | TEAM-1, PROTO-4 | Q101 | Planned | Out | (design 0111) |
+| TEAM-7 | Wake-ups for idle agents (`mail watch --hook`, MCP `mail_wait`) and an `agent_bridge.py` grid backend | P2 | M | TEAM-6 |  | Planned | Out | (design 0111) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
@@ -1828,6 +1837,23 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A client sees the first output line while the task runs. An MCP client polls a
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
+
+### TEAM-1 to TEAM-7: One project, several coding agents and machines
+
+- **Evidence:** This project's own process since 2026-11: agents reported work as verified when it was not,
+  parallel agents edited the same files (`docs/BACKLOG.md`, `CHANGELOG.md`, test files), day queues on the Drive
+  hub and this backlog are too long to load into an agent's context each time, and a failing test was retried by
+  an agent many times before a person saw it. The grid can verify on several systems (AX-1, AX-2, workspaces) but
+  has no notion of who works on what.
+- **Do:** [Design 0111](design/0111-team-plan-leases-and-verify-gate.md): TEAM-1 the shared plan
+  `.oxideswarm/plan.toml`, `plan check` and the snapshot of at most 30 lines (`plan status`, MCP `plan_snapshot`);
+  TEAM-2 claims and path leases as refs `refs/oxideswarm/lease/<task>` (create-only push, fast-forward renew,
+  takeover after expiry), worktrees and `plan check-diff`; TEAM-3 the verify gate (`verify`, at most 4 KB of
+  failures, worker, link and toolchain per cell); TEAM-4 the circuit breaker; TEAM-5 the pull request table,
+  re-verify on the latest base, and this project's first wave run on the plan (no wire change); TEAM-6 a mailbox in
+  the master for events, notes and files with a long-poll wait (protocol 11), and TEAM-7 wake-ups for idle agents
+  and a grid backend for `agent_bridge.py`, replacing the Drive hub.
+- **Done when:** Test plan T1 to T5 of design 0111 pass or are recorded, T4 with zero file conflicts.
 
 ### BUG-36: `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout
 
