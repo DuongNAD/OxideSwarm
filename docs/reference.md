@@ -768,7 +768,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--arch <ARCH>` | — | Pin to worker CPU architecture: `x86_64` (`amd64`, `x64`), `aarch64` (`arm64`) |
 | `--worker <NAME\|ID>` | — | Pin to a specific worker by name (case-insensitive) or UUID prefix |
 | `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`; reserved prefixes such as `opt:` and `speed:` are refused) |
-| `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, e.g. `cargo`, `rustc`, `git`) |
+| `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, probed at start-up: `cargo`, `rustc`, `git`, `python`; `python` tries `python` then `python3` and requires `Python 3.` output, skipping `%LOCALAPPDATA%\Microsoft\WindowsApps` on Windows and `/usr/bin/python3` or `/usr/bin/git` on macOS when `xcode-select -p` fails, [design 0110](design/0110-tools-on-kit-machines.md)) |
 | `--require-isolation <LEVEL>` | — | Require a worker confined at least at `fs` or `fs+net` (`worker --isolation`); the constraint is `require:iso=<level>`, met when the worker's `iso:` tag is at that level or above (`off < fs < fs+net`; a worker without the tag counts as `off`) |
 | `--source <PATH[:SANDBOX]>` (alias `--source-dir`) | Repeatable | Compile tasks: Rust source file or Cargo crate directory to compile (`cargo build --offline` when `Cargo.toml` is present, else `rustc`) |
 | `--stdin-file <PATH>` | — | Command tasks: send a local file (at most 32 MiB) as standard input |
