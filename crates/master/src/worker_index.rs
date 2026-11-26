@@ -216,10 +216,10 @@ impl WorkerAttrIndex {
         let mut seen_tags: HashSet<String> = HashSet::new();
 
         for (idx, worker) in workers.iter().enumerate() {
-            if worker.status != WorkerStatus::Disconnected {
+            if worker.status != WorkerStatus::Disconnected && !worker.paused {
                 connected.set(idx);
             }
-            if worker.capabilities.can_execute_gpu() {
+            if worker.capabilities.can_execute_gpu() && !worker.gpu_paused {
                 gpu.set(idx);
             }
             if worker.capabilities.has_blender {

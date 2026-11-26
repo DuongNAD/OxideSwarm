@@ -737,9 +737,10 @@ impl<'a> Engine<'a> {
             }
             seat_meta.push(SeatStaticMeta {
                 host_busy: seat.worker.cpu_usage_pct > config.max_host_cpu_pct,
-                is_gpu: seat.worker.capabilities.can_execute_gpu(),
+                is_gpu: seat.worker.capabilities.can_execute_gpu() && !seat.worker.gpu_paused,
                 is_real_gpu: seat.worker.capabilities.has_gpu
-                    && !seat.worker.capabilities.is_simulated_gpu,
+                    && !seat.worker.capabilities.is_simulated_gpu
+                    && !seat.worker.gpu_paused,
                 initial_load: seat.base.tasks,
             });
             remaining_slots.push(rem);
@@ -1570,10 +1571,9 @@ impl<'a> Engine<'a> {
         let prefer_cpu_only = config.preserve_gpu_for_gpu_tasks && !requires_gpu;
         let gpu_pref = |a: &Seat<'_>, b: &Seat<'_>| {
             if prefer_cpu_only {
-                a.worker
-                    .capabilities
-                    .can_execute_gpu()
-                    .cmp(&b.worker.capabilities.can_execute_gpu())
+                let a_gpu = a.worker.capabilities.can_execute_gpu() && !a.worker.gpu_paused;
+                let b_gpu = b.worker.capabilities.can_execute_gpu() && !b.worker.gpu_paused;
+                a_gpu.cmp(&b_gpu)
             } else if requires_gpu {
                 let a_real =
                     a.worker.capabilities.has_gpu && !a.worker.capabilities.is_simulated_gpu;
@@ -1956,7 +1956,7 @@ impl WorkloadScheduler {
         }
         let gpu_workers: Vec<&WorkerInfo> = workers
             .iter()
-            .filter(|w| w.capabilities.can_execute_gpu())
+            .filter(|w| w.capabilities.can_execute_gpu() && !w.gpu_paused)
             .collect();
         if gpu_workers.is_empty() {
             return (false, false);
@@ -2967,6 +2967,8 @@ mod tests {
             ram_available_mb: ram_mb,
             features: ProtocolCapabilities::all_supported(),
             mobile_status: None,
+            paused: false,
+            gpu_paused: false,
         }
     }
 

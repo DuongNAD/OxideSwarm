@@ -1169,6 +1169,8 @@ async fn test_workspace_tasks_are_not_placed_on_workers_without_the_workspaces_b
         cpu_usage_pct: 0.0,
         ram_available_mb: 8192,
         mobile_status: None,
+        paused: false,
+        gpu_paused: false,
     };
     let cfg = SchedulerConfig::default();
     let tasks = vec![ws_task.clone(), plain_task.clone()];

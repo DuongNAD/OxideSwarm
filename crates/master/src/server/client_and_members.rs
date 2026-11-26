@@ -106,7 +106,11 @@ async fn listed_worker(
     caps.tags.push(format!(
         "{}{}",
         rusty_grid_core::placement::STATE_TAG_PREFIX,
-        w.status.as_str()
+        if w.paused && w.status != crate::registry::WorkerStatus::Disconnected {
+            "paused"
+        } else {
+            w.status.as_str()
+        }
     ));
     if w.features
         .contains(rusty_grid_core::protocol::ProtocolCapabilities::WORKSPACES)

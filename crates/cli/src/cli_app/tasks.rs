@@ -717,7 +717,7 @@ pub(super) fn worker_state(w: &rusty_grid_core::WorkerCapabilities) -> Option<&s
 /// Whether a listed worker is connected. A worker without a `state:` tag counts as connected,
 /// which is how such a listing was meant before the master added the tag.
 pub(super) fn worker_is_connected(w: &rusty_grid_core::WorkerCapabilities) -> bool {
-    worker_state(w).is_none_or(|state| state == "connected")
+    worker_state(w).is_none_or(|state| state != "disconnected")
 }
 
 pub(super) fn parse_worker_speed_str(w: &rusty_grid_core::WorkerCapabilities) -> Option<&str> {

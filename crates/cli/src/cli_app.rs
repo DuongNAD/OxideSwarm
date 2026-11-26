@@ -425,8 +425,10 @@ pub struct MasterArgs {
     pub rendezvous: Option<String>,
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct WorkerArgs {
+    #[command(subcommand)]
+    pub action: Option<WorkerControlSubcommand>,
     #[arg(
         long,
         help = "Address of the Master's grid port (default 127.0.0.1:8088, the dashboard is on :8080); a bare host gets :8088; 'auto' discovers it on the LAN; for a P2P ticket use --p2p-ticket"
@@ -612,6 +614,110 @@ pub struct WorkerArgs {
         help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
     )]
     pub rendezvous: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Local Unix socket or Windows named pipe for worker pause/resume/status/limits control (env RUSTY_GRID_CONTROL_SOCKET)"
+    )]
+    pub control_socket: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Refuse GPU tasks while continuing to accept CPU tasks (env RUSTY_GRID_NO_GPU_TASKS)"
+    )]
+    pub no_gpu_tasks: bool,
+
+    #[arg(
+        long,
+        help = "Also hand back running tasks when an automatic contributor limit holds the worker"
+    )]
+    pub hold_ends_tasks: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkerControlSubcommand {
+    /// Pause this worker immediately and hand back running tasks uncharged
+    Pause(WorkerPauseArgs),
+    /// Resume a paused worker
+    Resume(WorkerControlTargetArgs),
+    /// Query local worker pause state and active contributor limits
+    Status(WorkerControlTargetArgs),
+    /// Get or set contributor limits on a running worker
+    Limits(WorkerLimitsArgs),
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub struct WorkerPauseArgs {
+    #[arg(
+        long,
+        value_name = "WHEN",
+        help = "Automatically resume after duration (e.g. 2h, 30m) or time (HH:MM, RFC3339)"
+    )]
+    pub until: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Reason recorded locally for the pause"
+    )]
+    pub reason: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to worker control socket or named pipe"
+    )]
+    pub control_socket: Option<PathBuf>,
+
+    #[arg(long, help = "Named worker to target (matches worker --name)")]
+    pub name: Option<String>,
+
+    #[arg(long, help = "Output machine-readable JSON")]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub struct WorkerControlTargetArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to worker control socket or named pipe"
+    )]
+    pub control_socket: Option<PathBuf>,
+
+    #[arg(long, help = "Named worker to target (matches worker --name)")]
+    pub name: Option<String>,
+
+    #[arg(long, help = "Output machine-readable JSON")]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct WorkerLimitsArgs {
+    #[command(subcommand)]
+    pub op: WorkerLimitsSubcommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkerLimitsSubcommand {
+    /// Print the running worker's contributor limits
+    Get(WorkerControlTargetArgs),
+    /// Set a contributor limit key and persist it into [worker] in config
+    Set {
+        key: String,
+        value: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Path to worker control socket or named pipe"
+        )]
+        control_socket: Option<PathBuf>,
+        #[arg(long, help = "Named worker to target (matches worker --name)")]
+        name: Option<String>,
+        #[arg(long, help = "Output machine-readable JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Parser, Debug, Clone, Default)]
