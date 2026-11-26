@@ -473,7 +473,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
 | BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Planned | In |  |
-| BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Planned | In |  |
+| BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Implemented |  |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -1692,6 +1692,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** a worker started with only a ticket never dials `127.0.0.1:8088`, its P2P failure lines name the
   ticket target, the Android-style ticket-plus-address fallback still works (existing tests), and the change is in
   a 0.4.x patch.
+- **Fix (`win/bug-40-ticket-only-no-tcp-fallback`):**
+  - `crates/cli/src/cli_app/worker.rs`: `resolve_worker_target_from` now resolves `p2p_ticket` first and sets `master_addr` to `""` (instead of `DEFAULT_MASTER_ADDR`) when a ticket is configured without an explicit `--master`, `RUSTY_GRID_MASTER_ADDR` / `RUSTY_GRID_MASTER`, or `[worker].master`, while preserving explicit master+ticket fallback (including Android's `start_worker_impl`) and ticketless `DEFAULT_MASTER_ADDR`. `run_worker` also passes `iroh://<node_id>` (via `peer_announce_target`) to `announce_peer_secret` instead of `""` (`"auto"`).
+  - `crates/worker/src/client/session.rs`: `establish_p2p_with_ticket` and `establish_stream` now log `master=iroh://<node_id>` on P2P dial attempts, stale-ticket errors, `no TCP fallback address configured` warnings, and explicit TCP fallback warnings (`tcp_fallback=<addr>`).
+  - `docs/reference.md`: documented the ticket-only no-TCP-fallback rule under `oxideswarm worker`.
+  - Failing-first tests added in `crates/cli/src/cli_app/worker.rs` (`bug40_ticket_only_has_no_tcp_fallback_while_explicit_master_keeps_it`) and `crates/worker/src/client/tests.rs` (`test_bug40_ticket_only_has_no_tcp_fallback_and_logs_node_id`, `test_bug40_ticket_plus_explicit_address_falls_back_to_tcp_and_logs_p2p_target`). Verified on Windows 11 (`origin/master` `b253f601`, `cargo +1.96.0 --locked`).
 
 ## Phase 13: the path to finished
 
@@ -3433,3 +3438,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: BUG-40 Implemented (`win/bug-40-ticket-only-no-tcp-fallback`): `resolve_worker_target_from` (`crates/cli/src/cli_app/worker.rs`) now resolves `master_addr` to `""` when a P2P ticket is set without an explicit `--master` / `RUSTY_GRID_MASTER[_ADDR]` / `[worker].master` (keeping explicit master+ticket fallback and Android unchanged, and passing `iroh://<node_id>` to `announce_peer_secret`); `WorkerClient::establish_stream` and `establish_p2p_with_ticket` (`crates/worker/src/client/session.rs`) now log `master=iroh://<node_id>` on P2P attempts, stale errors, ticket-only failure warnings, and explicit TCP fallback warnings (`tcp_fallback=<addr>`); updated `docs/reference.md`. Verified failing-first tests before fix and post-fix Windows 11 passes (`rusty_grid_cli --lib` `231/231`, `rusty_grid_worker --lib client::tests` `85/85`, `worker_connection_lifecycle` `12/12`, `rusty_grid_android_bridge --lib` `16/16`, workspace `clippy` `0` warnings, `fmt`, live `oxideswarm.exe` smoke check, `test_m1_challenger_hygiene.py`, `f2_t2_backlog_no_duplicate_ids_and_valid_lines`).
