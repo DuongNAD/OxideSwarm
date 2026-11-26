@@ -711,8 +711,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `oxideswarm worker` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`) |
-| `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` when no P2P ticket is set (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`; when set alongside `--p2p-ticket`, acts as TCP fallback if P2P dial fails) |
+| `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN (dials P2P only with no TCP fallback to `127.0.0.1:8088` unless an explicit `--master` / env / `[worker].master` address is also configured) |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
 | `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` (`os:`, `arch:`, `slots:`, `link:`, `id:`, `state:`, `iso:`, `tool:`, `feat:`, `ext:`, `proto:`, `opt:`, and `speed:` are reserved) |
