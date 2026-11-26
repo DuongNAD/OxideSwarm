@@ -97,8 +97,8 @@ pub fn parse_verify_record(json_str: &str) -> Result<VerifyRecord, String> {
         .map_err(|e| format!("invalid verify record JSON: {e}"))
 }
 
-/// Parses either a single JSON object, a JSON array of [`VerifyRecord`]s, or newline-delimited
-/// JSON objects (JSONL) into a `Vec<VerifyRecord>`.
+/// Parses either a JSON array of [`VerifyRecord`]s, or a whitespace-separated stream of one or more
+/// JSON [`VerifyRecord`] objects (single object, JSONL, or concatenated pretty-printed files).
 pub fn parse_verify_records(input: &str) -> Result<Vec<VerifyRecord>, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -108,18 +108,13 @@ pub fn parse_verify_records(input: &str) -> Result<Vec<VerifyRecord>, String> {
         return serde_json::from_str::<Vec<VerifyRecord>>(trimmed)
             .map_err(|e| format!("invalid verify record array JSON: {e}"));
     }
-    if let Ok(single) = serde_json::from_str::<VerifyRecord>(trimmed) {
-        return Ok(vec![single]);
-    }
 
     let mut out = Vec::new();
-    for (idx, line) in trimmed.lines().enumerate() {
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
-        }
-        let rec = parse_verify_record(l)
-            .map_err(|e| format!("invalid verify record at line {}: {e}", idx + 1))?;
+    for (idx, item) in serde_json::Deserializer::from_str(trimmed)
+        .into_iter::<VerifyRecord>()
+        .enumerate()
+    {
+        let rec = item.map_err(|e| format!("invalid verify record #{}: {e}", idx + 1))?;
         out.push(rec);
     }
     Ok(out)
@@ -617,6 +612,11 @@ mod tests {
         let jsonl = format!("{single_line_pass}\n\n{single_line_fail}\n");
         let parsed_jsonl = parse_verify_records(&jsonl).expect("parse jsonl");
         assert_eq!(parsed_jsonl.len(), 2);
+
+        // Concatenated multi-line pretty-printed `.oxideswarm/verify/*.json` stream
+        let pretty_stream = format!("{}\n{}", recorded_passing_json(), recorded_failing_json());
+        let parsed_stream = parse_verify_records(&pretty_stream).expect("parse pretty JSON stream");
+        assert_eq!(parsed_stream.len(), 2);
 
         // Invalid JSON rejected
         assert!(parse_verify_records("{bad json").is_err());
