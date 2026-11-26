@@ -1,17 +1,21 @@
-# 0110: Tools on kit machines: Python in the USB kit, a `tool:python` probe, and tool packs
+# 0110: A developer toolset on kit machines: Python, Rust and Git in the USB kit, probes, and tool packs
 
-Status: Draft
+Status: Accepted (Q99 decided by the owner on 2026-11-26: the full toolset)
 Created: 2026-11-26    Updated: 2026-11-26
 
 ## Summary
 
 A machine set up from the USB kit can run only what its owner already installed. On the friend's
-laptop of the 2026-11-26 trial that was `cmd`, PowerShell, `tar` and `curl`, so no Python script and no
-Rust build could go there. This record adds three things. The worker probes `python` and
-advertises `tool:python` (TOOL-1). The Windows kit can carry a pinned Python embeddable package and
-install it, when the person at the keyboard agrees, inside the kit's own folder (TOOL-1). Tool packs
-let a task bring a portable tool as a cached blob, with nothing installed at all (TOOL-2, Design only).
-Rust is not put in the kit; the owner decides how Rust reaches kit machines (Q99).
+laptop of the 2026-11-26 trial that was `cmd`, PowerShell, `tar` and `curl`: no Python script, no Rust
+build and no workspace could go there. The owner chose the full toolset (Q99), so that every kit
+machine can take every kind of task the project has. This record adds:
+
+- probes for `python` (new) and stub-safe probes for `cargo`, `rustc`, `git` (TOOL-1);
+- a Windows kit option `--toolset full` that carries pinned, private copies of Python (TOOL-1), a Rust
+  GNU toolchain (TOOL-3) and MinGit (TOOL-4), installed after one question inside the kit's own folder,
+  visible to the worker only, and removed by uninstall;
+- tool packs, which deliver any portable tool to any worker as a cached blob without installing it
+  (TOOL-2), for machines set up without the kit and for other tool versions.
 
 ## Context
 
@@ -19,186 +23,233 @@ Rust is not put in the kit; the owner decides how Rust reaches kit machines (Q99
   `detect_host_tools` runs `<tool> --version` bounded by `HOST_PROBE_TIMEOUT`
   ([design 0020](0020-bounded-host-capability-probes.md)) and the worker advertises `tool:<name>` for
   each that exits 0 (`crates/worker/src/client.rs`, about line 875). Clients select with
-  `submit --require-tool <name>` (`require:tool=<name>`, `crates/core/src/placement.rs`). Python is not
-  probed, so a Python task cannot be placed on a machine that has it.
-- **The kit installs the worker only.** `packaging/usb/install.ps1` copies the release archive into the
-  install folder, asks two questions (folder, GPU build: `Let the cluster use this computer's GPU as
-  well? [Y/n]`, about line 727), writes `start-worker.vbs`, which sets `OXIDESWARM_HOME` and `HOME` for
-  the worker process (about line 1255), and registers it in `HKCU\...\Run`. `uninstall.ps1` removes
-  the folder and revokes the `oxideswarm.toolchain` ACL grants of an isolated worker
-  ([design 0055](0055-usb-kit-windows-isolation.md)).
-- **What the trial machine had (2026-11-26, `msi`, Windows 11, kit 0.4.5, `--isolation off`).** A task
-  ran `where python py node git cargo rustc ffmpeg 7z tar curl powershell`. Found: `tar`, `curl`,
+  `submit --require-tool <name>` (`require:tool=<name>`, `crates/core/src/placement.rs`).
+- **What `tool:cargo` unlocks.** Persistent workspaces for coding agents
+  ([design 0039](0039-agent-workspaces.md)), `RustCompilation` tasks and the build-once mode of `shard`
+  ([design 0103](0103-ax2-sharded-runs.md)) need `cargo` and `rustc` on the worker. The Windows kit
+  turns on `--workspaces` only when `Get-Command cargo` succeeds in the installer's own session
+  (`packaging/usb/install.ps1`, about line 1228), so a kit machine without Rust has no workspaces.
+- **The kit installs the worker only.** `install.ps1` copies the release archive into the install
+  folder, asks for the folder and the GPU build (`Let the cluster use this computer's GPU as well?
+  [Y/n]`, about line 727), writes `start-worker.vbs`, which sets `OXIDESWARM_HOME` and `HOME` for the
+  worker process (about line 1255), and registers it in `HKCU\...\Run`. `uninstall.ps1` removes the
+  folder and revokes the `oxideswarm.toolchain` ACL grants of an isolated worker
+  ([design 0055](0055-usb-kit-windows-isolation.md)). Under isolation the worker grants that capability
+  SID read and execute on the Rust toolchain roots it finds (`crates/worker/src/isolation/windows/toolchain.rs`).
+- **The trial machine (2026-11-26, `msi`, Windows 11, kit 0.4.5, `--isolation off`).** A task ran
+  `where python py node git cargo rustc ffmpeg 7z tar curl powershell`: found `tar`, `curl`,
   PowerShell, and `python.exe` under `%LOCALAPPDATA%\Microsoft\WindowsApps`, which is the App Execution
-  Alias of the Microsoft Store, not an installed Python. A real task on that machine (a 372-file
-  source tree compressed with `tar` and hashed with PowerShell) worked; anything needing Python or Rust
-  could only run on the Mac.
-- **Stubs that look like tools.** On Windows the Store alias `python.exe` prints a hint and exits non-zero
-  when Python is not installed. On macOS without the Command Line Tools, `/usr/bin/python3` is a stub
-  that opens a GUI dialog offering to install them. A probe must not open that dialog on someone's
-  machine.
-- **Rust on Windows needs a linker.** The `x86_64-pc-windows-msvc` toolchain needs the Visual Studio
-  Build Tools (several GB, administrator install). The `x86_64-pc-windows-gnu` toolchain ships its own
-  linker but is still large (hundreds of MB). Both are far beyond the size of everything else on the
-  stick, and an elevated isolated worker already drops `tool:cargo` (`client.rs`, about line 980).
+  Alias of the Microsoft Store, not an installed Python.
+- **Stubs that look like tools.** The Store alias prints a hint and exits non-zero. On macOS without the
+  Command Line Tools, `/usr/bin/python3` and `/usr/bin/git` are stubs that open a GUI dialog offering to
+  install them. A probe must not open that dialog on someone's machine.
+- **Sizes measured on 2026-11-26.**
+  - Python embeddable package 3.15.2 for amd64: 13.7 MB.
+  - Rust 1.100.0 for `x86_64-pc-windows-gnu`, the four default components without docs (`rustc` 104.2 MB,
+    `rust-std` 28.2 MB, `cargo` 12.1 MB, `rust-mingw` 5.5 MB, `.tar.xz` from the stable channel
+    manifest): 150.0 MB compressed. `rust-mingw` is the self-contained MinGW linker, so no Visual Studio
+    Build Tools are needed.
+  - MinGit 2.56.1 64-bit (Git for Windows): 39.8 MB.
+  - Together about 204 MB on the stick, beside about 100 MB of release archives. The trial sticks hold
+    15.7 GB.
+- **Rust with MSVC is out of reach.** `x86_64-pc-windows-msvc` needs the Visual Studio Build Tools
+  (several GB, administrator install, a licence that does not allow redistribution), so the kit uses the
+  GNU toolchain.
 
 ## Goals
 
-- G1. A worker advertises `tool:python` when a working Python 3 is on its `PATH`, and never when only a
-  Store alias or the macOS stub is there; the probe never opens a window or a dialog.
-- G2. A Windows kit made with `make_kit.sh --python` can install a pinned Python embeddable package for
-  the worker, only after the person at the keyboard agrees, inside the install folder, removed by
-  uninstall, with no change to the user's `PATH`, registry or file associations.
-- G3. After such an install the kit checks it end to end: a task pinned to this worker with
-  `--require-tool python` prints the expected version.
-- G4. A design for tool packs (TOOL-2) that delivers a portable tool to any worker as a cached,
-  verified blob, without installing anything, so the same path can later carry Rust.
-- G5. The owner decides how Rust reaches kit machines (Q99) before any Rust work starts.
+- G1. A worker advertises `tool:python`, `tool:cargo`, `tool:rustc` and `tool:git` exactly when a working
+  tool is on its `PATH`; a probe never opens a window or a dialog.
+- G2. A Windows kit made with `make_kit.sh --toolset full` installs Python, Rust (GNU) and MinGit for the
+  worker after one question, pinned and verified, inside the install folder, with no change to the
+  user's `PATH`, registry or file associations, and uninstall removes all of it.
+- G3. A machine set up that way takes every task kind of the project: command and shell tasks,
+  Python scripts, `RustCompilation`, `cargo` builds in persistent workspaces, `shard --build-once`,
+  GPU tasks (unchanged) and blob inputs and outputs.
+- G4. The kit checks each installed tool end to end with a task pinned to the new worker.
+- G5. Tool packs deliver a portable tool to any worker as a cached, verified blob, with nothing installed
+  (TOOL-2).
 
 ## Non-goals
 
-- Installing Python system wide, through `winget`, the Store or the python.org installer.
-- `pip`, virtual environments or third-party packages in the kit's Python (the embeddable package has
-  no `pip`; tasks that need packages are a later tool-pack question).
-- Python in the macOS and Linux kits: macOS and most Linux machines have Python 3 already, and the probe
-  of G1 covers them.
-- Rust in the kit (see D4 and Q99).
-- Any wire change. `tool:python` is a new value of an existing tag prefix.
+- Installing tools system wide, through `winget`, the Store or vendor installers; administrator rights.
+- `pip` packages, virtual environments, or C/C++ toolchains beyond what `rust-mingw` brings (a full
+  MinGW or LLVM pack is a later tool pack, see Test plan T6).
+- Bundling Rust or Git in the macOS and Linux kits: their linkers come with the system (Command Line
+  Tools on macOS, the distribution's `cc` on Linux) and cannot be redistributed with the kit. The probes
+  of D1 and tool packs cover those machines.
+- Any wire change. The new tags are values of the existing `tool:` prefix.
 
 ## Design
 
-### D1 Probe `python` (TOOL-1)
+### D1 Probes (TOOL-1)
 
-1. Add `python` to the probed tools. The probe tries `python` and then `python3` with
-   `--version`, under the existing bound, and advertises the single tag `tool:python` when either exits
-   0 and its output starts with `Python 3.`.
-2. Windows: skip a candidate whose resolved path lies under `%LOCALAPPDATA%\Microsoft\WindowsApps`
-   (the Store alias). Resolution already goes through `resolve_windows_executable`.
-3. macOS: skip `/usr/bin/python3` unless `xcode-select -p` exits 0 (Command Line Tools present), so the
-   probe never triggers the install dialog. A Python from Homebrew or python.org earlier on `PATH` is
-   used as is.
-4. `docs/reference.md`: `tool:python` joins the list of probed tools next to `cargo`, `rustc`, `git`.
+1. Add `python` to `HOST_PROBED_TOOLS`. The probe tries `python`, then `python3`, with `--version`, under
+   the existing bound, and advertises `tool:python` when one exits 0 and prints `Python 3.`.
+2. Windows: skip any candidate that resolves under `%LOCALAPPDATA%\Microsoft\WindowsApps` (Store
+   aliases); resolution already goes through `resolve_windows_executable`.
+3. macOS: skip `/usr/bin/python3` and `/usr/bin/git` unless `xcode-select -p` exits 0, so a probe never
+   triggers the Command Line Tools dialog. A Homebrew or python.org Python earlier on `PATH` is used as is.
+4. `docs/reference.md`: `tool:python` joins `cargo`, `rustc`, `git` in the list of probed tools.
 
-### D2 Python in the Windows kit (TOOL-1)
+### D2 The toolset lock and the kit builder
 
-1. **Pin.** `packaging/usb/tools.lock` (new, text) names the Python embeddable package for
-   `amd64` by version, file name, download URL on `python.org` and SHA-256. A pull request changes the
-   pin; nothing downloads an unpinned file.
-2. **Build the kit.** `make_kit.sh --python` downloads the pinned file once (or takes it from
-   `--tools-dir <DIR>`), refuses it when its SHA-256 differs from the lock, and writes it to
-   `<kit>/tools/` with an entry in the kit's `SHA256SUMS`. Without `--python` the kit is unchanged.
-   The package's own `LICENSE.txt` (PSF licence) stays inside the zip and is extracted with it.
-3. **Ask.** When the kit holds the package, `install.ps1` asks after the GPU question:
-   `Install a private Python 3 for tasks (about 10 MB, only inside <install folder>)? [y/N]`.
-   The default is No: this is someone else's machine. `-Python` / `-NoPython` answer it without a
-   prompt; `-Update` keeps the earlier answer.
-4. **Install.** Verify the zip against `SHA256SUMS`, extract it to `<InstallRoot>\tools\python-<ver>`,
-   and write a marker file there. Nothing outside the install folder changes.
-5. **Reach the worker.** `start-worker.vbs` prepends `<InstallRoot>\tools\python-<ver>` to `PATH` in
-   the worker's process environment only (the same mechanism that sets `OXIDESWARM_HOME`). Task
-   processes inherit it; the user's own `PATH` does not change.
-6. **Isolation.** Under `-Isolation fs` the folder needs read and execute for the capability SID
-   `oxideswarm.toolchain`: the installer grants it the way the worker grants toolchain roots, and
-   records the grant in the install's `windows_acl_grants.txt`, so `uninstall.ps1` revokes it with the
-   others ([design 0055](0055-usb-kit-windows-isolation.md)).
-7. **Check (G3).** After the worker is listed, the installer submits
-   `--worker <name> --require-tool python --wait --command python -- -c "import sys; print(sys.version)"`
-   and prints the version line, next to the existing doctor checks. A failure is reported and leaves
-   the worker running without Python.
-8. **Update and uninstall.** `-Update` replaces the folder when the kit's pinned version differs and
-   removes the old one. `uninstall.ps1` deletes `tools\` with the install folder (it already deletes the
-   whole folder; the test asserts it).
+1. `packaging/usb/tools.lock` (new, text, one line per file) pins each file by tool, version, file name,
+   download URL and SHA-256:
+   - Python: the embeddable package for amd64 from `python.org/ftp/python/<ver>/`; its SHA-256 is
+     published on the python.org release page.
+   - Rust: `rustc`, `rust-std`, `cargo`, `rust-mingw` for `x86_64-pc-windows-gnu` from
+     `static.rust-lang.org/dist/`; their SHA-256 values are in the channel manifest
+     `channel-rust-<ver>.toml`. The pinned version is the project's CI toolchain (1.96.0 on 2026-11-26),
+     so a kit machine builds the project with the toolchain CI checks.
+   - MinGit: `MinGit-<ver>-64-bit.zip` from the `git-for-windows/git` GitHub release; its SHA-256 is
+     listed in the release notes.
+   A pull request changes a pin; nothing downloads an unpinned file.
+2. `make_kit.sh --toolset full` (or `--toolset python`, `--toolset python,rust,git`) downloads each pinned
+   file once into a cache directory (or takes it from `--tools-dir <DIR>`), refuses a file whose SHA-256
+   differs from the lock, and writes it to `<kit>/tools/` with entries in the kit's `SHA256SUMS`. It also
+   writes `<kit>/tools/NOTICE.txt` (D6). Without `--toolset` the kit is unchanged.
+3. `kit.json` records the toolset (`"toolset": ["python","rust","git"]`), so `install.ps1` knows what to
+   offer and `-Update` knows what a newer kit changes.
 
-### D3 Tool packs (TOOL-2, Design only)
+### D3 One question at install time
 
-A tool pack is a portable archive (for example the Python embeddable zip, or a Rust GNU toolchain
-tree) that a task names; the worker places it read-only next to the task instead of anyone installing
-it.
+1. When the kit carries tools, `install.ps1` asks once, after the GPU question:
+   `Install the developer tools for tasks (Python 3.15, Rust 1.96, Git 2.56, <N> MB on disk,
+   only inside <install folder>)? [Y/n]`. The sizes and versions come from `tools.lock` and the files on
+   the stick.
+2. The default is Yes for a kit made with `--toolset`: the owner chose it when making the kit, and the
+   person at the keyboard still sees and answers the question. `-Tools` / `-NoTools` answer it without a
+   prompt (for scripted installs); `-Update` keeps the earlier answer.
+3. On No the install is exactly today's.
+
+### D4 Private installs (TOOL-1, TOOL-3, TOOL-4)
+
+1. Verify each file against `SHA256SUMS`, then extract under `<InstallRoot>\tools\`:
+   - `python-<ver>\` from the Python zip;
+   - `rust-<ver>\` from the four Rust tarballs, merging each component's tree as its `install.sh`
+     manifest lists (rustc, cargo, rust-std and rust-mingw into one sysroot), done by PowerShell without
+     running the shell script;
+   - `git-<ver>\` from the MinGit zip.
+2. `<InstallRoot>\cargo-home\` becomes `CARGO_HOME` of the worker, so the registry and git caches of
+   builds stay inside the install folder. `RUSTUP_HOME` stays unset (no rustup).
+3. `start-worker.vbs` prepends `tools\python-<ver>`, `tools\rust-<ver>\bin` and `tools\git-<ver>\cmd`
+   to `PATH` and sets `CARGO_HOME`, in the worker's process environment only. Task processes inherit
+   them; the user's own `PATH` and environment do not change.
+4. Workspaces: the installer decides `--workspaces` from the private `cargo` it just installed, not only
+   from `Get-Command cargo`, so a kit machine with the toolset gets persistent workspaces
+   ([design 0039](0039-agent-workspaces.md)) and `tool:cargo`.
+5. Isolation (`-Isolation fs`): the worker's existing toolchain grant covers `CARGO_HOME`; the installer
+   grants `oxideswarm.toolchain` read and execute on `tools\` the same way and records it in the
+   install's `windows_acl_grants.txt`, so `uninstall.ps1` revokes it with the others
+   ([design 0055](0055-usb-kit-windows-isolation.md)). The elevated-worker rule that drops `tool:cargo`
+   stays.
+6. Update: `-Update` from a kit with newer pins installs the new versions beside the old ones, switches
+   `start-worker.vbs`, restarts the worker, and then deletes the old folders. Uninstall deletes the whole
+   install folder as today; the test asserts `tools\` and `cargo-home\` are gone.
+
+### D5 End-to-end check (G4)
+
+After the worker is listed, the installer submits one task per installed tool, pinned with
+`--worker <name>` and `--require-tool <tool>`:
+
+- `python -c "import sys; print(sys.version)"`;
+- `rustc --version` and a `RustCompilation` of a one-file program from the kit (`tools\check\hello.rs`)
+  whose output it runs;
+- `git --version`.
+
+It prints one line per tool. A failure is reported with the task's stderr and leaves the worker running
+with the tools that passed.
+
+### D6 Licences
+
+`<kit>/tools/NOTICE.txt` lists each bundled tool, its version, licence and source:
+
+- Python: PSF License (the package's own `LICENSE.txt` is extracted with it).
+- Rust: MIT or Apache-2.0; `rust-mingw` carries MinGW-w64 runtime files under their licences (included
+  in the component).
+- MinGit: GNU GPL version 2. Redistributing the binary requires the corresponding source: `NOTICE.txt`
+  names the exact Git for Windows release and links its source archive, and `make_kit.sh` refuses a
+  toolset kit without `NOTICE.txt`.
+
+### D7 Tool packs (TOOL-2)
+
+A tool pack is a portable archive that a task names; the worker places it read-only next to the task
+instead of anyone installing it. Packs serve machines set up without the kit (macOS, Linux, a Windows
+machine whose owner said No), other versions than the kit's, and tools the kit does not carry.
 
 1. **Naming a pack.** A task carries a list of pack references: name, version, and the `BlobId` of the
    archive ([design 0006](0006-content-addressed-data-plane.md)). It travels in the extension slot of
-   [design 0082](0082-task-extension-slot.md) as a critical `Worker` extension, so the master places such a
-   task only on workers that carry `ext:<id>` (no protocol bump).
+   [design 0082](0082-task-extension-slot.md) as a critical `Worker` extension, so the master places such
+   a task only on workers that carry `ext:<id>` (no protocol bump).
 2. **Upload once.** The client uploads the archive like any `--input`; the master's blob store and the
    worker's blob cache keep it, so a cluster sends each pack to each worker once.
 3. **Unpack once.** The worker extracts a pack into `<sandbox base>/cache/tools/<blake3>/`, verifying the
-   archive id first, marks the tree read-only, and evicts it with the blob cache's LRU. Every task
-   that names the pack gets the directory prepended to its `PATH`.
-4. **CLI.** `submit --tool-pack <name>=<archive>` (a local archive, hashed and uploaded) and later a
-   named catalogue. The first packs are the Python embeddable package and, if Q99 chooses it, a Rust
-   GNU toolchain.
-5. **Why this over installing.** Nothing persists outside the worker's cache; the uninstall stays a
-   folder delete; the same path serves Windows, macOS and Linux workers; and the owner, not each
-   machine, chooses tool versions.
-
-A manual version of this (the archive as a plain `--input`, unpacked by the task itself in its
-sandbox) runs on 0.4.x today and is the first live check of the idea (Test plan T4).
-
-### D4 Rust on kit machines (Q99)
-
-Three options for the owner:
-
-- **A. None.** Rust tasks run only on machines whose owners installed Rust. Nothing to build.
-- **B. Opt-in GNU toolchain in the kit.** Like D2, behind its own question; hundreds of MB on the stick
-  and on the machine; licence notices for Rust (MIT/Apache-2.0) and the bundled MinGW parts.
-- **C. Tool packs only.** No Rust in the kit; once TOOL-2 is built, a Rust pack is sent to the workers
-  that run Rust tasks and cached there.
-
-Default recommendation: **C**, with A until TOOL-2 lands. B puts the largest and least removable
-install on the machines whose owners asked for the least.
+   archive id first and never following links, marks the tree read-only, and evicts it with the blob
+   cache's LRU. Every task that names the pack gets the directory prepended to its `PATH`.
+4. **CLI.** `submit --tool-pack <name>=<archive>` (a local archive, hashed and uploaded), and later a named
+   catalogue built from `tools.lock`.
 
 ## Compatibility
 
-- No wire change, no protocol bump. `tool:python` is a value of the `tool:` prefix that every
-  release since the tag was introduced already passes through; an older master places
-  `require:tool=python` on it like any tool.
-- A kit made without `--python` behaves exactly as today. An older installer ignores `tools/` on a
-  newer stick.
-- TOOL-2 uses the extension slot of design 0082 (protocol 10), so a worker that does not understand
-  the extension never receives such a task.
+- No wire change, no protocol bump. `tool:python` is a new value of the `tool:` prefix; an older master
+  places `require:tool=python` on it like any tool.
+- A kit made without `--toolset` behaves exactly as today. An older installer ignores `tools/` on a newer
+  stick. A worker of any 0.4.x release benefits from D4: it only sees a different `PATH`.
+- TOOL-2 uses the extension slot of design 0082 (protocol 10), so a worker that does not understand the
+  extension never receives such a task.
 
 ## Security
 
-- **Supply chain.** The Python package is pinned by SHA-256 in `packaging/usb/tools.lock`, checked by
-  `make_kit.sh` before it reaches the stick and by `install.ps1` before extraction (kit `SHA256SUMS`).
-  A pin change is a reviewed pull request.
-- **Consent and footprint.** Default No; inside the install folder only; no `PATH`, registry or file
-  association change for the user; removed by uninstall.
-- **Trust.** Tasks already run arbitrary programs as the worker's user; a Python on the task `PATH`
-  adds convenience, not a new right. Under `--isolation fs` the folder gets read and execute only.
-- **Probes.** The probe never opens a window or dialog (D1.2, D1.3) and stays bounded by
-  `HOST_PROBE_TIMEOUT`.
-- **Tool packs** are verified by `BlobId` before unpacking, unpacked without following links (as
-  `staging.rs` does for outputs), and read-only to tasks.
+- **Supply chain.** Every file is pinned by SHA-256 in `tools.lock`, checked by `make_kit.sh` before it
+  reaches the stick and by `install.ps1` before extraction. A pin change is a reviewed pull request that
+  cites the vendor's published hash (python.org release page, Rust channel manifest, Git for Windows
+  release notes).
+- **Consent and footprint.** One question with sizes and versions; inside the install folder only; no
+  `PATH`, registry or file association change for the user; removed by uninstall.
+- **Trust.** Tasks already run arbitrary programs as the worker's user. A toolset on the task `PATH`
+  makes them more capable, not more privileged. `cargo` builds fetch crates from the network under
+  `--isolation off` and `fs`; `fs+net` keeps them offline as today.
+- **Probes.** Bounded by `HOST_PROBE_TIMEOUT`; never a window or dialog (D1.2, D1.3).
+- **Tool packs** are verified by `BlobId` before unpacking and are read-only to tasks.
 
 ## Test plan
 
-- T1. Unit: probe with a fake `python` that prints `Python 3.12.0` (tag), one that prints
-  `Python 2.7.18` (no tag), one that exits 9009 (no tag), and Windows paths under `WindowsApps` (no
-  tag); macOS stub path without Command Line Tools (not run at all).
-- T2. `tests/test_launcher_scripts.py`: `make_kit.sh --python` with a fake download whose hash matches
-  (kit holds it, `SHA256SUMS` lists it) and one whose hash differs (refused); `install.ps1` with
-  `-Python` and `-NoPython` against a fake binary; `uninstall.ps1` leaves no `tools\`.
-- T3. Live, Windows machine without Python: install from a `--python` kit, answer y; worker shows
-  `tool:python`; the D2.7 check prints the version; `Update` from the same kit keeps it; uninstall
-  leaves nothing. Repeat with `-Isolation fs`.
-- T4. Live, today's manual tool pack: send the Python embeddable zip as `--input` to a worker without
-  Python, unpack it inside the task's sandbox, run a script, bring an output back, and run it again to
-  show the master does not upload the zip twice.
+- T1. Unit: probe with fakes that print `Python 3.12.0` (tag), `Python 2.7.18` (no tag), exit 9009 (no
+  tag); Windows candidates under `WindowsApps` (skipped); macOS stubs without Command Line Tools (not run).
+- T2. `tests/test_launcher_scripts.py`: `make_kit.sh --toolset full` with fake downloads whose hashes
+  match (kit holds them, `SHA256SUMS` and `NOTICE.txt` list them) and one that differs (refused);
+  `install.ps1` with `-Tools` and `-NoTools` against fake binaries (the `start-worker.vbs` environment
+  lines are checked); `uninstall.ps1` leaves no `tools\` or `cargo-home\`.
+- T3. Live, a Windows machine without Python, Rust or Git: install from a `--toolset full` kit, answer
+  the default; the worker lists `tool:python`, `tool:cargo`, `tool:rustc`, `tool:git` and
+  `feat:workspaces`; the D5 checks pass; a `cargo build` of a small crate with dependencies runs in a
+  workspace; `Update` from the same kit keeps the tools; uninstall leaves nothing. Repeat with
+  `-Isolation fs`.
+- T4. Live, the manual tool pack of today: send the Python embeddable zip as `--input` to a worker
+  without Python, unpack it inside the task sandbox, run a script, bring the output back, run it again to
+  show the inputs are not sent twice.
+- T5. Live, the same for the four Rust GNU components: unpack them in a sandbox on a worker without Rust
+  and build a pure-Rust crate with `cargo build --offline` against vendored sources.
+- T6. Live, a crate whose build script compiles C (for example one that uses the `cc` crate): record
+  whether `rust-mingw` alone is enough. If not, a full MinGW-w64 or LLVM-MinGW toolchain becomes a tool
+  pack (new item), and D5 says which crates a kit machine cannot build.
 
 ## Work items
 
 | ID | Item | Files | Done when | Status |
 |---|---|---|---|---|
-| TOOL-1 | Probe `python`; optional pinned Python in the Windows kit | `crates/core/src/capabilities.rs`, `packaging/usb/{make_kit.sh,install.ps1,uninstall.ps1,tools.lock}`, `tests/test_launcher_scripts.py`, `docs/reference.md` | T1 to T3 pass | Planned |
-| TOOL-2 | Tool packs as cached blobs | `crates/core/src/task/extension.rs`, `crates/worker/src/{blob_cache.rs,staging.rs}`, `crates/cli` | Design accepted, then built behind the design 0082 extension | Design only |
-| Q99 | Owner decision: how Rust reaches kit machines (A, B or C of D4) | this record | The owner answers | Open |
+| TOOL-1 | Probe `python` (stub-safe probes); pinned private Python in the Windows kit; `tools.lock`, `--toolset`, the one question, `NOTICE.txt` | `crates/core/src/capabilities.rs`, `packaging/usb/{make_kit.sh,install.ps1,uninstall.ps1,tools.lock}`, `tests/test_launcher_scripts.py`, `docs/reference.md` | T1, T2 and the Python part of T3 pass | Planned |
+| TOOL-3 | Private Rust GNU toolchain in the Windows kit, `CARGO_HOME` in the install folder, workspaces from the private `cargo`, isolation grant | `packaging/usb/{install.ps1,uninstall.ps1,tools.lock}`, `tests/test_launcher_scripts.py` | The Rust part of T3, T5 and T6 recorded | Planned |
+| TOOL-4 | Private MinGit in the Windows kit with its GPL source notice | `packaging/usb/{make_kit.sh,install.ps1,tools.lock}` | The Git part of T3 passes and `NOTICE.txt` names the source | Planned |
+| TOOL-2 | Tool packs as cached blobs | `crates/core/src/task/extension.rs`, `crates/worker/src/{blob_cache.rs,staging.rs}`, `crates/cli` | A Python pack and a Rust pack run on a worker that has neither installed, each archive sent once per worker | Planned |
+| Q99 | Owner decision: how Rust reaches kit machines | this record | Decided 2026-11-26: the full toolset (kit and tool packs) | Decided |
 
 ## Status log
 
 - 2026-11-26: Draft, from the owner's question during the friend trial ("install and check Rust and
-  Python on the other machine when installing from USB"). Design number, TOOL-1, TOOL-2 and Q99
-  claimed with `agent_bridge.py claim`.
+  Python on the other machine when installing from USB"). Design number, TOOL-1, TOOL-2 and Q99 claimed
+  with `agent_bridge.py claim`.
 - 2026-11-26: T4 run live on the trial cluster (master 0.4.4 on an Apple M5 Mac, worker `msi`: Windows 11
   10.0.26200, kit 0.4.5, `--isolation off`, no Python installed, direct P2P link). Inputs:
   `python-3.15.2-embed-amd64.zip` (13,740,486 bytes, SHA-256 `d012f3aa…b9ad1f62`, equal to the value on
@@ -208,3 +259,8 @@ install on the machines whose owners asked for the least.
   of the same script run on the Mac. Run 1 waited 2.884 s, run 2 1.572 s (task time 1.40 s both): the
   inputs were not sent again. Nothing was installed on the laptop; the zip stays only in the worker's blob
   cache.
+- 2026-11-26: The owner decided Q99: the full toolset ("full, all of it, otherwise it cannot do much;
+  make it convenient and let the project work as fully as possible"). Status Accepted. Rust (TOOL-3) and
+  MinGit (TOOL-4) added beside Python; one question with default Yes for a `--toolset` kit; tool packs
+  (TOOL-2) moved from Design only to Planned. TOOL-3 and TOOL-4 claimed with `agent_bridge.py claim`.
+  Sizes measured from the vendors' servers the same day (Context).
