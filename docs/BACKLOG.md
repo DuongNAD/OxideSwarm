@@ -219,6 +219,7 @@ Recounted on 2026-11-24 from the rows with pull request 411: 291 items, 202 Impl
 Recounted on 2026-11-24 from the rows with pull request 464: 292 items, 202 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 465: 298 items, 202 Implemented, 22 Partial and 74 Planned; 22 open items are In and 74 are Out.
 Recounted on 2026-11-24 from the rows with pull request 466: 305 items, 202 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 467: 306 items, 203 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -341,6 +342,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
 | TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Implemented |  |  |
+| TEST-100 | CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'` | P1 | S | TEST-26 |  | Implemented |  |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -968,6 +970,16 @@ The full suite must pass on a clean machine before CI can require it.
      and CI.
 - **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
   --lib` passes `436/436` locally) and CI stays green.
+
+### TEST-100: CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'`
+
+- **Evidence:** CI run `45657051728` (`workflow_dispatch` on `master` `60e18cdd`, 2026-11-25), job `endurance (loopback)`: after the 45-minute soak finished, `run_soak` (`benchmarks/endurance/endurance.py:5809` / `:6068` on `fc95e4c9`) failed with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'`. Claimed via `agent_bridge.py claim` (`claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`).
+- **Problem:** Commit `751be5b5` (`2026-11-24`, `TEST-24` step 2) left a second copy of `resolve_master_arg` .. `class RemoteEnduranceCluster` inside `class SoakCluster` (`benchmarks/endurance/endurance.py:3706-3991` on `origin/master` `fc95e4c9`), ending `SoakCluster` early after `stop()` so `def leftover_pids` (`lines 3979-3991`) belonged to the second `RemoteEnduranceCluster` instead of `SoakCluster`, and the duplicate top-level functions/class shadowed the first copy. A line-by-line `difflib` check confirmed `lines 2477-2748` and `lines 3706-3977` were byte-for-byte identical (`0` diff lines).
+- **Do:**
+  1. Failing check first: added `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` to `tests/test_endurance_harness.py`; running `python3 -B -m unittest tests/test_endurance_harness.py -v` before the fix failed (`40` tests, `1` failure: duplicate top-level definitions `resolve_master_arg`, `_parse_host_port`, `_sum_tmp_bytes`, `_summarize_remote_worker`, `RemoteEnduranceCluster`, plus missing `SoakCluster.leftover_pids`).
+  2. Removed the duplicate block (`lines 3705-3978`) so `leftover_pids` sits back inside `SoakCluster` right after `stop()`, keeping every real change of both copies.
+  3. Verified `python3 -B -m unittest tests/test_endurance_harness.py -v` (`40` tests: `39` ok, `1` skipped without `OXIDESWARM_TEST_BIN`) and a 5-minute loopback soak (`endurance.py soak --duration 5m --fault-scale 0.1 --sample-interval 5s`, debug binary under `nice -n 10` with private temp home/work-dir): `exit 0`, `all_passed = True` (`1_accounting PASS` `280/280`, `2_resource_plateau PASS`, `3_disk_and_journal PASS` `277342 -> 24 B`, `4_probe_p99 PASS` `60/60` ok / `ratio 0.9801`, `5_clean_stop PASS` `leftover_pids=[]`, `6_fault_injection PASS` `3/3`). (An initial `--sample-interval 30s` 5-minute run had `1_accounting`/`2`/`3`/`5_clean_stop`/`6` `PASS` and failed `4_probe_p99` only with `insufficient_probes_per_window` because 30 s intervals yield at most 4 probes per window against `min_samples_per_window = 10`.)
+- **Done when:** `benchmarks/endurance/endurance.py` has no duplicate top-level definitions, `SoakCluster.leftover_pids` is restored, `tests/test_endurance_harness.py` and a short loopback soak pass locally, and `workflow_dispatch` `endurance (loopback)` passes on `master` after merge.
 
 ## Phase 3: make the documents true
 
@@ -3459,3 +3471,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: TEST-100 added and Implemented (`mac/test-100-endurance-soak-leftover-pids`, claim `claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`): added failing-first `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` in `tests/test_endurance_harness.py` (failed before fix on the 5 duplicate top-level definitions from `751be5b5` and detached `SoakCluster.leftover_pids`), removed the identical duplicate `resolve_master_arg..RemoteEnduranceCluster` block (`lines 3705-3978`) in `benchmarks/endurance/endurance.py` so `leftover_pids` returns to `SoakCluster`, and verified `tests/test_endurance_harness.py` (`40` tests: `39` ok, `1` skipped), `tests/test_m1_challenger_hygiene.py`, `fmt`, workspace `clippy`, and a 5-minute loopback soak (`--duration 5m --fault-scale 0.1 --sample-interval 5s`, `6/6 PASS`, `280/280` tasks, `leftover_pids=[]`).
