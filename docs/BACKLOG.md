@@ -467,6 +467,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEAM-3 | Verify gate: sync a worktree, run the task's profiles, return compact failure JSON | P2 | M | TEAM-1, AX-2 |  | Planned | Out | (design 0111) |
 | TEAM-4 | Circuit breaker after three identical failures, notice to the person | P2 | S | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
 | TEAM-5 | Merge flow with a verify table; this project's first wave on the plan | P2 | M | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
+| TEAM-6 | Grid mailbox in the master: messages, events and files between machines, long-poll wait (protocol 11) | P2 | L | TEAM-1, PROTO-4 |  | Planned | Out | (design 0111) |
+| TEAM-7 | Wake-ups for idle agents (`mail watch --hook`, MCP `mail_wait`) and an `agent_bridge.py` grid backend | P2 | M | TEAM-6 |  | Planned | Out | (design 0111) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
@@ -1764,7 +1766,7 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
 
-### TEAM-1 to TEAM-5: One project, several coding agents and machines
+### TEAM-1 to TEAM-7: One project, several coding agents and machines
 
 - **Evidence:** This project's own process since 2026-11: agents reported work as verified when it was not,
   parallel agents edited the same files (`docs/BACKLOG.md`, `CHANGELOG.md`, test files), day queues on the Drive
@@ -1776,8 +1778,10 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
   TEAM-2 claims and path leases as refs `refs/oxideswarm/lease/<task>` (create-only push, fast-forward renew,
   takeover after expiry), worktrees and `plan check-diff`; TEAM-3 the verify gate (`verify`, at most 4 KB of
   failures, worker, link and toolchain per cell); TEAM-4 the circuit breaker; TEAM-5 the pull request table,
-  re-verify on the latest base, and this project's first wave run on the plan. No wire change.
-- **Done when:** Test plan T1 to T4 of design 0111 pass or are recorded, T4 with zero file conflicts.
+  re-verify on the latest base, and this project's first wave run on the plan (no wire change); TEAM-6 a mailbox in
+  the master for events, notes and files with a long-poll wait (protocol 11), and TEAM-7 wake-ups for idle agents
+  and a grid backend for `agent_bridge.py`, replacing the Drive hub.
+- **Done when:** Test plan T1 to T5 of design 0111 pass or are recorded, T4 with zero file conflicts.
 
 ### BUG-36: `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout
 

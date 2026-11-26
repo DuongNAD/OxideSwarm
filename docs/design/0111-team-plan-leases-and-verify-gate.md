@@ -17,10 +17,14 @@ grid's machines check their work. This record adds the coordination layer that b
   checks there, and returns a short JSON list of failures (TEAM-3);
 - a **circuit breaker** that stops an agent after three failed verifies with the same failure and calls
   a person (TEAM-4);
-- a **merge flow** in which the pull request carries the verify table and a person merges (TEAM-5).
+- a **merge flow** in which the pull request carries the verify table and a person merges (TEAM-5);
+- a **grid mailbox** that carries events, short notes and files between machines through the master, and
+  **wake-ups** that start an idle agent session when something arrives for it, replacing the Google Drive
+  hub this project uses today (TEAM-6, TEAM-7).
 
-Git stays the single source of truth. Agents do not message each other. The first version needs no wire
-change.
+Git stays the single source of truth for code and plan. The mailbox carries events and hand-offs, not
+discussion. TEAM-1 to TEAM-5 need no wire change; the mailbox (TEAM-6) adds client messages and waits
+for the protocol 11 train after the stability release.
 
 ## Context
 
@@ -66,12 +70,15 @@ change.
   4 KB of structured failures.
 - G5. An agent that fails the same way three times stops and a person is told.
 - G6. A person merges every pull request; the pull request shows which machines verified which commit.
-- G7. No wire change for the first version; any 0.4.x master serves it.
+- G7. No wire change for TEAM-1 to TEAM-5; any 0.4.x master serves them.
+- G8. Machines exchange events, notes and files through the grid itself (authenticated, encrypted, across
+  NAT), and an idle agent wakes when something arrives for it, with no third-party storage.
 
 ## Non-goals
 
 - Agents merging, approving pull requests, or changing the plan's architecture decisions.
-- A chat or message bus between agents.
+- Free-form chat between agents. The mailbox (D8) carries typed events, short notes from people and file
+  hand-offs; plans and decisions stay in git.
 - Replacing GitHub (or another host's) pull requests, reviews or CI.
 - Running the agents themselves on the grid (that is AX-6, agent sessions).
 - Security against a hostile agent: leases are coordination, not access control (see Security).
@@ -212,6 +219,46 @@ The first user is this repository. The active wave moves from the Drive hub's da
 `.oxideswarm/plan.toml`; the hub keeps what must not be in git (machine-local facts, owner messages, id
 claims through `agent_bridge.py claim`). One wave runs both ways side by side before the day queues stop.
 
+### D8 Grid mailbox and wake-ups (TEAM-6, TEAM-7)
+
+Today the agents of this project exchange messages and files through a Google Drive folder
+(`scripts/agent_bridge.py`: `send`, `inbox`, per-consumer `watch`, and a Claude Code `Stop` hook with
+`asyncRewake` that wakes an idle session, [design 0007](0007-agent-bridge-message-trigger.md)). It works,
+but it depends on a third-party account and a sync client on every machine, delays messages by the sync
+interval, and must never carry secrets or tickets. The grid already has what a mailbox needs: every
+machine reaches the master authenticated and encrypted, across NAT over iroh, and the master has a
+content-addressed blob store and a journal that survives restarts.
+
+1. **Mail in the master (TEAM-6, protocol 11).** New client messages:
+   - `MailSend { to, topic, body, attachments }`: `to` is a member, a worker name, an agent id or a topic;
+     `body` is at most 64 KiB of text; `attachments` are `BlobId`s already uploaded through the existing
+     blob path (design 0006), so a file goes up once and every recipient fetches it from the master.
+   - `MailFetch { consumer, after }` returns the messages after a cursor; `MailAck { consumer, id }`
+     advances it, so each consumer sees each message once (at-least-once, like `watch --consumer` today).
+   - `MailWait { consumer, after, timeout }` is a long poll: the master answers as soon as a message for
+     that consumer arrives, or at the timeout. This is the trigger.
+   - The master keeps mail in its store journal, bounded by count and bytes (like retained tasks), and
+     pins attachment blobs until every addressed consumer has acknowledged or the message expires.
+2. **Events, not only notes.** The other parts publish to topics: a lease granted, renewed or expired
+   (D3), a verify finished (D4), a task blocked by the breaker (D5), a pull request merged (D6). An agent
+   waits on its own address plus the topics of its tasks; a person waits on `person:<name>`.
+3. **CLI and MCP.** `oxideswarm mail send|inbox|ack|watch` and the MCP tools `mail_send`, `mail_wait`
+   (with AX-3, an MCP task the agent polls). `oxideswarm mail send --file <path>` uploads the file as a
+   blob and attaches it; `mail inbox --save <dir>` downloads attachments without writing through links.
+4. **Wake-ups (TEAM-7).** `oxideswarm mail watch --consumer <id> --hook` blocks on `MailWait` and exits
+   with the message summary when mail arrives, which is exactly the contract of the existing
+   `agent_bridge_hook.sh watch --hook` used by the `asyncRewake` `Stop` hook in `.claude/settings.json`.
+   Other agents (Gemini, Codex and the like) run the same command as a background watcher, or
+   `--exec <command>` to start their own wake action. `agent_bridge.py` gains a `--backend grid` that
+   maps `send`, `inbox`, `watch` and `peek` onto these calls, so this project switches by configuration
+   and keeps Drive as the fallback for one release.
+5. **Links matter.** Attachments travel over the master's links: a direct link moved 9.3 MB/s and the public
+   relay about 0.12 MB/s on 2026-11-26, so `mail send --file` prints the size and the recipients' link
+   kinds, and large hand-offs should go to workers with a direct link or a relay the owner runs
+   (`p2p_relay_url`).
+6. **Until protocol 11.** Before the mailbox ships, D3 to D6 publish their events as git refs and the
+   Drive hub stays the mailbox; nothing in TEAM-1 to TEAM-5 waits for TEAM-6.
+
 ## Compatibility
 
 - No wire change: the plan, leases and records are files and refs in git; verify uses `submit`,
@@ -220,6 +267,10 @@ claims through `agent_bridge.py claim`). One wave runs both ways side by side be
 - New MCP tools: `plan_snapshot`, `task_claim`, `task_renew`, `task_release`, `verify`. Existing tools do
   not change. With AX-3, `verify` becomes an MCP task that the agent polls.
 - A repository without `.oxideswarm/plan.toml` sees no change.
+- TEAM-6 adds `ClientMessage` and `ClientResponse` variants (both mirror enums and all four `From` impls)
+  and raises the protocol version, so it joins the protocol 11 train after the stability release (Q80).
+  An older master answers the new messages with a version error; `agent_bridge.py --backend grid` then
+  falls back to Drive.
 
 ## Security
 
@@ -230,7 +281,11 @@ claims through `agent_bridge.py claim`). One wave runs both ways side by side be
   passes it to a shell.
 - **Other people's machines.** A profile may require `iso:fs` (or stronger) for workers that are not the
   person's own; the friend machines of design 0110 then run agents' code only in isolation.
-- **No secrets** in the plan, lease commits or verify records; the cluster secret stays where design
+- **Mail is data, not instructions.** A message or attachment from another machine never runs by itself;
+  the wake hook passes a summary to the agent, which treats it like any other untrusted input. Bodies and
+  attachments are bounded, and only authenticated cluster members may send (per-member rights follow
+  ENROLL-1).
+- **No secrets** in the plan, lease commits, verify records or mail; the cluster secret stays where design
   0048 puts it.
 
 ## Test plan
@@ -242,6 +297,9 @@ claims through `agent_bridge.py claim`). One wave runs both ways side by side be
   release deletes the ref.
 - T3. Integration on a loopback cluster: a worktree with a failing test returns the expected JSON; the
   third identical failure blocks the task; `plan unblock` clears it.
+- T5. Mailbox on a loopback cluster: send with an attachment, two consumers each fetch once, `MailWait`
+  returns within one second of a send, the message survives a master restart, the byte bound evicts the
+  oldest acknowledged mail, and `mail watch --hook` wakes a Claude Code session in a test harness.
 - T4. Live: three agents on three machines run one wave of six tasks with two dependency chains. Record
   conflicts (expected 0), verify round trips, tokens used per task, and compare with a wave run through
   the hub's day queues.
@@ -255,6 +313,8 @@ claims through `agent_bridge.py claim`). One wave runs both ways side by side be
 | TEAM-3 | Verify gate with compact failure JSON | `crates/cli/src/verify_gate.rs` (new), `crates/cli/src/mcp.rs` | T3 (verify part) passes | Planned |
 | TEAM-4 | Circuit breaker and notice to the person | `crates/cli/src/plan/lease.rs`, `scripts/agent_bridge.py` | T3 (breaker part) passes | Planned |
 | TEAM-5 | Merge flow: pull request table, re-verify on the latest base, this project's first wave | `crates/cli`, `.oxideswarm/plan.toml` | T4 recorded | Planned |
+| TEAM-6 | Grid mailbox in the master: send, fetch, ack, long-poll wait, attachments as blobs (protocol 11) | `crates/core/src/protocol.rs`, `crates/master/src/server`, `crates/master/src/store.rs`, `crates/cli/src/mail.rs` (new) | T5 (mailbox part) passes; wire layout files updated | Planned |
+| TEAM-7 | Wake-ups: `mail watch --hook` / `--exec`, MCP `mail_wait`, `agent_bridge.py --backend grid` | `crates/cli/src/mail.rs`, `scripts/agent_bridge.py`, `scripts/agent_bridge_hook.sh` | T5 (wake part) passes; this project runs one week on the grid backend | Planned |
 | Q100 | Where leases live first: git refs (default) or the master | this record | The owner answers or accepts the default | Open |
 
 ## Status log
@@ -263,3 +323,6 @@ claims through `agent_bridge.py claim`). One wave runs both ways side by side be
   verification layer for a team of coding agents with git as the source of truth. The owner added that a
   shared plan document is needed (D1, D2). Design number, TEAM-1 to TEAM-5 and Q100 claimed with
   `agent_bridge.py claim`.
+- 2026-11-26: The owner added that the agents need a way to send files and other things between machines
+  and to wait or be woken, as the Drive hub does today. D8 added (grid mailbox, events and wake-ups);
+  TEAM-6 and TEAM-7 claimed with `agent_bridge.py claim`.
