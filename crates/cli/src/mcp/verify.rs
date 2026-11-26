@@ -129,12 +129,27 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".oxideswarm")).unwrap();
         let outside = outer.path().join("outside.toml");
         std::fs::write(&outside, "[project]\nbase = \"master\"\n").unwrap();
+
+        let state = McpState::new("127.0.0.1:0".to_string(), None);
+        let mut ctx = ToolCallContext::default();
+        let trav = tool_verify_in_dir(
+            &state,
+            &cwd,
+            &json!({"task": "T-1", "repo_dir": "../escape"}),
+            &mut ctx,
+        )
+        .await;
+        assert!(trav.is_error);
+        let ToolContent::Text { text: trav_text } = &trav.content[0];
+        assert!(
+            trav_text.contains("..") || trav_text.contains("parent"),
+            "{trav_text}"
+        );
+
         #[cfg(unix)]
         {
             let link = cwd.join("link.toml");
             std::os::unix::fs::symlink(&outside, &link).unwrap();
-            let state = McpState::new("127.0.0.1:0".to_string(), None);
-            let mut ctx = ToolCallContext::default();
             let res = tool_verify_in_dir(
                 &state,
                 &cwd,
@@ -146,7 +161,6 @@ mod tests {
             let ToolContent::Text { text } = &res.content[0];
             assert!(text.contains("symbolic link"), "{text}");
         }
-        let state = McpState::new("127.0.0.1:0".to_string(), None);
         let res = call_tool(&state, "verify", &json!({"task": 123})).await;
         assert!(res.is_error);
     }

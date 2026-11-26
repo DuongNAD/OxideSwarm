@@ -3,22 +3,35 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
+#[cfg(unix)]
 use tempfile::TempDir;
+#[cfg(unix)]
 use tokio::sync::watch;
 
 use rusty_grid_cli::blobs::WorkspaceLimits;
+#[cfg(unix)]
 use rusty_grid_cli::mcp::{call_tool_with_context, McpState, ToolCallContext, ToolContent};
+use rusty_grid_cli::verify_gate::run_verify_gate;
+#[cfg(unix)]
 use rusty_grid_cli::verify_gate::{
-    run_verify_gate, VerifyFailureKind, MAX_VERIFY_JSON_BYTES, VERIFY_RECORD_REL_DIR,
+    VerifyFailureKind, MAX_VERIFY_JSON_BYTES, VERIFY_RECORD_REL_DIR,
 };
+#[cfg(unix)]
 use rusty_grid_master::reaper::ReaperConfig;
+#[cfg(unix)]
 use rusty_grid_master::registry::WorkerStatus;
+#[cfg(unix)]
 use rusty_grid_master::scheduler::SchedulerConfig;
+#[cfg(unix)]
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+#[cfg(unix)]
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 
+#[cfg(unix)]
 struct VerifyCluster {
     master: MasterHandle,
     addr: String,
@@ -26,6 +39,7 @@ struct VerifyCluster {
     _dirs: Vec<TempDir>,
 }
 
+#[cfg(unix)]
 impl VerifyCluster {
     async fn new() -> Self {
         let blob_dir = tempfile::tempdir().expect("blob dir");
@@ -94,6 +108,7 @@ impl VerifyCluster {
     }
 }
 
+#[cfg(unix)]
 impl Drop for VerifyCluster {
     fn drop(&mut self) {
         for (tx, handle) in &self.workers {
