@@ -115,7 +115,7 @@ pub(crate) async fn tool_verify_in_dir(
         breaker_threshold: CIRCUIT_BREAKER_THRESHOLD,
     };
 
-    match run_verify_gate_with_options(
+    match Box::pin(run_verify_gate_with_options(
         &repo_dir,
         plan_path.as_deref(),
         task_id,
@@ -126,7 +126,7 @@ pub(crate) async fn tool_verify_in_dir(
         Duration::from_secs(timeout_secs),
         workspace_limits,
         options,
-    )
+    ))
     .await
     {
         Ok((_report, compact_json)) => ToolCallResult::ok(compact_json),
