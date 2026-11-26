@@ -326,3 +326,9 @@ content-addressed blob store and a journal that survives restarts.
 - 2026-11-26: The owner added that the agents need a way to send files and other things between machines
   and to wait or be woken, as the Drive hub does today. D8 added (grid mailbox, events and wake-ups);
   TEAM-6 and TEAM-7 claimed with `agent_bridge.py claim`.
+- 2026-11-26: The owner asked that this work come before release 0.5.0. TEAM-1 to TEAM-5 have no wire change and
+  fit 0.4.x after the stability release (Q80). TEAM-6 adds client messages and raises the protocol version,
+  which the 0.4.x line does not allow; it goes into the first release with protocol 11, and the owner decides
+  whether that release is 0.5.0 (with language model serving moved after it) or 0.5.0 stays as planned.
+  Until then the Drive hub remains the mailbox (D8.6).
+
