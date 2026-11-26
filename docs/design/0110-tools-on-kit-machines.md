@@ -319,4 +319,15 @@ machine whose owner said No), other versions than the kit's, and tools the kit d
 - 2026-11-26: The owner asked that the work of this record and of design 0111
   come before release 0.5.0. The parts without a wire change (TOOL-1, TOOL-3, TOOL-4, TOOL-5) fit 0.4.x
   after the stability release; TOOL-2 uses the extension slot of design 0082 (protocol 10), so it fits too.
+- 2026-11-26: T3 live throwaway kit run passed on Windows 11 x86_64 (`PR #479` at `386f060e`, merged with
+  `origin/master` `034f5725`). A kit built with `make_kit.sh --toolset full --no-autostart --replace`
+  from the `tools.lock` archives installed cleanly with `install.ps1 -Tools -NoAutostart` under a
+  stripped host `PATH` to isolated NTFS throwaway folders in both `-Isolation off` and `-Isolation fs`
+  modes: `doctor` passed 8/8 checks (1 skipped GPU), all D5 checks passed (`python` 3.15.2, `rustc`
+  1.96.0, `hello.rs` -> `oxideswarm-tool-check-ok`, `cc-check --release` -> `add_c(40, 2) = 42`, `git`),
+  worker advertised `feat:workspaces`, `tool:cargo`, `tool:rustc`, `tool:git`, and `iso:off`/`iso:fs`,
+  explicit `python` and persistent-workspace `cargo build --release --offline` tasks succeeded
+  (`add_c(40, 2) = 42`), `-Update` preserved the installed tools and reconnected the worker, and
+  `uninstall.ps1 -Yes` removed the throwaway install folder and revoked all AppContainer ACL grants under
+  `-Isolation fs`.
 
