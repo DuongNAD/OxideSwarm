@@ -1662,16 +1662,16 @@ pub async fn call_tool_with_context(
         return ToolCallResult::error(err);
     }
     match name {
-        "status" => status::tool_status(state, args).await,
-        "workers" => workers::tool_workers(state, args).await,
-        "submit" => submit::tool_submit(state, args, ctx).await,
-        "shard" => shard::tool_shard(state, args, ctx).await,
-        "task_result" => task_result::tool_task_result(state, args, ctx).await,
-        "cancel" => cancel::tool_cancel(state, args).await,
-        "doctor" => doctor::tool_doctor(state, args).await,
-        "workspaces" => workspaces::tool_workspaces(state).await,
-        "plan_snapshot" => plan::tool_plan_snapshot(args).await,
-        "verify" => verify::tool_verify(state, args, ctx).await,
+        "status" => Box::pin(status::tool_status(state, args)).await,
+        "workers" => Box::pin(workers::tool_workers(state, args)).await,
+        "submit" => Box::pin(submit::tool_submit(state, args, ctx)).await,
+        "shard" => Box::pin(shard::tool_shard(state, args, ctx)).await,
+        "task_result" => Box::pin(task_result::tool_task_result(state, args, ctx)).await,
+        "cancel" => Box::pin(cancel::tool_cancel(state, args)).await,
+        "doctor" => Box::pin(doctor::tool_doctor(state, args)).await,
+        "workspaces" => Box::pin(workspaces::tool_workspaces(state)).await,
+        "plan_snapshot" => Box::pin(plan::tool_plan_snapshot(args)).await,
+        "verify" => Box::pin(verify::tool_verify(state, args, ctx)).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -3275,5 +3275,17 @@ mod tests {
             ToolContent::Text { text } => text.as_str(),
         };
         assert!(msg_files.contains("files"), "{msg_files}");
+    }
+
+    #[test]
+    fn test_call_tool_future_size_stays_bounded() {
+        let state = McpState::new("127.0.0.1:0".to_string(), None);
+        let args = json!({});
+        let fut = call_tool(&state, "submit", &args);
+        let fut_size = std::mem::size_of_val(&fut);
+        assert!(
+            fut_size <= 16 * 1024,
+            "call_tool future must stay small enough for 2 MiB Linux test stacks, got {fut_size} bytes"
+        );
     }
 }

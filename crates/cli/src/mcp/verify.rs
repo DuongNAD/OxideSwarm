@@ -85,7 +85,7 @@ pub(crate) async fn tool_verify_in_dir(
 
     let workspace_limits = state.workspace_limits;
 
-    match run_verify_gate(
+    match Box::pin(run_verify_gate(
         &repo_dir,
         plan_path.as_deref(),
         task_id,
@@ -95,7 +95,7 @@ pub(crate) async fn tool_verify_in_dir(
         state.secret.clone(),
         Duration::from_secs(timeout_secs),
         workspace_limits,
-    )
+    ))
     .await
     {
         Ok((_report, compact_json)) => ToolCallResult::ok(compact_json),
