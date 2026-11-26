@@ -39,8 +39,11 @@ pub const SIMULATED_GPU_MAX_DIM: u32 = 2048;
 pub const SPREAD_TASK_MS: u64 = 500;
 /// Tasks of the spread check per connected worker, unless `spread_tasks` says otherwise.
 pub const SPREAD_TASKS_PER_WORKER: usize = 4;
-/// Size of the blob the throughput probe (C8) moves to every worker.
+/// Size of the blob the throughput probe (C8) moves to direct/TCP workers.
 pub const THROUGHPUT_PROBE_BYTES: usize = 8 * 1024 * 1024;
+/// Smaller blob C8 moves to a relayed worker so a slow relay still yields a measured rate within
+/// [`DoctorOptions::probe_timeout`] instead of timing out at 60 s (`BUG-41`).
+pub const THROUGHPUT_PROBE_RELAY_BYTES: usize = 1024 * 1024;
 /// Where the throughput probe's blob appears in the worker's task sandbox.
 const THROUGHPUT_PROBE_FILE: &str = "doctor-probe.bin";
 /// How often outstanding probes are polled.
@@ -880,18 +883,130 @@ fn link_check(report: &mut DoctorReport) {
 
 /// The bytes of the throughput probe: pseudo-random and different on every run, so neither the
 /// master's blob store nor a worker's blob cache can answer from an earlier run.
+#[cfg(test)]
 fn throughput_payload(seed: Uuid) -> Vec<u8> {
+    throughput_payload_of_size(seed, THROUGHPUT_PROBE_BYTES)
+}
+
+/// Generates `size` pseudo-random bytes for a throughput probe payload.
+fn throughput_payload_of_size(seed: Uuid, size: usize) -> Vec<u8> {
     let (hi, lo) = seed.as_u64_pair();
     let mut state = hi ^ lo.rotate_left(32) | 1;
-    let mut out = Vec::with_capacity(THROUGHPUT_PROBE_BYTES);
-    while out.len() < THROUGHPUT_PROBE_BYTES {
+    let mut out = Vec::with_capacity(size);
+    while out.len() < size {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         out.extend_from_slice(&state.to_le_bytes());
     }
-    out.truncate(THROUGHPUT_PROBE_BYTES);
+    out.truncate(size);
     out
+}
+
+/// Probe payload size selected for `worker` (1 MiB when relayed, 8 MiB otherwise).
+fn throughput_probe_bytes_for_worker(worker: &WorkerSummary) -> usize {
+    if worker.relayed() {
+        THROUGHPUT_PROBE_RELAY_BYTES
+    } else {
+        THROUGHPUT_PROBE_BYTES
+    }
+}
+
+/// Formats decimal megabytes per second (`1e6` bytes/s), using two decimals below 1.0 MB/s so
+/// slow relayed rates remain legible.
+fn format_throughput_mbps(bytes: usize, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(1e-6);
+    let mbps = bytes as f64 / 1e6 / secs;
+    if mbps < 1.0 {
+        format!("{mbps:.2}")
+    } else {
+        format!("{mbps:.1}")
+    }
+}
+
+/// Evaluates one worker's C8 throughput probe outcome and detail message.
+fn judge_throughput(
+    worker: &WorkerSummary,
+    worker_id: Uuid,
+    probe_bytes: usize,
+    collected: Option<&Collected>,
+    elapsed: Duration,
+    timeout: Duration,
+) -> (Outcome, String) {
+    let mib = probe_bytes as f64 / (1024.0 * 1024.0);
+    match collected {
+        Some(Collected::Done(result)) if result.worker_id != worker_id => (
+            Outcome::Fail,
+            "ran on another worker: the master ignores placement constraints".to_string(),
+        ),
+        Some(Collected::Done(result)) if result.exit_code == 0 => {
+            let rate = format_throughput_mbps(probe_bytes, elapsed);
+            if worker.relayed() {
+                (
+                    Outcome::Warn,
+                    format!(
+                        "fetch to the worker over {}: {mib:.0} MiB in {} ms, {rate} MB/s (relayed link; smaller probe, submit to result, includes scheduling and a {} ms task)",
+                        worker.link_text(),
+                        elapsed.as_millis(),
+                        result.execution_time_ms
+                    ),
+                )
+            } else {
+                (
+                    Outcome::Pass,
+                    format!(
+                        "fetch to the worker over {}: {mib:.0} MiB in {} ms, {rate} MB/s (submit to result, includes scheduling and a {} ms task)",
+                        worker.link_text(),
+                        elapsed.as_millis(),
+                        result.execution_time_ms
+                    ),
+                )
+            }
+        }
+        Some(Collected::Done(result)) => (
+            Outcome::Fail,
+            format!("exit code {}: {}", result.exit_code, failure_text(result)),
+        ),
+        Some(Collected::Refused(message)) => (
+            Outcome::Fail,
+            format!("the master refused the probe: {message}"),
+        ),
+        Some(Collected::TimedOut(state)) => (
+            Outcome::Fail,
+            format!(
+                "no result within {}s (last state {state}); the worker may not support file transfer or the link is very slow",
+                timeout.as_secs()
+            ),
+        ),
+        None => (Outcome::Fail, "the probe was not collected".to_string()),
+    }
+}
+
+/// Stages a fresh `size`-byte probe file, uploads it over `connection`, and removes the temp file.
+async fn stage_and_upload_probe(
+    connection: &crate::blobs::BlobConnection,
+    size: usize,
+) -> Result<(crate::blobs::PreparedInputs, Duration), String> {
+    let path = std::env::temp_dir().join(format!("oxideswarm-doctor-{}.bin", Uuid::new_v4()));
+    let write = {
+        let payload = throughput_payload_of_size(Uuid::new_v4(), size);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &payload))
+    };
+    let outcome = async {
+        write.map_err(|e| format!("cannot stage the probe file: {e}"))?;
+        let prepared =
+            crate::blobs::scan_input_paths(&[(path.clone(), Some(THROUGHPUT_PROBE_FILE.into()))])?;
+        let started = Instant::now();
+        crate::blobs::upload_inputs(connection, &prepared).await?;
+        Ok::<_, String>((prepared, started.elapsed()))
+    }
+    .await;
+    let _ = std::fs::remove_file(&path);
+    outcome
 }
 
 /// The task that makes a worker fetch and read the probe blob.
@@ -922,11 +1037,12 @@ fn throughput_task(worker_id: Uuid, os: &str, inputs: &[TaskInput], timeout: Dur
 
 /// C8: moves a fixed-size blob to every connected worker and reports MB/s.
 ///
-/// The blob is uploaded to the master once (timed on its own); each worker then runs a pinned
-/// `cksum` (`certutil` on Windows) on it, which makes the worker fetch the blob from the master
-/// over the link it is connected by (TCP or P2P). The worker figure is the time from submit to
-/// result and so includes scheduling and the task's own run; it is a lower bound on the link
-/// speed. Workers are probed one after the other so they do not share the master's bandwidth.
+/// The 8 MiB blob is uploaded to the master once (timed on its own); each direct/TCP worker then
+/// runs a pinned `cksum` (`certutil` on Windows) on it, while any relayed worker fetches a smaller
+/// 1 MiB probe (`THROUGHPUT_PROBE_RELAY_BYTES`) and reports its measured rate as a warning instead
+/// of timing out at 60 s (`BUG-41`). The worker figure is the time from submit to result and so
+/// includes scheduling and the task's own run; it is a lower bound on the link speed. Workers are
+/// probed one after the other so they do not share the master's bandwidth.
 async fn throughput_check(
     master_addr: &str,
     secret: Option<&ClusterSecret>,
@@ -941,35 +1057,28 @@ async fn throughput_check(
         return Ok(());
     }
     let mib = THROUGHPUT_PROBE_BYTES as f64 / (1024.0 * 1024.0);
-    let mbps = |ms: f64| THROUGHPUT_PROBE_BYTES as f64 / 1e6 / (ms.max(0.001) / 1000.0);
+    let any_relayed = connected.iter().any(WorkerSummary::relayed);
 
-    // Stage the payload in a private temp file; the input scanner reads files.
-    let path = std::env::temp_dir().join(format!("oxideswarm-doctor-{}.bin", Uuid::new_v4()));
-    let write = {
-        let payload = throughput_payload(Uuid::new_v4());
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, &payload))
-    };
     let outcome = async {
-        write.map_err(|e| format!("cannot stage the probe file: {e}"))?;
-        let prepared =
-            crate::blobs::scan_input_paths(&[(path.clone(), Some(THROUGHPUT_PROBE_FILE.into()))])?;
         let connection = crate::blobs::BlobConnection::connect(master_addr, secret)
             .await
             .map_err(|e| e.to_string())?;
-        let started = Instant::now();
-        let upload_res = crate::blobs::upload_inputs(&connection, &prepared).await;
-        let elapsed = started.elapsed();
+        let full_res = stage_and_upload_probe(&connection, THROUGHPUT_PROBE_BYTES).await;
+        let relay_res = if full_res.is_ok() && any_relayed {
+            Some(stage_and_upload_probe(&connection, THROUGHPUT_PROBE_RELAY_BYTES).await)
+        } else {
+            None
+        };
         connection.close().await;
-        upload_res?;
-        Ok::<_, String>((prepared, elapsed))
+        let (prepared_full, upload) = full_res?;
+        let prepared_relay = match relay_res {
+            Some(res) => Some(res?.0),
+            None => None,
+        };
+        Ok::<_, String>((prepared_full, upload, prepared_relay))
     }
     .await;
-    let _ = std::fs::remove_file(&path);
-    let (prepared, upload) = match outcome {
+    let (prepared_full, upload, prepared_relay) = match outcome {
         Ok(ok) => ok,
         Err(message) => {
             let (outcome, detail) = if message.contains("no blob store") {
@@ -994,9 +1103,9 @@ async fn throughput_check(
         None,
         Outcome::Pass,
         format!(
-            "upload to the master: {mib:.0} MiB in {} ms, {:.1} MB/s",
+            "upload to the master: {mib:.0} MiB in {} ms, {} MB/s",
             upload.as_millis(),
-            mbps(upload.as_secs_f64() * 1000.0)
+            format_throughput_mbps(THROUGHPUT_PROBE_BYTES, upload)
         ),
     );
 
@@ -1011,7 +1120,16 @@ async fn throughput_check(
             );
             continue;
         };
-        let task = throughput_task(worker_id, os, &prepared.inputs, options.probe_timeout);
+        let probe_bytes = throughput_probe_bytes_for_worker(w);
+        let inputs = if w.relayed() {
+            &prepared_relay
+                .as_ref()
+                .expect("relayed probe staged when any_relayed")
+                .inputs
+        } else {
+            &prepared_full.inputs
+        };
+        let task = throughput_task(worker_id, os, inputs, options.probe_timeout);
         let started = Instant::now();
         let task_id = match submit(transport, task).await? {
             Ok(id) => id,
@@ -1034,38 +1152,14 @@ async fn throughput_check(
         )
         .await?;
         let elapsed = started.elapsed();
-        let (outcome, detail) = match collected.get(&task_id) {
-            Some(Collected::Done(result)) if result.worker_id != worker_id => (
-                Outcome::Fail,
-                "ran on another worker: the master ignores placement constraints".to_string(),
-            ),
-            Some(Collected::Done(result)) if result.exit_code == 0 => (
-                Outcome::Pass,
-                format!(
-                    "fetch to the worker over {}: {mib:.0} MiB in {} ms, {:.1} MB/s (submit to result, includes scheduling and a {} ms task)",
-                    w.link_text(),
-                    elapsed.as_millis(),
-                    mbps(elapsed.as_secs_f64() * 1000.0),
-                    result.execution_time_ms
-                ),
-            ),
-            Some(Collected::Done(result)) => (
-                Outcome::Fail,
-                format!("exit code {}: {}", result.exit_code, failure_text(result)),
-            ),
-            Some(Collected::Refused(message)) => (
-                Outcome::Fail,
-                format!("the master refused the probe: {message}"),
-            ),
-            Some(Collected::TimedOut(state)) => (
-                Outcome::Fail,
-                format!(
-                    "no result within {}s (last state {state}); the worker may not support file transfer or the link is very slow",
-                    options.probe_timeout.as_secs()
-                ),
-            ),
-            None => (Outcome::Fail, "the probe was not collected".to_string()),
-        };
+        let (outcome, detail) = judge_throughput(
+            w,
+            worker_id,
+            probe_bytes,
+            collected.get(&task_id),
+            elapsed,
+            options.probe_timeout,
+        );
         report.push("C8", NAME, Some(w.name.as_str()), outcome, detail);
     }
     Ok(())
@@ -1538,5 +1632,180 @@ mod tests {
         }
         let throughput = throughput_task(id, "macos", &[], timeout);
         assert_eq!(throughput.requirements.ram_mb, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate() {
+        use rusty_grid_master::reaper::ReaperConfig;
+        use rusty_grid_master::registry::WorkerStatus;
+        use rusty_grid_master::scheduler::SchedulerConfig;
+        use rusty_grid_master::server::{MasterServer, ServerConfig};
+        use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+        use tokio::sync::watch;
+
+        let blob_dir = tempfile::tempdir().expect("blob dir");
+        let sandbox_dir = tempfile::tempdir().expect("sandbox dir");
+        let master = MasterServer::spawn_with_config(
+            ServerConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_blob_store(blob_dir.path(), 64 * 1024 * 1024),
+            SchedulerConfig::default().without_host_cpu_backpressure(),
+            ReaperConfig::default(),
+        )
+        .await
+        .expect("master starts");
+        let addr = master.server_addr().to_string();
+
+        let config = WorkerConfig::new(addr.clone())
+            .with_no_battery(true)
+            .with_name("relayed-w")
+            .with_cores(2)
+            .with_ram_mb(2048)
+            .with_sandbox_base_dir(sandbox_dir.path())
+            .with_redirection_portal(false);
+        let mut client = WorkerClient::new(config);
+        let worker_id = client.worker_id();
+        let (tx, rx) = watch::channel(false);
+        let worker_handle = tokio::spawn(async move {
+            let _ = client.run(rx).await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Ok(workers) = master.list_workers().await {
+                if workers
+                    .iter()
+                    .any(|w| w.worker_id == worker_id && w.status != WorkerStatus::Disconnected)
+                {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "worker did not register");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let os_tag = format!("os:{}", std::env::consts::OS);
+        let id_tag = format!("id:{worker_id}");
+        let relayed = WorkerSummary::of(&caps(
+            "relayed-w",
+            &[&os_tag, "link:Relay (DERP):2200.0ms", &id_tag],
+        ));
+        let mut transport = connect_master(&addr, None).await.expect("connect master");
+        let mut report = DoctorReport {
+            master: addr.clone(),
+            workers: vec![relayed.clone()],
+            checks: Vec::new(),
+            auth_failed: false,
+        };
+        let options = DoctorOptions {
+            probe_timeout: Duration::from_secs(60),
+            ..DoctorOptions::default()
+        };
+
+        throughput_check(
+            &addr,
+            None,
+            &mut transport,
+            &options,
+            &[relayed],
+            &mut report,
+        )
+        .await
+        .expect("throughput_check succeeds");
+
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(10), worker_handle).await;
+        let _ = master.shutdown();
+
+        let worker_c8 = report
+            .checks
+            .iter()
+            .find(|c| c.id == "C8" && c.worker.as_deref() == Some("relayed-w"))
+            .expect("worker C8 line");
+        assert_eq!(
+            worker_c8.outcome,
+            Outcome::Warn,
+            "relayed worker C8 must warn with its rate: {:?}",
+            worker_c8
+        );
+        assert!(
+            worker_c8.detail.contains("1 MiB")
+                && worker_c8.detail.contains("relay")
+                && worker_c8.detail.contains("MB/s"),
+            "unexpected C8 detail: {}",
+            worker_c8.detail
+        );
+        assert!(!report.failed(), "{}", report.render());
+    }
+
+    #[test]
+    fn test_bug41_probe_size_and_judge_throughput_cases() {
+        let wid = Uuid::new_v4();
+        let timeout = Duration::from_secs(60);
+        let relayed =
+            WorkerSummary::of(&caps("msi", &["os:windows", "link:Relay (DERP):2200.0ms"]));
+        let tcp = WorkerSummary::of(&caps("lan", &["os:linux", "link:TCP/LAN"]));
+        let direct = WorkerSummary::of(&caps("p2p", &["os:macos", "link:Direct P2P (QUIC):3.1ms"]));
+
+        assert_eq!(
+            throughput_probe_bytes_for_worker(&relayed),
+            THROUGHPUT_PROBE_RELAY_BYTES
+        );
+        assert_eq!(
+            throughput_probe_bytes_for_worker(&tcp),
+            THROUGHPUT_PROBE_BYTES
+        );
+        assert_eq!(
+            throughput_probe_bytes_for_worker(&direct),
+            THROUGHPUT_PROBE_BYTES
+        );
+
+        // Slow relayed transfer (~0.12 MB/s for 1 MiB) warns with formatted rate and does not fail.
+        let (outcome, detail) = judge_throughput(
+            &relayed,
+            wid,
+            THROUGHPUT_PROBE_RELAY_BYTES,
+            Some(&done(wid, 0, "ok")),
+            Duration::from_millis(8700),
+            timeout,
+        );
+        assert_eq!(outcome, Outcome::Warn, "{detail}");
+        assert!(
+            detail.contains("1 MiB") && detail.contains("0.12 MB/s") && detail.contains("relay"),
+            "{detail}"
+        );
+
+        // Relayed timeout (no blob support / stalled) and non-zero exit still fail.
+        for bad in [
+            Some(Collected::TimedOut("Queued".to_string())),
+            Some(Collected::TimedOut("Running".to_string())),
+            Some(Collected::Refused("no blob store".to_string())),
+            Some(done(wid, 1, "missing certutil")),
+            None,
+        ] {
+            let (outcome, _) = judge_throughput(
+                &relayed,
+                wid,
+                THROUGHPUT_PROBE_RELAY_BYTES,
+                bad.as_ref(),
+                timeout,
+                timeout,
+            );
+            assert_eq!(outcome, Outcome::Fail);
+        }
+
+        // Direct/TCP workers continue to pass with the 8 MiB probe.
+        let (outcome, detail) = judge_throughput(
+            &tcp,
+            wid,
+            THROUGHPUT_PROBE_BYTES,
+            Some(&done(wid, 0, "ok")),
+            Duration::from_millis(200),
+            timeout,
+        );
+        assert_eq!(outcome, Outcome::Pass, "{detail}");
+        assert!(
+            detail.contains("8 MiB") && detail.contains("MB/s"),
+            "{detail}"
+        );
     }
 }

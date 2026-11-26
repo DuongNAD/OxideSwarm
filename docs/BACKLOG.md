@@ -472,7 +472,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
-| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Planned | In |  |
+| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Implemented |  |  |
 | BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
@@ -1659,6 +1659,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   link (a smaller payload) or report the measured rate as a warning when the task is still running and has made
   progress; keep FAIL for a worker without blob support or with no progress.
 - **Done when:** A relayed worker that moves data slowly gets a WARN with its rate, and the existing C8 tests pass.
+- **Update (2026-11-26, `mac/bug-41-doctor-c8-relay-warn`):**
+  1. Failing check first: `doctor::tests::test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate`
+     failed before the fix (`left: Pass`, `right: Warn`, sending `8 MiB` to a relayed worker).
+  2. Added `THROUGHPUT_PROBE_RELAY_BYTES` (`1 MiB`) and `throughput_probe_bytes_for_worker` /
+     `format_throughput_mbps` (`{:.2}` below `1.0 MB/s`) / `judge_throughput` in `crates/cli/src/doctor.rs` so
+     relayed workers (`worker.relayed()`) fetch a `1 MiB` probe and report `Outcome::Warn` with their measured
+     rate (`!report.failed()`), while timeouts, refusals, and non-zero exits stay `Outcome::Fail` and direct/TCP
+     workers keep the `8 MiB` `Outcome::Pass` probe; updated `docs/design/0001-two-node-readiness.md` and
+     `docs/reference.md`.
+  3. Verified `doctor::tests` (`11/11`), `cli_doctor_e2e` (`7/7`), `f2_t2_backlog_no_duplicate_ids_and_valid_lines`
+     (`1/1`), `tests/test_m1_challenger_hygiene.py` (`5/5`), `fmt`, workspace `clippy` (`0` warnings), and
+     `ox-mode test size`.
 
 ### BUG-40: A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails
 
@@ -3433,3 +3445,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: BUG-41 Implemented (`mac/bug-41-doctor-c8-relay-warn`): added `THROUGHPUT_PROBE_RELAY_BYTES` (`1 MiB`), `throughput_probe_bytes_for_worker`, `format_throughput_mbps` (`{:.2}` below `1.0 MB/s`), and `judge_throughput` in `crates/cli/src/doctor.rs` (plus `docs/design/0001-two-node-readiness.md` and `docs/reference.md`) so relayed workers fetch `1 MiB` and report `WARN` with their measured rate instead of timing out at `60 s` on `8 MiB`, while timeouts/refusals/failures stay `FAIL` and direct/TCP probes stay `8 MiB` `PASS`; verified failing-first resolved: `test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate` -> `doctor::tests` (`11/11`), `cli_doctor_e2e` (`7/7`), `f2_t2_backlog_no_duplicate_ids_and_valid_lines` (`1/1`), `test_m1_challenger_hygiene.py` (`5/5`), `fmt`, workspace `clippy` (`0` warnings), and `ox-mode test size`.
