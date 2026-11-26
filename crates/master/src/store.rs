@@ -86,6 +86,8 @@ use uuid::Uuid;
 
 use crate::queue::{RetryAttempt, TaskState};
 
+pub use crate::mail_store::{MailJournalRecord, MailRecovered, MailSnapshotImage, MailStore};
+
 /// Magic bytes at the start of `journal.bin`.
 pub const JOURNAL_MAGIC: &[u8; 8] = b"OXSWJRN1";
 /// Magic bytes at the start of `snapshot.bin`.
@@ -766,7 +768,7 @@ pub(crate) fn sync_file_all(file: &File, dir: &Path, kind: &'static str) -> std:
     Ok(())
 }
 
-fn sync_file_data(file: &File, dir: &Path, kind: &'static str) -> std::io::Result<()> {
+pub(crate) fn sync_file_data(file: &File, dir: &Path, kind: &'static str) -> std::io::Result<()> {
     file.sync_data()?;
     note_fsync(dir, kind);
     Ok(())
@@ -861,7 +863,7 @@ pub(crate) fn prepare_dir(dir: &Path) -> GridResult<()> {
 
 /// Opens `path` read-write (not append: Windows append handles cannot `set_len`), creating it with
 /// mode 0600 on Unix. The position is the start of the file.
-fn open_rw(path: &Path) -> GridResult<File> {
+pub(crate) fn open_rw(path: &Path) -> GridResult<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true);
     #[cfg(unix)]
@@ -923,7 +925,7 @@ fn parse_header(path: &Path, magic: &[u8; 8], bytes: &[u8]) -> GridResult<Header
     })
 }
 
-fn encode_frame(payload: &[u8]) -> GridResult<Vec<u8>> {
+pub(crate) fn encode_frame(payload: &[u8]) -> GridResult<Vec<u8>> {
     if payload.len() > MAX_FRAME_SIZE {
         return Err(GridError::FrameTooLarge {
             size: payload.len(),
@@ -1047,6 +1049,14 @@ struct LoadedJournal {
     reset: bool,
     /// The records were discarded because the journal predates the snapshot.
     stale: bool,
+}
+
+pub(crate) fn durable_ack_from_rx(rx: oneshot::Receiver<GridResult<()>>) -> DurableAck {
+    DurableAck(rx)
+}
+
+pub(crate) fn scan_valid_frame_follows(bytes: &[u8], from: usize) -> bool {
+    !matches!(valid_frame_follows(bytes, from), Scan::Nothing)
 }
 
 enum Scan {

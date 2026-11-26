@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::capabilities::WorkerCapabilities;
+use crate::mail::MailMessage;
 use crate::task::{TaskId, TaskResult, TaskStatus, WorkspaceAffinity};
 
 use super::{default_protocol_version, ClientResponse, PROTOCOL_VERSION_CURRENT};
@@ -172,6 +173,32 @@ pub(super) enum HumanClientResponse {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    MailSent {
+        id: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MailMessages {
+        #[serde(default)]
+        messages: Vec<MailMessage>,
+        cursor: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MailAcked {
+        cursor: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MailWaited {
+        #[serde(default)]
+        messages: Vec<MailMessage>,
+        cursor: u64,
+        #[serde(default)]
+        timed_out: bool,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -307,6 +334,25 @@ pub(super) enum BinaryClientResponse {
     },
     WorkerIdReleased {
         worker_id: Uuid,
+        protocol_version: u32,
+    },
+    MailSent {
+        id: u64,
+        protocol_version: u32,
+    },
+    MailMessages {
+        messages: Vec<MailMessage>,
+        cursor: u64,
+        protocol_version: u32,
+    },
+    MailAcked {
+        cursor: u64,
+        protocol_version: u32,
+    },
+    MailWaited {
+        messages: Vec<MailMessage>,
+        cursor: u64,
+        timed_out: bool,
         protocol_version: u32,
     },
 }
@@ -753,6 +799,31 @@ impl HumanClientResponse {
                     protocol_version,
                 }
             }
+            ClientResponse::MailSent { id } => HumanClientResponse::MailSent {
+                id,
+                protocol_version,
+            },
+            ClientResponse::MailMessages { messages, cursor } => {
+                HumanClientResponse::MailMessages {
+                    messages,
+                    cursor,
+                    protocol_version,
+                }
+            }
+            ClientResponse::MailAcked { cursor } => HumanClientResponse::MailAcked {
+                cursor,
+                protocol_version,
+            },
+            ClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+            } => HumanClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+                protocol_version,
+            },
         }
     }
 
@@ -832,6 +903,18 @@ impl HumanClientResponse {
                 protocol_version, ..
             }
             | Self::WorkerIdReleased {
+                protocol_version, ..
+            }
+            | Self::MailSent {
+                protocol_version, ..
+            }
+            | Self::MailMessages {
+                protocol_version, ..
+            }
+            | Self::MailAcked {
+                protocol_version, ..
+            }
+            | Self::MailWaited {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -1028,6 +1111,31 @@ impl BinaryClientResponse {
                     protocol_version,
                 }
             }
+            ClientResponse::MailSent { id } => BinaryClientResponse::MailSent {
+                id,
+                protocol_version,
+            },
+            ClientResponse::MailMessages { messages, cursor } => {
+                BinaryClientResponse::MailMessages {
+                    messages,
+                    cursor,
+                    protocol_version,
+                }
+            }
+            ClientResponse::MailAcked { cursor } => BinaryClientResponse::MailAcked {
+                cursor,
+                protocol_version,
+            },
+            ClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+            } => BinaryClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+                protocol_version,
+            },
         }
     }
 
@@ -1107,6 +1215,18 @@ impl BinaryClientResponse {
                 protocol_version, ..
             }
             | Self::WorkerIdReleased {
+                protocol_version, ..
+            }
+            | Self::MailSent {
+                protocol_version, ..
+            }
+            | Self::MailMessages {
+                protocol_version, ..
+            }
+            | Self::MailAcked {
+                protocol_version, ..
+            }
+            | Self::MailWaited {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -1264,6 +1384,21 @@ impl From<HumanClientResponse> for ClientResponse {
             HumanClientResponse::WorkerIdReleased { worker_id, .. } => {
                 ClientResponse::WorkerIdReleased { worker_id }
             }
+            HumanClientResponse::MailSent { id, .. } => ClientResponse::MailSent { id },
+            HumanClientResponse::MailMessages {
+                messages, cursor, ..
+            } => ClientResponse::MailMessages { messages, cursor },
+            HumanClientResponse::MailAcked { cursor, .. } => ClientResponse::MailAcked { cursor },
+            HumanClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+                ..
+            } => ClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+            },
         }
     }
 }
@@ -1415,6 +1550,21 @@ impl From<BinaryClientResponse> for ClientResponse {
             BinaryClientResponse::WorkerIdReleased { worker_id, .. } => {
                 ClientResponse::WorkerIdReleased { worker_id }
             }
+            BinaryClientResponse::MailSent { id, .. } => ClientResponse::MailSent { id },
+            BinaryClientResponse::MailMessages {
+                messages, cursor, ..
+            } => ClientResponse::MailMessages { messages, cursor },
+            BinaryClientResponse::MailAcked { cursor, .. } => ClientResponse::MailAcked { cursor },
+            BinaryClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+                ..
+            } => ClientResponse::MailWaited {
+                messages,
+                cursor,
+                timed_out,
+            },
         }
     }
 }
@@ -1470,7 +1620,7 @@ pub(super) fn serialize_client_response_for_peer(
     peer_version: u32,
     codec: super::WireCodec,
 ) -> Result<bytes::Bytes, super::ProtocolError> {
-    if peer_version >= 11 {
+    if peer_version >= PROTOCOL_VERSION_CURRENT {
         return serialize_client_response_with_version(msg, peer_version, codec);
     }
     let adapted = msg.for_peer(peer_version);

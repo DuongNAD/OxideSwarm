@@ -13,6 +13,7 @@ use rusty_grid_core::blob_transfer::BlobReply;
 use rusty_grid_core::noise_auth::{AuthenticatedV3Peer, HandshakePurpose};
 use rusty_grid_core::protocol::{
     format_incompatible_version_error, ClientMessage, ClientResponse, ProtocolError,
+    PROTOCOL_VERSION_CURRENT,
 };
 use rusty_grid_core::task::{TaskId, TaskStatus};
 use rusty_grid_core::{GridError, GridResult, MessageTransport, WorkerCapabilities};
@@ -532,6 +533,118 @@ pub(crate) async fn handle_client_connection<S: AsyncRead + AsyncWrite + Unpin +
                     broadcast_tx.as_ref(),
                 )
                 .await?;
+            }
+            ClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+            } => {
+                let peer_ver = transport
+                    .last_peer_version()
+                    .unwrap_or(PROTOCOL_VERSION_CURRENT);
+                let resp = if peer_ver < PROTOCOL_VERSION_CURRENT {
+                    ClientResponse::Error {
+                        message: format!(
+                            "Grid mailbox requires protocol version {PROTOCOL_VERSION_CURRENT} \
+                             (peer spoke version {peer_ver}; upgrade client)"
+                        ),
+                    }
+                } else {
+                    let from = v3_peer
+                        .as_ref()
+                        .map(|peer| {
+                            auth_ctx
+                                .members
+                                .get(&peer.public_key)
+                                .map(|m| m.name)
+                                .unwrap_or_else(|| peer.member_id.clone())
+                        })
+                        .unwrap_or_else(|| "local".to_string());
+                    match auth_ctx
+                        .mailbox
+                        .send(from, to, topic, body, attachments)
+                        .await
+                    {
+                        Ok(id) => ClientResponse::MailSent { id },
+                        Err(message) => ClientResponse::Error { message },
+                    }
+                };
+                send_client_response(&mut transport, &resp).await?;
+            }
+            ClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+            } => {
+                let peer_ver = transport
+                    .last_peer_version()
+                    .unwrap_or(PROTOCOL_VERSION_CURRENT);
+                let resp = if peer_ver < PROTOCOL_VERSION_CURRENT {
+                    ClientResponse::Error {
+                        message: format!(
+                            "Grid mailbox requires protocol version {PROTOCOL_VERSION_CURRENT} \
+                             (peer spoke version {peer_ver}; upgrade client)"
+                        ),
+                    }
+                } else {
+                    match auth_ctx.mailbox.fetch(&consumer, &topics, after) {
+                        Ok((messages, cursor)) => ClientResponse::MailMessages { messages, cursor },
+                        Err(message) => ClientResponse::Error { message },
+                    }
+                };
+                send_client_response(&mut transport, &resp).await?;
+            }
+            ClientMessage::MailAck { consumer, up_to_id } => {
+                let peer_ver = transport
+                    .last_peer_version()
+                    .unwrap_or(PROTOCOL_VERSION_CURRENT);
+                let resp = if peer_ver < PROTOCOL_VERSION_CURRENT {
+                    ClientResponse::Error {
+                        message: format!(
+                            "Grid mailbox requires protocol version {PROTOCOL_VERSION_CURRENT} \
+                             (peer spoke version {peer_ver}; upgrade client)"
+                        ),
+                    }
+                } else {
+                    match auth_ctx.mailbox.ack(consumer, up_to_id).await {
+                        Ok(cursor) => ClientResponse::MailAcked { cursor },
+                        Err(message) => ClientResponse::Error { message },
+                    }
+                };
+                send_client_response(&mut transport, &resp).await?;
+            }
+            ClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+            } => {
+                let peer_ver = transport
+                    .last_peer_version()
+                    .unwrap_or(PROTOCOL_VERSION_CURRENT);
+                let resp = if peer_ver < PROTOCOL_VERSION_CURRENT {
+                    ClientResponse::Error {
+                        message: format!(
+                            "Grid mailbox requires protocol version {PROTOCOL_VERSION_CURRENT} \
+                             (peer spoke version {peer_ver}; upgrade client)"
+                        ),
+                    }
+                } else {
+                    match auth_ctx
+                        .mailbox
+                        .wait(&consumer, &topics, after, timeout_secs)
+                        .await
+                    {
+                        Ok((messages, cursor, timed_out)) => ClientResponse::MailWaited {
+                            messages,
+                            cursor,
+                            timed_out,
+                        },
+                        Err(message) => ClientResponse::Error { message },
+                    }
+                };
+                send_client_response(&mut transport, &resp).await?;
             }
         }
     }

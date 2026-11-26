@@ -11,6 +11,7 @@ pub mod capabilities;
 pub mod cluster_auth;
 pub mod discovery;
 pub mod error;
+pub mod mail;
 pub mod mapreduce;
 pub mod mode;
 // LV-4: zeroize::ZeroizeOnDrop FFI buffer cleanup / secret keypair guard tests and Unix FFI helpers.

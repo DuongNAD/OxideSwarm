@@ -53,6 +53,7 @@ pub(crate) struct MasterAuthContext {
     pub member_connections: MemberConnections,
     pub p2p_ticket: Option<String>,
     pub enroll_confirm_timeout: Duration,
+    pub mailbox: Arc<crate::mail::Mailbox>,
 }
 
 impl Default for MasterAuthContext {
@@ -67,6 +68,7 @@ impl Default for MasterAuthContext {
             member_connections: MemberConnections::default(),
             p2p_ticket: None,
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
+            mailbox: Arc::new(crate::mail::Mailbox::in_memory_default()),
         }
     }
 }
@@ -147,7 +149,11 @@ pub(super) fn check_v3_client_message_role(
         | ClientMessage::CancelTask { .. }
         | ClientMessage::SubmitMapReduce { .. }
         | ClientMessage::GetTaskResult { .. }
-        | ClientMessage::BlobRequest { .. } => {
+        | ClientMessage::BlobRequest { .. }
+        | ClientMessage::MailSend { .. }
+        | ClientMessage::MailFetch { .. }
+        | ClientMessage::MailAck { .. }
+        | ClientMessage::MailWait { .. } => {
             if member.has_client_role() {
                 Ok(())
             } else {

@@ -9,6 +9,8 @@ pub mod cold_results;
 pub mod dashboard;
 pub mod fair_share;
 pub mod liveness;
+pub mod mail;
+pub mod mail_store;
 pub mod mapreduce;
 mod member_connections;
 pub mod metrics;
@@ -44,6 +46,8 @@ pub use cold_results::{
 };
 pub use fair_share::SubmitterId;
 pub use liveness::{RxClock, StampedStream};
+pub use mail::{Mailbox, DEFAULT_MAX_MAIL_BYTES, DEFAULT_MAX_MAIL_COUNT};
+pub use mail_store::{MailJournalRecord, MailRecovered, MailSnapshotImage, MailStore};
 pub use mapreduce::MapReduceEngine;
 pub use queue::{
     is_worker_rejection, AssignedLoad, CancelOutcome, DelayedRetryKey, QueueOrderKey, QueueStats,

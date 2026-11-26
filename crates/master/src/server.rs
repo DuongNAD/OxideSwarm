@@ -226,6 +226,10 @@ pub struct ServerConfig {
     /// Optional path to the local host's `node.key` to auto-enrol as `local-host` (`admin`) when
     /// `CreateInvite` first persists `master_noise.key`.
     pub local_node_key_path: Option<PathBuf>,
+    /// Maximum messages retained in the durable grid mailbox (`DEFAULT_MAX_MAIL_COUNT`).
+    pub max_mail_count: usize,
+    /// Maximum content bytes retained in the durable grid mailbox (`DEFAULT_MAX_MAIL_BYTES`).
+    pub max_mail_bytes: usize,
     /// Enrolled member list (`members.json`).
     pub members: Arc<MemberStore>,
     /// True when `with_members` was called explicitly so `bind_full` does not overwrite it from `state_dir`.
@@ -285,6 +289,8 @@ impl Default for ServerConfig {
             master_noise_key: None,
             master_noise_key_path: None,
             local_node_key_path: None,
+            max_mail_count: crate::mail::DEFAULT_MAX_MAIL_COUNT,
+            max_mail_bytes: crate::mail::DEFAULT_MAX_MAIL_BYTES,
             members: Arc::new(MemberStore::new()),
             members_explicit: false,
         }
@@ -577,6 +583,18 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the maximum number of retained messages in the grid mailbox.
+    pub fn with_max_mail_count(mut self, max: usize) -> Self {
+        self.max_mail_count = max.max(1);
+        self
+    }
+
+    /// Sets the maximum retained byte budget in the grid mailbox.
+    pub fn with_max_mail_bytes(mut self, max: usize) -> Self {
+        self.max_mail_bytes = max.max(1);
+        self
+    }
+
     /// Sets the master's static X25519 key pair for OXS-AUTH v3 handshakes.
     pub fn with_master_noise_key(mut self, key: NodeKeypair) -> Self {
         self.master_noise_key = Some(key);
@@ -802,6 +820,24 @@ impl MasterServer {
             }
         }
 
+        let mailbox = {
+            let state_dir_opt = config.state_dir.clone();
+            let blob_opt = blob_store.clone();
+            let max_mail_count = config.max_mail_count;
+            let max_mail_bytes = config.max_mail_bytes;
+            let opened = tokio::task::spawn_blocking(move || {
+                crate::mail::Mailbox::open(
+                    state_dir_opt.as_deref(),
+                    blob_opt,
+                    max_mail_count,
+                    max_mail_bytes,
+                )
+            })
+            .await
+            .map_err(|e| GridError::Config(format!("Mailbox start-up failed: {e}")))??;
+            Arc::new(opened)
+        };
+
         #[cfg(feature = "p2p")]
         let p2p_active_conns = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         #[cfg(feature = "p2p")]
@@ -944,6 +980,7 @@ impl MasterServer {
             member_connections: crate::member_connections::MemberConnections::default(),
             p2p_ticket: p2p_ticket.clone(),
             enroll_confirm_timeout: Duration::from_secs(ENROLL_CONFIRM_TIMEOUT_SECS),
+            mailbox,
         };
 
         Ok(Self {
@@ -2063,6 +2100,7 @@ impl MasterServer {
         }
 
         self.queue.close_and_compact_store().await;
+        auth_ctx.mailbox.close_and_compact_store_sync();
         if auth_ctx.auth_mode.allows_members() && auth_ctx.members.is_dirty() {
             let members_for_shutdown = Arc::clone(&auth_ctx.members);
             if let Err(e) =
@@ -2424,6 +2462,7 @@ impl MasterHandle {
     /// Signals all Master subsystems to shut down.
     pub fn shutdown(&self) -> GridResult<()> {
         self.queue.close_and_compact_store_sync();
+        self.auth_ctx.mailbox.close_and_compact_store_sync();
         if self.auth_mode.allows_members() && self.members.is_dirty() {
             if let Err(e) = self.members.flush_dirty() {
                 warn!(
