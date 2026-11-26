@@ -617,18 +617,50 @@ pub(super) async fn run_worker(
     config = config.with_wire_codec(wire_codec);
 
     let config_write_path = resolve_config_write_path(config_file.as_ref());
-    let mut initial_limits = config_write_path
+    let loaded_file_limits = config_write_path
         .as_deref()
-        .and_then(|p| load_worker_limits_from_toml(p).ok())
-        .unwrap_or_default();
-    let no_gpu_tasks_override = resolve_bool(
-        args.no_gpu_tasks.then_some(true),
-        &["RUSTY_GRID_NO_GPU_TASKS"],
-        None,
-        initial_limits.no_gpu_tasks,
-    );
-    initial_limits.no_gpu_tasks = no_gpu_tasks_override;
-    let _hold_ends_tasks = args.hold_ends_tasks;
+        .and_then(|p| load_worker_limits_from_toml(p).ok());
+    let fallback_file_cfg = worker_cfg.clone().or_else(|| {
+        loaded_file_limits
+            .as_ref()
+            .map(|lim| crate::config::WorkerFileConfig {
+                local_max_cpu_pct: lim.local_max_cpu_pct,
+                hours: lim.hours.clone(),
+                max_task_hours_per_day: lim.max_task_hours_per_day,
+                no_tasks_on_battery: lim.no_tasks_on_battery,
+                no_tasks_on_metered: lim.no_tasks_on_metered,
+                no_gpu_tasks: Some(lim.no_gpu_tasks),
+                ..Default::default()
+            })
+    });
+    let cli_limits = crate::config::WorkerLimitsCliOverrides {
+        local_max_cpu_pct: args.local_max_cpu_pct,
+        hours: args.hours.clone(),
+        max_task_hours_per_day: args.max_task_hours_per_day,
+        no_tasks_on_battery: args.no_tasks_on_battery.then_some(true),
+        no_tasks_on_metered: args.no_tasks_on_metered.then_some(true),
+        no_gpu_tasks: args.no_gpu_tasks.then_some(true),
+        hold_ends_tasks: args.hold_ends_tasks.then_some(true),
+    };
+    let resolved_limits = match crate::config::resolve_worker_limits_from(
+        &cli_limits,
+        fallback_file_cfg.as_ref(),
+        |name| std::env::var(name).ok(),
+    ) {
+        Ok(lim) => lim,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let initial_limits = WorkerLimitsConfig {
+        local_max_cpu_pct: resolved_limits.local_max_cpu_pct,
+        hours: resolved_limits.hours.clone(),
+        max_task_hours_per_day: resolved_limits.max_task_hours_per_day,
+        no_tasks_on_battery: resolved_limits.no_tasks_on_battery.then_some(true),
+        no_tasks_on_metered: resolved_limits.no_tasks_on_metered.then_some(true),
+        no_gpu_tasks: resolved_limits.no_gpu_tasks,
+    };
 
     let control_socket_override = resolve_opt_string(
         args.control_socket.map(|p| p.display().to_string()),
@@ -646,6 +678,7 @@ pub(super) async fn run_worker(
     config = config
         .with_control_endpoint(control_endpoint)
         .with_initial_limits(initial_limits)
+        .with_hold_ends_tasks(resolved_limits.hold_ends_tasks)
         .with_control_config_path(config_write_path)
         .with_limit_persist_hook(persist_hook);
 
@@ -890,6 +923,9 @@ pub(crate) async fn run_worker_control_action(
                 "  active_tasks={}, no_gpu_tasks={}",
                 snapshot.active_tasks, snapshot.no_gpu_tasks
             );
+            if let Some(detail) = snapshot.detail.as_deref() {
+                println!("  detail={detail}");
+            }
             if let Some(ms) = snapshot.paused_until_epoch_ms {
                 println!("  paused_until_epoch_ms={ms}");
             }
@@ -975,7 +1011,7 @@ pub(crate) fn load_worker_limits_from_toml(
         max_task_hours_per_day: worker_tbl
             .get("max_task_hours_per_day")
             .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-            .filter(|f| f.is_finite() && *f > 0.0),
+            .filter(|f| f.is_finite() && *f > 0.0 && *f <= 24.0),
         no_tasks_on_battery: worker_tbl
             .get("no_tasks_on_battery")
             .and_then(|v| v.as_bool()),

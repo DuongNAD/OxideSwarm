@@ -140,19 +140,7 @@ fn parse_bool_flag(val: &str, key: &str) -> Result<bool, String> {
 }
 
 fn validate_hours_window(val: &str) -> Result<(), String> {
-    let Some((start, end)) = val.split_once('-') else {
-        return Err(format!(
-            "invalid hours window '{val}' (expected HH:MM-HH:MM)"
-        ));
-    };
-    parse_hhmm(start.trim())?;
-    parse_hhmm(end.trim())?;
-    Ok(())
-}
-
-fn parse_hhmm(s: &str) -> Result<NaiveTime, String> {
-    NaiveTime::parse_from_str(s, "%H:%M")
-        .map_err(|_| format!("invalid time '{s}' (expected HH:MM 24-hour clock)"))
+    crate::limits::HoursSchedule::parse(val).map(|_| ())
 }
 
 /// High-level local operational state reported by `oxideswarm worker status`.
@@ -181,6 +169,8 @@ pub struct ControlStatusSnapshot {
     pub worker_name: String,
     pub state: WorkerControlState,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub paused_until_epoch_ms: Option<u64>,
     pub no_gpu_tasks: bool,
     pub active_tasks: usize,
@@ -327,6 +317,7 @@ pub fn default_windows_pipe_name(worker_name: Option<&str>) -> String {
 pub enum ControlEvent {
     PauseHandBack { reason: String },
     ResumeReconnect,
+    LimitsUpdated,
 }
 
 /// Assignment eligibility outcome checked in `WorkerClient` right before running an `AssignTask`.
@@ -359,6 +350,7 @@ struct ControlStateInner {
     paused_until_epoch_ms: Option<u64>,
     held: bool,
     hold_reason: Option<String>,
+    hold_detail: Option<String>,
     limits: WorkerLimitsConfig,
 }
 
@@ -407,6 +399,7 @@ impl ControlHandle {
                 paused_until_epoch_ms: None,
                 held: false,
                 hold_reason: None,
+                hold_detail: None,
                 limits,
             }),
             event_tx,
@@ -456,13 +449,14 @@ impl ControlHandle {
     }
 
     fn build_snapshot(&self, inner: &ControlStateInner) -> ControlStatusSnapshot {
-        let (state, reason) = if inner.paused {
+        let (state, reason, detail) = if inner.paused {
             (
                 WorkerControlState::Paused,
                 inner
                     .pause_reason
                     .clone()
                     .or_else(|| Some("contributor paused worker".to_string())),
+                None,
             )
         } else if inner.held {
             (
@@ -471,9 +465,10 @@ impl ControlHandle {
                     .hold_reason
                     .clone()
                     .or_else(|| Some("local contributor limit active".to_string())),
+                inner.hold_detail.clone(),
             )
         } else {
-            (WorkerControlState::Running, None)
+            (WorkerControlState::Running, None, None)
         };
         let config_path = self
             .config_path
@@ -486,6 +481,7 @@ impl ControlHandle {
             worker_name: self.worker_name.clone(),
             state,
             reason,
+            detail,
             paused_until_epoch_ms: inner.paused_until_epoch_ms,
             no_gpu_tasks: inner.limits.no_gpu_tasks,
             active_tasks: self.active_tasks.load(Ordering::Acquire),
@@ -531,16 +527,17 @@ impl ControlHandle {
 
     /// Clears contributor pause state and asks the active session to reconnect if held back.
     pub fn resume(&self) -> ControlStatusSnapshot {
-        let (was_paused, snapshot) = {
+        let (was_paused, still_held, snapshot) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let was_paused = inner.paused;
             inner.paused = false;
             inner.pause_reason = None;
             inner.paused_until = None;
             inner.paused_until_epoch_ms = None;
-            (was_paused, self.build_snapshot(&inner))
+            (was_paused, inner.held, self.build_snapshot(&inner))
         };
-        if was_paused || self.session_sent_pause_rejection.load(Ordering::Acquire) {
+        if !still_held && (was_paused || self.session_sent_pause_rejection.load(Ordering::Acquire))
+        {
             let _ = self.event_tx.send(ControlEvent::ResumeReconnect);
         }
         snapshot
@@ -548,6 +545,17 @@ impl ControlHandle {
 
     /// Sets or clears automatic hold state (for D1 limit enforcement; `NET-9b`).
     pub fn set_held(&self, held: bool, reason: Option<String>, hand_back_running: bool) {
+        self.set_held_with_detail(held, reason, None, hand_back_running);
+    }
+
+    /// Sets or clears automatic hold state alongside a local-only explanation string.
+    pub fn set_held_with_detail(
+        &self,
+        held: bool,
+        reason: Option<String>,
+        detail: Option<String>,
+        hand_back_running: bool,
+    ) {
         let mut trigger_handback = None;
         let mut trigger_resume = false;
         {
@@ -566,7 +574,16 @@ impl ControlHandle {
             } else {
                 None
             };
-            if held && !was_held && hand_back_running {
+            inner.hold_detail = if held {
+                detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            if held && !was_held && !inner.paused && hand_back_running {
                 trigger_handback = inner.hold_reason.clone();
             } else if !held && was_held && !inner.paused {
                 trigger_resume = true;
@@ -579,6 +596,21 @@ impl ControlHandle {
         } else if trigger_resume {
             let _ = self.event_tx.send(ControlEvent::ResumeReconnect);
         }
+    }
+
+    /// Returns `true` when either manual pause or an automatic contributor limit hold is active.
+    pub fn is_paused_or_held(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.paused || inner.held
+    }
+
+    /// Returns a cloned snapshot of the current contributor limits configuration.
+    pub fn limits(&self) -> WorkerLimitsConfig {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .limits
+            .clone()
     }
 
     /// Checks whether a timed pause has expired; if so, clears it and emits `ResumeReconnect`.
@@ -653,6 +685,7 @@ impl ControlHandle {
             inner.limits = candidate;
             self.build_snapshot(&inner)
         };
+        let _ = self.event_tx.send(ControlEvent::LimitsUpdated);
         if gpu_toggled_off {
             let _ = self.event_tx.send(ControlEvent::ResumeReconnect);
         }
@@ -1397,5 +1430,46 @@ mod tests {
         let _ = shutdown_tx.send(true);
         srv.await.unwrap().unwrap();
         assert!(!sock.exists(), "socket must be removed cleanly on shutdown");
+    }
+
+    #[test]
+    fn resume_while_held_skips_reconnect_and_limits_set_emits_updated() {
+        let handle = ControlHandle::new(
+            Uuid::new_v4(),
+            "held-box",
+            Arc::new(AtomicUsize::new(0)),
+            WorkerLimitsConfig::default(),
+            None,
+            None,
+        );
+        let mut rx = handle.subscribe();
+        handle.set_held_with_detail(
+            true,
+            Some("on battery".into()),
+            Some("running on battery power".into()),
+            false,
+        );
+        handle.mark_session_pause_rejection();
+        let paused = handle.pause(None, Some("break".into())).unwrap();
+        assert_eq!(paused.state, WorkerControlState::Paused);
+        let _ = rx.try_recv(); // PauseHandBack
+
+        // Manual resume while held keeps Held state and must not emit ResumeReconnect.
+        let resumed = handle.resume();
+        assert_eq!(resumed.state, WorkerControlState::Held);
+        assert_eq!(resumed.reason.as_deref(), Some("on battery"));
+        assert_eq!(resumed.detail.as_deref(), Some("running on battery power"));
+        assert!(rx.try_recv().is_err());
+
+        // `limits set` emits LimitsUpdated and supports D1 weekday schedule syntax.
+        handle
+            .set_limit("hours", "mon-fri 22:00-07:00; sat-sun 00:00-24:00")
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), ControlEvent::LimitsUpdated);
+        assert_eq!(
+            handle.limits().hours.as_deref(),
+            Some("mon-fri 22:00-07:00; sat-sun 00:00-24:00")
+        );
+        assert!(handle.set_limit("hours", "10:00-10:00").is_err());
     }
 }

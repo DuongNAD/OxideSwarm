@@ -68,6 +68,22 @@ pub struct WorkerLimits {
 }
 
 impl WorkerLimits {
+    /// Converts control/CLI persisted limits plus `--hold-ends-tasks` into an evaluator config.
+    pub fn from_control_config(
+        cfg: &crate::control::WorkerLimitsConfig,
+        hold_ends_tasks: bool,
+    ) -> Self {
+        Self {
+            local_max_cpu_pct: cfg.local_max_cpu_pct,
+            hours: cfg.hours.clone(),
+            max_task_hours_per_day: cfg.max_task_hours_per_day,
+            no_tasks_on_battery: cfg.no_tasks_on_battery.unwrap_or(false),
+            no_tasks_on_metered: cfg.no_tasks_on_metered.unwrap_or(false),
+            no_gpu_tasks: cfg.no_gpu_tasks,
+            hold_ends_tasks,
+        }
+    }
+
     /// Validates every configured limit value upfront.
     pub fn validate(&self) -> Result<(), String> {
         if let Some(pct) = self.local_max_cpu_pct {
@@ -420,7 +436,7 @@ pub enum BatteryStatus {
 }
 
 /// Abstract host power source probe for unit tests and live runtime checks.
-pub trait BatteryProbe {
+pub trait BatteryProbe: Send + Sync {
     fn probe_battery(&self) -> BatteryStatus;
 }
 
@@ -433,8 +449,38 @@ pub enum MeteredStatus {
 }
 
 /// Abstract host metered-network probe for unit tests and live runtime checks.
-pub trait MeteredNetworkProbe {
+pub trait MeteredNetworkProbe: Send + Sync {
     fn probe_metered(&self) -> MeteredStatus;
+}
+
+/// Abstract host CPU utilization probe for unit tests and live runtime checks (`0.0..=100.0`).
+pub trait HostCpuProbe: Send + Sync {
+    fn probe_cpu_pct(&self) -> Option<f32>;
+}
+
+/// Live host CPU probe backed by the worker's non-blocking telemetry sampler.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemHostCpuProbe;
+
+impl HostCpuProbe for SystemHostCpuProbe {
+    fn probe_cpu_pct(&self) -> Option<f32> {
+        Some(crate::heartbeat::get_system_telemetry().0)
+    }
+}
+
+/// Abstract local wall-clock time source for schedule and daily budget evaluation.
+pub trait LocalClock: Send + Sync {
+    fn local_now(&self) -> NaiveDateTime;
+}
+
+/// Live wall-clock time source (`chrono::Local::now().naive_local()`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemLocalClock;
+
+impl LocalClock for SystemLocalClock {
+    fn local_now(&self) -> NaiveDateTime {
+        chrono::Local::now().naive_local()
+    }
 }
 
 /// Classifies a Windows `SYSTEM_POWER_STATUS` (`ACLineStatus`, `BatteryFlag`) reading.

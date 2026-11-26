@@ -1554,3 +1554,33 @@ async fn test_cli_env_lock_serializes_wire_codec_mutation_and_restores_on_panic(
         r2.unwrap();
     }
 }
+
+#[test]
+fn test_worker_d1_contributor_limit_flags_parse() {
+    let cli = parse(&[
+        "worker",
+        "--local-max-cpu-pct",
+        "70",
+        "--hours",
+        "mon-fri 22:00-07:00; sat-sun 00:00-24:00",
+        "--max-task-hours-per-day",
+        "4.5",
+        "--no-tasks-on-battery",
+        "--no-tasks-on-metered",
+        "--no-gpu-tasks",
+        "--hold-ends-tasks",
+    ]);
+    let Commands::Worker(w) = cli.command else {
+        panic!("expected Worker command");
+    };
+    assert_eq!(w.local_max_cpu_pct, Some(70));
+    assert_eq!(
+        w.hours.as_deref(),
+        Some("mon-fri 22:00-07:00; sat-sun 00:00-24:00")
+    );
+    assert_eq!(w.max_task_hours_per_day, Some(4.5));
+    assert!(w.no_tasks_on_battery);
+    assert!(w.no_tasks_on_metered);
+    assert!(w.no_gpu_tasks);
+    assert!(w.hold_ends_tasks);
+}

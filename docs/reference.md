@@ -748,8 +748,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
 | `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | `http://HOST[:PORT][/PATH]` URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery (`https://` is refused upfront; use a reverse proxy for TLS) |
 | `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/oxideswarm/[<name>.]control.sock` or `~/.oxideswarm/[<name>.]control.sock` (`\\.\pipe\oxideswarm-<user>-<name>` on Windows; `RUSTY_GRID_CONTROL_SOCKET`) | Local same-user control socket or Windows named pipe for `oxideswarm worker pause\|resume\|status\|limits` (`design 0113` D2) |
-| `--no-gpu-tasks` | `false` (`RUSTY_GRID_NO_GPU_TASKS`, `[worker].no_gpu_tasks`) | Refuse GPU task assignments (`Task rejected by worker: no gpu tasks`) while continuing to execute CPU tasks normally (`design 0113` D2/D3) |
-| `--hold-ends-tasks` | `false` | Hand back currently running tasks when an automatic contributor limit holds the worker (`design 0113` D2.3) |
+| `--local-max-cpu-pct <P>`, `--hours "<SPEC>"`, `--max-task-hours-per-day <H>`, `--no-tasks-on-battery`, `--no-tasks-on-metered`, `--no-gpu-tasks`, `--hold-ends-tasks` | Contributor Resource Limits table below | Contributor resource limits (`NET-9b`, `design 0113` D1/D2) |
 
 ##### Contributor Resource Limits (NET-9b, design 0113 D1)
 | Flag / Config Key | Default / Env / `[worker]` Key | Description |

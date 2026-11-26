@@ -175,7 +175,7 @@ impl Drop for AbortOnDrop {
 }
 
 /// Configuration options for initializing and connecting a Worker client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     /// Address of the Master node to connect to (e.g. "127.0.0.1:8088"; the dashboard is on :8080).
     pub master_addr: String,
@@ -334,6 +334,30 @@ pub struct WorkerConfig {
     pub control_config_path: Option<PathBuf>,
     /// Persistence callback invoked by `oxideswarm worker limits set` to update `[worker]` TOML keys.
     pub limit_persist_hook: Option<crate::control::LimitPersistHook>,
+    /// Also hand back already-running tasks when an automatic contributor limit holds (`NET-9b`).
+    pub hold_ends_tasks: bool,
+    /// Interval for re-evaluating automatic contributor limits (default: [`crate::limits::LIMITS_EVAL_INTERVAL`]).
+    pub limit_eval_interval: Duration,
+    /// Optional battery probe override (for tests; defaults to [`crate::limits::SystemBatteryProbe`] unless `no_battery`).
+    pub battery_probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
+    /// Optional metered-network probe override (for tests; defaults to [`crate::limits::SystemMeteredNetworkProbe`]).
+    pub metered_probe: Option<Arc<dyn crate::limits::MeteredNetworkProbe>>,
+    /// Optional host CPU probe override (for tests; defaults to [`crate::limits::SystemHostCpuProbe`]).
+    pub cpu_probe: Option<Arc<dyn crate::limits::HostCpuProbe>>,
+    /// Optional local wall-clock override (for tests; defaults to [`crate::limits::SystemLocalClock`]).
+    pub local_clock: Option<Arc<dyn crate::limits::LocalClock>>,
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("master_addr", &self.master_addr)
+            .field("name", &self.name)
+            .field("no_battery", &self.no_battery)
+            .field("hold_ends_tasks", &self.hold_ends_tasks)
+            .field("limit_eval_interval", &self.limit_eval_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkerConfig {
@@ -396,6 +420,12 @@ impl WorkerConfig {
             initial_limits: crate::control::WorkerLimitsConfig::default(),
             control_config_path: None,
             limit_persist_hook: None,
+            hold_ends_tasks: false,
+            limit_eval_interval: crate::limits::LIMITS_EVAL_INTERVAL,
+            battery_probe: None,
+            metered_probe: None,
+            cpu_probe: None,
+            local_clock: None,
         }
     }
 
@@ -724,6 +754,48 @@ impl WorkerConfig {
         self
     }
 
+    /// Configures `--hold-ends-tasks`: hand back running tasks on automatic limit holds (`NET-9b`).
+    pub fn with_hold_ends_tasks(mut self, enabled: bool) -> Self {
+        self.hold_ends_tasks = enabled;
+        self
+    }
+
+    /// Overrides the periodic evaluation cadence for automatic contributor limits.
+    pub fn with_limit_eval_interval(mut self, interval: Duration) -> Self {
+        self.limit_eval_interval = interval;
+        self
+    }
+
+    /// Injects a custom [`BatteryProbe`] (used by `net9b` integration tests).
+    pub fn with_battery_probe(
+        mut self,
+        probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
+    ) -> Self {
+        self.battery_probe = probe;
+        self
+    }
+
+    /// Injects a custom [`MeteredNetworkProbe`] (used by `net9b` integration tests).
+    pub fn with_metered_probe(
+        mut self,
+        probe: Option<Arc<dyn crate::limits::MeteredNetworkProbe>>,
+    ) -> Self {
+        self.metered_probe = probe;
+        self
+    }
+
+    /// Injects a custom [`HostCpuProbe`] (used by `net9b` integration tests).
+    pub fn with_cpu_probe(mut self, probe: Option<Arc<dyn crate::limits::HostCpuProbe>>) -> Self {
+        self.cpu_probe = probe;
+        self
+    }
+
+    /// Injects a custom [`LocalClock`] (used by `net9b` integration tests).
+    pub fn with_local_clock(mut self, clock: Option<Arc<dyn crate::limits::LocalClock>>) -> Self {
+        self.local_clock = clock;
+        self
+    }
+
     /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
     pub fn simulated(
         master_addr: impl Into<String>,
@@ -850,6 +922,14 @@ pub struct WorkerClient {
     control: Arc<crate::control::ControlHandle>,
     /// Set by `run_session` when a pause-resume asks for an immediate reconnect without backoff.
     resume_reconnect_pending: AtomicBool,
+    /// Stateful D1 limits evaluator (30 s CPU averager + daily task-hours budget + weekly hours).
+    limits_evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
+    /// Wakes `run_session` after completed tasks record daily runtime.
+    limits_reeval_notify: Arc<tokio::sync::Notify>,
+    battery_probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
+    metered_probe: Arc<dyn crate::limits::MeteredNetworkProbe>,
+    cpu_probe: Arc<dyn crate::limits::HostCpuProbe>,
+    local_clock: Arc<dyn crate::limits::LocalClock>,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
     #[cfg(feature = "p2p")]
@@ -1156,6 +1236,38 @@ impl WorkerClient {
             initial_features.insert(ProtocolCapabilities::WORKSPACES);
         }
 
+        let local_clock: Arc<dyn crate::limits::LocalClock> = config
+            .local_clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::limits::SystemLocalClock));
+        let battery_probe = config.battery_probe.clone().or_else(|| {
+            (!config.no_battery).then(|| {
+                Arc::new(crate::limits::SystemBatteryProbe) as Arc<dyn crate::limits::BatteryProbe>
+            })
+        });
+        let metered_probe: Arc<dyn crate::limits::MeteredNetworkProbe> = config
+            .metered_probe
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::limits::SystemMeteredNetworkProbe));
+        let cpu_probe: Arc<dyn crate::limits::HostCpuProbe> = config
+            .cpu_probe
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::limits::SystemHostCpuProbe));
+        let init_limits = crate::limits::WorkerLimits::from_control_config(
+            &config.initial_limits,
+            config.hold_ends_tasks,
+        );
+        let init_day = local_clock.local_now().date();
+        let limits_evaluator = crate::limits::LimitsEvaluator::new(init_limits, init_day)
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "Invalid initial contributor limits ignored; using defaults");
+                crate::limits::LimitsEvaluator::new(
+                    crate::limits::WorkerLimits::default(),
+                    init_day,
+                )
+                .expect("default limits are valid")
+            });
+
         let control = crate::control::ControlHandle::new(
             worker_id,
             capabilities.name.clone(),
@@ -1199,6 +1311,12 @@ impl WorkerClient {
             )),
             control,
             resume_reconnect_pending: AtomicBool::new(false),
+            limits_evaluator: Arc::new(std::sync::Mutex::new(limits_evaluator)),
+            limits_reeval_notify: Arc::new(tokio::sync::Notify::new()),
+            battery_probe,
+            metered_probe,
+            cpu_probe,
+            local_clock,
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "p2p")]
@@ -1663,6 +1781,8 @@ impl WorkerClient {
                 }
             })
         });
+
+        self.sync_and_evaluate_limits(false).await;
 
         let mut run_result = Ok(());
         loop {

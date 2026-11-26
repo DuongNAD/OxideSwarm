@@ -59,9 +59,10 @@ pub use isolation::{
 pub use limits::{
     classify_windows_nlm_cost, format_limit_rejection, parse_linux_nm_metered_output,
     parse_macos_path_flags, BatteryProbe, BatteryStatus, CpuAverager, DailyTaskBudget,
-    HoldEvaluation, HoursSchedule, LimitSample, LimitsEvaluator, MeteredNetworkProbe,
-    MeteredStatus, SystemBatteryProbe, SystemMeteredNetworkProbe, WorkerLimits, CPU_AVERAGE_WINDOW,
-    LIMITS_EVAL_INTERVAL, NO_GPU_TASKS_REJECTION_MESSAGE, PAUSE_REJECTION_PREFIX,
+    HoldEvaluation, HostCpuProbe, HoursSchedule, LimitSample, LimitsEvaluator, LocalClock,
+    MeteredNetworkProbe, MeteredStatus, SystemBatteryProbe, SystemHostCpuProbe, SystemLocalClock,
+    SystemMeteredNetworkProbe, WorkerLimits, CPU_AVERAGE_WINDOW, LIMITS_EVAL_INTERVAL,
+    NO_GPU_TASKS_REJECTION_MESSAGE, PAUSE_REJECTION_PREFIX,
 };
 pub use process_tree::{terminate_all_task_process_trees, ProcessPriority};
 pub use runner::{

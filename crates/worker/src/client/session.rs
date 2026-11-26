@@ -434,6 +434,88 @@ impl Drop for Session {
 }
 
 impl WorkerClient {
+    /// Evaluates active D1 contributor limits (optionally syncing updated `limits set` config)
+    /// and updates [`ControlHandle::set_held_with_detail`].
+    pub(super) async fn sync_and_evaluate_limits(&self, sync_from_control: bool) {
+        if sync_from_control {
+            let latest = crate::limits::WorkerLimits::from_control_config(
+                &self.control.limits(),
+                self.config.hold_ends_tasks,
+            );
+            if let Ok(mut eval) = self.limits_evaluator.lock() {
+                if let Err(err) = eval.update_limits(latest) {
+                    warn!(error = %err, "Failed to apply updated contributor limits");
+                }
+            }
+        }
+
+        let (need_battery, need_metered, need_cpu) = {
+            let Ok(eval) = self.limits_evaluator.lock() else {
+                return;
+            };
+            let lim = eval.limits();
+            (
+                lim.no_tasks_on_battery,
+                lim.no_tasks_on_metered,
+                lim.local_max_cpu_pct.is_some(),
+            )
+        };
+
+        let battery = if need_battery {
+            if let Some(probe) = self.battery_probe.as_ref().map(Arc::clone) {
+                tokio::task::spawn_blocking(move || probe.probe_battery())
+                    .await
+                    .unwrap_or(crate::limits::BatteryStatus::Unknown)
+            } else {
+                crate::limits::BatteryStatus::Unknown
+            }
+        } else {
+            crate::limits::BatteryStatus::Unknown
+        };
+
+        let metered = if need_metered {
+            let probe = Arc::clone(&self.metered_probe);
+            tokio::task::spawn_blocking(move || probe.probe_metered())
+                .await
+                .unwrap_or(crate::limits::MeteredStatus::Unknown)
+        } else {
+            crate::limits::MeteredStatus::Unknown
+        };
+
+        let host_cpu_pct = if need_cpu {
+            self.cpu_probe.probe_cpu_pct()
+        } else {
+            None
+        };
+
+        let sample = crate::limits::LimitSample {
+            now: std::time::Instant::now(),
+            local_now: self.local_clock.local_now(),
+            host_cpu_pct,
+            battery,
+            metered,
+        };
+        let eval_res = {
+            let Ok(mut eval) = self.limits_evaluator.lock() else {
+                return;
+            };
+            eval.evaluate(sample)
+        };
+        self.control.set_held_with_detail(
+            eval_res.held,
+            eval_res.reason,
+            eval_res.local_detail,
+            eval_res.hand_back_running,
+        );
+    }
+
+    async fn should_reconnect_after_hold_clears(&self, session: &Session) -> bool {
+        !self.control.is_paused_or_held()
+            && self.active_task_table.read().await.is_empty()
+            && session.data_tx.capacity() == session.data_tx.max_capacity()
+            && self.control.take_session_pause_rejection()
+    }
+
     /// True when a plain TCP address (or `auto` discovery) is configured next to a P2P ticket.
     #[cfg(feature = "p2p")]
     pub(super) fn has_tcp_fallback(&self) -> bool {
@@ -979,9 +1061,16 @@ impl WorkerClient {
             }
         }
         self.control.clear_session_pause_rejection();
+        self.sync_and_evaluate_limits(true).await;
         let mut control_rx = self.control.subscribe();
         let mut pause_expiry_tick = tokio::time::interval(Duration::from_secs(1));
         pause_expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut limit_eval_tick = tokio::time::interval(
+            self.config
+                .limit_eval_interval
+                .max(Duration::from_millis(50)),
+        );
+        limit_eval_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut farewell: Option<WorkerMessage> = None;
         let _outbox_flush_guard = (!buffered_checkpoints.is_empty()
@@ -1172,10 +1261,19 @@ impl WorkerClient {
                             self.hand_back_running_tasks_on_pause(&reason, &session.data_tx)
                                 .await;
                         }
+                        Ok(crate::control::ControlEvent::LimitsUpdated) => {
+                            self.sync_and_evaluate_limits(true).await;
+                            if self.should_reconnect_after_hold_clears(&session).await {
+                                info!(
+                                    worker_id = %worker_id,
+                                    "Worker limits updated and hold cleared; closing session to re-register immediately"
+                                );
+                                self.resume_reconnect_pending.store(true, Ordering::Release);
+                                break Err(GridError::ConnectionClosed);
+                            }
+                        }
                         Ok(crate::control::ControlEvent::ResumeReconnect) => {
-                            if self.control.take_session_pause_rejection()
-                                && self.active_task_table.read().await.is_empty()
-                            {
+                            if self.should_reconnect_after_hold_clears(&session).await {
                                 info!(
                                     worker_id = %worker_id,
                                     "Worker resumed while held back; closing session to re-register immediately"
@@ -1191,8 +1289,40 @@ impl WorkerClient {
                     }
                 }
 
+                _ = limit_eval_tick.tick() => {
+                    self.sync_and_evaluate_limits(false).await;
+                    if self.should_reconnect_after_hold_clears(&session).await {
+                        info!(
+                            worker_id = %worker_id,
+                            "Contributor limit hold cleared; closing session to re-register immediately"
+                        );
+                        self.resume_reconnect_pending.store(true, Ordering::Release);
+                        break Err(GridError::ConnectionClosed);
+                    }
+                }
+
+                _ = self.limits_reeval_notify.notified() => {
+                    self.sync_and_evaluate_limits(false).await;
+                    if self.should_reconnect_after_hold_clears(&session).await {
+                        info!(
+                            worker_id = %worker_id,
+                            "Completed task idle check cleared hold; closing session to re-register immediately"
+                        );
+                        self.resume_reconnect_pending.store(true, Ordering::Release);
+                        break Err(GridError::ConnectionClosed);
+                    }
+                }
+
                 _ = pause_expiry_tick.tick() => {
                     let _ = self.control.check_pause_expiry();
+                    if self.should_reconnect_after_hold_clears(&session).await {
+                        info!(
+                            worker_id = %worker_id,
+                            "Worker pause expired while held back; closing session to re-register immediately"
+                        );
+                        self.resume_reconnect_pending.store(true, Ordering::Release);
+                        break Err(GridError::ConnectionClosed);
+                    }
                 }
 
                 // External shutdown signal

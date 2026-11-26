@@ -630,9 +630,42 @@ pub struct WorkerArgs {
 
     #[arg(
         long,
-        help = "Also hand back running tasks when an automatic contributor limit holds the worker"
+        help = "Also hand back running tasks when an automatic contributor limit holds the worker (env RUSTY_GRID_HOLD_ENDS_TASKS)"
     )]
     pub hold_ends_tasks: bool,
+
+    #[arg(
+        long,
+        value_name = "PCT",
+        help = "Hold new tasks while 30 s average host CPU % exceeds PCT (1..=100; env RUSTY_GRID_LOCAL_MAX_CPU_PCT)"
+    )]
+    pub local_max_cpu_pct: Option<u8>,
+
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help = "Allowed weekly local execution hours (e.g. \"mon-fri 18:00-08:00; sat-sun 00:00-24:00\"; env RUSTY_GRID_HOURS)"
+    )]
+    pub hours: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "HOURS",
+        help = "Maximum summed task execution hours per local calendar day in (0, 24] (env RUSTY_GRID_MAX_TASK_HOURS_PER_DAY)"
+    )]
+    pub max_task_hours_per_day: Option<f64>,
+
+    #[arg(
+        long,
+        help = "Hold new tasks while operating on battery power (env RUSTY_GRID_NO_TASKS_ON_BATTERY)"
+    )]
+    pub no_tasks_on_battery: bool,
+
+    #[arg(
+        long,
+        help = "Hold new tasks while on a metered network connection (env RUSTY_GRID_NO_TASKS_ON_METERED)"
+    )]
+    pub no_tasks_on_metered: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]

@@ -612,6 +612,9 @@ impl WorkerClient {
         let resume_window_active = Arc::clone(&self.resume_window_active);
         let pending_resume_outbox = Arc::clone(&self.pending_resume_outbox);
         let grace_enabled = self.config.session_resume_grace_cap != Some(Duration::ZERO);
+        let limits_evaluator = Arc::clone(&self.limits_evaluator);
+        let limits_clock = Arc::clone(&self.local_clock);
+        let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
         // own cleanup (which needs the lock) can never overtake the insertion and leave a stale
@@ -785,6 +788,7 @@ impl WorkerClient {
             let (exec_cancel_tx, exec_cancel_rx) = oneshot::channel::<String>();
             let mut exec_cancel_tx = Some(exec_cancel_tx);
             let mut cancelled_reason: Option<String> = None;
+            let exec_started = std::time::Instant::now();
             let mut result = {
                 let exec_fut = runner.execute_task_with_checkpoint(
                     &task,
@@ -834,6 +838,14 @@ impl WorkerClient {
                 resume_ack_token(resume_enabled, &result, master_features::result_ack_token);
 
             if cancelled_reason.is_none() && !suppress.load(Ordering::Acquire) {
+                let runtime =
+                    Duration::from_millis(result.execution_time_ms).max(exec_started.elapsed());
+                let local_day = limits_clock.local_now().date();
+                if let Ok(mut eval) = limits_evaluator.lock() {
+                    eval.record_completed_task(local_day, runtime);
+                }
+                limits_reeval_notify.notify_one();
+
                 let (live_tx, evicted_used_blobs) = {
                     let mut outbox = pending_resume_outbox
                         .lock()
