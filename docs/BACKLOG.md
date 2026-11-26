@@ -332,7 +332,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
-| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Partial | In |  |
+| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Implemented |  |  |
 | TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Implemented |  | 449, 455 |
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
@@ -904,14 +904,23 @@ The full suite must pass on a clean machine before CI can require it.
   line `1430`). When `--fail-fast` tears down remaining shards while a sibling child is creating/truncating
   or writing `shard_<N>.pid`, the test's reader (`line 4784`, and `line 3777` in `test_t2_ax2_03`) can observe
   a zero-byte `.pid` file and raise `ValueError`.
-- **Do:** (Code fix landed on `mac/test-95-atomic-pid-writes`; 20-run loaded loop under busy loops waits until after the Stage C `S7` 24-hour soak finishes — `loop after S7`.)
+- **Do:** (Code fix landed on `mac/test-95-atomic-pid-writes`; 20-run loaded loop completed 2026-11-26.)
   1. Failing check first: `HarnessAtomicWriteTests` reproduced empty `shard_2.pid` `ValueError: invalid literal for int() with base 10: ''` and failed before the fix (`AssertionError: 'os.replace(' not found`).
   2. Write all `.pid` and marker files via a temporary file in the same directory followed by atomic
      rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_<N>.pid` and
      `install_fake_blender` `PROBE_PID_FILE` / `HANG_PID_FILE` / `HANG_MARKER_FILE`; temp file + `mv -f`
      in `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards`), so readers only see complete `*.pid`
      and marker files.
-  3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`. Remaining: `20/20` runs under busy loops (`loop after S7`).
+  3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`.
+  4. Verified `20/20` sequential loaded runs on clean `origin/master` `fc95e4c9` (2026-11-26, macOS `arm64`,
+     `python3 -B -m unittest tests/test_wave3_e2e.py -v` under `nice -n 10` with `4` Python CPU busy loops,
+     `OXIDESWARM_PROFILE=debug`, `OXIDESWARM_E2E_TIER=all`, private `HOME`/`OXIDESWARM_HOME`/`TMPDIR` per run):
+     `65/65` tests passed in every run (including both `--fail-fast` tests
+     `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` and
+     `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards`), `0` failures, `min 113.933 s`,
+     `median 119.161 s`, `max 126.237 s`, `total 2,398.919 s` (`113.933`, `118.678`, `122.782`, `126.237`,
+     `125.351`, `125.249`, `123.664`, `122.912`, `121.222`, `118.611`, `117.813`, `120.043`, `116.871`,
+     `116.273`, `117.953`, `117.490`, `116.683`, `117.865`, `119.644`, `119.645 s`).
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
@@ -3362,3 +3371,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: TEST-95 Implemented (`mac/test-95-loaded-loop`): verified `20/20` sequential loaded runs of `python3 -B -m unittest tests/test_wave3_e2e.py -v` on clean `origin/master` `fc95e4c9` (`macOS arm64`, `nice -n 10`, `4` Python CPU busy loops, private per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR`, `OXIDESWARM_PROFILE=debug`, `OXIDESWARM_E2E_TIER=all`): `65/65` tests passed per run (including both `--fail-fast` tests `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` and `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards`), `0` failures (`min 113.933 s`, `median 119.161 s`, `max 126.237 s`, `total 2,398.919 s`).
