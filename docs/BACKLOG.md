@@ -128,6 +128,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D9 | Keep the `/api/chat` route, which runs `agy` on the master host, in the master dashboard? | Remove it from the master. If it stays, it needs Admin scope and an opt-in flag | SEC-14 |
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
+| Q99 | How does Rust reach machines set up from the USB kit: (A) not at all, (B) an opt-in GNU toolchain in the kit, or (C) tool packs only? | C, with A until TOOL-2 lands ([design 0110](design/0110-tools-on-kit-machines.md) D4) | TOOL-2 |
 
 ## Index
 
@@ -396,6 +397,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051), 190, 201, 328 |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented |  | (design 0052), 221 |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | In | (design 0053), 185, 195, 207, 228 |
+| TOOL-1 | Probe `python` and offer a pinned private Python in the Windows USB kit | P2 | M | USB-1 |  | Planned | Out | (design 0110) |
+| TOOL-2 | Tool packs: portable tools delivered to workers as cached blobs | P3 | L | TOOL-1 | Q99 | Design only | Out | (design 0110) |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented |  | 204 (design 0055) |
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented |  | 226 |
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented |  | 209, 207, 210 |
@@ -1164,6 +1167,30 @@ then JOIN-2 and USB-1 in parallel.
   ENROLL-1b against a fake `join`.
 - **Done when:** `tests/cli_usb_kit_e2e.rs` and the installer launcher tests pass, and a stick made
   on one system sets up a machine of another system, recorded with its date.
+
+### TOOL-1: Probe `python` and offer a pinned private Python in the Windows USB kit
+
+- **Evidence:** Friend trial of 2026-11-26: the Windows laptop set up from kit 0.4.5 had no Python (only the
+  Microsoft Store alias `python.exe` under `WindowsApps`) and no Rust, so only `cmd`, PowerShell, `tar` and `curl`
+  tasks could go there. The worker probes `cargo`, `rustc` and `git` only (`HOST_PROBED_TOOLS`,
+  `crates/core/src/capabilities.rs`).
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D1 and D2: probe `python`/`python3` (skip the Store
+  alias and the macOS Command Line Tools stub) and advertise `tool:python`; `packaging/usb/tools.lock` pins the
+  Python embeddable package by SHA-256; `make_kit.sh --python` puts it on the stick; `install.ps1` asks
+  (default No, `-Python`/`-NoPython`), extracts it under `<InstallRoot>\tools`, puts it on the worker's process
+  `PATH` only, grants `oxideswarm.toolchain` read and execute under `-Isolation fs`, and checks it with a pinned
+  `--require-tool python` task; uninstall removes it.
+- **Done when:** Test plan T1 to T3 of design 0110 pass, and `docs/reference.md` lists `tool:python` and the new
+  kit options.
+
+### TOOL-2: Tool packs: portable tools delivered to workers as cached blobs
+
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D3 after Q99: a task names packs (name, version,
+  archive `BlobId`) in a critical `Worker` extension of design 0082; the worker unpacks each pack once into
+  `<sandbox base>/cache/tools/<blake3>/`, read-only, evicted with the blob cache, and prepends it to the task's
+  `PATH`; `submit --tool-pack <name>=<archive>`.
+- **Done when:** The design is accepted and a Python pack and (if Q99 says so) a Rust pack run on a worker that
+  has neither installed, with each archive sent once per worker.
 
 ## Phase 7: scale out
 
