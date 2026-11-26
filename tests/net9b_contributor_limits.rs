@@ -205,10 +205,24 @@ impl Drop for Net9bCluster {
     }
 }
 
+fn ipc_tempdir() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("ox9b-")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|_| tempfile::tempdir().expect("ipc dir"))
+    }
+    #[cfg(windows)]
+    {
+        tempfile::tempdir().expect("ipc dir")
+    }
+}
+
 fn unique_endpoint(dir: &Path, label: &str) -> ControlEndpoint {
     #[cfg(unix)]
     {
-        ControlEndpoint::UnixSocket(dir.join(format!("{label}-{}.control.sock", Uuid::new_v4())))
+        ControlEndpoint::UnixSocket(dir.join(format!("{label}.sock")))
     }
     #[cfg(windows)]
     {
@@ -292,7 +306,7 @@ fn echo_task(text: &str) -> Task {
 #[tokio::test]
 async fn net9b_fake_battery_and_metered_holds_hand_back_and_recover() {
     let mut cluster = Net9bCluster::new().await;
-    let dir = tempfile::tempdir().expect("ipc dir");
+    let dir = ipc_tempdir();
     let ep_lim = unique_endpoint(dir.path(), "lim");
 
     let battery_state = Arc::new(AtomicU8::new(2)); // OnAc
@@ -474,7 +488,7 @@ async fn net9b_fake_battery_and_metered_holds_hand_back_and_recover() {
 #[tokio::test]
 async fn net9b_mid_task_lift_without_hold_ends_tasks_reconnects_when_idle() {
     let mut cluster = Net9bCluster::new().await;
-    let dir = tempfile::tempdir().expect("ipc dir");
+    let dir = ipc_tempdir();
     let ep_lim = unique_endpoint(dir.path(), "nolimhandback");
     let battery_state = Arc::new(AtomicU8::new(2)); // OnAc
 
@@ -553,7 +567,7 @@ async fn net9b_mid_task_lift_without_hold_ends_tasks_reconnects_when_idle() {
 #[tokio::test]
 async fn net9b_live_limits_set_hours_cpu_daily_budget_and_manual_resume_while_held() {
     let mut cluster = Net9bCluster::new().await;
-    let dir = tempfile::tempdir().expect("ipc dir");
+    let dir = ipc_tempdir();
     let ep_lim = unique_endpoint(dir.path(), "dyn");
 
     let cpu_bits = Arc::new(AtomicU32::new(15.0f32.to_bits()));
@@ -573,6 +587,7 @@ async fn net9b_live_limits_set_hours_cpu_daily_budget_and_manual_resume_while_he
         },
     );
     cluster.wait_for_workers(1).await;
+    let _ = poll_control_status(&ep_lim, |s| s.state == WorkerControlState::Running).await;
 
     // 1. Live `limits set hours "mon-fri 18:00-08:00"` (outside 14:00 Thu) -> Held immediately!
     let resp = send_control_request(
