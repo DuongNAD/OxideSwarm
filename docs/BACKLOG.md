@@ -129,6 +129,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
 | Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-5 |
+| Q102 | Tray app toolkit: a native tray menu with the dashboard in the browser, or a Tauri window? | Native tray menu (`tray-icon`, `muda`) first ([design 0112](design/0112-tray-app-for-contributors.md) D5) | TRAY-1 |
 
 ## Index
 
@@ -523,6 +524,10 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | LLM-11 | A balance per member, display only | P3 | S | LLM-10 | Q14 | Planned | Out | (design 0061) |
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| TRAY-1 | Tray app: start and watch the worker, state, Pause/Resume, Limits, logs, Quit | P2 | M | NET-9 | Q102 | Planned | Out | (design 0112) |
+| TRAY-2 | Tray app: first-run join from a token, invite or USB kit; verified updates | P2 | M | TRAY-1 |  | Planned | Out | (design 0112) |
+| TRAY-3 | Tray app in the USB kit and installers, start at logon by default, `--no-tray` | P2 | S | TRAY-1 |  | Planned | Out | (design 0112) |
+| TRAY-4 | Pause while a full-screen program runs; GPU on/off for new tasks | P2 | M | TRAY-1, NET-9 |  | Planned | Out | (design 0112) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376, 383 (open), (design 0094) |
 
@@ -2789,6 +2794,19 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   and the task completes on another worker with its retry count unchanged. The record of APP-6 lists
   the controls each contributor set.
 
+
+### TRAY-1 to TRAY-4: A tray app for contributors
+
+- **Evidence:** Friend trial of 2026-11-26: kits made with `--no-autostart` needed someone to find the install
+  folder and start the worker after every restart; with start at logon, the worker runs with no window, and the
+  person at the machine cannot see it, pause it, or keep it out of a game except through Task Manager or by
+  uninstalling. GPU tasks run inside the worker and do not yield.
+- **Do:** [Design 0112](design/0112-tray-app-for-contributors.md): TRAY-1 a tray app (Windows notification area,
+  macOS menu bar, Linux tray) that starts and watches the worker, shows connected / idle / busy / paused, and
+  offers Pause, Resume, the NET-9 limits, logs and Quit over a same-user local control channel; TRAY-2 first-run
+  join and verified updates; TRAY-3 the tray in the USB kit and installers with start at logon by default and
+  `--no-tray`; TRAY-4 pause while a full-screen program runs, and GPU on/off.
+- **Done when:** Test plan T1 to T4 of design 0112 pass or are recorded.
 ### NET-10: Contribution credits per participant, display only
 
 - **Evidence:** Read on 2026-11-19 at `master` `f77eabd`. A task result carries the worker id and the
