@@ -1714,11 +1714,13 @@ class UsbKitTests(unittest.TestCase):
             ("git", "mingit", "2.56.1", "MinGit-fake.zip", _make_zip_bytes_raw({"cmd/git.exe": b"MZgit"})),
         ]
         lock_lines = []
+        expected_sums = []
         for tool, comp, ver, fname, payload in fake_files:
             fpath = os.path.join(tools_cache, fname)
             with open(fpath, "wb") as f:
                 f.write(payload)
             digest = hashlib.sha256(payload).hexdigest()
+            expected_sums.append((fname, digest))
             lock_lines.append(f"{tool}\t{comp}\t{ver}\t{fname}\t{digest}\thttps://example.invalid/{fname}")
         lock_file = os.path.join(self.tmp, "fake_tools.lock")
         with open(lock_file, "w", encoding="utf-8", newline="\n") as f:
@@ -1745,7 +1747,7 @@ class UsbKitTests(unittest.TestCase):
         )
         self.assertEqual(res_full.returncode, 0, res_full.stdout)
         sums_text = read(os.path.join(kit, "archives", "SHA256SUMS"))
-        for _, _, _, fname, digest, _ in fake_files:
+        for fname, digest in expected_sums:
             self.assertTrue(os.path.isfile(os.path.join(kit, "tools", fname)), fname)
             self.assertIn(f"{digest}  tools/{fname}", sums_text)
         notice_path = os.path.join(kit, "tools", "NOTICE.txt")
