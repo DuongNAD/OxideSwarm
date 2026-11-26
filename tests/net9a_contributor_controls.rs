@@ -15,10 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+#[cfg(unix)]
 use tokio::process::Command;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+#[cfg(unix)]
 use rusty_grid_cli::doctor::{run_doctor, DoctorOptions, Outcome};
 use rusty_grid_core::capabilities::WorkerCapabilities;
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec, TaskStatus};
@@ -27,10 +29,11 @@ use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
+#[cfg(unix)]
 use rusty_grid_worker::control::{
-    send_control_request, ControlEndpoint, ControlRequest, ControlResponse, WorkerControlState,
-    WorkerLimitsConfig,
+    send_control_request, ControlRequest, ControlResponse, WorkerControlState,
 };
+use rusty_grid_worker::control::{ControlEndpoint, WorkerLimitsConfig};
 
 struct Net9Cluster {
     master: MasterHandle,
@@ -143,6 +146,7 @@ impl Net9Cluster {
         panic!("{count} workers did not register");
     }
 
+    #[cfg(unix)]
     async fn wait_until_paused(&self, worker_id: Uuid, want_paused: bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
