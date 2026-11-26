@@ -35,7 +35,7 @@ for the protocol 11 train after the stability release.
   a synced tree and a warm `target/` per worker ([design 0039](0039-agent-workspaces.md)), placement
   selects machines by `os:`, `arch:`, `tool:`, `iso:` and user tags, and `submit --verify` re-runs a task
   elsewhere and compares outputs (VERIFY-1). Live output and MCP tasks are designed in AX-3
-  ([design 0109](0109-ax3-live-output-and-mcp-tasks.md), draft).
+  (design 0109, draft in pull request 440).
 - **What the grid does not give.** Nothing says which agent works on what, which files it may change,
   which task must wait for another, or when an agent should stop and ask a person. One `submit` returns
   the head and tail of the output; an agent reads a long log to find the first error.
