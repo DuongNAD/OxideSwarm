@@ -6,7 +6,7 @@
 //! verified to belong to the same OS user before any command runs.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -363,7 +363,9 @@ pub struct ControlHandle {
     persist_hook: Option<LimitPersistHook>,
     inner: Mutex<ControlStateInner>,
     event_tx: broadcast::Sender<ControlEvent>,
-    session_sent_pause_rejection: AtomicBool,
+    next_rejection_seq: AtomicU64,
+    session_pause_rejection_gen: AtomicU64,
+    session_gpu_pause_rejection_gen: AtomicU64,
 }
 
 impl std::fmt::Debug for ControlHandle {
@@ -403,7 +405,9 @@ impl ControlHandle {
                 limits,
             }),
             event_tx,
-            session_sent_pause_rejection: AtomicBool::new(false),
+            next_rejection_seq: AtomicU64::new(1),
+            session_pause_rejection_gen: AtomicU64::new(0),
+            session_gpu_pause_rejection_gen: AtomicU64::new(0),
         })
     }
 
@@ -412,22 +416,76 @@ impl ControlHandle {
         self.event_tx.subscribe()
     }
 
-    /// Records that the current master session received a pause refusal or hold-back.
+    /// Records that the current master session received a full-worker pause or hold refusal.
     pub fn mark_session_pause_rejection(&self) {
-        self.session_sent_pause_rejection
-            .store(true, Ordering::Release);
+        let gen_id = self.next_rejection_seq.fetch_add(1, Ordering::AcqRel);
+        self.session_pause_rejection_gen
+            .store(gen_id, Ordering::Release);
+    }
+
+    /// Records that the current master session received a `--no-gpu-tasks` refusal.
+    pub fn mark_session_gpu_pause_rejection(&self) {
+        let gen_id = self.next_rejection_seq.fetch_add(1, Ordering::AcqRel);
+        self.session_gpu_pause_rejection_gen
+            .store(gen_id, Ordering::Release);
+    }
+
+    /// Captures the current full-pause and GPU-pause rejection generations before sending a result.
+    pub fn pause_rejection_snapshot(&self) -> (u64, u64) {
+        (
+            self.session_pause_rejection_gen.load(Ordering::Acquire),
+            self.session_gpu_pause_rejection_gen.load(Ordering::Acquire),
+        )
+    }
+
+    /// Clears holdback tracking when a completed task result resets Master's hold-back timer.
+    pub fn clear_session_pause_rejection_on_completed_result(
+        &self,
+        snapshot: (u64, u64),
+        task_requires_gpu: bool,
+    ) {
+        if snapshot.0 != 0 {
+            let _ = self.session_pause_rejection_gen.compare_exchange(
+                snapshot.0,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        if task_requires_gpu && snapshot.1 != 0 {
+            let _ = self.session_gpu_pause_rejection_gen.compare_exchange(
+                snapshot.1,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 
     /// Resets the per-session pause refusal tracker when a fresh master session connects.
     pub fn clear_session_pause_rejection(&self) {
-        self.session_sent_pause_rejection
-            .store(false, Ordering::Release);
+        self.session_pause_rejection_gen.store(0, Ordering::Release);
+        self.session_gpu_pause_rejection_gen
+            .store(0, Ordering::Release);
     }
 
-    /// Returns and clears whether the current session needs an immediate reconnect on resume.
+    /// Returns and clears whether the current session sent a full-worker pause refusal.
     pub fn take_session_pause_rejection(&self) -> bool {
-        self.session_sent_pause_rejection
-            .swap(false, Ordering::AcqRel)
+        self.session_pause_rejection_gen.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// Returns and clears whether the current session should reconnect now that local holds cleared.
+    pub fn take_session_reconnect_needed(&self) -> bool {
+        if self.is_paused_or_held() {
+            return false;
+        }
+        let full = self.session_pause_rejection_gen.swap(0, Ordering::AcqRel) != 0;
+        let gpu = !self.no_gpu_tasks()
+            && self
+                .session_gpu_pause_rejection_gen
+                .swap(0, Ordering::AcqRel)
+                != 0;
+        full || gpu
     }
 
     /// Formats the worker's `Task rejected by worker: paused: <reason>` message.
@@ -536,7 +594,8 @@ impl ControlHandle {
             inner.paused_until_epoch_ms = None;
             (was_paused, inner.held, self.build_snapshot(&inner))
         };
-        if !still_held && (was_paused || self.session_sent_pause_rejection.load(Ordering::Acquire))
+        if !still_held
+            && (was_paused || self.session_pause_rejection_gen.load(Ordering::Acquire) != 0)
         {
             let _ = self.event_tx.send(ControlEvent::ResumeReconnect);
         }
@@ -1471,5 +1530,46 @@ mod tests {
             Some("mon-fri 22:00-07:00; sat-sun 00:00-24:00")
         );
         assert!(handle.set_limit("hours", "10:00-10:00").is_err());
+    }
+
+    #[test]
+    fn session_pause_rejection_clears_on_completed_result_and_respects_gpu_separation() {
+        let handle = ControlHandle::new(
+            Uuid::new_v4(),
+            "race-box",
+            Arc::new(AtomicUsize::new(0)),
+            WorkerLimitsConfig::default(),
+            None,
+            None,
+        );
+
+        // 1. Full pause rejection + completed CPU result CAS clears it cleanly.
+        handle.mark_session_pause_rejection();
+        let snap = handle.pause_rejection_snapshot();
+        handle.clear_session_pause_rejection_on_completed_result(snap, false);
+        assert!(!handle.take_session_reconnect_needed());
+
+        // 2. Stale snapshot CAS must NOT clear a newer pause rejection.
+        handle.mark_session_pause_rejection();
+        let stale = handle.pause_rejection_snapshot();
+        handle.mark_session_pause_rejection();
+        handle.clear_session_pause_rejection_on_completed_result(stale, false);
+        assert!(handle.take_session_reconnect_needed());
+        assert!(!handle.take_session_reconnect_needed());
+
+        // 3. GPU-only rejection stays separate from CPU completions and gates reconnect on !no_gpu_tasks.
+        handle.set_limit("no_gpu_tasks", "true").unwrap();
+        handle.mark_session_gpu_pause_rejection();
+        let gpu_snap = handle.pause_rejection_snapshot();
+        handle.clear_session_pause_rejection_on_completed_result(gpu_snap, false);
+        assert!(!handle.take_session_reconnect_needed()); // still no_gpu_tasks=true
+        handle.set_limit("no_gpu_tasks", "false").unwrap();
+        assert!(handle.take_session_reconnect_needed()); // reconnect clears gpu gen
+
+        // Re-mark GPU rejection and clear via GPU result.
+        handle.mark_session_gpu_pause_rejection();
+        let gpu_snap2 = handle.pause_rejection_snapshot();
+        handle.clear_session_pause_rejection_on_completed_result(gpu_snap2, true);
+        assert!(!handle.take_session_reconnect_needed());
     }
 }

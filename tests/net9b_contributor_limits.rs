@@ -544,7 +544,8 @@ async fn net9b_mid_task_lift_without_hold_ends_tasks_reconnects_when_idle() {
     })
     .await;
 
-    // Release active task: once it completes, worker must auto-reconnect, clear `paused`, and run `second_tid`!
+    // Release active task: completing `running_tid` clears `paused` via Master's `clear_pause_holdback`
+    // without dropping the healthy live session while `second_tid` is dispatched.
     std::fs::write(&release, b"go").unwrap();
     let r1 = cluster
         .master

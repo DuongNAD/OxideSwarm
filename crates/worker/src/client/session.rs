@@ -513,7 +513,7 @@ impl WorkerClient {
         !self.control.is_paused_or_held()
             && self.active_task_table.read().await.is_empty()
             && session.data_tx.capacity() == session.data_tx.max_capacity()
-            && self.control.take_session_pause_rejection()
+            && self.control.take_session_reconnect_needed()
     }
 
     /// True when a plain TCP address (or `auto` discovery) is configured next to a P2P ticket.

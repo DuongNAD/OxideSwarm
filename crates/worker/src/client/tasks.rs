@@ -408,7 +408,6 @@ impl WorkerClient {
         match self.control.check_assignment(requires_gpu) {
             crate::control::AssignmentDecision::Allow => {}
             crate::control::AssignmentDecision::RejectPaused(reason) => {
-                self.control.mark_session_pause_rejection();
                 let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
                 warn!(task_id = %task_id, reason = %reason, "Refusing task: worker paused");
                 let result = TaskResult::failure(
@@ -421,10 +420,10 @@ impl WorkerClient {
                     Some(msg.clone()),
                 );
                 let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                self.control.mark_session_pause_rejection();
                 return;
             }
             crate::control::AssignmentDecision::RejectNoGpuTasks => {
-                self.control.mark_session_pause_rejection();
                 let msg = crate::control::NO_GPU_TASKS_REJECTION_MESSAGE.to_string();
                 warn!(task_id = %task_id, "Refusing GPU task: --no-gpu-tasks enabled");
                 let result = TaskResult::failure(
@@ -437,6 +436,7 @@ impl WorkerClient {
                     Some(msg.clone()),
                 );
                 let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                self.control.mark_session_gpu_pause_rejection();
                 return;
             }
         }
@@ -615,6 +615,7 @@ impl WorkerClient {
         let limits_evaluator = Arc::clone(&self.limits_evaluator);
         let limits_clock = Arc::clone(&self.local_clock);
         let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
+        let control = Arc::clone(&self.control);
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
         // own cleanup (which needs the lock) can never overtake the insertion and leave a stale
@@ -947,6 +948,7 @@ impl WorkerClient {
                 }
             }
 
+            let completed_cleanly = cancelled_reason.is_none() && !suppress.load(Ordering::Acquire);
             if let Some(reason) = cancelled_reason {
                 if result.exit_code != EXIT_CODE_CANCELLED {
                     result.exit_code = EXIT_CODE_CANCELLED;
@@ -959,7 +961,13 @@ impl WorkerClient {
 
             if !suppress.load(Ordering::Acquire) {
                 if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
-                    let _ = tx.send(WorkerMessage::from(result)).await;
+                    let rej_snap = control.pause_rejection_snapshot();
+                    if tx.send(WorkerMessage::from(result)).await.is_ok() && completed_cleanly {
+                        control.clear_session_pause_rejection_on_completed_result(
+                            rej_snap,
+                            requires_gpu,
+                        );
+                    }
                 }
             }
             drop(cancel_slot);
@@ -1201,7 +1209,6 @@ impl WorkerClient {
                 join.abort();
             }
         }
-        self.control.mark_session_pause_rejection();
         let msg = crate::control::ControlHandle::format_pause_rejection(reason);
         for tid in task_ids {
             let result = TaskResult::failure(
@@ -1215,6 +1222,7 @@ impl WorkerClient {
             );
             let _ = outbound_tx.send(WorkerMessage::from(result)).await;
         }
+        self.control.mark_session_pause_rejection();
         count
     }
 
