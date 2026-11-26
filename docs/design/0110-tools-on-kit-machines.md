@@ -316,7 +316,7 @@ machine whose owner said No), other versions than the kit's, and tools the kit d
   failed with `no result within 60s (last state Running)`, because 8 MiB at 0.12 MB/s needs about 67 s;
   BUG-41 records that. Large tool hand-offs (packs, kit updates) must use a direct link or a relay the owner
   runs.
-- 2026-11-26: The owner asked that the work of this record and of [design 0111](0111-team-plan-leases-and-verify-gate.md)
+- 2026-11-26: The owner asked that the work of this record and of design 0111
   come before release 0.5.0. The parts without a wire change (TOOL-1, TOOL-3, TOOL-4, TOOL-5) fit 0.4.x
   after the stability release; TOOL-2 uses the extension slot of design 0082 (protocol 10), so it fits too.
 
