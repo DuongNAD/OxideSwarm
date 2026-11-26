@@ -128,6 +128,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D9 | Keep the `/api/chat` route, which runs `agy` on the master host, in the master dashboard? | Remove it from the master. If it stays, it needs Admin scope and an opt-in flag | SEC-14 |
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
+| Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-5 |
 | Q100 | Where do task path leases live first: git refs on the project's remote, or the master? | Git refs: no wire change, visible to people, survive a master restart ([design 0111](design/0111-team-plan-leases-and-verify-gate.md) D3) | TEAM-2 |
 
 ## Index
@@ -216,6 +217,7 @@ Recounted on 2026-11-24 from the rows with pull request 461: 291 items, 201 Impl
 Recounted on 2026-11-24 from the rows with pull request 462: 291 items, 202 Implemented, 21 Partial and 68 Planned; 20 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 411: 291 items, 202 Implemented, 22 Partial and 67 Planned; 20 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 464: 292 items, 202 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
+Recounted on 2026-11-24 from the rows with pull request 465: 298 items, 202 Implemented, 22 Partial and 74 Planned; 22 open items are In and 74 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -398,6 +400,11 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ENROLL-1 | A key per machine, invites and revocation | P1 | L | JOIN-1 |  | Partial | In | (design 0051), 190, 201, 328 |
 | JOIN-2 | Join on a LAN with a short code | P2 | M | ENROLL-1 |  | Implemented |  | (design 0052), 221 |
 | USB-1 | Set up machines from a USB stick | P2 | M | ENROLL-1, REL-4 |  | Partial | In | (design 0053), 185, 195, 207, 228 |
+| TOOL-1 | Probe `python`; `--toolset` kits and a pinned private Python in the Windows USB kit | P2 | M | USB-1 |  | Planned | Out | (design 0110) |
+| TOOL-3 | Private Rust GNU toolchain in the Windows USB kit | P2 | M | TOOL-1 |  | Planned | Out | (design 0110) |
+| TOOL-5 | Private MinGW-w64 C toolchain in the Windows USB kit, so crates that compile C build | P2 | M | TOOL-3 |  | Planned | Out | (design 0110) |
+| TOOL-4 | Private MinGit in the Windows USB kit | P3 | S | TOOL-1 |  | Planned | Out | (design 0110) |
+| TOOL-2 | Tool packs: portable tools delivered to workers as cached blobs | P2 | L | TOOL-1 |  | Planned | Out | (design 0110) |
 | USB-2 | Opt-in Windows isolation in the USB kit | P2 | S | USB-1, FEAT-3d |  | Implemented |  | 204 (design 0055) |
 | USB-3 | Keep the Windows USB install folder apart from the default workspace root | P2 | S | USB-1, W2 |  | Implemented |  | 226 |
 | USB-4 | Size the kit's task slots to the machine's fast cores | P2 | S | USB-1 |  | Implemented |  | 209, 207, 210 |
@@ -473,6 +480,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
+| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Planned | In |  |
 | BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
@@ -1175,6 +1183,55 @@ then JOIN-2 and USB-1 in parallel.
 - **Done when:** `tests/cli_usb_kit_e2e.rs` and the installer launcher tests pass, and a stick made
   on one system sets up a machine of another system, recorded with its date.
 
+### TOOL-1: Probe `python`; `--toolset` kits and a pinned private Python in the Windows USB kit
+
+- **Evidence:** Friend trial of 2026-11-26: the Windows laptop set up from kit 0.4.5 had no Python (only the
+  Microsoft Store alias `python.exe` under `WindowsApps`), no Rust and no Git, so only `cmd`, PowerShell, `tar` and
+  `curl` tasks could go there and the kit gave it no workspaces. The worker probes `cargo`, `rustc` and `git` only
+  (`HOST_PROBED_TOOLS`, `crates/core/src/capabilities.rs`). The owner chose the full toolset (Q99).
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D1 to D3, D5, D6 and the Python part of D4: stub-safe
+  probes and `tool:python`; `packaging/usb/tools.lock`; `make_kit.sh --toolset`; the one install question (default
+  Yes on a toolset kit, `-Tools`/`-NoTools`); Python under `<InstallRoot>\tools`, on the worker's process `PATH`
+  only; the pinned end-to-end checks; `NOTICE.txt`.
+- **Done when:** Test plan T1, T2 and the Python part of T3 of design 0110 pass, and `docs/reference.md` lists
+  `tool:python` and the new kit options.
+
+### TOOL-3: Private Rust GNU toolchain in the Windows USB kit
+
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D4: the four pinned `x86_64-pc-windows-gnu`
+  components (the CI toolchain version) merged into `<InstallRoot>\tools\rust-<ver>`, `CARGO_HOME` in the install
+  folder, `--workspaces` decided from the private `cargo`, the isolation grant recorded for uninstall, and the
+  `RustCompilation` check of D5.
+- **Done when:** The Rust part of T3 passes, and T5 and T6 are recorded (T6 says whether crates with C build
+  scripts need a further MinGW or LLVM pack).
+
+### TOOL-5: Private MinGW-w64 C toolchain in the Windows USB kit
+
+- **Evidence:** 2026-11-26, worker `msi` with Rust 1.96.0 `x86_64-pc-windows-gnu` sent as a zip input: crates with
+  pure Rust dependencies built, but a crate whose `build.rs` compiles C with `cc` failed with `failed to find tool
+  "gcc.exe": program not found`. `rust-mingw` brings a linker only (its `GCC-WARNING.txt`). OxideSwarm depends on
+  `ring`, which compiles C.
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D2, D4 to D6: pick the smallest MinGW-w64 GCC
+  distribution that builds `ring` and the T6 crate, pin it in `tools.lock`, install it under
+  `<InstallRoot>\tools\mingw-<ver>`, put its `bin` on the worker's `PATH`, add the `cc-check` crate to the kit
+  checks, and name its GPL source release in `NOTICE.txt`. The same archive is the first C tool pack of TOOL-2.
+- **Done when:** T6 passes on a kit machine and `cargo build --locked -p rusty_grid_cli` passes there.
+
+### TOOL-4: Private MinGit in the Windows USB kit
+
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D4 and D6: the pinned MinGit zip under
+  `<InstallRoot>\tools\git-<ver>`, `cmd\` on the worker's `PATH`, and the GPL source notice in `NOTICE.txt`.
+- **Done when:** The Git part of T3 passes and `NOTICE.txt` names the exact source release.
+
+### TOOL-2: Tool packs: portable tools delivered to workers as cached blobs
+
+- **Do:** [Design 0110](design/0110-tools-on-kit-machines.md) D7: a task names packs (name, version, archive
+  `BlobId`) in a critical `Worker` extension of design 0082; the worker unpacks each pack once into
+  `<sandbox base>/cache/tools/<blake3>/`, read-only, evicted with the blob cache, and prepends it to the task's
+  `PATH`; `submit --tool-pack <name>=<archive>`.
+- **Done when:** A Python pack and a Rust pack run on a worker that has neither installed, with each archive sent
+  once per worker.
+
 ## Phase 7: scale out
 
 Draft, added on 2026-11-09 with Phase F of [ROADMAP.md](ROADMAP.md). The design is
@@ -1596,6 +1653,20 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Root cause:** `BlobCache::open` (`crates/worker/src/blob_cache.rs`) only removed files in `<sandbox base>/cache/blobs/tmp/` older than `STALE_TMP_AGE` (24 hours) so a worker starting on a shared `--sandbox-base-dir` would not delete another live worker's in-flight write. Hard-killed workers never run `TempPartFile::drop`, so their `.part` files remained in `tmp/` for 24 hours across restarts.
 - **Fix:** Each `BlobCache` instance now holds an exclusive advisory file lock (`File::try_lock`) on `<sandbox base>/cache/blobs/owners/<owner_uuid>.lock` and names its `temp_path()` files `<owner_uuid>.<part_uuid>.part`, unlinking and calling `unlock()` on clean `Drop`. On `BlobCache::open` and worker startup (`sweep_dead_owner_tmp` via `crates/worker/src/sandbox.rs`, without creating missing cache directories), a worker probes `owners/<owner_uuid>.lock`: if `try_lock()` succeeds (`lock_file_is_still_named`), the owner is gone so its `.part` files and orphan `.lock` are removed; if `WouldBlock`, the live writer's files stay untouched. Legacy unowned `.part` files retain the 24-hour `STALE_TMP_AGE` rule, and Windows/Unix security checks cover `owners/` against symlinks, junctions, and foreign grants.
 - **Done when:** A killed writer's `.part` file is removed at the next worker startup / `BlobCache::open`, while a live writer holding its owner lock in another process keeps its `.part` file untouched, on both Windows and Unix.
+
+### BUG-41: `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate
+
+- **Evidence:** 2026-11-26, trial cluster (master 0.4.4, client 0.4.4), worker `msi` forced onto the public n0 relay
+  (RTT about 2.2 s, about 0.12 MB/s measured with a 50 MB input): `FAIL C8 Blob throughput msi no result within 60s
+  (last state Running); the worker may not support file transfer or the link is very slow`, while C7 already
+  warned that the link is relayed. An 8 MiB fetch at that rate needs about 67 s. Details in
+  [design 0110](design/0110-tools-on-kit-machines.md), status log.
+- **Problem:** The per-worker C8 probe uses the doctor's fixed `probe_timeout` (60 s, `crates/cli/src/doctor.rs`,
+  about line 74) whatever the link kind, so a working but slow relayed worker is reported as failed.
+- **Do:** Failing check first; then, for a worker whose `link:` tag says relay, either size the probe to the
+  link (a smaller payload) or report the measured rate as a warning when the task is still running and has made
+  progress; keep FAIL for a worker without blob support or with no progress.
+- **Done when:** A relayed worker that moves data slowly gets a WARN with its rate, and the existing C8 tests pass.
 
 ### BUG-40: A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails
 
