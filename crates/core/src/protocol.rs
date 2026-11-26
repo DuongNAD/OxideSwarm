@@ -879,10 +879,18 @@ impl ClientResponse {
     /// `cancelled_tasks` is folded back into `failed_tasks` with saturating addition so v10
     /// peers observe the same combined count.
     pub fn for_peer(&self, version: u32) -> Self {
-        if version >= 11 {
+        if version >= PROTOCOL_VERSION_CURRENT {
             return self.clone();
         }
         match self {
+            Self::TaskCompleted { task_id, result } => {
+                let mut folded = result.clone();
+                folded.cached = false;
+                Self::TaskCompleted {
+                    task_id: *task_id,
+                    result: folded,
+                }
+            }
             Self::ClusterStatus {
                 total_tasks,
                 pending_tasks,

@@ -591,6 +591,9 @@ async fn run_result_inner(
                     }
                     println!("Exit Code: {}", result.exit_code);
                     println!("Execution Time: {}ms", result.execution_time_ms);
+                    if result.cached {
+                        println!("Cached: yes");
+                    }
                     if let Some(ref saved) = saved_artifacts {
                         println!(
                             "Artifacts ({} saved to {}):",

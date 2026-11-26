@@ -3443,6 +3443,7 @@ mod tests {
             asset_bytes: None,
             artifacts: Vec::new(),
             outputs: Vec::new(),
+            cached: false,
         };
         let report = ShardReport::from_executions(
             vec![ShardExecution {

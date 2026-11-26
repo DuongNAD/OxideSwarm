@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod action_cache;
 pub mod auth;
 pub mod blob_store;
 pub mod cold_results;
@@ -29,6 +30,10 @@ pub mod store;
 pub mod web_ui;
 pub mod worker_index;
 
+pub use action_cache::{
+    ActionCache, ActionCacheConfig, ActionCacheStats, ACTION_CACHE_FILE,
+    DEFAULT_ACTION_CACHE_MAX_BYTES,
+};
 pub use auth::{
     dashboard_admin_token, resolve_dashboard_auth, ApiToken, AuthConfig, AuthIdentity, AuthScope,
     DevBypass,

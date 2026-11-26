@@ -29,12 +29,20 @@ const PREVIOUS: u32 = 10;
 /// longer differs (design 0083 D7.3).
 const DIFFERS_FROM_PREVIOUS: &[(&str, &str)] = &[
     (
+        "ClientResponse::TaskCompleted",
+        "TaskResult gained `cached: bool` in protocol 11 (CACHE-1, design 0100)",
+    ),
+    (
         "ClientResponse::ClusterStatus",
         "gained `cancelled_tasks: usize` in protocol 11 (BUG-22)",
     ),
     (
         "ClientResponse::Hello",
         "canonical sample carries PROTOCOL_VERSION_MIN_COMPATIBLE (10 in protocol 11 vs 9 in protocol 10); wire layout is unchanged",
+    ),
+    (
+        "Extension::00001",
+        "registered `action-cache` master-scope task extension in protocol 11 (CACHE-1, design 0100)",
     ),
 ];
 

@@ -365,13 +365,15 @@ pub fn deserialize_message_as_v10<M: DeserializeOwned + 'static>(
         let (stamp, is_error, msg, codec) = match bytes.first().copied() {
             Some(WIRE_FORMAT_BINCODE) => {
                 let slice = &bytes[1..];
-                if slice.len() >= 4 && slice[..4] == 4u32.to_le_bytes() {
+                if slice.len() >= 4
+                    && (slice[..4] == 4u32.to_le_bytes() || slice[..4] == 1u32.to_le_bytes())
+                {
                     let legacy: LegacyV10BinaryClientResponse =
                         bincode_exact_deserialize(slice).map_err(ProtocolError::Bincode)?;
                     let stamp = legacy.protocol_version();
                     let msg = legacy
-                        .into_cluster_status()
-                        .expect("variant tag 4 is ClusterStatus");
+                        .into_v10_message()
+                        .expect("variant tags 1 and 4 are TaskCompleted/ClusterStatus");
                     (stamp, false, msg, WireCodec::Bincode)
                 } else {
                     let bin: BinaryClientResponse =
@@ -386,13 +388,32 @@ pub fn deserialize_message_as_v10<M: DeserializeOwned + 'static>(
             }
             Some(WIRE_FORMAT_JSON) => {
                 let val: serde_json::Value = serde_json::from_slice(&bytes[1..])?;
-                if val.get("type").and_then(|v| v.as_str()) == Some("ClusterStatus") {
+                let ty = val.get("type").and_then(|v| v.as_str());
+                if ty == Some("ClusterStatus") {
                     if val
                         .as_object()
                         .is_some_and(|obj| obj.contains_key("cancelled_tasks"))
                     {
                         return Err(ProtocolError::Violation(
                             "v10 ClientResponse::ClusterStatus must not contain cancelled_tasks"
+                                .into(),
+                        ));
+                    }
+                    let human: HumanLegacyV10ClientResponse = serde_json::from_value(val)?;
+                    (
+                        human.protocol_version(),
+                        false,
+                        ClientResponse::from(human),
+                        WireCodec::Json,
+                    )
+                } else if ty == Some("TaskCompleted") {
+                    if val
+                        .get("result")
+                        .and_then(|r| r.as_object())
+                        .is_some_and(|obj| obj.contains_key("cached"))
+                    {
+                        return Err(ProtocolError::Violation(
+                            "v10 ClientResponse::TaskCompleted result must not contain cached"
                                 .into(),
                         ));
                     }

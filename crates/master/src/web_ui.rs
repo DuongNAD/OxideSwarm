@@ -623,12 +623,18 @@ async fn api_metrics(State(state): State<WebUiState>) -> impl IntoResponse {
         .as_ref()
         .and_then(|h| h.blob_store())
         .map(|b| b.stats());
+    let cache_stats = state
+        .master_handle
+        .as_ref()
+        .and_then(|h| h.action_cache())
+        .map(|c| c.stats());
 
     let body = crate::metrics::render_prometheus_metrics(
         &queue_stats,
         &queue_metrics,
         &workers,
         blob_stats.as_ref(),
+        cache_stats.as_ref(),
         &store_metrics,
     );
     (

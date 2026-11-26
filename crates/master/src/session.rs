@@ -40,6 +40,7 @@ use rusty_grid_core::{
     GridError, GridResult, MasterMessage, MessageTransport, WireCodec, WorkerMessage,
 };
 
+use crate::action_cache::ActionCache;
 use crate::blob_store::BlobStore;
 use crate::liveness::{RxClock, StampedStream};
 use crate::member_connections::{MemberConnectionGuard, MemberLane};
@@ -529,6 +530,7 @@ pub(crate) struct WorkerSession<
     scheduler_notify: Arc<tokio::sync::Notify>,
     waiters: WaiterMap,
     blob_store: Option<Arc<BlobStore>>,
+    action_cache: Option<Arc<ActionCache>>,
     shutdown_rx: watch::Receiver<bool>,
     #[cfg(feature = "dashboard")]
     broadcast_tx: Option<DashboardTx>,
@@ -559,6 +561,7 @@ impl<
         auth_ctx: MasterAuthContext,
         handshake_permit: Option<OwnedSemaphorePermit>,
         blob_store: Option<Arc<BlobStore>>,
+        action_cache: Option<Arc<ActionCache>>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
     ) -> GridResult<()> {
         // 1. Cluster authentication + handshake watchdog (Slowloris defense)
@@ -733,6 +736,7 @@ impl<
                             waiters,
                             mapreduce_parallelism,
                             blob_store,
+                            action_cache,
                             auth_ctx,
                             v3_peer,
                             member_conn_id,
@@ -764,6 +768,7 @@ impl<
                 shutdown_rx,
                 abort_handle,
                 blob_store,
+                action_cache,
                 &auth_ctx,
                 v3_peer.as_ref(),
                 #[cfg(feature = "dashboard")]
@@ -814,6 +819,7 @@ impl<
         shutdown_rx: watch::Receiver<bool>,
         abort_handle: Option<AbortHandle>,
         blob_store: Option<Arc<BlobStore>>,
+        action_cache: Option<Arc<ActionCache>>,
         auth_ctx: &MasterAuthContext,
         v3_peer: Option<&rusty_grid_core::noise_auth::AuthenticatedV3Peer>,
         #[cfg(feature = "dashboard")] broadcast_tx: Option<DashboardTx>,
@@ -1457,6 +1463,7 @@ impl<
             scheduler_notify,
             waiters,
             blob_store,
+            action_cache,
             shutdown_rx,
             #[cfg(feature = "dashboard")]
             broadcast_tx,
@@ -1700,6 +1707,7 @@ impl<
                     worker_id,
                     session_id,
                     self.blob_store.as_ref(),
+                    self.action_cache.as_ref(),
                     #[cfg(feature = "dashboard")]
                     self.broadcast_tx.as_ref(),
                 )
@@ -1985,6 +1993,7 @@ mod tests {
                 MasterAuthContext::default(),
                 None,
                 blob_store,
+                None,
                 #[cfg(feature = "dashboard")]
                 None,
             )
@@ -3357,8 +3366,8 @@ mod tests {
     async fn tier5_wire_register_strips_all_master_reserved_tags() {
         use rusty_grid_core::protocol::ProtocolCapabilities;
 
-        // 1. v10 peer: strips opt:*, speed:*, proto:*, state:*, id:*, link:*, feat:*, while
-        //    preserving ext:32770, slots:4, and user:legit.
+        // 1. Current-protocol (v11) peer: strips opt:*, speed:*, proto:*, state:*, id:*, link:*,
+        //    feat:*, while preserving ext:32770, slots:4, and user:legit.
         let (ctrl_master, ctrl_worker) = tokio::io::duplex(64 * 1024);
         let (data_master, _data_worker) = tokio::io::duplex(64 * 1024);
         let registry = WorkerRegistry::new();
@@ -3485,6 +3494,7 @@ mod tests {
                 MasterAuthContext::default(),
                 None,
                 Some(b_min),
+                None,
                 #[cfg(feature = "dashboard")]
                 None,
             )
@@ -3591,6 +3601,7 @@ mod tests {
                     WireCodec::Json,
                     None,
                     MasterAuthContext::default(),
+                    None,
                     None,
                     None,
                     #[cfg(feature = "dashboard")]

@@ -622,3 +622,111 @@ async fn v9_peers_are_refused_outside_window() {
 
     let _ = master.shutdown();
 }
+
+/// CACHE-1 across protocol versions: when a v11 master serves a cached completion, v11 clients
+/// receive `TaskResult::cached == true`, while v10 clients (both Bincode and JSON) receive the
+/// legacy `TaskCompleted` shape stamped 10 with `cached` absent on the wire (decoded as `false`).
+#[tokio::test]
+async fn v11_cached_task_result_serves_v11_cached_flag_and_stays_v10_compatible() {
+    use rusty_grid_core::task::StagedFile;
+
+    let master = spawn_master().await;
+    let mut worker = V10Worker::register(&master, "v10-cache-worker", WireCodec::Bincode).await;
+
+    let mut first = Task::new(
+        TaskSpec::command("echo", vec!["cached-window".into()]),
+        TaskRequirements::generic(1, 10),
+    )
+    .with_action_cache();
+    first
+        .staged_files
+        .push(StagedFile::new("in.txt", b"seed".to_vec(), false));
+    let first_id = first.id;
+    master.submit_task(first).await.unwrap();
+
+    let (assigned, _) = worker
+        .next_assigned_task(Duration::from_secs(5))
+        .await
+        .expect("worker receives first cacheable task");
+    assert_eq!(assigned.id, first_id);
+    assert!(
+        !assigned.is_action_cache_enabled(),
+        "Master-scope action-cache extension must be stripped before dispatching to worker"
+    );
+    worker.finish(first_id, 0).await;
+    let first_res = master
+        .wait_task(first_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert!(!first_res.cached);
+
+    // Identical task hits the master cache directly without dispatching to the worker.
+    let mut second = Task::new(
+        TaskSpec::command("echo", vec!["cached-window".into()]),
+        TaskRequirements::generic(1, 10),
+    )
+    .with_action_cache();
+    second
+        .staged_files
+        .push(StagedFile::new("in.txt", b"seed".to_vec(), false));
+    let second_id = second.id;
+    master.submit_task(second).await.unwrap();
+    let second_res = master
+        .wait_task(second_id, Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert!(second_res.cached, "second submit must hit action cache");
+    assert!(
+        worker
+            .next_assigned_task(Duration::from_millis(200))
+            .await
+            .is_none(),
+        "cached hit must not dispatch to worker"
+    );
+
+    for codec in CODECS {
+        // v11 client sees `cached: true` via GetTaskResult.
+        let stream_v11 = TcpStream::connect(master.server_addr()).await.unwrap();
+        let mut client_v11 = MessageTransport::with_codec(stream_v11, codec);
+        client_v11
+            .send_msg(&ClientMessage::GetTaskResult { task_id: second_id })
+            .await
+            .unwrap();
+        match client_v11
+            .recv_msg::<ClientResponse>()
+            .await
+            .unwrap()
+            .expect("v11 TaskCompleted")
+        {
+            ClientResponse::TaskCompleted { task_id, result } => {
+                assert_eq!(task_id, second_id);
+                assert!(result.cached, "{codec:?}: v11 client sees cached: true");
+            }
+            other => panic!("expected TaskCompleted, got {other:?}"),
+        }
+
+        // v10 client decodes via frozen v10 reader (which asserts JSON has no `"cached"` key
+        // and Bincode matches LegacyV10BinaryTaskResult).
+        let stream_v10 = TcpStream::connect(master.server_addr()).await.unwrap();
+        let mut client_v10 = MessageTransport::with_codec(stream_v10, codec);
+        match v10_call(
+            &mut client_v10,
+            codec,
+            ClientMessage::GetTaskResult { task_id: second_id },
+        )
+        .await
+        {
+            ClientResponse::TaskCompleted { task_id, result } => {
+                assert_eq!(task_id, second_id);
+                assert!(
+                    !result.cached,
+                    "{codec:?}: v10 wire omits cached so v10 reader decodes false"
+                );
+                assert_eq!(result.exit_code, 0);
+            }
+            other => panic!("expected TaskCompleted, got {other:?}"),
+        }
+    }
+
+    let _ = master.shutdown();
+}

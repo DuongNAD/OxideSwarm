@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::action_cache::ActionCacheStats;
 use crate::blob_store::BlobStoreStats;
 use crate::queue::{QueueStats, TaskState};
 use crate::registry::{WorkerInfo, WorkerStatus};
@@ -371,6 +372,7 @@ pub fn render_prometheus_metrics(
     queue_metrics: &QueueMetricsSnapshot,
     workers: &[WorkerMetricSample],
     blob_stats: Option<&BlobStoreStats>,
+    action_cache: Option<&ActionCacheStats>,
     store_metrics: &StoreMetricsSnapshot,
 ) -> String {
     let mut out = String::with_capacity(4096);
@@ -568,6 +570,36 @@ pub fn render_prometheus_metrics(
     let _ = writeln!(out, "# TYPE oxideswarm_blob_store_objects gauge");
     let _ = writeln!(out, "oxideswarm_blob_store_objects {}", blob.blobs);
 
+    if let Some(cache) = action_cache {
+        let _ = writeln!(
+            out,
+            "# HELP oxideswarm_action_cache_hits_total Total action cache lookups served without worker execution."
+        );
+        let _ = writeln!(out, "# TYPE oxideswarm_action_cache_hits_total counter");
+        let _ = writeln!(out, "oxideswarm_action_cache_hits_total {}", cache.hits);
+
+        let _ = writeln!(
+            out,
+            "# HELP oxideswarm_action_cache_misses_total Total action cache lookups that missed or were stale."
+        );
+        let _ = writeln!(out, "# TYPE oxideswarm_action_cache_misses_total counter");
+        let _ = writeln!(out, "oxideswarm_action_cache_misses_total {}", cache.misses);
+
+        let _ = writeln!(
+            out,
+            "# HELP oxideswarm_action_cache_entries Current number of cached action entries."
+        );
+        let _ = writeln!(out, "# TYPE oxideswarm_action_cache_entries gauge");
+        let _ = writeln!(out, "oxideswarm_action_cache_entries {}", cache.entries);
+
+        let _ = writeln!(
+            out,
+            "# HELP oxideswarm_action_cache_bytes Current retained bytes accounted by the action cache."
+        );
+        let _ = writeln!(out, "# TYPE oxideswarm_action_cache_bytes gauge");
+        let _ = writeln!(out, "oxideswarm_action_cache_bytes {}", cache.bytes);
+    }
+
     // Durable journal & store health metrics.
     let _ = writeln!(
         out,
@@ -740,7 +772,7 @@ mod tests {
             fsync_duration: Histogram::default().snapshot(),
         };
 
-        let text = render_prometheus_metrics(&stats, &qsnap, &workers, Some(&blob), &store);
+        let text = render_prometheus_metrics(&stats, &qsnap, &workers, Some(&blob), None, &store);
         for expected in [
             "oxideswarm_queue_tasks{state=\"queued\"} 1",
             "oxideswarm_queue_tasks{state=\"running\"} 1",
@@ -763,7 +795,7 @@ mod tests {
 
         store.healthy = false;
         let unhealthy_text =
-            render_prometheus_metrics(&stats, &qsnap, &workers, Some(&blob), &store);
+            render_prometheus_metrics(&stats, &qsnap, &workers, Some(&blob), None, &store);
         assert!(unhealthy_text.contains("oxideswarm_store_healthy 0"));
     }
 }

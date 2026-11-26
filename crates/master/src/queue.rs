@@ -759,6 +759,8 @@ pub struct ResultOutcome {
     pub timeout_secs: u64,
     /// True when this attempt resumed from a prior checkpoint (`AssignTaskWithCheckpoint`).
     pub resumed_from_checkpoint: bool,
+    /// Precomputed action cache key when the task completed successfully with caching enabled.
+    pub action_cache_key: Option<rusty_grid_core::task::ActionCacheKey>,
     /// Reporting worker's assigned session id, when tracked.
     pub session_id: Option<u64>,
     /// Reporting worker's dispatch reservation `session_live` handle, when tracked.

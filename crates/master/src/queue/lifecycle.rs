@@ -379,6 +379,7 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    action_cache_key: None,
                     session_id: None,
                     session_live: None,
                     cancel_sibling: None,
@@ -435,6 +436,7 @@ impl TaskQueue {
                     task_key,
                     timeout_secs,
                     resumed_from_checkpoint,
+                    action_cache_key: None,
                     session_id: reporting_session_id,
                     session_live: reporting_session_live,
                     cancel_sibling: None,
@@ -524,6 +526,7 @@ impl TaskQueue {
                         task_key,
                         timeout_secs,
                         resumed_from_checkpoint,
+                        action_cache_key: None,
                         session_id: reporting_session_id,
                         session_live: reporting_session_live,
                         cancel_sibling: None,
@@ -778,6 +781,19 @@ impl TaskQueue {
                 (None, true)
             }
         };
+
+        let action_cache_key = if !durability_failed
+            && disposition == ResultDisposition::Terminal
+            && res_state == TaskState::Completed
+        {
+            inner
+                .tasks
+                .get(&task_id)
+                .filter(|e| e.task.is_action_cache_enabled())
+                .map(|e| rusty_grid_core::task::compute_action_cache_key(&e.task))
+        } else {
+            None
+        };
         inner.maybe_trigger_compaction();
 
         Ok((
@@ -789,6 +805,7 @@ impl TaskQueue {
                 task_key,
                 timeout_secs,
                 resumed_from_checkpoint,
+                action_cache_key,
                 session_id: reporting_session_id,
                 session_live: reporting_session_live,
                 cancel_sibling,

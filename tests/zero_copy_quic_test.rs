@@ -99,6 +99,7 @@ fn test_task_result_stdout_stderr_cow_methods() {
         asset_bytes: None,
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     };
 
     match res_utf8.stdout_str() {
@@ -125,6 +126,7 @@ fn test_task_result_stdout_stderr_cow_methods() {
         asset_bytes: None,
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     };
 
     match res_binary.stdout_str() {
@@ -164,6 +166,7 @@ fn test_zero_copy_large_payload_serialization_roundtrip() {
         asset_bytes: None,
         artifacts: Vec::new(),
         outputs: Vec::new(),
+        cached: false,
     };
 
     // 1. Test JSON Roundtrip

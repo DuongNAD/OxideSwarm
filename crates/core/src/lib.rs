@@ -49,8 +49,9 @@ pub use protocol::{
     MAX_FRAME_SIZE, WIRE_FORMAT_AUTH, WIRE_FORMAT_BINCODE, WIRE_FORMAT_JSON,
 };
 pub use task::{
-    Task, TaskId, TaskRequirements, TaskResult, TaskSpec, TaskStatus, WorkspaceAffinity,
-    WorkspaceRef, WorkspaceSource,
+    compute_action_cache_key, ActionCacheKey, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
+    TaskStatus, WorkspaceAffinity, WorkspaceRef, WorkspaceSource, ACTION_CACHE_EXTENSION_ID,
+    ACTION_CACHE_EXT_PAYLOAD_READ_WRITE, ACTION_CACHE_KEY_DOMAIN,
 };
 
 #[cfg(test)]

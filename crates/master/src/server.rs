@@ -66,7 +66,7 @@ pub(crate) use tasks_and_blobs::{
     admit_blob_task, apply_mobile_telemetry, cancel_task_and_notify, failover_superseded_session,
     feature_announcement, handle_oversized_master_message, handle_session_task_message,
     handle_workers_revoked_with_broadcast, prune_closed_waiters, resolve_terminal_waiters,
-    serve_worker_blob_request, BlobService,
+    serve_worker_blob_request, try_serve_action_cache_hit, BlobService,
 };
 pub use tasks_and_blobs::{
     handle_task_progress, handle_task_result, handle_worker_disconnect,
@@ -77,6 +77,9 @@ pub use tasks_and_blobs::{
 pub use tasks_and_blobs::{handle_task_progress_with_broadcast, handle_task_result_with_broadcast};
 use tasks_and_blobs::{spawn_blob_store_sweeper, terminal_result};
 
+use crate::action_cache::{
+    ActionCache, ActionCacheConfig, ACTION_CACHE_FILE, DEFAULT_ACTION_CACHE_MAX_BYTES,
+};
 use crate::auth::DevBypass;
 use crate::blob_store::{BlobStore, BlobStoreConfig};
 use crate::mapreduce::{MapReduceEngine, DEFAULT_MAPREDUCE_PARALLELISM};
@@ -205,6 +208,9 @@ pub struct ServerConfig {
     /// [`crate::blob_store`]). `None` (the default) runs without one unless `state_dir` is set, in
     /// which case it defaults to `<state_dir>/blobs`. The CLI keeps one under `~/.oxideswarm/blobs`.
     pub blob_store: Option<BlobStoreConfig>,
+    /// Maximum total bytes retained by the opt-in action cache (`0` disables caching; default
+    /// `512 MiB` / `DEFAULT_ACTION_CACHE_MAX_BYTES`).
+    pub action_cache_max_bytes: u64,
     /// Optional directory for durable task queue persistence (`store.lock`, `snapshot.bin`,
     /// `journal.bin`; see [`crate::store::TaskStore`]). `None` (the default) keeps the queue
     /// purely in memory.
@@ -278,6 +284,7 @@ impl Default for ServerConfig {
             implicit_local_dashboard: false,
             rendezvous_url: None,
             blob_store: None,
+            action_cache_max_bytes: DEFAULT_ACTION_CACHE_MAX_BYTES,
             state_dir: None,
             session_resume_hold: Duration::ZERO,
             session_resume_hold_explicit: false,
@@ -536,6 +543,12 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the maximum total byte budget of the master action cache (`0` disables caching).
+    pub fn with_action_cache_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.action_cache_max_bytes = max_bytes;
+        self
+    }
+
     /// Configures the durable task queue state directory (`store.lock`, `snapshot.bin`,
     /// `journal.bin`). When `blob_store` is not configured explicitly, it defaults to
     /// `<dir>/blobs`, and when `session_resume_hold` was not set explicitly, it defaults to
@@ -663,6 +676,8 @@ pub struct MasterServer {
     pub p2p_ticket: Option<String>,
     /// The blob store, when `ServerConfig::blob_store` names one.
     blob_store: Option<Arc<BlobStore>>,
+    /// The opt-in content-addressed action cache, when `action_cache_max_bytes > 0`.
+    action_cache: Option<Arc<ActionCache>>,
     /// Shared OXS-AUTH v3 authentication, member store, and live member connection registry.
     auth_ctx: MasterAuthContext,
 }
@@ -784,6 +799,24 @@ impl MasterServer {
                 })?)
             }
             None => None,
+        };
+
+        let action_cache = if config.action_cache_max_bytes > 0 {
+            let cache_cfg = ActionCacheConfig {
+                max_bytes: config.action_cache_max_bytes,
+                persist_path: config
+                    .state_dir
+                    .as_ref()
+                    .map(|dir| dir.join(ACTION_CACHE_FILE)),
+            };
+            let cache_blobs = blob_store.clone();
+            let opened =
+                tokio::task::spawn_blocking(move || ActionCache::open(cache_cfg, cache_blobs))
+                    .await
+                    .map_err(|e| GridError::Config(format!("Action cache start-up failed: {e}")))?;
+            Some(opened)
+        } else {
+            None
         };
 
         queue
@@ -962,6 +995,7 @@ impl MasterServer {
             broadcast_tx: None,
             p2p_ticket,
             blob_store,
+            action_cache,
             auth_ctx,
         })
     }
@@ -1031,6 +1065,7 @@ impl MasterServer {
         let p2p_active_conns = Arc::clone(&server.p2p_active_conns);
         let p2p_ticket = server.p2p_ticket.clone();
         let blob_store = server.blob_store.clone();
+        let action_cache = server.action_cache.clone();
         let master_noise_public_key = server
             .config
             .master_noise_key
@@ -1288,6 +1323,7 @@ impl MasterServer {
             auth_mode,
             members,
             blob_store: blob_store.clone(),
+            action_cache,
             auth_ctx,
         };
 
@@ -1747,6 +1783,7 @@ impl MasterServer {
             let p2p_mapreduce_parallelism = self.config.mapreduce_parallelism;
             let p2p_limits = limits.clone();
             let p2p_blob_store = self.blob_store.clone();
+            let p2p_action_cache = self.action_cache.clone();
             let p2p_auth_ctx = auth_ctx.clone();
 
             tokio::spawn(async move {
@@ -1786,6 +1823,7 @@ impl MasterServer {
                             let c_conns = Arc::clone(&p2p_conns);
                             let c_secret = p2p_secret.clone();
                             let c_blob_store = p2p_blob_store.clone();
+                            let c_action_cache = p2p_action_cache.clone();
                             let c_auth_ctx = p2p_auth_ctx.clone();
                             #[cfg(feature = "dashboard")]
                             let c_bcast = p2p_broadcast_tx.clone();
@@ -1894,6 +1932,7 @@ impl MasterServer {
                                             c_auth_ctx,
                                             Some(handshake_permit),
                                             c_blob_store,
+                                            c_action_cache,
                                             #[cfg(feature = "dashboard")]
                                             c_bcast,
                                             #[cfg(feature = "p2p")]
@@ -1921,6 +1960,7 @@ impl MasterServer {
                                             Some(handshake_permit),
                                             p2p_mapreduce_parallelism,
                                             c_blob_store,
+                                            c_action_cache,
                                             #[cfg(feature = "dashboard")]
                                             c_bcast,
                                             #[cfg(feature = "p2p")]
@@ -1983,6 +2023,7 @@ impl MasterServer {
                             let conn_secret = self.config.cluster_secret.clone();
                             let conn_mapreduce_parallelism = self.config.mapreduce_parallelism;
                             let conn_blob_store = self.blob_store.clone();
+                            let conn_action_cache = self.action_cache.clone();
                             let conn_auth_ctx = auth_ctx.clone();
                             #[cfg(feature = "dashboard")]
                             let conn_broadcast_tx = self.broadcast_tx.clone();
@@ -2010,6 +2051,7 @@ impl MasterServer {
                                     Some(handshake_permit),
                                     conn_mapreduce_parallelism,
                                     conn_blob_store,
+                                    conn_action_cache,
                                     #[cfg(feature = "dashboard")]
                                     conn_broadcast_tx,
                                     #[cfg(feature = "p2p")]
@@ -2105,6 +2147,7 @@ pub struct MasterHandle {
     auth_mode: AuthMode,
     members: Arc<MemberStore>,
     blob_store: Option<Arc<BlobStore>>,
+    action_cache: Option<Arc<ActionCache>>,
     auth_ctx: MasterAuthContext,
 }
 
@@ -2139,6 +2182,11 @@ impl MasterHandle {
     /// The blob store of task inputs and output files, if this master runs one.
     pub fn blob_store(&self) -> Option<&Arc<BlobStore>> {
         self.blob_store.as_ref()
+    }
+
+    /// The master action cache, if enabled (`action_cache_max_bytes > 0`).
+    pub fn action_cache(&self) -> Option<&Arc<ActionCache>> {
+        self.action_cache.as_ref()
     }
 
     /// Admits a task for submission through this handle (see `admit_blob_task`); returns
@@ -2220,42 +2268,31 @@ impl MasterHandle {
             .and_then(rusty_grid_core::transport::inspect_connection_paths)
     }
 
-    /// Submits a task with default priority (0).
-    pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {
+    async fn submit_task_inner(&self, task: Task, priority: u32) -> GridResult<TaskId> {
         let task_id = task.id;
         let (admitted, needs_tree_v2) = self.admit(&task).await?;
-        let id = match self
-            .queue
-            .submit_with_priority_and_tree_v2(task, 0, needs_tree_v2)
+        if admitted {
+            match try_serve_action_cache_hit(
+                &task,
+                priority,
+                crate::fair_share::SubmitterId::Default,
+                &self.queue,
+                &self.waiters,
+                self.blob_store.as_ref(),
+                self.action_cache.as_ref(),
+                #[cfg(feature = "dashboard")]
+                self.broadcast_tx.as_ref(),
+            )
             .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                self.release_admission(&task_id, admitted).await;
-                return Err(e);
-            }
-        };
-        self.scheduler_notify.notify_one();
-        #[cfg(feature = "dashboard")]
-        if let Some(ref b_tx) = self.broadcast_tx {
-            if b_tx.receiver_count() > 0 {
-                if let Some(info) = self.queue.get_task(&id).await {
-                    let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::TaskUpdated(
-                        info,
-                    ));
+            {
+                Ok(Some(_)) => return Ok(task_id),
+                Ok(None) => {}
+                Err(e) => {
+                    self.release_admission(&task_id, admitted).await;
+                    return Err(e);
                 }
-                let _ = b_tx.send(crate::dashboard::dto::DashboardStreamMessage::StatsUpdated(
-                    self.queue.stats().await,
-                ));
             }
         }
-        Ok(id)
-    }
-
-    /// Submits a task with explicit priority.
-    pub async fn submit_task_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
-        let task_id = task.id;
-        let (admitted, needs_tree_v2) = self.admit(&task).await?;
         let id = match self
             .queue
             .submit_with_priority_and_tree_v2(task, priority, needs_tree_v2)
@@ -2282,6 +2319,16 @@ impl MasterHandle {
             }
         }
         Ok(id)
+    }
+
+    /// Submits a task with default priority (0).
+    pub async fn submit_task(&self, task: Task) -> GridResult<TaskId> {
+        self.submit_task_inner(task, 0).await
+    }
+
+    /// Submits a task with explicit priority.
+    pub async fn submit_task_with_priority(&self, task: Task, priority: u32) -> GridResult<TaskId> {
+        self.submit_task_inner(task, priority).await
     }
 
     /// Queries current task lifecycle status.

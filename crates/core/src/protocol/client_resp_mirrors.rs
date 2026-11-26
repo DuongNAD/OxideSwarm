@@ -322,7 +322,7 @@ pub(super) enum LegacyV2BinaryClientResponse {
     },
     TaskCompleted {
         task_id: TaskId,
-        result: TaskResult,
+        result: crate::task::LegacyV10BinaryTaskResult,
     },
     TaskStatusInfo {
         task_id: TaskId,
@@ -373,7 +373,7 @@ pub(super) enum LegacyV3V4BinaryClientResponse {
     },
     TaskCompleted {
         task_id: TaskId,
-        result: TaskResult,
+        result: crate::task::LegacyV10BinaryTaskResult,
         protocol_version: u32,
     },
     TaskStatusInfo {
@@ -418,7 +418,7 @@ pub(super) enum LegacyV10BinaryClientResponse {
     },
     TaskCompleted {
         task_id: TaskId,
-        result: TaskResult,
+        result: crate::task::LegacyV10BinaryTaskResult,
         protocol_version: u32,
     },
     TaskStatusInfo {
@@ -455,6 +455,12 @@ pub(super) enum LegacyV10BinaryClientResponse {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub(super) enum HumanLegacyV10ClientResponse {
+    TaskCompleted {
+        task_id: TaskId,
+        result: crate::task::HumanLegacyV10TaskResult,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
     ClusterStatus {
         total_tasks: usize,
         pending_tasks: usize,
@@ -477,7 +483,10 @@ pub(super) enum HumanLegacyV10ClientResponse {
 impl HumanLegacyV10ClientResponse {
     pub(super) const fn protocol_version(&self) -> u32 {
         match self {
-            Self::ClusterStatus {
+            Self::TaskCompleted {
+                protocol_version, ..
+            }
+            | Self::ClusterStatus {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -488,6 +497,12 @@ impl HumanLegacyV10ClientResponse {
 impl From<HumanLegacyV10ClientResponse> for ClientResponse {
     fn from(msg: HumanLegacyV10ClientResponse) -> Self {
         match msg {
+            HumanLegacyV10ClientResponse::TaskCompleted {
+                task_id, result, ..
+            } => ClientResponse::TaskCompleted {
+                task_id,
+                result: result.into(),
+            },
             HumanLegacyV10ClientResponse::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -537,8 +552,14 @@ impl LegacyV10BinaryClientResponse {
     }
 
     #[cfg(any(test, feature = "test-extensions"))]
-    pub(super) fn into_cluster_status(self) -> Option<ClientResponse> {
+    pub(super) fn into_v10_message(self) -> Option<ClientResponse> {
         match self {
+            Self::TaskCompleted {
+                task_id, result, ..
+            } => Some(ClientResponse::TaskCompleted {
+                task_id,
+                result: result.into(),
+            }),
             Self::ClusterStatus {
                 total_tasks,
                 pending_tasks,
@@ -1470,11 +1491,29 @@ pub(super) fn serialize_client_response_for_peer(
     peer_version: u32,
     codec: super::WireCodec,
 ) -> Result<bytes::Bytes, super::ProtocolError> {
-    if peer_version >= 11 {
+    if peer_version >= PROTOCOL_VERSION_CURRENT {
         return serialize_client_response_with_version(msg, peer_version, codec);
     }
     let adapted = msg.for_peer(peer_version);
     match adapted {
+        ClientResponse::TaskCompleted { task_id, result } => match codec {
+            super::WireCodec::Bincode => {
+                let wire = LegacyV10BinaryClientResponse::TaskCompleted {
+                    task_id,
+                    result: (&result).into(),
+                    protocol_version: peer_version,
+                };
+                super::codec::serialize_message(&wire, super::WireCodec::Bincode)
+            }
+            super::WireCodec::Json => {
+                let wire = HumanLegacyV10ClientResponse::TaskCompleted {
+                    task_id,
+                    result: (&result).into(),
+                    protocol_version: peer_version,
+                };
+                super::codec::serialize_message(&wire, super::WireCodec::Json)
+            }
+        },
         ClientResponse::ClusterStatus {
             total_tasks,
             pending_tasks,

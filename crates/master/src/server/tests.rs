@@ -870,6 +870,7 @@ async fn test_oversized_master_frames_fail_only_the_task_and_return_client_error
             MasterAuthContext::default(),
             None,
             None,
+            None,
             #[cfg(feature = "dashboard")]
             None,
             #[cfg(feature = "p2p")]
@@ -1081,6 +1082,7 @@ async fn test_claim_master_role_is_refused_with_and_without_secret_and_sends_no_
                     None,
                     4,
                     None,
+                    None,
                     #[cfg(feature = "dashboard")]
                     None,
                     #[cfg(feature = "p2p")]
@@ -1116,6 +1118,7 @@ async fn test_claim_master_role_is_refused_with_and_without_secret_and_sends_no_
                         WireCodec::Bincode,
                         secret_clone,
                         MasterAuthContext::default(),
+                        None,
                         None,
                         None,
                         #[cfg(feature = "dashboard")]
@@ -1501,6 +1504,7 @@ async fn test_master_server_bind_enforces_max_queue_size_and_json_wire_codec() {
             MasterAuthContext::default(),
             None,
             None,
+            None,
             #[cfg(feature = "dashboard")]
             None,
             #[cfg(feature = "p2p")]
@@ -1592,6 +1596,7 @@ async fn test_master_server_bind_enforces_max_queue_size_and_json_wire_codec() {
             WireCodec::Bincode,
             None,
             MasterAuthContext::default(),
+            None,
             None,
             None,
             #[cfg(feature = "dashboard")]
