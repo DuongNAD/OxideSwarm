@@ -960,17 +960,28 @@ pub fn check_owned_paths_discipline(
 }
 
 fn placement_from_require(require: &[String]) -> Result<Placement, String> {
-    let tags: Vec<String> = require
-        .iter()
-        .map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.starts_with(REQUIRE_PREFIX) {
-                trimmed.to_string()
-            } else {
-                format!("{REQUIRE_PREFIX}{trimmed}")
+    let mut tags = Vec::new();
+    for raw in require {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with(REQUIRE_PREFIX) {
+            tags.push(trimmed.to_string());
+        } else if let Some((key, val)) = trimmed.split_once(':') {
+            // `plan.rs` validates `[profile].require` using `key:value` syntax (plus capability
+            // tags `feat:workspaces` / `opt:repeatable` and bare user tags), whereas
+            // `Placement::from_task_tags` expects `require:<key>=<value>`.
+            if matches!(key, "feat" | "opt") {
+                continue;
             }
-        })
-        .collect();
+            tags.push(format!("{REQUIRE_PREFIX}{key}={val}"));
+        } else if trimmed.contains('=') {
+            tags.push(format!("{REQUIRE_PREFIX}{trimmed}"));
+        } else {
+            tags.push(format!("{REQUIRE_PREFIX}tag={trimmed}"));
+        }
+    }
     Placement::from_task_tags(&tags)
 }
 
@@ -2512,5 +2523,27 @@ boom expected true
             let err = check_and_record_verify_rate_at(&linked, "agent-a", 5, t0).unwrap_err();
             assert!(err.contains("symlink"), "{err}");
         }
+    }
+
+    #[test]
+    fn placement_from_require_accepts_plan_colon_tags_and_bare_tags() {
+        let p = placement_from_require(&[
+            "os:windows".to_string(),
+            "arch:x86_64".to_string(),
+            "iso:off".to_string(),
+            "tool:rustc".to_string(),
+            "feat:workspaces".to_string(),
+            "gpu".to_string(),
+            "require:tag=fast-ssd".to_string(),
+        ])
+        .expect("plan require syntax must map cleanly to Placement");
+        assert_eq!(p.os.as_deref(), Some("windows"));
+        assert_eq!(p.arch.as_deref(), Some("x86_64"));
+        assert_eq!(
+            p.isolation,
+            Some(rusty_grid_core::placement::IsolationLevel::Off)
+        );
+        assert_eq!(p.tools, vec!["rustc".to_string()]);
+        assert_eq!(p.tags, vec!["fast-ssd".to_string(), "gpu".to_string()]);
     }
 }
