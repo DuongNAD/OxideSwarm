@@ -23,6 +23,10 @@
 //! 7. `workspaces`: List persistent agent workspaces and their worker affinities.
 //! 8. `shard`: Run commands or `cargo nextest` build-once suites across parallel shards.
 //! 9. `plan_snapshot`: Render the compact `<= 30`-line shared plan snapshot.
+//! 10. `task_claim`: Atomically claim a task lease ref (`refs/oxideswarm/lease/<task-id>`) and worktree.
+//! 11. `task_renew`: Renew an active task lease ref via fast-forward push.
+//! 12. `task_release`: Delete a task lease ref on the remote.
+//! 13. `verify`: Sync worktree into worker workspaces and run task verify profiles (<= 4 KiB JSON).
 //!
 //! # Stdout Hygiene
 //!
@@ -54,6 +58,7 @@ use crate::secret_cmd::SecretOpts;
 
 mod cancel;
 mod doctor;
+mod lease;
 mod plan;
 mod shard;
 mod status;
@@ -980,6 +985,144 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 "required": ["task"]
             }),
         },
+        ToolDefinition {
+            name: "task_claim",
+            description: "Atomically claim a task lease ref (refs/oxideswarm/lease/<task_id>) via create-only git push and create an isolated worktree.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id in .oxideswarm/plan.toml"
+                    },
+                    "holder": {
+                        "type": "string",
+                        "description": "Claiming agent identifier"
+                    },
+                    "person": {
+                        "type": "string",
+                        "description": "Optional human owner override"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional base branch/ref overriding [project].base"
+                    },
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Optional path inside repo_dir to the plan TOML file"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Optional worktree branch name (default: team/<task_id>)"
+                    },
+                    "worktree_root": {
+                        "type": "string",
+                        "description": "Optional directory inside cwd where wt-<task_id> is created (default: <repo_dir>/.oxideswarm/worktrees)"
+                    },
+                    "create_worktree": {
+                        "type": "boolean",
+                        "description": "Create git worktree for the claimed task (default: true)"
+                    },
+                    "ttl_minutes": {
+                        "type": "integer",
+                        "description": "Lease lifetime in minutes (default: 45, range: 1..=1440)"
+                    }
+                },
+                "required": ["task_id", "holder"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_renew",
+            description: "Renew an active task lease ref via strictly fast-forward git push.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id in .oxideswarm/plan.toml"
+                    },
+                    "holder": {
+                        "type": "string",
+                        "description": "Current lease holder identifier"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory"
+                    },
+                    "expected_oid": {
+                        "type": "string",
+                        "description": "Optional expected remote lease commit OID"
+                    },
+                    "ttl_minutes": {
+                        "type": "integer",
+                        "description": "Extended lease lifetime in minutes (default: 45, range: 1..=1440)"
+                    },
+                    "blocked": {
+                        "type": "boolean",
+                        "description": "Optional blocked flag update"
+                    },
+                    "verify_attempts": {
+                        "type": "integer",
+                        "description": "Optional verify attempt counter update"
+                    },
+                    "verify_failures": {
+                        "type": "integer",
+                        "description": "Optional verify failure counter update"
+                    },
+                    "last_failure": {
+                        "type": "string",
+                        "description": "Optional short last failure summary"
+                    },
+                    "last_fingerprint": {
+                        "type": "string",
+                        "description": "Optional normalized failure fingerprint"
+                    }
+                },
+                "required": ["task_id", "holder"]
+            }),
+        },
+        ToolDefinition {
+            name: "task_release",
+            description: "Delete a task lease ref (refs/oxideswarm/lease/<task_id>) on the git remote.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task id whose lease ref should be released"
+                    },
+                    "holder": {
+                        "type": "string",
+                        "description": "Expected lease holder (required unless force is true)"
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Git remote hosting refs/oxideswarm/lease/* (default: origin)"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Force deletion even if holder is omitted or does not match (default: false)"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
     ]
 }
 
@@ -1643,6 +1786,9 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             }
             Ok(())
         }
+        "task_claim" => lease::validate_task_claim_args(obj),
+        "task_renew" => lease::validate_task_renew_args(obj),
+        "task_release" => lease::validate_task_release_args(obj),
         other => Err(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1672,6 +1818,9 @@ pub async fn call_tool_with_context(
         "workspaces" => workspaces::tool_workspaces(state).await,
         "plan_snapshot" => plan::tool_plan_snapshot(args).await,
         "verify" => verify::tool_verify(state, args, ctx).await,
+        "task_claim" => lease::tool_task_claim(args).await,
+        "task_renew" => lease::tool_task_renew(args).await,
+        "task_release" => lease::tool_task_release(args).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -2635,7 +2784,7 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 13);
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),
