@@ -2,7 +2,9 @@
 //!
 //! Formats recorded verification outputs (worker, OS, link kind, toolchain, exit result, task id,
 //! and verified base commit) into a deterministic GFM Markdown pull request body with stale-base
-//! warnings and failure summaries.
+//! warnings and failure summaries. Compatible with both design 0111 D4.3/D6.1 JSON and TEAM-3
+//! `verify_gate::{VerifyGateReport, VerifyRecord}` JSON (where optional fields use `Option<String>`
+//! with `skip_serializing_if = "Option::is_none"`).
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +12,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyFailureSummary {
     pub kind: String,
-    pub name: String,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub file: Option<String>,
     #[serde(default)]
@@ -22,18 +25,30 @@ pub struct VerifyFailureSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifyCellRecord {
     pub profile: String,
-    pub os: String,
-    pub worker: String,
-    pub link: String,
-    pub toolchain: String,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
+    #[serde(default)]
+    pub shard: Option<String>,
+    #[serde(default)]
+    pub worker: Option<String>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default)]
+    pub link: Option<String>,
+    #[serde(default)]
+    pub toolchain: Option<String>,
     pub exit: i32,
     pub secs: f64,
-    pub task_id: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
     #[serde(default)]
     pub failures: Vec<VerifyFailureSummary>,
 }
 
-/// Compact verify output produced by the verify gate for one task revision (design 0111, D4.3).
+/// Compact verify output produced by the verify gate for one task revision (design 0111, D4.3)
+/// or stored in `.oxideswarm/verify/<task>.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifyRecord {
     pub task: String,
@@ -46,9 +61,17 @@ pub struct VerifyRecord {
     pub base_branch: Option<String>,
     pub ok: bool,
     #[serde(default)]
+    pub timestamp_utc: Option<String>,
+    #[serde(default)]
+    pub first_fingerprint: Option<String>,
+    #[serde(default)]
+    pub untrusted_data: Option<bool>,
+    #[serde(default)]
     pub cells: Vec<VerifyCellRecord>,
     #[serde(default)]
     pub omitted: usize,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Metadata required to render a complete pull request description for a completed task.
@@ -126,6 +149,14 @@ pub fn escape_md_cell(raw: &str) -> String {
     cleaned.trim().to_string()
 }
 
+fn escape_code_span(raw: &str) -> String {
+    escape_md_cell(raw).replace('`', "'")
+}
+
+fn display_opt_or_dash(opt: Option<&str>) -> &str {
+    opt.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("-")
+}
+
 /// Formats one verify cell's result string (`PASS (...)` or `FAIL (...)`).
 pub fn format_cell_result(cell: &VerifyCellRecord) -> String {
     let secs = if cell.secs.is_finite() && cell.secs >= 0.0 {
@@ -146,13 +177,8 @@ pub fn format_cell_result(cell: &VerifyCellRecord) -> String {
     }
 }
 
-fn short_sha(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if trimmed.len() <= 12 {
-        trimmed
-    } else {
-        &trimmed[..12]
-    }
+fn short_sha(raw: &str) -> String {
+    raw.trim().chars().take(12).collect()
 }
 
 fn validate_non_empty_token(raw: &str, field: &str) -> Result<String, String> {
@@ -187,19 +213,27 @@ pub fn render_verify_table(records: &[VerifyRecord], default_base_commit: Option
             .filter(|s| !s.trim().is_empty())
             .or_else(|| default_base_commit.filter(|s| !s.trim().is_empty()))
             .unwrap_or("unknown");
-        let base_cell = escape_md_cell(short_sha(base_ref));
+        let base_cell = escape_code_span(&short_sha(base_ref));
 
         for cell in &rec.cells {
+            let worker_disp = cell
+                .worker
+                .as_deref()
+                .or(cell.worker_id.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-");
+            let task_id_disp = display_opt_or_dash(cell.task_id.as_deref());
             let row = format!(
                 "| {} | {} | {} | {} | `{}` | {} | `{}` | `{}` |",
                 escape_md_cell(&cell.profile),
-                escape_md_cell(&cell.worker),
-                escape_md_cell(&cell.os),
-                escape_md_cell(&cell.link),
-                escape_md_cell(&cell.toolchain.replace('`', "'")),
+                escape_md_cell(worker_disp),
+                escape_md_cell(display_opt_or_dash(cell.os.as_deref())),
+                escape_md_cell(display_opt_or_dash(cell.link.as_deref())),
+                escape_code_span(display_opt_or_dash(cell.toolchain.as_deref())),
                 escape_md_cell(&format_cell_result(cell)),
-                escape_md_cell(&cell.task_id.replace('`', "'")),
-                base_cell.replace('`', "'"),
+                escape_code_span(task_id_disp),
+                base_cell,
             );
             lines.push(row);
         }
@@ -229,6 +263,10 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
         }
     }
 
+    let safe_task_id = escape_code_span(&task_id);
+    let safe_base_branch = escape_code_span(base_branch);
+    let short_verified = short_sha(&base_commit);
+
     let mut out = String::new();
     out.push_str("## Task\n\n");
     let resolved_title = opts
@@ -239,8 +277,8 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
         .filter(|t| !t.is_empty());
 
     match resolved_title {
-        Some(title) => out.push_str(&format!("- **Task:** `{task_id}` — {title}\n")),
-        None => out.push_str(&format!("- **Task:** `{task_id}`\n")),
+        Some(title) => out.push_str(&format!("- **Task:** `{safe_task_id}` — {title}\n")),
+        None => out.push_str(&format!("- **Task:** `{safe_task_id}`\n")),
     }
     if let Some(branch) = opts
         .branch
@@ -248,12 +286,11 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        out.push_str(&format!("- **Branch:** `{}`\n", escape_md_cell(branch)));
+        out.push_str(&format!("- **Branch:** `{}`\n", escape_code_span(branch)));
     }
     out.push_str(&format!(
-        "- **Base verified:** `{}` @ `{}`\n",
-        escape_md_cell(base_branch),
-        escape_md_cell(short_sha(&base_commit))
+        "- **Base verified:** `{safe_base_branch}` @ `{}`\n",
+        escape_code_span(&short_verified)
     ));
 
     if let Some(cur_base) = opts
@@ -262,14 +299,14 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
+        let short_cur = short_sha(cur_base);
         if !cur_base.eq_ignore_ascii_case(&base_commit)
-            && !short_sha(cur_base).eq_ignore_ascii_case(short_sha(&base_commit))
+            && !short_cur.eq_ignore_ascii_case(&short_verified)
         {
             out.push_str(&format!(
-                "- **Stale base warning:** current `{}` is at `{}`, which differs from verified `{}` — re-verify on the latest base before merging.\n",
-                escape_md_cell(base_branch),
-                escape_md_cell(short_sha(cur_base)),
-                escape_md_cell(short_sha(&base_commit))
+                "- **Stale base warning:** current `{safe_base_branch}` is at `{}`, which differs from verified `{}` — re-verify on the latest base before merging.\n",
+                escape_code_span(&short_cur),
+                escape_code_span(&short_verified)
             ));
         }
     }
@@ -311,18 +348,26 @@ pub fn render_pr_body(opts: &PrBodyOptions, records: &[VerifyRecord]) -> Result<
     for rec in records {
         omitted_total = omitted_total.saturating_add(rec.omitted);
         for cell in &rec.cells {
+            let worker_disp = cell
+                .worker
+                .as_deref()
+                .or(cell.worker_id.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-");
             for f in &cell.failures {
                 let loc = match (&f.file, f.line) {
                     (Some(file), Some(line)) => format!(" ({}:{line})", escape_md_cell(file)),
                     (Some(file), None) => format!(" ({})", escape_md_cell(file)),
                     _ => String::new(),
                 };
+                let name_disp = display_opt_or_dash(f.name.as_deref());
                 failure_lines.push(format!(
                     "- `{}` on `{}` [{}]: `{}`{loc} — {}",
-                    escape_md_cell(&cell.profile),
-                    escape_md_cell(&cell.worker),
+                    escape_code_span(&cell.profile),
+                    escape_code_span(worker_disp),
                     escape_md_cell(&f.kind),
-                    escape_md_cell(&f.name),
+                    escape_code_span(name_disp),
                     escape_md_cell(&f.message),
                 ));
             }
@@ -493,6 +538,73 @@ mod tests {
     }
 
     #[test]
+    fn test_pr_body_accepts_team3_verify_gate_json_with_omitted_optional_fields() {
+        // Recorded TEAM-3 `VerifyGateReport` + `.oxideswarm/verify/<task>.json` shape where
+        // `Option<String>` keys are omitted when `None` (unplaced cell and command failure).
+        let team3_report_json = r#"{
+  "task": "TEAM-3",
+  "commit": "de04d03b+dirty-1234",
+  "ok": false,
+  "untrusted_data": true,
+  "cells": [
+    {
+      "profile": "unit",
+      "os": "linux",
+      "arch": "x86_64",
+      "exit": 101,
+      "secs": 12.3,
+      "failures": [
+        {
+          "kind": "compile",
+          "file": "crates/cli/src/lib.rs",
+          "line": 42,
+          "message": "mismatched types"
+        }
+      ]
+    },
+    {
+      "profile": "gpu",
+      "exit": 1,
+      "secs": 0.0,
+      "failures": [
+        {
+          "kind": "unplaced",
+          "message": "no connected worker satisfies gpu:true"
+        }
+      ]
+    }
+  ],
+  "omitted": 0,
+  "warnings": ["relayed link estimated ~1.2s sync"]
+}"#;
+        let rec = parse_verify_record(team3_report_json).expect("parse TEAM-3 report");
+        let body = render_pr_body(
+            &PrBodyOptions {
+                task_id: "TEAM-3".to_string(),
+                task_title: Some("Verify gate".to_string()),
+                branch: Some("team/TEAM-3".to_string()),
+                base_branch: Some("master".to_string()),
+                base_commit: "5e48fb02".to_string(),
+                summary: None,
+                current_base_commit: None,
+            },
+            &[rec],
+        )
+        .expect("render TEAM-3 report");
+
+        assert!(body.contains("**Status:** `FAIL` (2 cell(s))"));
+        assert!(body.contains("| unit | - | linux | - | `-` | FAIL (exit 101, 12.3s, 1 failure(s)) | `-` | `5e48fb02` |"));
+        assert!(body.contains(
+            "| gpu | - | - | - | `-` | FAIL (exit 1, 0.0s, 1 failure(s)) | `-` | `5e48fb02` |"
+        ));
+        assert!(body.contains(
+            "- `unit` on `-` [compile]: `-` (crates/cli/src/lib.rs:42) — mismatched types"
+        ));
+        assert!(body
+            .contains("- `gpu` on `-` [unplaced]: `-` — no connected worker satisfies gpu:true"));
+    }
+
+    #[test]
     fn test_pr_body_parses_arrays_jsonl_and_rejects_mismatched_or_empty_inputs() {
         // Array input
         let arr_json = format!("[{}, {}]", recorded_passing_json(), recorded_failing_json());
@@ -549,13 +661,16 @@ mod tests {
 
         let nan_cell = VerifyCellRecord {
             profile: "p|1".to_string(),
-            os: "linux".to_string(),
-            worker: "w1\nline2".to_string(),
-            link: "direct".to_string(),
-            toolchain: "rustc`1.96".to_string(),
+            os: Some("linux".to_string()),
+            arch: None,
+            shard: None,
+            worker: Some("w1\nline2".to_string()),
+            worker_id: None,
+            link: Some("direct".to_string()),
+            toolchain: Some("rustc`1.96".to_string()),
             exit: 0,
             secs: f64::NAN,
-            task_id: "id|1".to_string(),
+            task_id: Some("id|1".to_string()),
             failures: Vec::new(),
         };
         assert_eq!(format_cell_result(&nan_cell), "PASS (exit 0, 0.0s)");
@@ -567,11 +682,18 @@ mod tests {
                 base_commit: None,
                 base_branch: None,
                 ok: true,
+                timestamp_utc: None,
+                first_fingerprint: None,
+                untrusted_data: None,
                 cells: vec![nan_cell],
                 omitted: 0,
+                warnings: Vec::new(),
             }],
             Some("deadbeef12345678"),
         );
         assert!(table.contains("| p\\|1 | w1 line2 | linux | direct | `rustc'1.96` | PASS (exit 0, 0.0s) | `id\\|1` | `deadbeef1234` |"));
+
+        // Non-ASCII base_commit char-boundary slicing must never panic.
+        assert_eq!(short_sha("éééééééééééérest").chars().count(), 12);
     }
 }
