@@ -218,6 +218,7 @@ Recounted on 2026-11-24 from the rows with pull request 462: 291 items, 202 Impl
 Recounted on 2026-11-24 from the rows with pull request 411: 291 items, 202 Implemented, 22 Partial and 67 Planned; 20 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 464: 292 items, 202 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 465: 298 items, 202 Implemented, 22 Partial and 74 Planned; 22 open items are In and 74 are Out.
+Recounted on 2026-11-24 from the rows with pull request 466: 305 items, 202 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
