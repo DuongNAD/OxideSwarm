@@ -33,7 +33,7 @@ pub(super) async fn run_mcp_matrix(
     prepared_inputs: PreparedInputs,
     ws_uploads: Option<PreparedInputs>,
     mut ws_meta: Option<WorkspaceSubmitMeta>,
-    wait_secs: u64,
+    explicit_wait_secs: Option<u64>,
     max_output_bytes: usize,
     submit_started: Instant,
 ) -> ToolCallResult {
@@ -62,7 +62,14 @@ pub(super) async fn run_mcp_matrix(
         Err(e) => return ToolCallResult::error(e),
     };
 
-    let rpc_timeout = Duration::from_secs(wait_secs.clamp(2, 10)).max(DEFAULT_MASTER_RPC_TIMEOUT);
+    let rpc_wait_secs = explicit_wait_secs.unwrap_or_else(|| {
+        template
+            .requirements
+            .timeout_secs
+            .saturating_add(crate::matrix::DEFAULT_WAIT_MARGIN_SECS)
+    });
+    let rpc_timeout =
+        Duration::from_secs(rpc_wait_secs.clamp(2, 10)).max(DEFAULT_MASTER_RPC_TIMEOUT);
     let workers = match state
         .request_with_timeout(&ClientMessage::ListWorkers, rpc_timeout)
         .await
@@ -83,11 +90,16 @@ pub(super) async fn run_mcp_matrix(
         check_placeability(&cells, &workers, &template.requirements, ws_meta.is_some());
     let placeable_count = placeability.iter().filter(|r| r.is_none()).count();
     let total_cells = cells.len();
+    let wait_secs = crate::matrix::resolve_run_wait_secs(
+        explicit_wait_secs,
+        placeable_count,
+        template.requirements.timeout_secs,
+    );
 
     let mut input_upload: Option<UploadReport> = None;
     if placeable_count > 0 {
         let blob_connect_timeout =
-            Duration::from_secs(wait_secs.max(1)).min(DEFAULT_MASTER_RPC_TIMEOUT);
+            Duration::from_secs(rpc_wait_secs.max(1)).min(DEFAULT_MASTER_RPC_TIMEOUT);
         if !prepared_inputs.inputs.is_empty() {
             let conn = match tokio::time::timeout(
                 blob_connect_timeout,

@@ -62,6 +62,12 @@ Created: 2026-11-22    Updated: 2026-11-22
 
 The SWRR plan is a preference, not a pin: a shard tagged `prefer:worker=<id|name>` is placed on that worker only while it is connected, matches the task's placement and capabilities, and has a free slot for it in the current pass (`Engine::has_eligible_matching_worker`, `crates/master/src/scheduler.rs`). Otherwise the tag is ignored and the task is placed like any other, so a busy, held-back or departed preferred worker never makes a shard wait while another worker is idle. `prefer:` is not a reserved prefix: a user may set the tag on any task and gets the same soft behaviour. A master older than this change ignores the tag, so shards then spread by the master's own ranking.
 
+### D8: Per-shard timeout and whole-run wait budget (`BUG-36`)
+
+- `DEFAULT_SHARD_TIMEOUT_SECS` is raised from `60` s to `300` s (`DEFAULT_BUILD_ONCE_TIMEOUT_SECS` remains `1800` s when `--build-once` or `--workspace` is set). `--timeout-secs` / MCP `timeout_secs` sets only `TaskRequirements::timeout_secs`, enforced by workers per shard (and per builder task in `--build-once`).
+- CLI `oxideswarm shard --wait-secs <SECS>` and MCP `shard.wait_secs` (decoupled from `timeout_secs`, no longer an alias) control the client's whole-run wait budget shared across `execute_build_once` and `execute_shards`.
+- When `--wait-secs` / `wait_secs` is omitted, `matrix::resolve_run_wait_secs` computes `(builders + shards) * max(1, timeout_secs) + DEFAULT_WAIT_MARGIN_SECS` (`DEFAULT_WAIT_MARGIN_SECS = 5`), so shards queued behind fewer free worker slots do not report `timed_out` before they can run, with zero wire changes.
+
 ## Compatibility
 
 - `crates/master/src/queue.rs` (`TaskView::prefer_worker`) and `crates/master/src/scheduler.rs` (D7) change; `crates/core`, `crates/worker` and `Cargo.toml` do not.
@@ -91,3 +97,4 @@ The SWRR plan is a preference, not a pin: a shard tagged `prefer:worker=<id|name
 - 2026-11-22: Implemented `oxideswarm shard`, MCP `shard`, `shard::junit`, `--build-once`, `test_ax2_shard.rs`, R2/M1 loopback benchmark, and `docs/guides/sharded-runs.md`.
 - 2026-11-22: Review fix: `prefer:worker=` is soft in the master (D7); before, shards waited for a saturated preferred worker while others sat idle, and this record wrongly said the master was unchanged.
 - 2026-11-22: Recorded single-host loopback Spike R2 (`51.26 %` savings across 3 workers, clearing the `30 %` stop rule) and Measure M1 (`0.5061x` median, `0.466x` min across 725 unit tests on Apple M5 loopback) in `benchmarks/grid/results/2026-11-22-r2-m1-macos-arm64-apple-m5.json` (`benchmarks/grid/bench_shard_r2_m1.py`).
+- 2026-11-26: Amended (`BUG-36`): raised `DEFAULT_SHARD_TIMEOUT_SECS` from `60` s to `300` s and added `--wait-secs` (and decoupled MCP `shard.wait_secs`) with a whole-run budget defaulting to `tasks * timeout_secs + 5` shared across `--build-once` builders and shards.

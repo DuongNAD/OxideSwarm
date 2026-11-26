@@ -55,8 +55,8 @@ pub const HARD_MAX_SHARDS: usize = 256;
 /// Default per-shard inline stdout/stderr escaped-JSON byte budget for CLI `--json`.
 pub const DEFAULT_SHARD_OUTPUT_BYTES: usize = crate::matrix::DEFAULT_CELL_OUTPUT_BYTES;
 
-/// Default task timeout in seconds for regular `oxideswarm shard`.
-pub const DEFAULT_SHARD_TIMEOUT_SECS: u64 = 60;
+/// Default per-shard task timeout in seconds for regular `oxideswarm shard`.
+pub const DEFAULT_SHARD_TIMEOUT_SECS: u64 = 300;
 
 /// Default task timeout in seconds for `oxideswarm shard --build-once` (compilation + test).
 pub const DEFAULT_BUILD_ONCE_TIMEOUT_SECS: u64 = 1800;
@@ -745,7 +745,7 @@ pub async fn execute_build_once<C, Fut>(
     env: &HashMap<String, String>,
     repeatable: bool,
     workers: &[WorkerCapabilities],
-    timeout: Duration,
+    wait_budget: Duration,
     external_cancel_rx: Option<watch::Receiver<bool>>,
     connect: Arc<C>,
 ) -> Result<BTreeMap<(String, String), BuildOnceOutcome>, String>
@@ -783,7 +783,7 @@ where
     }
 
     let handshake_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-    let deadline = safe_deadline(timeout);
+    let deadline = safe_deadline(wait_budget);
     let mut set = JoinSet::new();
 
     for group in groups {
@@ -835,7 +835,7 @@ where
         set.spawn(async move {
             let task_id = task.id;
             let outcome =
-                run_single_task_wait(task, timeout, deadline, &mut cancel_rx, &sem, &*connect)
+                run_single_task_wait(task, wait_budget, deadline, &mut cancel_rx, &sem, &*connect)
                     .await;
 
             match outcome {
@@ -1078,7 +1078,7 @@ async fn wait_for_cancel(cancel_rx: &mut watch::Receiver<bool>) {
 
 async fn run_single_task_wait<C, Fut>(
     task: Task,
-    timeout: Duration,
+    wait_budget: Duration,
     deadline: tokio::time::Instant,
     cancel_rx: &mut watch::Receiver<bool>,
     sem: &Semaphore,
@@ -1115,7 +1115,7 @@ where
             Err(_) => {
                 return SingleTaskOutcome::Failed {
                     status: CellStatus::TimedOut,
-                    error: format!("timed out after {}s", timeout.as_secs()),
+                    error: format!("timed out after {}s (wait budget)", wait_budget.as_secs()),
                 };
             }
         }
@@ -1143,7 +1143,10 @@ where
                 drop(permit);
                 return SingleTaskOutcome::Failed {
                     status: CellStatus::TimedOut,
-                    error: format!("timed out connecting to master after {}s", timeout.as_secs()),
+                    error: format!(
+                        "timed out connecting to master after {}s (wait budget)",
+                        wait_budget.as_secs()
+                    ),
                 };
             }
         }
@@ -1174,7 +1177,10 @@ where
             Ok(Err(err)) => Err((CellStatus::Error, format!("could not submit shard: {err}"))),
             Err(_) => Err((
                 CellStatus::TimedOut,
-                format!("timed out submitting shard after {}s", timeout.as_secs()),
+                format!(
+                    "timed out submitting shard after {}s (wait budget)",
+                    wait_budget.as_secs()
+                ),
             )),
         }
     };
@@ -1230,7 +1236,7 @@ where
             send_best_effort_cancel(connect, task_id).await;
             SingleTaskOutcome::Failed {
                 status: CellStatus::TimedOut,
-                error: format!("timed out after {}s", timeout.as_secs()),
+                error: format!("timed out after {}s (wait budget)", wait_budget.as_secs()),
             }
         }
     }
@@ -1265,7 +1271,7 @@ pub async fn execute_shards<C, Fut>(
     build_once_outcomes: Option<&BTreeMap<(String, String), BuildOnceOutcome>>,
     nextest_config_file: Option<&StagedFile>,
     extra_args: &[String],
-    timeout: Duration,
+    wait_budget: Duration,
     fail_fast: bool,
     external_cancel_rx: Option<watch::Receiver<bool>>,
     progress_tx: Option<mpsc::UnboundedSender<ShardProgressEvent>>,
@@ -1288,7 +1294,7 @@ where
     let mut outcomes: Vec<Option<ShardExecution>> = vec![None; total];
     let mut spawned_meta: HashMap<tokio::task::Id, (usize, TaskId)> = HashMap::with_capacity(total);
     let handshake_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-    let deadline = safe_deadline(timeout);
+    let deadline = safe_deadline(wait_budget);
     let (internal_cancel_tx, internal_cancel_rx) = watch::channel(false);
 
     if let Some(mut ext_rx) = external_cancel_rx {
@@ -1343,7 +1349,7 @@ where
 
             let exec = match run_single_task_wait(
                 task,
-                timeout,
+                wait_budget,
                 deadline,
                 &mut cancel_rx,
                 &sem,
@@ -2823,6 +2829,7 @@ pub mod junit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matrix::resolve_run_wait_secs;
     use rusty_grid_core::task::Bytes;
 
     fn sample_worker(
@@ -3961,6 +3968,276 @@ mod tests {
         assert!(
             omitted_err.contains("did not produce expected output"),
             "{omitted_err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bug36_queued_shards_within_per_task_timeout_do_not_time_out() {
+        use rusty_grid_core::protocol::WireCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker_slots = Arc::new(Semaphore::new(1));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let cancel_srv = Arc::clone(&cancel_count);
+
+        let srv_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let slots = Arc::clone(&worker_slots);
+                let cancels = Arc::clone(&cancel_srv);
+                tokio::spawn(async move {
+                    let mut transport =
+                        MessageTransport::with_codec(GridStream::Tcp(stream), WireCodec::Bincode);
+                    let Ok(Some(msg)) = transport.recv_msg::<ClientMessage>().await else {
+                        return;
+                    };
+                    match msg {
+                        ClientMessage::SubmitTask { task, .. } => {
+                            let _slot = slots.acquire().await.unwrap();
+                            // Simulated execution is well within per_task_timeout_secs (4s < 10s),
+                            // while 4 queued shards on 1 slot take 16s > 10s end-to-end.
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskCompleted {
+                                    task_id: task.id,
+                                    result: TaskResult::success(
+                                        Uuid::nil(),
+                                        task.id,
+                                        Bytes::new(),
+                                        4000,
+                                        false,
+                                    ),
+                                })
+                                .await;
+                        }
+                        ClientMessage::CancelTask { task_id } => {
+                            cancels.fetch_add(1, Ordering::AcqRel);
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskCancelled {
+                                    task_id,
+                                    success: true,
+                                })
+                                .await;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        });
+
+        let wid = Uuid::new_v4();
+        let workers = vec![sample_worker(
+            "slot-1",
+            wid,
+            1,
+            Some(1),
+            "linux",
+            "x86_64",
+            &[],
+        )];
+        let per_task_timeout_secs = 10u64;
+        let reqs = TaskRequirements::new(1, 0, false, per_task_timeout_secs);
+        let eligible =
+            filter_eligible_workers(&workers, &Placement::default(), &reqs, false, false).unwrap();
+        let assignments = spread_shards_swrr(4, &eligible, &Placement::default()).unwrap();
+        let template = Task::new(
+            TaskSpec::Command {
+                program: "echo".to_string(),
+                args: vec!["ok".to_string()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            reqs,
+        );
+        let connect = Arc::new(move || async move {
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(MessageTransport::with_codec(
+                GridStream::Tcp(stream),
+                WireCodec::Bincode,
+            ))
+        });
+
+        // Whole-run client wait budget defaults to N * per_task_timeout_secs + DEFAULT_WAIT_MARGIN_SECS.
+        let wait_secs =
+            resolve_run_wait_secs(None, assignments.len(), template.requirements.timeout_secs);
+        let wait_budget = Duration::from_secs(wait_secs);
+        let execs = execute_shards(
+            assignments,
+            &workers,
+            &template,
+            None,
+            None,
+            &[],
+            wait_budget,
+            false,
+            None,
+            None,
+            connect,
+        )
+        .await;
+        srv_handle.abort();
+
+        let completed = execs
+            .iter()
+            .filter(|e| e.status == CellStatus::Completed)
+            .count();
+        let timed_out = execs
+            .iter()
+            .filter(|e| e.status == CellStatus::TimedOut)
+            .count();
+        assert_eq!(completed, 4, "all queued shards should complete: {execs:?}");
+        assert_eq!(
+            timed_out, 0,
+            "no shard exceeded per-task timeout: {execs:?}"
+        );
+        assert_eq!(
+            cancel_count.load(Ordering::Acquire),
+            0,
+            "no client CancelTask should fire for queued shards within per-task timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bug36_explicit_wait_secs_caps_whole_shard_run() {
+        use rusty_grid_core::protocol::WireCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker_slots = Arc::new(Semaphore::new(1));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let cancel_srv = Arc::clone(&cancel_count);
+
+        let srv_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let slots = Arc::clone(&worker_slots);
+                let cancels = Arc::clone(&cancel_srv);
+                tokio::spawn(async move {
+                    let mut transport =
+                        MessageTransport::with_codec(GridStream::Tcp(stream), WireCodec::Bincode);
+                    let Ok(Some(msg)) = transport.recv_msg::<ClientMessage>().await else {
+                        return;
+                    };
+                    match msg {
+                        ClientMessage::SubmitTask { task, .. } => {
+                            let _slot = slots.acquire().await.unwrap();
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskCompleted {
+                                    task_id: task.id,
+                                    result: TaskResult::success(
+                                        Uuid::nil(),
+                                        task.id,
+                                        Bytes::new(),
+                                        4000,
+                                        false,
+                                    ),
+                                })
+                                .await;
+                        }
+                        ClientMessage::CancelTask { task_id } => {
+                            cancels.fetch_add(1, Ordering::AcqRel);
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskCancelled {
+                                    task_id,
+                                    success: true,
+                                })
+                                .await;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        });
+
+        let wid = Uuid::new_v4();
+        let workers = vec![sample_worker(
+            "slot-1",
+            wid,
+            1,
+            Some(1),
+            "linux",
+            "x86_64",
+            &[],
+        )];
+        let per_task_timeout_secs = 10u64;
+        let reqs = TaskRequirements::new(1, 0, false, per_task_timeout_secs);
+        let eligible =
+            filter_eligible_workers(&workers, &Placement::default(), &reqs, false, false).unwrap();
+        let assignments = spread_shards_swrr(4, &eligible, &Placement::default()).unwrap();
+        let template = Task::new(
+            TaskSpec::Command {
+                program: "echo".to_string(),
+                args: vec!["ok".to_string()],
+                env: HashMap::new(),
+                working_dir: None,
+                stdin: None,
+            },
+            reqs,
+        );
+        let connect = Arc::new(move || async move {
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(MessageTransport::with_codec(
+                GridStream::Tcp(stream),
+                WireCodec::Bincode,
+            ))
+        });
+
+        let wait_secs = resolve_run_wait_secs(
+            Some(10),
+            assignments.len(),
+            template.requirements.timeout_secs,
+        );
+        assert_eq!(wait_secs, 10);
+        let execs = execute_shards(
+            assignments,
+            &workers,
+            &template,
+            None,
+            None,
+            &[],
+            Duration::from_secs(wait_secs),
+            false,
+            None,
+            None,
+            connect,
+        )
+        .await;
+        srv_handle.abort();
+
+        let completed = execs
+            .iter()
+            .filter(|e| e.status == CellStatus::Completed)
+            .count();
+        let timed_out = execs
+            .iter()
+            .filter(|e| e.status == CellStatus::TimedOut)
+            .count();
+        assert!(
+            completed < 4,
+            "explicit wait_secs=10 should cap queued run: {execs:?}"
+        );
+        assert!(
+            timed_out > 0,
+            "explicit wait_secs=10 should time out waiting shards: {execs:?}"
+        );
+        assert!(
+            cancel_count.load(Ordering::Acquire) > 0,
+            "explicit wait_secs expiry should issue best-effort CancelTask"
         );
     }
 }

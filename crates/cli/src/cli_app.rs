@@ -657,8 +657,18 @@ pub struct SubmitArgs {
     #[arg(long, help = "Require GPU worker node")]
     pub gpu: bool,
 
-    #[arg(long, help = "Task execution timeout in seconds (default: 60)")]
+    #[arg(
+        long,
+        help = "Per-task execution timeout in seconds (default: 60, or 1800 with --workspace)"
+    )]
     pub timeout_secs: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Whole-run client wait budget in seconds when waiting or using --matrix (default: tasks * timeout_secs + 5)"
+    )]
+    pub wait_secs: Option<u64>,
 
     #[arg(long, help = "Maximum execution retries for this task")]
     pub max_retries: Option<u32>,

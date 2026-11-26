@@ -26,7 +26,7 @@ use crate::connect::{
     client_p2p_minimal_requested, connect_master, report_master_failure, save_output_artifacts,
     with_client_relay_url, DEFAULT_MASTER_ADDR,
 };
-use crate::matrix::CellStatus;
+use crate::matrix::{resolve_run_wait_secs, safe_deadline, CellStatus};
 use crate::secret_cmd::{client_secret, peer_insecure, SecretOpts};
 use crate::shard::{
     blob_matches_junit, check_build_once_path_collision, execute_build_once, execute_shards,
@@ -176,9 +176,16 @@ pub struct ShardArgs {
 
     #[arg(
         long,
-        help = "Task execution timeout in seconds (default: 60, or 1800 with --build-once)"
+        help = "Per-shard execution timeout in seconds (default: 300, or 1800 with --build-once / --workspace)"
     )]
     pub timeout_secs: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Whole-run client wait budget in seconds (default: tasks * timeout_secs + 5)"
+    )]
+    pub wait_secs: Option<u64>,
 
     #[arg(long, help = "Maximum execution retries per shard")]
     pub max_retries: Option<u32>,
@@ -1195,6 +1202,7 @@ async fn run_shard_with_secret_inner(
     let mut build_once_map = None;
     let mut build_once_list: Vec<BuildOnceOutcome> = Vec::new();
     let mut nextest_config_staged: Option<StagedFile> = None;
+    let mut run_deadline: Option<tokio::time::Instant> = None;
 
     if let Some(ref scan) = build_source_scan {
         let manifest_input = TaskInput::tree(SANDBOX_ROOT, scan.manifest_id, scan.manifest_len);
@@ -1220,6 +1228,16 @@ async fn run_shard_with_secret_inner(
             nextest_config_staged = Some(StagedFile::new(cfg_rel, cfg_toml.into_bytes(), false));
         }
 
+        let run_wait_secs = resolve_run_wait_secs(
+            args.wait_secs,
+            groups.len() + assignments.len(),
+            requirements.timeout_secs,
+        );
+        let shared_deadline = safe_deadline(Duration::from_secs(run_wait_secs));
+        run_deadline = Some(shared_deadline);
+        let build_once_budget =
+            shared_deadline.saturating_duration_since(tokio::time::Instant::now());
+
         let outcomes = match execute_build_once(
             &groups,
             &manifest_input,
@@ -1229,7 +1247,7 @@ async fn run_shard_with_secret_inner(
             &env,
             args.repeatable,
             &workers,
-            Duration::from_secs(requirements.timeout_secs),
+            build_once_budget,
             Some(ctrl_c_rx.clone()),
             Arc::clone(&connect),
         )
@@ -1255,6 +1273,14 @@ async fn run_shard_with_secret_inner(
         template = template.with_workspace(ws);
     }
 
+    let shard_wait_budget = match run_deadline {
+        Some(dl) => dl.saturating_duration_since(tokio::time::Instant::now()),
+        None => Duration::from_secs(resolve_run_wait_secs(
+            args.wait_secs,
+            assignments.len(),
+            requirements.timeout_secs,
+        )),
+    };
     let mut executions = execute_shards(
         assignments,
         &workers,
@@ -1262,7 +1288,7 @@ async fn run_shard_with_secret_inner(
         build_once_map.as_ref(),
         nextest_config_staged.as_ref(),
         &args.args,
-        Duration::from_secs(requirements.timeout_secs),
+        shard_wait_budget,
         args.fail_fast,
         Some(ctrl_c_rx),
         None,
