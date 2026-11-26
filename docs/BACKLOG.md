@@ -470,6 +470,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
+| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Planned | In |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -1641,6 +1642,20 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Root cause:** `BlobCache::open` (`crates/worker/src/blob_cache.rs`) only removed files in `<sandbox base>/cache/blobs/tmp/` older than `STALE_TMP_AGE` (24 hours) so a worker starting on a shared `--sandbox-base-dir` would not delete another live worker's in-flight write. Hard-killed workers never run `TempPartFile::drop`, so their `.part` files remained in `tmp/` for 24 hours across restarts.
 - **Fix:** Each `BlobCache` instance now holds an exclusive advisory file lock (`File::try_lock`) on `<sandbox base>/cache/blobs/owners/<owner_uuid>.lock` and names its `temp_path()` files `<owner_uuid>.<part_uuid>.part`, unlinking and calling `unlock()` on clean `Drop`. On `BlobCache::open` and worker startup (`sweep_dead_owner_tmp` via `crates/worker/src/sandbox.rs`, without creating missing cache directories), a worker probes `owners/<owner_uuid>.lock`: if `try_lock()` succeeds (`lock_file_is_still_named`), the owner is gone so its `.part` files and orphan `.lock` are removed; if `WouldBlock`, the live writer's files stay untouched. Legacy unowned `.part` files retain the 24-hour `STALE_TMP_AGE` rule, and Windows/Unix security checks cover `owners/` against symlinks, junctions, and foreign grants.
 - **Done when:** A killed writer's `.part` file is removed at the next worker startup / `BlobCache::open`, while a live writer holding its owner lock in another process keeps its `.part` file untouched, on both Windows and Unix.
+
+### BUG-41: `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate
+
+- **Evidence:** 2026-11-26, trial cluster (master 0.4.4, client 0.4.4), worker `msi` forced onto the public n0 relay
+  (RTT about 2.2 s, about 0.12 MB/s measured with a 50 MB input): `FAIL C8 Blob throughput msi no result within 60s
+  (last state Running); the worker may not support file transfer or the link is very slow`, while C7 already
+  warned that the link is relayed. An 8 MiB fetch at that rate needs about 67 s. Details in
+  [design 0110](design/0110-tools-on-kit-machines.md), status log.
+- **Problem:** The per-worker C8 probe uses the doctor's fixed `probe_timeout` (60 s, `crates/cli/src/doctor.rs`,
+  about line 74) whatever the link kind, so a working but slow relayed worker is reported as failed.
+- **Do:** Failing check first; then, for a worker whose `link:` tag says relay, either size the probe to the
+  link (a smaller payload) or report the measured rate as a warning when the task is still running and has made
+  progress; keep FAIL for a worker without blob support or with no progress.
+- **Done when:** A relayed worker that moves data slowly gets a WARN with its rate, and the existing C8 tests pass.
 
 ## Phase 13: the path to finished
 

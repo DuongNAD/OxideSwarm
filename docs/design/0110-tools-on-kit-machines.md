@@ -292,3 +292,31 @@ machine whose owner said No), other versions than the kit's, and tools the kit d
     tool "gcc.exe": program not found` (it runs on the Mac). `rust-mingw` is a linker only, as its
     `GCC-WARNING.txt` says. TOOL-5 added (claimed with `agent_bridge.py claim`): the kit also needs a
     MinGW-w64 C compiler, or OxideSwarm itself (`ring`) cannot be built on a kit machine.
+- 2026-11-26: TOOL-5 checked live on `msi`. w64devkit 2.11.0 x64 (`w64devkit-x64-2.11.0.7z.exe`, 68.8 MB, SHA-256
+  equal to the GitHub release digest; unpacked on the Mac with `bsdtar`, 739 MB, sent as a 187.4 MB zip) put
+  `gcc 16.2.0` on the task `PATH`. The T6 crate then compiled its C file but failed to link with
+  `cannot find -lgcc_eh` (w64devkit's `ld` was picked as the linker). With
+  `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` set to Rust's own
+  `lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained\x86_64-w64-mingw32-gcc.exe` (C compiled by
+  w64devkit, linking by Rust's linker) it built in 1.71 s and printed `add_c(40, 2) = 42`. D4 must set that
+  variable in `start-worker.vbs`.
+- 2026-11-26: OxideSwarm itself built on `msi` from source (`origin/master` `df06768d`, 494 vendored crates,
+  a 95.6 MB zip, `cargo build --offline -p rusty_grid_cli --bin oxideswarm` with the toolchains above).
+  The debug build compiled 332 crates (including `ring`) and failed to link `iroh` with
+  `ld: error: export ordinal too large: 110023` (more than 65,535 exports in a DLL on the GNU target when
+  generics are shared in debug builds). The release build passed: `Finished release profile in 18m 04s`,
+  `rusty-grid 0.4.5`, a 35.9 MB `oxideswarm.exe` returned to the Mac. The kit's check (D5) and any verify
+  profile on a GNU Windows worker therefore build with `--release`, or set `-Zshare-generics=n` once that is
+  stable.
+- 2026-11-26: Relay measurements (the Mac blocked UDP with a `pf` anchor, so the worker fell back to the public
+  n0 relay, as two machines on different networks without hole punching would): the link changed from
+  direct (about 4 ms) to `Relay (DERP)` without a reconnect; small tasks returned in 0.58 to 0.70 s; a 50 MB
+  input took 431 s (about 0.12 MB/s) and its hash matched; the 35.9 MB build output came back at the same
+  rate. `doctor` against the relayed worker: C3 to C6 passed, C7 warned (relayed link, RTT 2,199.8 ms), and C8
+  failed with `no result within 60s (last state Running)`, because 8 MiB at 0.12 MB/s needs about 67 s;
+  BUG-41 records that. Large tool hand-offs (packs, kit updates) must use a direct link or a relay the owner
+  runs.
+- 2026-11-26: The owner asked that the work of this record and of [design 0111](0111-team-plan-leases-and-verify-gate.md)
+  come before release 0.5.0. The parts without a wire change (TOOL-1, TOOL-3, TOOL-4, TOOL-5) fit 0.4.x
+  after the stability release; TOOL-2 uses the extension slot of design 0082 (protocol 10), so it fits too.
+
