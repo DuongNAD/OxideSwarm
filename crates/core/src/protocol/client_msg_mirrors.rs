@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::mail::MailAttachment;
 use crate::task::{Task, TaskId};
 
 use super::{default_protocol_version, ClientMessage, PROTOCOL_VERSION_CURRENT};
@@ -118,6 +119,40 @@ pub(super) enum HumanClientMessage {
         #[serde(default = "default_protocol_version")]
         protocol_version: u32,
     },
+    MailSend {
+        to: Vec<String>,
+        topic: String,
+        body: String,
+        #[serde(default)]
+        attachments: Vec<MailAttachment>,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MailFetch {
+        consumer: String,
+        #[serde(default)]
+        topics: Vec<String>,
+        #[serde(default)]
+        after: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MailAck {
+        consumer: String,
+        up_to_id: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
+    MailWait {
+        consumer: String,
+        #[serde(default)]
+        topics: Vec<String>,
+        #[serde(default)]
+        after: u64,
+        timeout_secs: u64,
+        #[serde(default = "default_protocol_version")]
+        protocol_version: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -208,6 +243,31 @@ pub(super) enum BinaryClientMessage {
     },
     ReleaseWorkerId {
         worker_id: Uuid,
+        protocol_version: u32,
+    },
+    MailSend {
+        to: Vec<String>,
+        topic: String,
+        body: String,
+        attachments: Vec<MailAttachment>,
+        protocol_version: u32,
+    },
+    MailFetch {
+        consumer: String,
+        topics: Vec<String>,
+        after: u64,
+        protocol_version: u32,
+    },
+    MailAck {
+        consumer: String,
+        up_to_id: u64,
+        protocol_version: u32,
+    },
+    MailWait {
+        consumer: String,
+        topics: Vec<String>,
+        after: u64,
+        timeout_secs: u64,
         protocol_version: u32,
     },
 }
@@ -459,6 +519,45 @@ impl HumanClientMessage {
                 worker_id,
                 protocol_version,
             },
+            ClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+            } => HumanClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+                protocol_version,
+            },
+            ClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+            } => HumanClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+                protocol_version,
+            },
+            ClientMessage::MailAck { consumer, up_to_id } => HumanClientMessage::MailAck {
+                consumer,
+                up_to_id,
+                protocol_version,
+            },
+            ClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+            } => HumanClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+                protocol_version,
+            },
         }
     }
 
@@ -511,6 +610,18 @@ impl HumanClientMessage {
                 protocol_version, ..
             }
             | Self::ReleaseWorkerId {
+                protocol_version, ..
+            }
+            | Self::MailSend {
+                protocol_version, ..
+            }
+            | Self::MailFetch {
+                protocol_version, ..
+            }
+            | Self::MailAck {
+                protocol_version, ..
+            }
+            | Self::MailWait {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -613,6 +724,45 @@ impl BinaryClientMessage {
                 worker_id,
                 protocol_version,
             },
+            ClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+            } => BinaryClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+                protocol_version,
+            },
+            ClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+            } => BinaryClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+                protocol_version,
+            },
+            ClientMessage::MailAck { consumer, up_to_id } => BinaryClientMessage::MailAck {
+                consumer,
+                up_to_id,
+                protocol_version,
+            },
+            ClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+            } => BinaryClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+                protocol_version,
+            },
         }
     }
 
@@ -665,6 +815,18 @@ impl BinaryClientMessage {
                 protocol_version, ..
             }
             | Self::ReleaseWorkerId {
+                protocol_version, ..
+            }
+            | Self::MailSend {
+                protocol_version, ..
+            }
+            | Self::MailFetch {
+                protocol_version, ..
+            }
+            | Self::MailAck {
+                protocol_version, ..
+            }
+            | Self::MailWait {
                 protocol_version, ..
             } => *protocol_version,
         }
@@ -754,6 +916,43 @@ impl From<HumanClientMessage> for ClientMessage {
             HumanClientMessage::ReleaseWorkerId { worker_id, .. } => {
                 ClientMessage::ReleaseWorkerId { worker_id }
             }
+            HumanClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+                ..
+            } => ClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+            },
+            HumanClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+                ..
+            } => ClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+            },
+            HumanClientMessage::MailAck {
+                consumer, up_to_id, ..
+            } => ClientMessage::MailAck { consumer, up_to_id },
+            HumanClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+                ..
+            } => ClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+            },
         }
     }
 }
@@ -843,6 +1042,43 @@ impl From<BinaryClientMessage> for ClientMessage {
             BinaryClientMessage::ReleaseWorkerId { worker_id, .. } => {
                 ClientMessage::ReleaseWorkerId { worker_id }
             }
+            BinaryClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+                ..
+            } => ClientMessage::MailSend {
+                to,
+                topic,
+                body,
+                attachments,
+            },
+            BinaryClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+                ..
+            } => ClientMessage::MailFetch {
+                consumer,
+                topics,
+                after,
+            },
+            BinaryClientMessage::MailAck {
+                consumer, up_to_id, ..
+            } => ClientMessage::MailAck { consumer, up_to_id },
+            BinaryClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+                ..
+            } => ClientMessage::MailWait {
+                consumer,
+                topics,
+                after,
+                timeout_secs,
+            },
         }
     }
 }

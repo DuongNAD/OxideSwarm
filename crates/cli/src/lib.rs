@@ -10,6 +10,7 @@ pub mod doctor;
 // LV-4: Windows console mode / Unix termios calls for no-echo password prompts.
 #[allow(unsafe_code)]
 pub mod join;
+pub mod mail;
 pub mod matrix;
 pub mod mcp;
 pub mod members_cmd;

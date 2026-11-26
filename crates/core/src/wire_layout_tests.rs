@@ -34,6 +34,7 @@ use crate::arbitrage::MasterLeaseTicket;
 use crate::blob::{BlobFile, BlobId, InputSource, TaskInput};
 use crate::blob_transfer::{BlobReply, BlobRequest};
 use crate::capabilities::{BatteryTier, MobileCapabilities, ThermalTier, WorkerCapabilities};
+use crate::mail::{MailAttachment, MailMessage};
 use crate::mapreduce::{MapFunctionSpec, MapReduceJobSpec, MapReduceResult, ReduceFunctionSpec};
 use crate::protocol::{
     deserialize_message, serialize_client_message_with_version,
@@ -713,6 +714,43 @@ pub(crate) fn client_messages() -> Vec<(&'static str, ClientMessage)> {
                 worker_id: worker_id(),
             },
         ),
+        (
+            "MailSend",
+            ClientMessage::MailSend {
+                to: vec!["agent-win".into(), "topic:team-6".into()],
+                topic: "verify.done".into(),
+                body: "ready for review".into(),
+                attachments: vec![MailAttachment {
+                    name: "handoff.bin".into(),
+                    blob_id: blob_id(0xe2),
+                    size: 4_096,
+                }],
+            },
+        ),
+        (
+            "MailFetch",
+            ClientMessage::MailFetch {
+                consumer: "agent-win-2".into(),
+                topics: vec!["topic:team-6".into()],
+                after: 9,
+            },
+        ),
+        (
+            "MailAck",
+            ClientMessage::MailAck {
+                consumer: "agent-win-2".into(),
+                up_to_id: 9,
+            },
+        ),
+        (
+            "MailWait",
+            ClientMessage::MailWait {
+                consumer: "agent-win-2".into(),
+                topics: vec!["topic:team-6".into()],
+                after: 9,
+                timeout_secs: 30,
+            },
+        ),
     ];
     check_instances("ClientMessage", &all, |msg| match msg {
         ClientMessage::SubmitTask { .. } => "SubmitTask",
@@ -736,6 +774,10 @@ pub(crate) fn client_messages() -> Vec<(&'static str, ClientMessage)> {
         ClientMessage::RevokeMember { .. } => "RevokeMember",
         ClientMessage::RenameMember { .. } => "RenameMember",
         ClientMessage::ReleaseWorkerId { .. } => "ReleaseWorkerId",
+        ClientMessage::MailSend { .. } => "MailSend",
+        ClientMessage::MailFetch { .. } => "MailFetch",
+        ClientMessage::MailAck { .. } => "MailAck",
+        ClientMessage::MailWait { .. } => "MailWait",
     });
     all
 }
@@ -954,6 +996,47 @@ pub(crate) fn client_responses() -> Vec<(&'static str, ClientResponse)> {
                 worker_id: worker_id(),
             },
         ),
+        ("MailSent", ClientResponse::MailSent { id: 12 }),
+        (
+            "MailMessages",
+            ClientResponse::MailMessages {
+                messages: vec![MailMessage {
+                    id: 12,
+                    from: "agent-mac-ag".into(),
+                    to: vec!["agent-win-2".into()],
+                    topic: "verify.done".into(),
+                    body: "ready for inspection".into(),
+                    attachments: vec![MailAttachment {
+                        name: "handoff.bin".into(),
+                        blob_id: blob_id(0xe2),
+                        size: 4_096,
+                    }],
+                    created_at_utc: EPOCH_SECS + 10,
+                }],
+                cursor: 12,
+            },
+        ),
+        ("MailAcked", ClientResponse::MailAcked { cursor: 12 }),
+        (
+            "MailWaited",
+            ClientResponse::MailWaited {
+                messages: vec![MailMessage {
+                    id: 13,
+                    from: "agent-mac-ag".into(),
+                    to: vec!["agent-win-2".into()],
+                    topic: "wake".into(),
+                    body: "wake up".into(),
+                    attachments: vec![MailAttachment {
+                        name: "wake.log".into(),
+                        blob_id: blob_id(0xe3),
+                        size: 512,
+                    }],
+                    created_at_utc: EPOCH_SECS + 11,
+                }],
+                cursor: 13,
+                timed_out: true,
+            },
+        ),
     ];
     check_instances("ClientResponse", &all, |msg| match msg {
         ClientResponse::TaskSubmitted { .. } => "TaskSubmitted",
@@ -982,6 +1065,10 @@ pub(crate) fn client_responses() -> Vec<(&'static str, ClientResponse)> {
         ClientResponse::MemberRevoked { .. } => "MemberRevoked",
         ClientResponse::MemberRenamed { .. } => "MemberRenamed",
         ClientResponse::WorkerIdReleased { .. } => "WorkerIdReleased",
+        ClientResponse::MailSent { .. } => "MailSent",
+        ClientResponse::MailMessages { .. } => "MailMessages",
+        ClientResponse::MailAcked { .. } => "MailAcked",
+        ClientResponse::MailWaited { .. } => "MailWaited",
     });
     all
 }

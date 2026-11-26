@@ -30,6 +30,11 @@ pub use codec::{
 #[cfg(any(test, feature = "test-extensions"))]
 pub use codec::{deserialize_message_as_v10, serialize_v10_client_message};
 
+pub use crate::mail::{
+    MailAttachment, MailMessage, MAX_MAIL_ATTACHMENTS, MAX_MAIL_BODY_BYTES,
+    MAX_MAIL_WAIT_TIMEOUT_SECS,
+};
+
 /// Maximum allowable frame size in bytes (64 MB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 /// Length prefix field width in bytes (4-byte unsigned big-endian integer).
@@ -739,6 +744,30 @@ pub enum ClientMessage {
     /// Releases a non-live `worker_id` claim so an enrolled member can register with that ID
     /// (design 0051 D5/D6; requires `admin` role).
     ReleaseWorkerId { worker_id: Uuid },
+    /// Publishes a durable message and optional blob attachment list to recipients or a topic
+    /// (design 0111 D8 / TEAM-6, protocol 11).
+    MailSend {
+        to: Vec<String>,
+        topic: String,
+        body: String,
+        attachments: Vec<MailAttachment>,
+    },
+    /// Fetches unread messages for `consumer` strictly after `after` and its durable ack cursor
+    /// (design 0111 D8 / TEAM-6, protocol 11).
+    MailFetch {
+        consumer: String,
+        topics: Vec<String>,
+        after: u64,
+    },
+    /// Advances `consumer`'s durable acknowledgment cursor through `up_to_id` (protocol 11).
+    MailAck { consumer: String, up_to_id: u64 },
+    /// Long-polls up to `timeout_secs` for matching mail arriving for `consumer` (protocol 11).
+    MailWait {
+        consumer: String,
+        topics: Vec<String>,
+        after: u64,
+        timeout_secs: u64,
+    },
 }
 
 /// Responses sent from the Master node to the CLI client.
@@ -869,6 +898,25 @@ pub enum ClientResponse {
     WorkerIdReleased {
         worker_id: Uuid,
     },
+    /// Answer to `ClientMessage::MailSend` (protocol 11).
+    MailSent {
+        id: u64,
+    },
+    /// Answer to `ClientMessage::MailFetch` (protocol 11).
+    MailMessages {
+        messages: Vec<MailMessage>,
+        cursor: u64,
+    },
+    /// Answer to `ClientMessage::MailAck` (protocol 11).
+    MailAcked {
+        cursor: u64,
+    },
+    /// Answer to `ClientMessage::MailWait` (protocol 11).
+    MailWaited {
+        messages: Vec<MailMessage>,
+        cursor: u64,
+        timed_out: bool,
+    },
 }
 
 impl ClientResponse {
@@ -877,9 +925,10 @@ impl ClientResponse {
     /// Protocol 10 had no `cancelled_tasks` field on `ClusterStatus` and reported cancelled tasks
     /// inside `failed_tasks` (`QueueStats::cluster_buckets` before protocol 11). For `version < 11`,
     /// `cancelled_tasks` is folded back into `failed_tasks` with saturating addition so v10
-    /// peers observe the same combined count.
+    /// peers observe the same combined count. Protocol 11 mailbox responses are mapped to a clear
+    /// protocol-version `Error` so a v10 peer never receives an undecodable variant tag.
     pub fn for_peer(&self, version: u32) -> Self {
-        if version >= 11 {
+        if version >= PROTOCOL_VERSION_CURRENT {
             return self.clone();
         }
         match self {
@@ -905,6 +954,15 @@ impl ClientResponse {
                 max_active_bytes: *max_active_bytes,
                 store_error: store_error.clone(),
                 cancelled_tasks: 0,
+            },
+            Self::MailSent { .. }
+            | Self::MailMessages { .. }
+            | Self::MailAcked { .. }
+            | Self::MailWaited { .. } => Self::Error {
+                message: format!(
+                    "Grid mailbox requires protocol version {PROTOCOL_VERSION_CURRENT} \
+                     (peer spoke version {version}; upgrade client)"
+                ),
             },
             other => other.clone(),
         }

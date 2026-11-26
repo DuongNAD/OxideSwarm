@@ -177,6 +177,9 @@ pub enum Commands {
     /// List, approve, reject, revoke, or rename enrolled cluster members
     Members(crate::members_cmd::MembersCliArgs),
 
+    /// Send, fetch, and acknowledge durable grid mailbox messages and attachments
+    Mail(crate::mail::MailArgs),
+
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
 
@@ -1332,6 +1335,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
         Commands::Members(args) => {
             crate::members_cmd::run_members(args, config_file, secret_opts).await
         }
+        Commands::Mail(args) => crate::mail::run_mail(args, config_file, secret_opts).await,
         Commands::Mode(args) => {
             let code = mode_cli::run_mode_cli(args).await;
             if code == 0 {
@@ -1637,7 +1641,7 @@ impl ShutdownSignals {
 /// Sends one request on an authenticated connection and reads the single reply, printing a
 /// clear message and returning the exit code on any failure (including an authentication
 /// rejection from a Master that requires a secret this client does not have).
-pub(super) async fn exchange(
+pub(crate) async fn exchange(
     transport: &mut MessageTransport<GridStream>,
     master_addr: &str,
     had_secret: bool,

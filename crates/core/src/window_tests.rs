@@ -29,6 +29,22 @@ const PREVIOUS: u32 = 10;
 /// longer differs (design 0083 D7.3).
 const DIFFERS_FROM_PREVIOUS: &[(&str, &str)] = &[
     (
+        "ClientMessage::MailAck",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
+        "ClientMessage::MailFetch",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
+        "ClientMessage::MailSend",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
+        "ClientMessage::MailWait",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
         "ClientResponse::ClusterStatus",
         "gained `cancelled_tasks: usize` in protocol 11 (BUG-22)",
     ),
@@ -36,6 +52,34 @@ const DIFFERS_FROM_PREVIOUS: &[(&str, &str)] = &[
         "ClientResponse::Hello",
         "canonical sample carries PROTOCOL_VERSION_MIN_COMPATIBLE (10 in protocol 11 vs 9 in protocol 10); wire layout is unchanged",
     ),
+    (
+        "ClientResponse::MailAcked",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
+        "ClientResponse::MailMessages",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
+        "ClientResponse::MailSent",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+    (
+        "ClientResponse::MailWaited",
+        "added in protocol 11 (TEAM-6 grid mailbox)",
+    ),
+];
+
+/// Variants added in protocol 11 that did not exist in v0.4.5 (`wire_layout_previous.txt`).
+const ADDED_IN_CURRENT: &[&str] = &[
+    "ClientMessage::MailSend",
+    "ClientMessage::MailFetch",
+    "ClientMessage::MailAck",
+    "ClientMessage::MailWait",
+    "ClientResponse::MailSent",
+    "ClientResponse::MailMessages",
+    "ClientResponse::MailAcked",
+    "ClientResponse::MailWaited",
 ];
 
 fn previous_text() -> String {
@@ -98,6 +142,13 @@ fn peer_to_master_previous_bytes_decode_to_the_canonical_samples() {
 
     for (variant, expected) in client_messages() {
         let key = format!("ClientMessage::{variant}");
+        if ADDED_IN_CURRENT.contains(&key.as_str()) {
+            assert!(
+                !previous.contains_key(&key),
+                "{key} is listed in ADDED_IN_CURRENT and must not exist in previous release"
+            );
+            continue;
+        }
         let hex = previous
             .get(&key)
             .unwrap_or_else(|| panic!("{key} is not in the previous file"));
@@ -179,6 +230,26 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
 
     for (variant, resp) in client_responses() {
         let key = format!("ClientResponse::{variant}");
+        if ADDED_IN_CURRENT.contains(&key.as_str()) {
+            assert!(
+                !previous.contains_key(&key),
+                "{key} is listed in ADDED_IN_CURRENT and must not exist in previous release"
+            );
+            let frame = serialize_message_for_peer(&resp, WireCodec::Bincode, PREVIOUS).unwrap();
+            let (read, _) = deserialize_message_as_v10::<ClientResponse>(&frame)
+                .unwrap_or_else(|e| panic!("{key}: the v10 reader: {e}"));
+            match read {
+                ClientResponse::Error { message } => {
+                    assert!(
+                        message.contains("11"),
+                        "{key}: expected protocol 11 error for v10 peer, got: {message}"
+                    );
+                }
+                other => panic!("{key}: expected v10 refusal Error, got {other:?}"),
+            }
+            checked += 1;
+            continue;
+        }
         let recorded = previous
             .get(&key)
             .unwrap_or_else(|| panic!("{key} is not in the previous file"));

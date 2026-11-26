@@ -140,6 +140,7 @@ struct Inner {
     total_bytes: u64,
     upload_bytes: u64,
     pins: HashMap<TaskId, (Instant, Vec<BlobId>)>,
+    mail_pins: HashMap<u64, Vec<BlobId>>,
     output_pins: HashMap<TaskId, OutputPinEntry>,
     output_pin_counts: HashMap<BlobId, u32>,
     output_pin_seq: u64,
@@ -963,6 +964,93 @@ impl BlobStore {
         }
     }
 
+    /// Atomically verifies that every attachment `(BlobId, expected_size)` is stored with a
+    /// matching byte size, touches each blob in LRU order, and pins them under `mail_id`.
+    /// Returns `Err` without pinning anything if any attachment is missing or has a mismatched size.
+    pub fn pin_mail_checked(
+        &self,
+        mail_id: u64,
+        attachments: &[(BlobId, u64)],
+    ) -> Result<(), String> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        let mut ids = Vec::with_capacity(attachments.len());
+        let mut seen = HashSet::with_capacity(attachments.len());
+        for &(id, expected_size) in attachments {
+            match inner.entries.get(&id).map(|e| e.size) {
+                Some(stored) if stored == expected_size => {
+                    inner.touch(&id);
+                    if seen.insert(id) {
+                        ids.push(id);
+                    }
+                }
+                Some(stored) => {
+                    return Err(format!(
+                        "mail attachment blob {id} has {stored} bytes on the master, expected {expected_size}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "mail attachment blob {id} is not on the master; upload it before sending"
+                    ));
+                }
+            }
+        }
+        for &id in &ids {
+            *inner.pin_counts.entry(id).or_insert(0) += 1;
+        }
+        if let Some(previous) = inner.mail_pins.insert(mail_id, ids) {
+            release_pins(&mut inner, previous);
+        }
+        Ok(())
+    }
+
+    /// Re-establishes attachment pins for a retained mailbox message after master restart.
+    /// Returns any attachment `BlobId`s no longer present in the blob store.
+    pub fn restore_mail_pins(&self, mail_id: u64, ids: Vec<BlobId>) -> Vec<BlobId> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut inner = self.lock();
+        let mut present = Vec::with_capacity(ids.len());
+        let mut gone = Vec::new();
+        let mut seen = HashSet::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if inner.entries.contains_key(&id) {
+                *inner.pin_counts.entry(id).or_insert(0) += 1;
+                present.push(id);
+            } else {
+                gone.push(id);
+            }
+        }
+        if let Some(previous) = inner.mail_pins.insert(mail_id, present) {
+            release_pins(&mut inner, previous);
+        }
+        gone
+    }
+
+    /// Releases the attachment pins of `mail_id` and evicts unpinned LRU blobs if over cap.
+    pub async fn unpin_mail(self: &Arc<Self>, mail_id: u64) {
+        let need_evict = {
+            let mut inner = self.lock();
+            if let Some(ids) = inner.mail_pins.remove(&mail_id) {
+                release_pins(&mut inner, ids);
+                inner.total_bytes.saturating_add(inner.upload_bytes) > self.max_bytes
+            } else {
+                false
+            }
+        };
+        if need_evict {
+            let store = Arc::clone(self);
+            let _ = tokio::task::spawn_blocking(move || store.evict_to_fit(None)).await;
+        }
+    }
+
     /// Tasks that currently pin blobs, with when they pinned them.
     pub fn pinned_tasks(&self) -> Vec<(TaskId, Instant)> {
         self.lock()
@@ -1770,5 +1858,33 @@ mod tests {
             .await
             .unwrap();
         assert!(reopened_v2_needs_v2);
+    }
+
+    #[tokio::test]
+    async fn mail_pin_checked_protects_from_eviction_until_unpin_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![b'M'; 4096];
+        let store = open(dir.path(), 6 * 1024);
+        let id = store.put(&data).await.unwrap();
+
+        assert!(store
+            .pin_mail_checked(1, &[(BlobId::of(b"missing"), 4)])
+            .is_err());
+        assert!(store.pin_mail_checked(1, &[(id, 10)]).is_err());
+        store
+            .pin_mail_checked(1, &[(id, data.len() as u64)])
+            .unwrap();
+
+        let _filler = store.put(&vec![b'F'; 4096]).await.unwrap();
+        assert!(
+            store.contains(&id),
+            "pinned mail attachment must survive LRU pressure"
+        );
+
+        store.unpin_mail(1).await;
+        assert!(
+            !store.contains(&id),
+            "unpin_mail must allow over-cap LRU victim eviction"
+        );
     }
 }
