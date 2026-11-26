@@ -1550,3 +1550,52 @@ async fn test_cli_env_lock_serializes_wire_codec_mutation_and_restores_on_panic(
         r2.unwrap();
     }
 }
+
+#[test]
+fn test_plan_cli_subcommands_parse_cleanly() {
+    let check_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "check",
+        "--plan",
+        "custom.toml",
+        "--json",
+    ])
+    .expect("parse plan check");
+    let Commands::Plan(check_args) = check_cli.command else {
+        panic!("expected Plan");
+    };
+    let crate::plan::PlanSubcommand::Check { plan, json } = check_args.command else {
+        panic!("expected Check");
+    };
+    assert_eq!(plan.as_deref(), Some(std::path::Path::new("custom.toml")));
+    assert!(json);
+
+    let status_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "status",
+        "--repo",
+        ".",
+        "--base",
+        "master",
+        "--json",
+    ])
+    .expect("parse plan status");
+    let Commands::Plan(status_args) = status_cli.command else {
+        panic!("expected Plan");
+    };
+    let crate::plan::PlanSubcommand::Status {
+        plan,
+        repo,
+        base,
+        json,
+    } = status_args.command
+    else {
+        panic!("expected Status");
+    };
+    assert!(plan.is_none());
+    assert_eq!(repo.as_deref(), Some(std::path::Path::new(".")));
+    assert_eq!(base.as_deref(), Some("master"));
+    assert!(json);
+}

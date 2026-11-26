@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod members_cmd;
 pub mod mode_cli;
 pub mod pair;
+pub mod plan;
 pub mod rendezvous_cmd;
 pub mod run_summary;
 pub mod secret_cmd;
