@@ -232,3 +232,7 @@ path = "../../tests/cli_usb_kit_e2e.rs"
 [[test]]
 name = "verify_e2e"
 path = "../../tests/verify_e2e.rs"
+
+[[test]]
+name = "team3_verify_gate_e2e"
+path = "../../tests/team3_verify_gate_e2e.rs"
