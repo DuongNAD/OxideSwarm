@@ -129,6 +129,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
 | Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-5 |
+| Q100 | Where do task path leases live first: git refs on the project's remote, or the master? | Git refs: no wire change, visible to people, survive a master restart ([design 0111](design/0111-team-plan-leases-and-verify-gate.md) D3) | TEAM-2 |
 
 ## Index
 
@@ -217,6 +218,8 @@ Recounted on 2026-11-24 from the rows with pull request 462: 291 items, 202 Impl
 Recounted on 2026-11-24 from the rows with pull request 411: 291 items, 202 Implemented, 22 Partial and 67 Planned; 20 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 464: 292 items, 202 Implemented, 22 Partial and 68 Planned; 21 open items are In and 69 are Out.
 Recounted on 2026-11-24 from the rows with pull request 465: 298 items, 202 Implemented, 22 Partial and 74 Planned; 22 open items are In and 74 are Out.
+Recounted on 2026-11-24 from the rows with pull request 466: 305 items, 202 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 467: 306 items, 203 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -339,6 +342,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
 | TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Implemented |  |  |
+| TEST-100 | CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'` | P1 | S | TEST-26 |  | Implemented |  |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -468,6 +472,13 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Implemented |  | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
 | AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
+| TEAM-1 | Shared plan file `.oxideswarm/plan.toml`, `plan check` and a 30-line snapshot | P2 | M | AX-1 |  | Planned | Out | (design 0111) |
+| TEAM-2 | Task claims and path leases as git refs, worktrees, `plan check-diff` | P2 | M | TEAM-1 | Q100 | Planned | Out | (design 0111) |
+| TEAM-3 | Verify gate: sync a worktree, run the task's profiles, return compact failure JSON | P2 | M | TEAM-1, AX-2 |  | Planned | Out | (design 0111) |
+| TEAM-4 | Circuit breaker after three identical failures, notice to the person | P2 | S | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
+| TEAM-5 | Merge flow with a verify table; this project's first wave on the plan | P2 | M | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
+| TEAM-6 | Grid mailbox in the master: messages, events and files between machines, long-poll wait (protocol 11, release 0.5.0, Q101) | P2 | L | TEAM-1, PROTO-4 | Q101 | Planned | Out | (design 0111) |
+| TEAM-7 | Wake-ups for idle agents (`mail watch --hook`, MCP `mail_wait`) and an `agent_bridge.py` grid backend | P2 | M | TEAM-6 |  | Planned | Out | (design 0111) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
@@ -959,6 +970,16 @@ The full suite must pass on a clean machine before CI can require it.
      and CI.
 - **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
   --lib` passes `436/436` locally) and CI stays green.
+
+### TEST-100: CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'`
+
+- **Evidence:** CI run `45657051728` (`workflow_dispatch` on `master` `60e18cdd`, 2026-11-25), job `endurance (loopback)`: after the 45-minute soak finished, `run_soak` (`benchmarks/endurance/endurance.py:5809` / `:6068` on `fc95e4c9`) failed with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'`. Claimed via `agent_bridge.py claim` (`claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`).
+- **Problem:** Commit `751be5b5` (`2026-11-24`, `TEST-24` step 2) left a second copy of `resolve_master_arg` .. `class RemoteEnduranceCluster` inside `class SoakCluster` (`benchmarks/endurance/endurance.py:3706-3991` on `origin/master` `fc95e4c9`), ending `SoakCluster` early after `stop()` so `def leftover_pids` (`lines 3979-3991`) belonged to the second `RemoteEnduranceCluster` instead of `SoakCluster`, and the duplicate top-level functions/class shadowed the first copy. A line-by-line `difflib` check confirmed `lines 2477-2748` and `lines 3706-3977` were byte-for-byte identical (`0` diff lines).
+- **Do:**
+  1. Failing check first: added `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` to `tests/test_endurance_harness.py`; running `python3 -B -m unittest tests/test_endurance_harness.py -v` before the fix failed (`40` tests, `1` failure: duplicate top-level definitions `resolve_master_arg`, `_parse_host_port`, `_sum_tmp_bytes`, `_summarize_remote_worker`, `RemoteEnduranceCluster`, plus missing `SoakCluster.leftover_pids`).
+  2. Removed the duplicate block (`lines 3705-3978`) so `leftover_pids` sits back inside `SoakCluster` right after `stop()`, keeping every real change of both copies.
+  3. Verified `python3 -B -m unittest tests/test_endurance_harness.py -v` (`40` tests: `39` ok, `1` skipped without `OXIDESWARM_TEST_BIN`) and a 5-minute loopback soak (`endurance.py soak --duration 5m --fault-scale 0.1 --sample-interval 5s`, debug binary under `nice -n 10` with private temp home/work-dir): `exit 0`, `all_passed = True` (`1_accounting PASS` `280/280`, `2_resource_plateau PASS`, `3_disk_and_journal PASS` `277342 -> 24 B`, `4_probe_p99 PASS` `60/60` ok / `ratio 0.9801`, `5_clean_stop PASS` `leftover_pids=[]`, `6_fault_injection PASS` `3/3`). (An initial `--sample-interval 30s` 5-minute run had `1_accounting`/`2`/`3`/`5_clean_stop`/`6` `PASS` and failed `4_probe_p99` only with `insufficient_probes_per_window` because 30 s intervals yield at most 4 probes per window against `min_samples_per_window = 10`.)
+- **Done when:** `benchmarks/endurance/endurance.py` has no duplicate top-level definitions, `SoakCluster.leftover_pids` is restored, `tests/test_endurance_harness.py` and a short loopback soak pass locally, and `workflow_dispatch` `endurance (loopback)` passes on `master` after merge.
 
 ## Phase 3: make the documents true
 
@@ -1828,6 +1849,23 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A client sees the first output line while the task runs. An MCP client polls a
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
+
+### TEAM-1 to TEAM-7: One project, several coding agents and machines
+
+- **Evidence:** This project's own process since 2026-11: agents reported work as verified when it was not,
+  parallel agents edited the same files (`docs/BACKLOG.md`, `CHANGELOG.md`, test files), day queues on the Drive
+  hub and this backlog are too long to load into an agent's context each time, and a failing test was retried by
+  an agent many times before a person saw it. The grid can verify on several systems (AX-1, AX-2, workspaces) but
+  has no notion of who works on what.
+- **Do:** [Design 0111](design/0111-team-plan-leases-and-verify-gate.md): TEAM-1 the shared plan
+  `.oxideswarm/plan.toml`, `plan check` and the snapshot of at most 30 lines (`plan status`, MCP `plan_snapshot`);
+  TEAM-2 claims and path leases as refs `refs/oxideswarm/lease/<task>` (create-only push, fast-forward renew,
+  takeover after expiry), worktrees and `plan check-diff`; TEAM-3 the verify gate (`verify`, at most 4 KB of
+  failures, worker, link and toolchain per cell); TEAM-4 the circuit breaker; TEAM-5 the pull request table,
+  re-verify on the latest base, and this project's first wave run on the plan (no wire change); TEAM-6 a mailbox in
+  the master for events, notes and files with a long-poll wait (protocol 11), and TEAM-7 wake-ups for idle agents
+  and a grid backend for `agent_bridge.py`, replacing the Drive hub.
+- **Done when:** Test plan T1 to T5 of design 0111 pass or are recorded, T4 with zero file conflicts.
 
 ### BUG-36: `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout
 
@@ -3433,3 +3471,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: TEST-100 added and Implemented (`mac/test-100-endurance-soak-leftover-pids`, claim `claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`): added failing-first `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` in `tests/test_endurance_harness.py` (failed before fix on the 5 duplicate top-level definitions from `751be5b5` and detached `SoakCluster.leftover_pids`), removed the identical duplicate `resolve_master_arg..RemoteEnduranceCluster` block (`lines 3705-3978`) in `benchmarks/endurance/endurance.py` so `leftover_pids` returns to `SoakCluster`, and verified `tests/test_endurance_harness.py` (`40` tests: `39` ok, `1` skipped), `tests/test_m1_challenger_hygiene.py`, `fmt`, workspace `clippy`, and a 5-minute loopback soak (`--duration 5m --fault-scale 0.1 --sample-interval 5s`, `6/6 PASS`, `280/280` tasks, `leftover_pids=[]`).
