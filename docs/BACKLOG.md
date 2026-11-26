@@ -1039,21 +1039,36 @@ The full suite must pass on a clean machine before CI can require it.
      windows once probe cadence increases.
 - **Do:** (Per [design 0065](design/0065-large-transfer-and-long-run-tests.md#d3-soak-scenario-endurancepy-soak) D3 #4 / #6.4):
   1. Failing check first: added `test_threshold_arithmetic` `floor_ms` assertions,
-     `test_soak_probe_p99_shared_runner_hardening_test102`, and CI `--probe-interval 6s` check in
-     `tests/test_endurance_harness.py`; before the fix `python3 -B -m unittest tests/test_endurance_harness.py`
-     failed (`Ran 41 tests: FAILED (failures=1, errors=2, skipped=1)` — `TypeError` on `floor_ms`,
-     `KeyError: 'reason'` at `14/16` samples, missing `--probe-interval 6s`).
+     `test_soak_probe_p99_shared_runner_hardening_test102` (including `45821686282` replay, uniform
+     `~30 ms -> ~200 ms` and `~30 -> ~110 ms` regression failure checks, high-cadence outlier immunity, and
+     `30 s` pad checks), and CI `--probe-interval 6s` check in `tests/test_endurance_harness.py`; before the
+     initial fix `tests/test_endurance_harness.py` failed (`Ran 41 tests: FAILED (failures=1, errors=2,
+     skipped=1)` — `TypeError` on `floor_ms`, `KeyError: 'reason'` at `14/16` samples, missing
+     `--probe-interval 6s`), and tightening `500 ms -> 100 ms` tests before updating
+     `SOAK_PROBE_P99_FLOOR_MS` failed (`Ran 41 tests: FAILED (failures=2, skipped=1)` — `200 ms` slowdown
+     and `330.897 ms` `45821686282` replay accepted under `500 ms`).
   2. In `benchmarks/endurance/endurance.py` and `.github/workflows/ci.yml`: added decoupled `--probe-interval`
-     (default `min(6s, --sample-interval)`, `--probe-interval 6s` in CI `endurance` job -> `>= 100` clean
-     probes/window in `45m`), raised `SOAK_MIN_PROBE_SAMPLES_PER_WINDOW = 30`, added `floor_ms = 500.0` ms
-     in `check_p99_ratio` / `check_soak_probe_p99` (`max(1.5x baseline, 500 ms)`), and widened
-     `SOAK_PROBE_FAULT_PAD_S` from `15.0` to `30.0` (with `soak_fault_pad_seconds` scaling to `>= 5 s` when
-     `fault_scale < 0.25`); updated `docs/design/0065-large-transfer-and-long-run-tests.md` and `benchmarks/endurance/README.md`.
-  3. Verified `10/10` runs of `python3 -B -m unittest tests/test_endurance_harness.py` (`41` tests/run: `40` ok, `1` skipped without `OXIDESWARM_TEST_BIN`), `tests/test_m1_challenger_hygiene.py` (`5/5 OK`, `1,511` links), `f2_t2_backlog_no_duplicate_ids_and_valid_lines` (`1/1`), and a `3m` live loopback soak (`--duration 3m --fault-scale 0.1 --load-scale 0.1 --sample-interval 5s --probe-interval 2s --no-write`, debug binary under `nice -n 10`): `all_passed = True` (`6/6` checks: `1_accounting` `112/112`, `4_probe_p99` `88/88` ok / `9` fault-excluded / `baseline_count = 35` `88.643 ms` / `late_count = 31` `84.899 ms` / `ratio = 0.9578` / `floor_ms = 500.0`, `5_clean_stop` `leftover_pids=[]`, `6_fault_injection` `1/1`).
-- **Done when:** `tests/test_endurance_harness.py` (including CI run `45821686282` replay, single-outlier
-  high-cadence immunity, 30-sample minimum, 500 ms floor, 30 s fault pad, and CI YAML check),
-  `tests/test_m1_challenger_hygiene.py`, backlog hygiene tests, and a short loopback soak pass locally,
-  and CI `endurance (loopback)` passes `4_probe_p99` after merge.
+     (default `min(6s, --sample-interval)`, `--probe-interval 6s` in CI `endurance` job -> `~140–160` clean
+     probes/window in `45m`), raised `SOAK_MIN_PROBE_SAMPLES_PER_WINDOW = 30`, added `floor_ms = 100.0` ms
+     in `check_p99_ratio` / `check_soak_probe_p99` (`max(1.5x baseline, 100 ms)` tied to measured `32 ms`
+     median / `+39–79 ms` runner noise while catching `30 -> 200 ms`), and widened `SOAK_PROBE_FAULT_PAD_S`
+     from `15.0` to `30.0` (with `soak_fault_pad_seconds` scaling to `>= 5 s` when `fault_scale < 0.25`);
+     updated `docs/design/0065-large-transfer-and-long-run-tests.md` (documenting both the `100 ms`
+     noise justification and the `worker_kill`, `link_cut`, and `queue_burst`/`master_restart` post-`end_s`
+     recovery tails) and `benchmarks/endurance/README.md`.
+  3. Verified `tests/test_endurance_harness.py` (`41` tests: `40` ok, `1` skipped without
+     `OXIDESWARM_TEST_BIN`), `tests/test_m1_challenger_hygiene.py` (`5/5 OK`),
+     `f2_t2_backlog_no_duplicate_ids_and_valid_lines` (`1/1`), and a `3m` live loopback soak
+     (`--duration 3m --fault-scale 0.1 --load-scale 0.1 --sample-interval 5s --probe-interval 2s --out ...`,
+     debug binary under `nice -n 10`): `all_passed = True` (`6/6` checks: `1_accounting` `112/112`,
+     `2_resource_plateau` `PASS`, `3_disk_and_journal` `95,042 -> 24 B`, `4_probe_p99` `88/88` ok / `9`
+     fault-excluded / `baseline_count = 35` `78.15 ms` / `late_count = 31` `79.512 ms` / `ratio = 1.0174` /
+     `floor_ms = 100.0` / `limit_ms = 117.225`, `5_clean_stop` `leftover_pids=[]`, `6_fault_injection`
+     `1/1`).
+- **Done when:** `tests/test_endurance_harness.py` (including CI run `45821686282` replay, uniform
+  `30 -> 200 ms` regression failure, single-outlier high-cadence immunity, 30-sample minimum, 100 ms floor,
+  30 s fault pad, and CI YAML check), `tests/test_m1_challenger_hygiene.py`, backlog hygiene tests, and a
+  short loopback soak pass locally, and CI `endurance (loopback)` passes `4_probe_p99` after merge.
 
 ## Phase 3: make the documents true
 
@@ -3555,4 +3570,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-26: TEST-93 Implemented and TEST-86 updated (`mac/test-93-macos-loaded-loop`): verified `20/20` sequential loaded macOS runs of `cargo test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture` on clean `origin/master` `b253f601` (`nice -n 10`, `6` Python CPU busy loops, isolated per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR`): `12 passed; 0 failed` per run (`min 0.516 s`, `median 0.569 s`, `max 1.184 s`, `total 12.042 s`; `[timing] QUIC 5MB saturation` `avg_latency 498.505 µs–750.279 µs`, `max_latency 2.4885 ms–7.825583 ms`); updated `TEST-86` (`Partial | In`) with `33/33` passing `workspace tests (macos-latest)` jobs across all `master` push CI runs since `2026-11-24T00:00:00Z` (`45297098266` through `45781445276`, `0` `test_ax2_shard`/`test_ax1_matrix` stalls).
 - 2026-11-26: TEST-101 Implemented (`win2/test-101-default-path-oxideswarm-home`, claim `claims/item/TEST-101__win__20261126T080448414890Z__9d72ebc8.json`): refactored `ClusterSecret::default_path()` in `crates/core/src/cluster_auth.rs` to delegate to private `default_path_with(env)` without changing product behaviour or calling `std::env::set_var`, updated `default_path_lives_under_home` to test the `HOME`/`USERPROFILE` branch deterministically, and added `default_path_honours_oxideswarm_home_override`; verified `20/20` with `OXIDESWARM_HOME` set and `20/20` without `OXIDESWARM_HOME` on Windows.
 - 2026-11-26: TEST-100 added and Implemented (`mac/test-100-endurance-soak-leftover-pids`, claim `claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`): added failing-first `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` in `tests/test_endurance_harness.py` (failed before fix on the 5 duplicate top-level definitions from `751be5b5` and detached `SoakCluster.leftover_pids`), removed the identical duplicate `resolve_master_arg..RemoteEnduranceCluster` block (`lines 3705-3978`) in `benchmarks/endurance/endurance.py` so `leftover_pids` returns to `SoakCluster`, and verified `tests/test_endurance_harness.py` (`40` tests: `39` ok, `1` skipped), `tests/test_m1_challenger_hygiene.py`, `fmt`, workspace `clippy`, and a 5-minute loopback soak (`--duration 5m --fault-scale 0.1 --sample-interval 5s`, `6/6 PASS`, `280/280` tasks, `leftover_pids=[]`).
-- 2026-11-26: TEST-102 Implemented and TEST-90 Implemented (`mac/test-102-soak-probe-p99`, claim `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): CI run `45821686282` (`034f5725`, `ubuntu-latest` `endurance (loopback)`) passed `transfer` (`6/6`), `1_accounting` (`2,185/2,185`), `2_resource_plateau`, `3_disk_and_journal` (Linux `--workspaces` `0700` confirmed, closing `TEST-90`), `5_clean_stop`, and `6_fault_injection` (`16/16`), failing only `4_probe_p99` (`67.402 -> 330.897 ms`, `ratio 4.9093` on `14`/`16` probes despite lower late median `31.28 vs 32.38 ms`) due to 60 s probe cadence, missing latency floor, and 15 s fault pad; added `--probe-interval 6s` (`min(6s, --sample-interval)`), `30` clean probes/window minimum, `500 ms` floor (`max(1.5x baseline, 500 ms)`), `30 s` post-fault exclusion pad (`soak_fault_pad_seconds`), failing-first tests in `tests/test_endurance_harness.py`, and design `0065` status-log update.
+- 2026-11-26: TEST-102 Implemented and TEST-90 Implemented (`mac/test-102-soak-probe-p99`, claim `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): CI run `45821686282` (`034f5725`, `ubuntu-latest` `endurance (loopback)`) passed `transfer` (`6/6`), `1_accounting` (`2,185/2,185`), `2_resource_plateau`, `3_disk_and_journal` (Linux `--workspaces` `0700` confirmed, closing `TEST-90`), `5_clean_stop`, and `6_fault_injection` (`16/16`), failing only `4_probe_p99` (`67.402 -> 330.897 ms`, `ratio 4.9093` on `14`/`16` probes despite lower late median `31.28 vs 32.38 ms`) due to 60 s probe cadence, missing latency floor, and 15 s fault pad; added `--probe-interval 6s` (`min(6s, --sample-interval)`), `30` clean probes/window minimum, `100 ms` floor (`max(1.5x baseline, 100 ms)`, catching `30 -> 200 ms` uniform regressions), `30 s` post-fault exclusion pad (`soak_fault_pad_seconds`), failing-first tests in `tests/test_endurance_harness.py`, and design `0065` status-log update.

@@ -198,15 +198,15 @@ class DiskAndThresholdTests(unittest.TestCase):
         self.assertFalse(endurance.check_p99_ratio(10.0, 15.1)["passed"])
 
         # Absolute floor avoids failing on tiny-baseline ratios while preserving 1.5x above floor
-        small_jit = endurance.check_p99_ratio(67.402, 330.897, max_ratio=1.5, floor_ms=500.0)
+        small_jit = endurance.check_p99_ratio(32.0, 85.0, max_ratio=1.5, floor_ms=100.0)
         self.assertTrue(small_jit["passed"])
-        self.assertEqual(small_jit["floor_ms"], 500.0)
-        self.assertEqual(small_jit["limit_ms"], 500.0)
-        self.assertFalse(endurance.check_p99_ratio(67.402, 500.1, max_ratio=1.5, floor_ms=500.0)["passed"])
-        big_pass = endurance.check_p99_ratio(400.0, 600.0, max_ratio=1.5, floor_ms=500.0)
+        self.assertEqual(small_jit["floor_ms"], 100.0)
+        self.assertEqual(small_jit["limit_ms"], 100.0)
+        self.assertFalse(endurance.check_p99_ratio(32.0, 100.1, max_ratio=1.5, floor_ms=100.0)["passed"])
+        big_pass = endurance.check_p99_ratio(80.0, 120.0, max_ratio=1.5, floor_ms=100.0)
         self.assertTrue(big_pass["passed"])
-        self.assertEqual(big_pass["limit_ms"], 600.0)
-        self.assertFalse(endurance.check_p99_ratio(400.0, 600.1, max_ratio=1.5, floor_ms=500.0)["passed"])
+        self.assertEqual(big_pass["limit_ms"], 120.0)
+        self.assertFalse(endurance.check_p99_ratio(80.0, 120.1, max_ratio=1.5, floor_ms=100.0)["passed"])
         with self.assertRaises(ValueError):
             endurance.check_p99_ratio(10.0, 15.0, floor_ms=-1.0)
 
@@ -754,14 +754,14 @@ class SoakHarnessTests(unittest.TestCase):
         self.assertFalse(r3d["checks"]["3_disk_and_journal"]["worker_cache_peak_ok"])
         self.assertFalse(r3d["checks"]["3_disk_and_journal"]["passed"])
 
-        # 4) Probe p99 > max(1.5x, 500 ms floor) fails 4_probe_p99; fault-window probe is excluded
+        # 4) Probe p99 > max(1.5x, 100 ms floor) fails 4_probe_p99; fault-window probe is excluded
         bad4 = self._make_recorded_soak(hours_24=False)
         bad4["fault_plan"] = [{"kind": "queue_burst", "seq": 0, "worker_index": None, "at_s": 1360.0, "down_s": 0.0}]
         bad4["faults_executed"] = [{"kind": "queue_burst", "seq": 0, "worker_index": None, "t_s": 1360.0, "end_s": 1365.0, "ok": True}]
-        # Huge spike during fault window at t=1362 is excluded without hiding late slowdown > 500 ms floor
+        # Huge spike during fault window at t=1362 is excluded without hiding late slowdown > 100 ms floor
         bad4["probes"].append({"t_s": 1362.0, "latency_ms": 11098.0, "ok": True})
-        bad4["probes"].append({"t_s": 2400.0, "latency_ms": 600.0, "ok": True})
-        bad4["probes"].append({"t_s": 2430.0, "latency_ms": 600.0, "ok": True})
+        bad4["probes"].append({"t_s": 2400.0, "latency_ms": 200.0, "ok": True})
+        bad4["probes"].append({"t_s": 2430.0, "latency_ms": 200.0, "ok": True})
         r4 = endurance.evaluate_soak_pass_checks(**bad4)
         self.assertEqual(r4["checks"]["4_probe_p99"]["excluded_fault_probes"], 1)
         self.assertFalse(r4["checks"]["4_probe_p99"]["passed"])
@@ -1095,34 +1095,45 @@ class SoakHarnessTests(unittest.TestCase):
         self.assertEqual(low_res["reason"], "insufficient_probes_per_window")
         self.assertEqual(low_res["min_samples_required"], 30)
 
-        # 2) With explicit low min_samples_per_window, the 500 ms floor accepts sub-second jitter in CI run 45821686282
-        #    while still catching a real regression above the floor.
+        # 2) Even with explicit low min_samples_per_window, the raw 14/16-sample 45821686282 record
+        #    (67.402 -> 330.897 ms) still fails under the 100 ms floor (1.5x = 101.103 ms) — floor does not mask 331 ms.
         ci_eval = endurance.check_soak_probe_p99(ci_probes, 2700.0, min_samples_per_window=10)
-        self.assertTrue(ci_eval["passed"], ci_eval)
-        self.assertEqual(ci_eval["floor_ms"], 500.0)
-        self.assertEqual(ci_eval["limit_ms"], 500.0)
+        self.assertFalse(ci_eval["passed"], ci_eval)
+        self.assertEqual(ci_eval["floor_ms"], 100.0)
+        self.assertEqual(ci_eval["limit_ms"], 101.103)
         self.assertEqual(ci_eval["late_p99_ms"], 330.897)
 
-        slow_probes = (
-            [{"t_s": 360.0 + i * 70.0, "latency_ms": lat, "ok": True} for i, lat in enumerate(base_ci_lats)]
-            + [{"t_s": 1560.0 + i * 70.0, "latency_ms": 600.0, "ok": True} for i in range(16)]
-        )
-        self.assertFalse(endurance.check_soak_probe_p99(slow_probes, 2700.0, min_samples_per_window=10)["passed"])
+        # 3) Coordinator regression test: a uniform late-window shift from ~30 ms to ~200 ms (or ~110 ms) MUST fail
+        base_uniform = [{"t_s": 300.0 + i * 8.0, "latency_ms": 30.0, "ok": True} for i in range(120)]
+        late_200 = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 200.0, "ok": True} for i in range(120)]
+        res_200 = endurance.check_soak_probe_p99(base_uniform + late_200, 2700.0)
+        self.assertFalse(res_200["passed"], res_200)
+        self.assertEqual(res_200["floor_ms"], 100.0)
+        self.assertEqual(res_200["limit_ms"], 100.0)
+        self.assertEqual(res_200["late_p99_ms"], 200.0)
 
-        # 3) Higher cadence (>=100 probes/window) makes p99 immune to a single (<1%) shared-runner glitch
-        #    yet catches a >=2.5% sustained tail > floor.
-        base_120 = [{"t_s": 300.0 + i * 8.0, "latency_ms": 32.0, "ok": True} for i in range(120)]
-        late_1_glitch = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 32.0, "ok": True} for i in range(120)]
-        late_1_glitch[40]["latency_ms"] = 750.0
-        res_1 = endurance.check_soak_probe_p99(base_120 + late_1_glitch, 2700.0)
+        late_110 = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 110.0, "ok": True} for i in range(120)]
+        res_110 = endurance.check_soak_probe_p99(base_uniform + late_110, 2700.0)
+        self.assertFalse(res_110["passed"], res_110)
+
+        # 4) Higher cadence (~160 clean probes/window at 6 s across 45 m) makes p99 immune to the two
+        #    isolated shared-runner outliers seen in CI run 45821686282 (369.801 ms + 110.443 ms -> p99 < 100 ms),
+        #    while catching >=3 sustained 200 ms probes in 120 late samples.
+        base_160 = [{"t_s": 280.0 + i * 6.5, "latency_ms": 32.0, "ok": True} for i in range(160)]
+        late_ci_cadence = [{"t_s": 1500.0 + i * 7.0, "latency_ms": 31.5, "ok": True} for i in range(160)]
+        late_ci_cadence[40]["latency_ms"] = 369.801
+        late_ci_cadence[90]["latency_ms"] = 110.443
+        res_1 = endurance.check_soak_probe_p99(base_160 + late_ci_cadence, 2700.0)
         self.assertTrue(res_1["passed"], res_1)
+        self.assertEqual(res_1["floor_ms"], 100.0)
+        self.assertLess(res_1["late_p99_ms"], 100.0)
 
         late_3_glitches = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 32.0, "ok": True} for i in range(120)]
         for idx in (30, 60, 90):
-            late_3_glitches[idx]["latency_ms"] = 750.0
-        res_3 = endurance.check_soak_probe_p99(base_120 + late_3_glitches, 2700.0)
+            late_3_glitches[idx]["latency_ms"] = 200.0
+        res_3 = endurance.check_soak_probe_p99(base_uniform + late_3_glitches, 2700.0)
         self.assertFalse(res_3["passed"])
-        self.assertGreater(res_3["late_p99_ms"], 500.0)
+        self.assertEqual(res_3["late_p99_ms"], 200.0)
 
         # 4) Default 30 s post-fault settling pad excludes recovery tails 20 s after end_s (but keeps >=35 s)
         faults = [{"kind": "worker_kill", "seq": 0, "worker_index": 0, "t_s": 1600.0, "end_s": 1615.0, "ok": True}]

@@ -170,7 +170,7 @@ compares them with the bound of 4 MiB per round trip.
    3. The blob store stays within its bound plus pinned bytes. The worker cache is within its
       bound after each task. When the cluster is idle, the sandbox base holds only the cache. The
       journal shrinks after each compaction.
-   4. Excluding probes overlapping fault windows `[t_s, end_s + 30 s]` (scaled down to a 5 s minimum only when `--fault-scale < 0.25`), with at least 30 clean probes per comparison window, the probe's p99 in the last hour is at most `max(1.5 * baseline_p99, 500 ms)`.
+   4. Excluding probes overlapping fault windows `[t_s, end_s + 30 s]` (scaled down to a 5 s minimum only when `--fault-scale < 0.25`), with at least 30 clean probes per comparison window, the probe's p99 in the last hour is at most `max(1.5 * baseline_p99, 100 ms)`.
    5. After the stop, no process the harness started is left, and no task process tree remains.
 
 ### D4: Where it runs
@@ -319,10 +319,20 @@ The right column records the owner's decisions of 2026-11-19, listed in
   failed (`67.402 -> 330.897 ms`, ratio `4.9093 > 1.5`) despite no product latency growth (clean
   baseline `n=14` median `32.38 ms`, `13/14` in `30.36–37.86 ms` + 1 sample `[12]=71.816 ms`; clean late
   `n=16` median `31.28 ms` lower than baseline, last 6 probes `24.59–28.69 ms` mean `27.11 ms`, `14/16 <=
-  33.45 ms`, with only `[28]=369.801 ms` and `[37]=110.443 ms`). At `1` probe/min (`60 s`), `16` clean
+  33.455 ms`, with only `[28]=369.801 ms` and `[37]=110.443 ms`). At `1` probe/min (`60 s`), `16` clean
   samples made `p99` (`0.85*max + 0.15*second_max`) equal the single host jitter outlier on a tiny
-  `67 ms` baseline with no floor. Adjusted D3 #4 and #6.4: decoupled default `--probe-interval 6s`
-  (yielding `>= 100` clean probes/window in a 45 m CI soak), raised `min_samples_per_window` from `10`
-  to `30`, added a `500 ms` floor (`max(1.5 * baseline, 500 ms)`, keeping `1.5x` strictly above
-  `333 ms`), and widened post-fault exclusion pad `fault_pad_s` from `15 s` to `30 s` (scaled to `>= 5 s`
-  for `fault_scale < 0.25`).
+  `32–67 ms` baseline with no floor. Adjusted D3 #4 and #6.4:
+  - Decoupled default `--probe-interval 6s` (yielding `~140–160` clean probes/window in a 45 m CI soak) and
+    raised `min_samples_per_window` from `10` to `30`: at `160` clean samples, a single `369.8 ms` outlier
+    sits above the 99th percentile (`pos = 157.41`) and one `110.4 ms` tick yields `p99 ≈ 65 ms`.
+  - Added a `100 ms` floor (`max(1.5 * baseline, 100 ms)`): justified by the measured `45821686282` runner
+    noise on ~`32 ms` medians (`[12]=71.816 ms`, `+39.4 ms`; `[37]=110.443 ms`, `+79.2 ms`; `baseline_p99
+    = 67.402 ms -> 1.5x = 101.103 ms > 100 ms`), absorbing sub-`100 ms` jitter without masking any
+    `>= 101 ms` / `30 -> 200 ms` regression, while keeping `1.5x` strictly binding above `66.7 ms` baseline.
+  - Widened post-fault exclusion pad `fault_pad_s` from `15 s` to `30 s` (scaled to `>= 5 s` when
+    `fault_scale < 0.25`) to remove three specific post-fault recovery tails that occur after `end_s` is
+    stamped: (a) `worker_kill`, where `end_s` is recorded immediately upon spawning `new_pid` before the
+    restarted worker reconnects, orphaned tasks time out and fail over, and load queued during `2/3`
+    capacity drains; (b) `link_cut`, where `end_s` is recorded when `ThrottleProxy` unpauses before client
+    reconnect backoff, handshake, and failover drain finish; and (c) `queue_burst` / `master_restart`,
+    where `SOAK_QUEUE_FULL_BACKOFF_S` (`2.5 s`) retried load tasks and re-queued work drain after restart.

@@ -55,8 +55,8 @@ Subcommands in `TEST-24` and `TEST-25`:
   faults (`--duration`, `--fault-scale`, `--sample-interval`, `--probe-interval`: worker kill/restart, master restart
   on the same state dir, proxy link cuts, and queue-cap bursts), checks every task via `TaskLedger`
   and computes all five D3 item 6 pass/fail checks (`4_probe_p99` defaults to `--probe-interval min(6s, --sample-interval)`,
-  at least `30` clean probes per window outside `[t_s, end_s + 30 s]` fault windows, and a `500 ms` floor
-  `max(1.5x baseline, 500 ms)`) into
+  at least `30` clean probes per window outside `[t_s, end_s + 30 s]` fault windows, and a `100 ms` floor
+  `max(1.5x baseline, 100 ms)`) into
   `benchmarks/endurance/results/<UTC date>-soak-<duration>-<link>-<os>-<arch>-<cpu>.json`.
 - `throttle`: runs a standalone user-space TCP proxy bound strictly to `127.0.0.1` (`--listen`,
   `--target`, `--rate-mbps`, `--delay-ms`, `--port-file`). Used in `T6`, `T7`, and `T8`.
