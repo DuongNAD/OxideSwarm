@@ -182,7 +182,14 @@ fi
 if [ -f "$KIT_JSON" ]; then
   _flat_json=$(tr '\r\n' '  ' < "$KIT_JSON")
   _kit_format=$(printf '%s\n' "$_flat_json" | awk '{ if (match($0, /"kit_format"[[:space:]]*:[[:space:]]*[0-9]+/)) { s=substr($0,RSTART,RLENGTH); sub(/^.*:[[:space:]]*/, "", s); print s } }')
-  [ "$_kit_format" = "1" ] || fail "unsupported kit_format '$_kit_format' in kit.json (expected 1)"
+  if [ "$IS_V1_KIT" = 1 ]; then
+    [ "$_kit_format" = "1" ] || fail "unsupported kit_format '$_kit_format' in kit.json (expected 1)"
+  else
+    case "$_kit_format" in
+      0|1) ;;
+      *) fail "unsupported kit_format '$_kit_format' in kit.json (expected 0 or 1)" ;;
+    esac
+  fi
   KIT_VERSION=$(printf '%s\n' "$_flat_json" | awk '{ if (match($0, /"version"[[:space:]]*:[[:space:]]*"[^"]*"/)) { s=substr($0,RSTART,RLENGTH); sub(/^.*:[[:space:]]*"/, "", s); sub(/"$/, "", s); print s } }')
   case "$KIT_VERSION" in
     ''|*..*|*/*|*\\*|*[!A-Za-z0-9.+_-]*) fail "invalid version '$KIT_VERSION' in kit.json" ;;
