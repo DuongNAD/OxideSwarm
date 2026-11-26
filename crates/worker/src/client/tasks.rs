@@ -403,6 +403,44 @@ impl WorkerClient {
             return;
         }
 
+        // Local pause / held / --no-gpu-tasks admission check (`design 0113` D2).
+        let requires_gpu = task.spec.requires_gpu() || task.requirements.gpu_required;
+        match self.control.check_assignment(requires_gpu) {
+            crate::control::AssignmentDecision::Allow => {}
+            crate::control::AssignmentDecision::RejectPaused(reason) => {
+                self.control.mark_session_pause_rejection();
+                let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
+                warn!(task_id = %task_id, reason = %reason, "Refusing task: worker paused");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    1,
+                    "",
+                    msg.as_str(),
+                    0,
+                    Some(msg.clone()),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                return;
+            }
+            crate::control::AssignmentDecision::RejectNoGpuTasks => {
+                self.control.mark_session_pause_rejection();
+                let msg = crate::control::NO_GPU_TASKS_REJECTION_MESSAGE.to_string();
+                warn!(task_id = %task_id, "Refusing GPU task: --no-gpu-tasks enabled");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    1,
+                    "",
+                    msg.as_str(),
+                    0,
+                    Some(msg.clone()),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                return;
+            }
+        }
+
         // Defence in depth (design 0082 D2.3): the Master never places a task with an extension this
         // worker lacks, but a task with an unknown critical extension, or a malformed extension
         // list, is never run without the restriction it carries.
@@ -1115,6 +1153,55 @@ impl WorkerClient {
                 warn!("Active task did not finish checkpoint drain within timeout; aborting it");
                 join.abort();
             }
+        }
+        count
+    }
+
+    /// Stops all currently running tasks on contributor pause (`design 0113` D2.3) within 4 s
+    /// (bounded under the 5 s target) and hands each back with `"Task rejected by worker: paused: <reason>"`
+    /// (`exit_code = 1`, `execution_time_ms = 0`, empty stdout) so the Master requeues them
+    /// uncharged and enters `state:paused` hold-back.
+    pub(super) async fn hand_back_running_tasks_on_pause(
+        &self,
+        reason: &str,
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> usize {
+        let drained: Vec<(TaskId, TaskExecutionHandle)> = {
+            let mut lock = self.active_task_table.write().await;
+            lock.drain().collect()
+        };
+        if drained.is_empty() {
+            return 0;
+        }
+        let count = drained.len();
+        let mut task_ids = Vec::with_capacity(count);
+        let mut joins = Vec::with_capacity(count);
+        for (tid, handle) in drained {
+            task_ids.push(tid);
+            if let Some(join) = Self::begin_stop(handle, reason) {
+                joins.push(join);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        for mut join in joins {
+            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
+                warn!("Paused task did not stop within hand-back deadline; aborting handle");
+                join.abort();
+            }
+        }
+        self.control.mark_session_pause_rejection();
+        let msg = crate::control::ControlHandle::format_pause_rejection(reason);
+        for tid in task_ids {
+            let result = TaskResult::failure(
+                self.worker_id,
+                tid,
+                1,
+                "",
+                msg.as_str(),
+                0,
+                Some(msg.clone()),
+            );
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
         }
         count
     }

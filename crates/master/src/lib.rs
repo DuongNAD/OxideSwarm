@@ -46,10 +46,10 @@ pub use fair_share::SubmitterId;
 pub use liveness::{RxClock, StampedStream};
 pub use mapreduce::MapReduceEngine;
 pub use queue::{
-    is_worker_rejection, AssignedLoad, CancelOutcome, DelayedRetryKey, QueueOrderKey, QueueStats,
-    ResultDisposition, ResultOutcome, RetryAttempt, RetryPolicy, TaskEntry, TaskInfo, TaskQueue,
-    TaskState, TaskStatusDetail, TaskView, DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES,
-    DEFAULT_MAX_TERMINAL_TASKS,
+    classify_worker_rejection, is_worker_rejection, AssignedLoad, CancelOutcome, DelayedRetryKey,
+    QueueOrderKey, QueueStats, ResultDisposition, ResultOutcome, RetryAttempt, RetryPolicy,
+    TaskEntry, TaskInfo, TaskQueue, TaskState, TaskStatusDetail, TaskView, WorkerRejectionKind,
+    DEFAULT_MAX_ACTIVE_BYTES, DEFAULT_MAX_TERMINAL_BYTES, DEFAULT_MAX_TERMINAL_TASKS,
 };
 pub use reaper::{spawn_reaper, spawn_reaper_with_queue, ReaperConfig};
 pub use registry::{

@@ -87,6 +87,8 @@ fn create_mock_worker_info(
         ram_available_mb: ram_mb,
         features: Default::default(),
         mobile_status: None,
+        paused: false,
+        gpu_paused: false,
     }
 }
 

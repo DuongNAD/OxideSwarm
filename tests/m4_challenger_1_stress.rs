@@ -600,6 +600,8 @@ fn test_adversarial_pure_matchmake_spread_under_varied_topologies() {
             ram_available_mb: 8192,
             features: Default::default(),
             mobile_status: None,
+            paused: false,
+            gpu_paused: false,
         }
     }
 

@@ -1840,6 +1840,8 @@ async fn test_three_d_tasks_require_three_d_protocol_capability_for_placement() 
         cpu_usage_pct: 0.0,
         ram_available_mb: 8192,
         mobile_status: None,
+        paused: false,
+        gpu_paused: false,
     };
 
     let tasks = vec![gen3d_task.clone(), autorig_task.clone()];

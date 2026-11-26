@@ -978,6 +978,11 @@ impl WorkerClient {
                 }
             }
         }
+        self.control.clear_session_pause_rejection();
+        let mut control_rx = self.control.subscribe();
+        let mut pause_expiry_tick = tokio::time::interval(Duration::from_secs(1));
+        pause_expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut farewell: Option<WorkerMessage> = None;
         let _outbox_flush_guard = (!buffered_checkpoints.is_empty()
             || !buffered_results.is_empty())
@@ -1160,6 +1165,36 @@ impl WorkerClient {
                     }
                 }
 
+                // Local pause / resume control transitions (`design 0113` D2/D3).
+                ev = control_rx.recv() => {
+                    match ev {
+                        Ok(crate::control::ControlEvent::PauseHandBack { reason }) => {
+                            self.hand_back_running_tasks_on_pause(&reason, &session.data_tx)
+                                .await;
+                        }
+                        Ok(crate::control::ControlEvent::ResumeReconnect) => {
+                            if self.control.take_session_pause_rejection()
+                                && self.active_task_table.read().await.is_empty()
+                            {
+                                info!(
+                                    worker_id = %worker_id,
+                                    "Worker resumed while held back; closing session to re-register immediately"
+                                );
+                                self.resume_reconnect_pending.store(true, Ordering::Release);
+                                break Err(GridError::ConnectionClosed);
+                            }
+                        }
+                        Err(
+                            tokio::sync::broadcast::error::RecvError::Lagged(_)
+                            | tokio::sync::broadcast::error::RecvError::Closed,
+                        ) => {}
+                    }
+                }
+
+                _ = pause_expiry_tick.tick() => {
+                    let _ = self.control.check_pause_expiry();
+                }
+
                 // External shutdown signal
                 res = shutdown_rx.changed() => {
                     if res.is_ok() && *shutdown_rx.borrow() {
@@ -1198,6 +1233,7 @@ impl WorkerClient {
         if outcome.is_err()
             && !*shutdown_rx.borrow()
             && current_evacuation_reason().is_none()
+            && !self.resume_reconnect_pending.load(Ordering::Acquire)
             && grace > Duration::ZERO
         {
             self.resume_deadline = Some(tokio::time::Instant::now() + grace);
