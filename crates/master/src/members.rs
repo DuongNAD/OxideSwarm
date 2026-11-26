@@ -561,7 +561,7 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
 #[cfg(windows)]
 fn check_members_file_permissions(path: &Path) -> GridResult<()> {
     use rusty_grid_core::private_file::{
-        current_user_sid, open_acl_or_volume_message, open_grants, read_dacl,
+        current_user_sid, open_acl_or_volume_message_for_aces, open_grants, read_dacl,
     };
     let user_sid = current_user_sid().map_err(|e| {
         GridError::Config(format!(
@@ -578,16 +578,22 @@ fn check_members_file_permissions(path: &Path) -> GridResult<()> {
     let offenders = open_grants(&aces, &user_sid);
     // On a volume without permissions (exFAT, FAT32) the message says so instead of suggesting an
     // `icacls` command that cannot work there (BUG-24, design 0085).
-    if let Some(msg) = open_acl_or_volume_message(path, "members file", &offenders, &user_sid) {
+    if let Some(msg) =
+        open_acl_or_volume_message_for_aces(path, "members file", &aces, &offenders, &user_sid)
+    {
         tracing::warn!("{msg}");
         return Err(GridError::Config(msg));
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         if let Ok((dir_aces, _)) = read_dacl(parent) {
             let dir_offenders = open_grants(&dir_aces, &user_sid);
-            if let Some(msg) =
-                open_acl_or_volume_message(parent, "members directory", &dir_offenders, &user_sid)
-            {
+            if let Some(msg) = open_acl_or_volume_message_for_aces(
+                parent,
+                "members directory",
+                &dir_aces,
+                &dir_offenders,
+                &user_sid,
+            ) {
                 tracing::warn!("{msg}");
                 return Err(GridError::Config(msg));
             }
@@ -3249,7 +3255,8 @@ mod tests {
     #[test]
     fn admin_invite_rule_revoked_keys_role_merge_and_id_only_resolution() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let members_dir = dir.path().join("members");
+        let store = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
 
         // Item 6: admin invite requires approval and uses == 1.
         assert!(store
@@ -3352,7 +3359,7 @@ mod tests {
         // Item 7: revoking a member records its public key in `revoked_keys` (persisted across reload)
         // and refuses re-enrollment of that key.
         store.revoke_member(&cand_real.member_id()[..6]).unwrap();
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         let proof2 = compute_enroll_proof(&worker_inv.invite_secret.0, &hash);
         match reloaded
             .handle_enroll_request(
@@ -3428,6 +3435,7 @@ mod tests {
     #[test]
     fn claim_worker_id_evicting_drops_oldest_non_live_claims_and_caps_live_claims_at_64() {
         let dir = tempfile::tempdir().unwrap();
+        let members_dir = dir.path().join("members");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3440,7 +3448,7 @@ mod tests {
             *member_kp.public_key(),
             vec![MemberRole::Worker],
         )])
-        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        .with_save_path(members_dir.join(MEMBERS_FILE_NAME));
         let member_id_owned = member_kp.member_id();
         let member_id = member_id_owned.as_str();
 
@@ -3503,7 +3511,7 @@ mod tests {
             .claim_worker_id_evicting(pre_reload_wid, member_id, |_existing| false)
             .expect("eviction must succeed and flush updated worker_last_seq");
         assert_eq!(evicted_before_reload, vec![history[7]]);
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         let post_reload_wid = Uuid::new_v4();
         let evicted_after_reload = reloaded
             .claim_worker_id_evicting(post_reload_wid, member_id, |_existing| false)
@@ -4188,7 +4196,8 @@ mod tests {
         //    invite's `uses_remaining` is restored to 1 (both in memory and on disk, even if
         //    another invite was created during the confirm window).
         let dir = tempfile::tempdir().unwrap();
-        let store = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let members_dir = dir.path().join("members");
+        let store = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         let existing_kp = NodeKeypair::generate().unwrap();
         let seed_inv = store
             .create_invite(vec![MemberRole::Client], 1, 3600, false)
@@ -4259,7 +4268,7 @@ mod tests {
         );
         assert_eq!(store.unconfirmed_tracking_counts(), (0, 0));
 
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         assert_eq!(
             reloaded.get(existing_kp.public_key()).unwrap().roles,
             vec![MemberRole::Client]
@@ -4327,7 +4336,8 @@ mod tests {
         //    must still be rolled back consistently (member removed, invite use restored, no
         //    leaked tracker op) while returning `Err` so the caller logs it.
         let dir_fail = tempfile::tempdir().unwrap();
-        let store_fail = MemberStore::load_from_dir(Some(dir_fail.path())).unwrap();
+        let members_dir_fail = dir_fail.path().join("members");
+        let store_fail = MemberStore::load_from_dir(Some(&members_dir_fail)).unwrap();
         let inv_fail = store_fail
             .create_invite(vec![MemberRole::Worker], 1, 3600, true)
             .unwrap();
@@ -4357,7 +4367,8 @@ mod tests {
         // 4. NIT 4: Concurrent worker claim bookkeeping bursts alongside admin mutations persist
         //    every claim and coalesce bursts without losing updates.
         let dir_burst = tempfile::tempdir().unwrap();
-        let store_burst = MemberStore::load_from_dir(Some(dir_burst.path()))
+        let members_dir_burst = dir_burst.path().join("members");
+        let store_burst = MemberStore::load_from_dir(Some(&members_dir_burst))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let burst_kp = NodeKeypair::generate().unwrap();
@@ -4409,7 +4420,7 @@ mod tests {
         }
         admin_handle.join().unwrap();
 
-        let reloaded_burst = MemberStore::load_from_dir(Some(dir_burst.path())).unwrap();
+        let reloaded_burst = MemberStore::load_from_dir(Some(&members_dir_burst)).unwrap();
         assert_eq!(
             reloaded_burst.get(burst_kp.public_key()).unwrap().name,
             "burst-worker-renamed"
@@ -4451,7 +4462,7 @@ mod tests {
             1,
             "8 concurrent worker claims queued behind write_lock must coalesce into 1 disk write"
         );
-        let reloaded_after_coalesce = MemberStore::load_from_dir(Some(dir_burst.path())).unwrap();
+        let reloaded_after_coalesce = MemberStore::load_from_dir(Some(&members_dir_burst)).unwrap();
         let owned_after_coalesce = reloaded_after_coalesce.workers_owned_by(&burst_mid);
         assert_eq!(owned_after_coalesce.len(), wids.len() + coalesce_wids.len());
         for wid in &coalesce_wids {
@@ -4501,7 +4512,8 @@ mod tests {
         //    a regular file) and restores both v3 and v2 claims in memory unless concurrently
         //    reclaimed.
         let dir_m1 = tempfile::tempdir().unwrap();
-        let store_m1 = MemberStore::load_from_dir(Some(dir_m1.path()))
+        let members_dir_m1 = dir_m1.path().join("members");
+        let store_m1 = MemberStore::load_from_dir(Some(&members_dir_m1))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let v3_kp = NodeKeypair::generate().unwrap();
@@ -4586,7 +4598,8 @@ mod tests {
         //    retry (`flush_dirty` or a reconnect bookkeeping flush) writes the rollback to disk so
         //    the declined member cannot come back after a restart and the 1-use invite stays valid.
         let dir_s1 = tempfile::tempdir().unwrap();
-        let store_s1 = MemberStore::load_from_dir(Some(dir_s1.path()))
+        let members_dir_s1 = dir_s1.path().join("members");
+        let store_s1 = MemberStore::load_from_dir(Some(&members_dir_s1))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let inv_s1 = store_s1
@@ -4609,15 +4622,15 @@ mod tests {
         assert!(!store_s1.contains(cand_s1.public_key()));
         assert!(store_s1.is_dirty());
         // Before retry, disk still holds the pre-rollback approved member.
-        assert!(MemberStore::load_from_dir(Some(dir_s1.path()))
+        assert!(MemberStore::load_from_dir(Some(&members_dir_s1))
             .unwrap()
             .contains(cand_s1.public_key()));
 
         // Restore valid save path and retry via `flush_dirty()`.
-        store_s1.set_save_path(Some(dir_s1.path().join(MEMBERS_FILE_NAME)));
+        store_s1.set_save_path(Some(members_dir_s1.join(MEMBERS_FILE_NAME)));
         store_s1.flush_dirty().unwrap();
         assert!(!store_s1.is_dirty());
-        let reloaded_s1 = MemberStore::load_from_dir(Some(dir_s1.path())).unwrap();
+        let reloaded_s1 = MemberStore::load_from_dir(Some(&members_dir_s1)).unwrap();
         assert!(
             !reloaded_s1.contains(cand_s1.public_key()),
             "S1: retried rollback write must remove unconfirmed member on disk"
@@ -4666,13 +4679,13 @@ mod tests {
         store_s1.set_save_path(Some(blocker_s1.join(MEMBERS_FILE_NAME)));
         assert!(store_s1.rollback_approved_enrollment(rb_s1b).is_err());
         assert!(store_s1.is_dirty());
-        store_s1.set_save_path(Some(dir_s1.path().join(MEMBERS_FILE_NAME)));
+        store_s1.set_save_path(Some(members_dir_s1.join(MEMBERS_FILE_NAME)));
         // Reconnect of already-owned `existing_wid` flushes because `dirty == true`.
         store_s1
             .claim_worker_id(existing_wid, &existing_worker_kp.member_id())
             .unwrap();
         assert!(!store_s1.is_dirty());
-        let reloaded_s1b = MemberStore::load_from_dir(Some(dir_s1.path())).unwrap();
+        let reloaded_s1b = MemberStore::load_from_dir(Some(&members_dir_s1)).unwrap();
         assert!(!reloaded_s1b.contains(cand_s1b.public_key()));
         assert_eq!(reloaded_s1b.list_invites()[0].uses_remaining, 1);
 
@@ -4681,7 +4694,8 @@ mod tests {
         //    `dirty` must be set and honoured by a later flush so disk drops the staged member and
         //    restores the invite use.
         let dir_nit2 = tempfile::tempdir().unwrap();
-        let store_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path()))
+        let members_dir_nit2 = dir_nit2.path().join("members");
+        let store_nit2 = MemberStore::load_from_dir(Some(&members_dir_nit2))
             .unwrap()
             .with_auth_mode(AuthMode::Both);
         let inv_nit2 = store_nit2
@@ -4732,15 +4746,15 @@ mod tests {
             "NIT 2: failed resync_write after staged_write + disconnect must mark store dirty"
         );
         // Confirm `staged_write` really landed on disk and `resync_write` really failed.
-        assert!(MemberStore::load_from_dir(Some(dir_nit2.path()))
+        assert!(MemberStore::load_from_dir(Some(&members_dir_nit2))
             .unwrap()
             .contains(cand_nit2.public_key()));
 
         // Restore valid save path and flush dirty state -> disk matches memory again.
-        store_nit2.set_save_path(Some(dir_nit2.path().join(MEMBERS_FILE_NAME)));
+        store_nit2.set_save_path(Some(members_dir_nit2.join(MEMBERS_FILE_NAME)));
         store_nit2.flush_dirty().unwrap();
         assert!(!store_nit2.is_dirty());
-        let reloaded_nit2 = MemberStore::load_from_dir(Some(dir_nit2.path())).unwrap();
+        let reloaded_nit2 = MemberStore::load_from_dir(Some(&members_dir_nit2)).unwrap();
         assert!(!reloaded_nit2.contains(cand_nit2.public_key()));
         assert_eq!(reloaded_nit2.list_invites()[0].uses_remaining, 1);
     }
@@ -4861,13 +4875,14 @@ mod non_member_claim_tests {
     #[test]
     fn revoke_prunes_claims_of_earlier_removed_members() {
         let dir = tempfile::tempdir().unwrap();
+        let members_dir = dir.path().join("members");
         let kept = NodeKeypair::generate().unwrap();
         let revoked = NodeKeypair::generate().unwrap();
         let store = MemberStore::from_entries(vec![
             MemberEntry::new("kept", *kept.public_key(), vec![MemberRole::Worker]),
             MemberEntry::new("revoked", *revoked.public_key(), vec![MemberRole::Worker]),
         ])
-        .with_save_path(dir.path().join(MEMBERS_FILE_NAME));
+        .with_save_path(members_dir.join(MEMBERS_FILE_NAME));
         let kept_wid = Uuid::new_v4();
         let revoked_wid = Uuid::new_v4();
         let orphan_wid = Uuid::new_v4();
@@ -4888,12 +4903,12 @@ mod non_member_claim_tests {
         assert!(store.workers_owned_by(NON_MEMBER).is_empty());
         assert_eq!(store.workers_owned_by(&kept.member_id()), vec![kept_wid]);
 
-        let reloaded = MemberStore::load_from_dir(Some(dir.path())).unwrap();
+        let reloaded = MemberStore::load_from_dir(Some(&members_dir)).unwrap();
         assert_eq!(reloaded.workers_owned_by(&kept.member_id()), vec![kept_wid]);
         assert!(reloaded.workers_owned_by(&revoked.member_id()).is_empty());
         assert!(reloaded.workers_owned_by(NON_MEMBER).is_empty());
         let on_disk: MembersFile = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(MEMBERS_FILE_NAME)).unwrap(),
+            &std::fs::read_to_string(members_dir.join(MEMBERS_FILE_NAME)).unwrap(),
         )
         .unwrap();
         assert_eq!(

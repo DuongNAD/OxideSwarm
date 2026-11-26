@@ -27,6 +27,14 @@ fn cli_cmd(home: &Path) -> Command {
     cmd
 }
 
+/// Runs the CLI binary under the shared macOS spawn lock (`BUG-35`) so concurrent subprocess
+/// spawns inside this test never inherit the in-process `WorkerClient`'s pre-CLOEXEC pipes.
+fn cli_output(home: &Path, args: &[&str], what: &str) -> std::process::Output {
+    let mut cmd = cli_cmd(home);
+    cmd.args(args);
+    rusty_grid_core::process_spawn::output_std(&mut cmd).expect(what)
+}
+
 async fn spawn_test_cluster() -> (
     rusty_grid_master::MasterHandle,
     String,
@@ -80,8 +88,9 @@ async fn test_cli_cancel_stops_running_sleep_task() {
     let (master, master_addr, shutdown_tx, worker_handle, temp) = spawn_test_cluster().await;
     let home = temp.path();
 
-    let submit_out = cli_cmd(home)
-        .args([
+    let submit_out = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &master_addr,
@@ -92,9 +101,9 @@ async fn test_cli_cancel_stops_running_sleep_task() {
             "--command",
             "import time; time.sleep(120)",
             "--json",
-        ])
-        .output()
-        .expect("spawn submit");
+        ],
+        "spawn submit",
+    );
     assert!(
         submit_out.status.success(),
         "submit failed: {}",
@@ -125,10 +134,11 @@ async fn test_cli_cancel_stops_running_sleep_task() {
 
     // F30-4: `result <ID>` without `--wait` on a still-running task exits with code 3
     // (distinct from exit 1 for a failed task).
-    let running_res = cli_cmd(home)
-        .args(["result", &task_id_str, "--master", &master_addr])
-        .output()
-        .expect("spawn result without --wait on running task");
+    let running_res = cli_output(
+        home,
+        &["result", &task_id_str, "--master", &master_addr],
+        "spawn result without --wait on running task",
+    );
     assert_eq!(
         running_res.status.code(),
         Some(3),
@@ -137,10 +147,11 @@ async fn test_cli_cancel_stops_running_sleep_task() {
     );
 
     let cancel_start = Instant::now();
-    let cancel_out = cli_cmd(home)
-        .args(["cancel", &task_id_str, "--master", &master_addr])
-        .output()
-        .expect("spawn cancel");
+    let cancel_out = cli_output(
+        home,
+        &["cancel", &task_id_str, "--master", &master_addr],
+        "spawn cancel",
+    );
     assert!(
         cancel_out.status.success(),
         "cancel failed: {}",
@@ -153,20 +164,22 @@ async fn test_cli_cancel_stops_running_sleep_task() {
     );
 
     // Repeating cancel on an already cancelled task exits non-zero.
-    let second_cancel = cli_cmd(home)
-        .args(["cancel", &task_id_str, "--master", &master_addr, "--json"])
-        .output()
-        .expect("spawn second cancel");
+    let second_cancel = cli_output(
+        home,
+        &["cancel", &task_id_str, "--master", &master_addr, "--json"],
+        "spawn second cancel",
+    );
     assert!(!second_cancel.status.success());
     let second_json: serde_json::Value =
         serde_json::from_slice(&second_cancel.stdout).expect("parse second cancel json");
     assert_eq!(second_json["cancelled"], false);
 
     // `result --wait` on the cancelled task reports cancellation well before 120s sleep.
-    let res_out = cli_cmd(home)
-        .args(["result", &task_id_str, "--master", &master_addr, "--wait"])
-        .output()
-        .expect("spawn result --wait");
+    let res_out = cli_output(
+        home,
+        &["result", &task_id_str, "--master", &master_addr, "--wait"],
+        "spawn result --wait",
+    );
     let cancel_elapsed = cancel_start.elapsed();
     println!("cancelled 120s sleep task reported via result --wait in {cancel_elapsed:?}");
     assert!(!res_out.status.success());
@@ -194,8 +207,9 @@ async fn test_cli_cancel_stops_running_sleep_task() {
 
     // F30-a: Submit a task that stays Queued (`--require-tag absent`), cancel it while queued
     // (so `result.worker_id` is `Uuid::nil()`), and assert `result` prints no `Worker:` line.
-    let queued_sub = cli_cmd(home)
-        .args([
+    let queued_sub = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &master_addr,
@@ -205,24 +219,26 @@ async fn test_cli_cancel_stops_running_sleep_task() {
             "--",
             "echo",
             "never-runs",
-        ])
-        .output()
-        .expect("spawn queued submit");
+        ],
+        "spawn queued submit",
+    );
     assert!(queued_sub.status.success());
     let queued_sub_json: serde_json::Value =
         serde_json::from_slice(&queued_sub.stdout).expect("parse queued_sub json");
     let queued_id = queued_sub_json["task_id"].as_str().expect("queued_id");
 
-    let queued_cancel = cli_cmd(home)
-        .args(["cancel", queued_id, "--master", &master_addr])
-        .output()
-        .expect("cancel queued task");
+    let queued_cancel = cli_output(
+        home,
+        &["cancel", queued_id, "--master", &master_addr],
+        "cancel queued task",
+    );
     assert!(queued_cancel.status.success());
 
-    let queued_res = cli_cmd(home)
-        .args(["result", queued_id, "--master", &master_addr])
-        .output()
-        .expect("result of queued-cancelled task");
+    let queued_res = cli_output(
+        home,
+        &["result", queued_id, "--master", &master_addr],
+        "result of queued-cancelled task",
+    );
     assert!(!queued_res.status.success());
     let queued_res_stdout = String::from_utf8_lossy(&queued_res.stdout);
     assert!(
@@ -241,8 +257,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
     let home = temp.path();
 
     // 1. Submit without `--wait` (so `submit` returns immediately with the task_id).
-    let async_out = cli_cmd(home)
-        .args([
+    let async_out = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &master_addr,
@@ -253,9 +270,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--command",
             "print('hello-from-async-submit')",
             "--json",
-        ])
-        .output()
-        .expect("spawn async submit");
+        ],
+        "spawn async submit",
+    );
     assert!(
         async_out.status.success(),
         "async submit failed: {}",
@@ -269,10 +286,11 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         .to_string();
 
     // Wait for completion via `result --wait`, then read again without `--wait` in JSON mode.
-    let wait_out = cli_cmd(home)
-        .args(["result", &async_id, "--master", &master_addr, "--wait"])
-        .output()
-        .expect("spawn result --wait");
+    let wait_out = cli_output(
+        home,
+        &["result", &async_id, "--master", &master_addr, "--wait"],
+        "spawn result --wait",
+    );
     assert!(
         wait_out.status.success(),
         "result --wait failed: {}",
@@ -286,10 +304,11 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         "unexpected result stdout: {wait_stdout}"
     );
 
-    let read_out = cli_cmd(home)
-        .args(["result", &async_id, "--master", &master_addr, "--json"])
-        .output()
-        .expect("spawn result --json");
+    let read_out = cli_output(
+        home,
+        &["result", &async_id, "--master", &master_addr, "--json"],
+        "spawn result --json",
+    );
     assert!(read_out.status.success());
     let read_json: serde_json::Value =
         serde_json::from_slice(&read_out.stdout).expect("parse result json");
@@ -304,8 +323,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
 
     // 2. Submit a task that produces a blob output and verify `result --output-dir` downloads it.
     let submit_out_dir = home.join("submit_out");
-    let out_submit = cli_cmd(home)
-        .args([
+    let out_submit = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &master_addr,
@@ -320,9 +340,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--output-dir",
             submit_out_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .expect("spawn submit with output");
+        ],
+        "spawn submit with output",
+    );
     assert!(
         out_submit.status.success(),
         "submit with output failed: {}",
@@ -336,8 +356,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         .to_string();
 
     let out_dir: PathBuf = home.join("downloaded_results");
-    let result_out = cli_cmd(home)
-        .args([
+    let result_out = cli_output(
+        home,
+        &[
             "result",
             &task_id_str,
             "--master",
@@ -345,9 +366,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--output-dir",
             out_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .expect("spawn result --output-dir");
+        ],
+        "spawn result --output-dir",
+    );
     assert!(
         result_out.status.success(),
         "result --output-dir failed: {}",
@@ -362,8 +383,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
     // exits non-zero and reports `output_download_error` in `--json`.
     let not_a_dir = home.join("regular_file_not_dir");
     std::fs::write(&not_a_dir, "blocker").expect("write regular_file_not_dir");
-    let bad_blob_dl = cli_cmd(home)
-        .args([
+    let bad_blob_dl = cli_output(
+        home,
+        &[
             "result",
             &task_id_str,
             "--master",
@@ -371,9 +393,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--output-dir",
             not_a_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .expect("spawn result with bad --output-dir for blob");
+        ],
+        "spawn result with bad --output-dir for blob",
+    );
     assert!(
         !bad_blob_dl.status.success(),
         "failed blob download must exit non-zero"
@@ -386,8 +408,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
     );
 
     // 4. F30-5: Verify that `result` preserves the task's non-1 exit code (e.g. exit 7).
-    let exit7_sub = cli_cmd(home)
-        .args([
+    let exit7_sub = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &master_addr,
@@ -398,17 +421,18 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--command",
             "import sys; sys.exit(7)",
             "--json",
-        ])
-        .output()
-        .expect("spawn exit 7 submit");
+        ],
+        "spawn exit 7 submit",
+    );
     let exit7_json: serde_json::Value =
         serde_json::from_slice(&exit7_sub.stdout).expect("parse exit7_sub json");
     let exit7_id = exit7_json["task_id"].as_str().expect("exit7_id");
 
-    let exit7_res = cli_cmd(home)
-        .args(["result", exit7_id, "--master", &master_addr, "--wait"])
-        .output()
-        .expect("spawn result --wait for exit 7");
+    let exit7_res = cli_output(
+        home,
+        &["result", exit7_id, "--master", &master_addr, "--wait"],
+        "spawn result --wait for exit 7",
+    );
     assert_eq!(
         exit7_res.status.code(),
         Some(7),
@@ -419,8 +443,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
     // 4b. N1: Verify that a task exiting with code 3 maps to process exit code 1 in `result`
     // (so exit code 3 is reserved unambiguously for a still-running/non-terminal task),
     // while `--json` preserves `"exit_code": 3`.
-    let exit3_sub = cli_cmd(home)
-        .args([
+    let exit3_sub = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &master_addr,
@@ -431,24 +456,25 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--command",
             "import sys; sys.exit(3)",
             "--json",
-        ])
-        .output()
-        .expect("spawn exit 3 submit");
+        ],
+        "spawn exit 3 submit",
+    );
     let exit3_json: serde_json::Value =
         serde_json::from_slice(&exit3_sub.stdout).expect("parse exit3_sub json");
     let exit3_id = exit3_json["task_id"].as_str().expect("exit3_id");
 
-    let exit3_res = cli_cmd(home)
-        .args([
+    let exit3_res = cli_output(
+        home,
+        &[
             "result",
             exit3_id,
             "--master",
             &master_addr,
             "--wait",
             "--json",
-        ])
-        .output()
-        .expect("spawn result --wait --json for exit 3");
+        ],
+        "spawn result --wait --json for exit 3",
+    );
     assert_eq!(
         exit3_res.status.code(),
         Some(1),
@@ -488,8 +514,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         .expect("recv inline task completion");
 
     let inline_ok_dir = home.join("inline_ok");
-    let inline_ok = cli_cmd(home)
-        .args([
+    let inline_ok = cli_output(
+        home,
+        &[
             "result",
             &inline_id,
             "--master",
@@ -497,9 +524,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--output-dir",
             inline_ok_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .expect("spawn result for inline artifact");
+        ],
+        "spawn result for inline artifact",
+    );
     assert!(
         inline_ok.status.success(),
         "inline artifact save failed: {}",
@@ -518,8 +545,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         std::fs::write(&victim, "SAFE_ORIGINAL").expect("write victim");
         std::os::unix::fs::symlink(&victim, symlink_dir.join("rep.txt")).expect("create symlink");
 
-        let symlink_res = cli_cmd(home)
-            .args([
+        let symlink_res = cli_output(
+            home,
+            &[
                 "result",
                 &inline_id,
                 "--master",
@@ -527,9 +555,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
                 "--output-dir",
                 symlink_dir.to_str().unwrap(),
                 "--json",
-            ])
-            .output()
-            .expect("spawn result into symlink dir");
+            ],
+            "spawn result into symlink dir",
+        );
         assert!(
             !symlink_res.status.success(),
             "result must exit non-zero when artifact target is a symlink"
@@ -555,8 +583,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         std::os::unix::fs::symlink(&real_root_dir, &symlink_root_dir)
             .expect("create symlink_output_root");
 
-        let symlink_root_res = cli_cmd(home)
-            .args([
+        let symlink_root_res = cli_output(
+            home,
+            &[
                 "result",
                 &inline_id,
                 "--master",
@@ -564,9 +593,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
                 "--output-dir",
                 symlink_root_dir.to_str().unwrap(),
                 "--json",
-            ])
-            .output()
-            .expect("spawn result into symlinked root output-dir");
+            ],
+            "spawn result into symlinked root output-dir",
+        );
         assert!(
             symlink_root_res.status.success(),
             "symlinked --output-dir root directory must be accepted: {}",
@@ -579,8 +608,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         );
     }
 
-    let bad_inline_dl = cli_cmd(home)
-        .args([
+    let bad_inline_dl = cli_output(
+        home,
+        &[
             "result",
             &inline_id,
             "--master",
@@ -588,9 +618,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--output-dir",
             not_a_dir.to_str().unwrap(),
             "--json",
-        ])
-        .output()
-        .expect("spawn result with file as --output-dir for inline artifact");
+        ],
+        "spawn result with file as --output-dir for inline artifact",
+    );
     assert!(
         !bad_inline_dl.status.success(),
         "failed inline artifact save must exit non-zero"
@@ -674,8 +704,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
         }
     });
 
-    let bad_submit_inline = cli_cmd(home)
-        .args([
+    let bad_submit_inline = cli_output(
+        home,
+        &[
             "submit",
             "--master",
             &mock_addr,
@@ -688,9 +719,9 @@ async fn test_cli_result_reads_finished_task_and_downloads_outputs() {
             "--",
             "echo",
             "inline-fail",
-        ])
-        .output()
-        .expect("spawn submit with regular file as --output-dir for inline artifact");
+        ],
+        "spawn submit with regular file as --output-dir for inline artifact",
+    );
     assert!(
         !bad_submit_inline.status.success(),
         "submit must exit non-zero when saving inline OutputArtifact fails"

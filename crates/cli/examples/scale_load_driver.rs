@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Serialize;
-use sysinfo::{Pid, ProcessRefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile::Builder as TempBuilder;
 use tokio::sync::watch;
 
@@ -489,11 +489,13 @@ fn spawn_process_sampler(
     let handle = std::thread::spawn(move || {
         let mut sys = System::new();
         let sys_pid = Pid::from_u32(pid);
-        let refresh = ProcessRefreshKind::new().with_memory().with_cpu();
-        sys.refresh_process_specifics(sys_pid, refresh);
+        let refresh = ProcessRefreshKind::nothing().with_memory().with_cpu();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sys_pid]), true, refresh);
         while !stop_flag.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(100));
-            if sys.refresh_process_specifics(sys_pid, refresh) {
+            if sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sys_pid]), true, refresh)
+                > 0
+            {
                 if let Some(proc) = sys.process(sys_pid) {
                     samples_ref
                         .lock()

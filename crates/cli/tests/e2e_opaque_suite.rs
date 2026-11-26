@@ -56,9 +56,32 @@ fn txt(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+fn preserve_toolchain_env(cmd: &mut Command) {
+    let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".rustup"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", p);
+    }
+    if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".cargo"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("CARGO_HOME", p);
+    }
+}
+
 fn cmd_for(bin: &str, h: &Path) -> Command {
     let mut c = Command::new(bin);
     scrub_env(&mut c);
+    preserve_toolchain_env(&mut c);
     c.current_dir(h)
         .env("HOME", h)
         .env("USERPROFILE", h)
@@ -179,6 +202,7 @@ fn mode_run(h: &Path, args: &[&str]) -> Output {
 fn py_in(h: &Path, dir: &Path, extra_env: &[(&str, &Path)], args: &[&str]) -> Output {
     let mut c = Command::new("python3");
     scrub_env(&mut c);
+    preserve_toolchain_env(&mut c);
     c.current_dir(dir).env("HOME", h).env("TMPDIR", h);
     for (k, v) in extra_env {
         c.env(k, v);
@@ -2963,7 +2987,17 @@ fn s5a_release_readiness_hygiene_and_skew_baseline_e2e() {
 #[test]
 fn s5b_release_readiness_m2_citation_and_skew_pin_e2e() {
     let cff = fs::read_to_string(root().join("CITATION.cff")).unwrap();
-    assert!(cff.contains("cff-version: 1.2.0") && cff.contains("0.4.4"));
+    let cargo = fs::read_to_string(root().join("Cargo.toml")).unwrap();
+    let version = cargo
+        .split("[workspace.package]")
+        .nth(1)
+        .and_then(|sec| sec.lines().find(|l| l.trim_start().starts_with("version")))
+        .and_then(|l| l.split('"').nth(1))
+        .expect("[workspace.package] version in Cargo.toml");
+    assert!(
+        cff.contains("cff-version: 1.2.0") && cff.contains(&format!("version: \"{version}\"")),
+        "CITATION.cff must name the workspace version {version}"
+    );
     let ci = fs::read_to_string(root().join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains("v0.3.0") && ci.contains("release-skew"));
 }

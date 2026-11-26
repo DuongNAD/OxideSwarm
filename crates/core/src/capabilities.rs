@@ -1532,7 +1532,7 @@ fn run_command_bounded(
     let mut child = {
         let mut attempt = 0;
         loop {
-            match cmd.spawn() {
+            match crate::process_spawn::spawn_std(cmd) {
                 Ok(c) => break c,
                 // On Unix, executing a freshly written script while another thread forks can yield
                 // ETXTBSY (26); retry briefly.
@@ -3670,7 +3670,7 @@ Now drawing from 'AC Power'
         };
         let deadline = std::time::Instant::now() + wait_budget;
         loop {
-            sys.refresh_processes();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let alive = sys
                 .process(sysinfo::Pid::from(pid as usize))
                 .is_some_and(|p| p.status() != sysinfo::ProcessStatus::Zombie);

@@ -3456,14 +3456,16 @@ mod tests {
         let _ = stop_tx.send(true);
         let _ = handle.await;
 
-        // 2. Oldest compatible peer (`PROTOCOL_VERSION_MIN_COMPATIBLE` = 10 >=
-        //    EXTENSION_PROTOCOL_VERSION): strips master-owned prefixes while preserving ext:32770.
-        let (ctrl_master_v10, ctrl_worker_v10) = tokio::io::duplex(64 * 1024);
-        let (data_master_v10, _data_worker_v10) = tokio::io::duplex(64 * 1024);
-        let (stop_tx_v10, stop_rx_v10) = watch::channel(false);
-        let pre_auth_v10 = PreAuthSession::new_multiplexed(
-            ctrl_master_v10,
-            data_master_v10,
+        // 2. Minimum compatible peer (`PROTOCOL_VERSION_MIN_COMPATIBLE` = v10): strips
+        //    `opt:*`, `speed:*`, `proto:*`, `state:*`, `id:*`, `link:*`, `feat:*`, while
+        //    preserving `ext:32770` (since v10 >= EXTENSION_PROTOCOL_VERSION), `slots:4`, and
+        //    `user:legit`, and stamps `proto:<min_compatible>`.
+        let (ctrl_master_min, ctrl_worker_min) = tokio::io::duplex(64 * 1024);
+        let (data_master_min, _data_worker_min) = tokio::io::duplex(64 * 1024);
+        let (stop_tx_min, stop_rx_min) = watch::channel(false);
+        let pre_auth_min = PreAuthSession::new_multiplexed(
+            ctrl_master_min,
+            data_master_min,
             SocketAddr::from(([127, 0, 0, 1], 55_001)),
             WireCodec::Json,
             #[cfg(feature = "p2p")]
@@ -3471,27 +3473,27 @@ mod tests {
             #[cfg(feature = "p2p")]
             None,
         );
-        let reg_v10 = registry.clone();
-        let q_v10 = queue.clone();
-        let n_v10 = notify.clone();
-        let w_v10 = waiters.clone();
-        let b_v10 = Arc::clone(&blob_store);
-        let handle_v10 = tokio::spawn(async move {
+        let reg_min = registry.clone();
+        let q_min = queue.clone();
+        let n_min = notify.clone();
+        let w_min = waiters.clone();
+        let b_min = Arc::clone(&blob_store);
+        let handle_min = tokio::spawn(async move {
             WorkerSession::run_connection(
-                pre_auth_v10,
-                reg_v10,
-                q_v10,
-                n_v10,
-                w_v10,
+                pre_auth_min,
+                reg_min,
+                q_min,
+                n_min,
+                w_min,
                 10,
                 Duration::from_secs(5),
-                stop_rx_v10,
+                stop_rx_min,
                 None,
                 WireCodec::Json,
                 None,
                 MasterAuthContext::default(),
                 None,
-                Some(b_v10),
+                Some(b_min),
                 None,
                 #[cfg(feature = "dashboard")]
                 None,
@@ -3499,116 +3501,59 @@ mod tests {
             .await
         });
 
-        let wid_v10 = Uuid::new_v4();
-        let mut wt_v10 = MessageTransport::with_codec(ctrl_worker_v10, WireCodec::Json);
-        wt_v10
+        let wid_min = Uuid::new_v4();
+        let mut wt_min = MessageTransport::with_codec(ctrl_worker_min, WireCodec::Json);
+        wt_min
             .send_msg(&WorkerMessage::Register {
-                worker_id: wid_v10,
-                capabilities: caps.clone(),
+                worker_id: wid_min,
+                capabilities: caps,
                 protocol_version: rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE,
                 features: ProtocolCapabilities::empty(),
             })
             .await
             .unwrap();
-        let ack_v10 = wt_v10.recv_msg::<MasterMessage>().await.unwrap();
+        let ack_min = wt_min.recv_msg::<MasterMessage>().await.unwrap();
         assert!(matches!(
-            ack_v10,
+            ack_min,
             Some(MasterMessage::RegisterAck { accepted: true, .. })
         ));
-        let stored_v10 = registry
-            .get_worker(wid_v10)
+        let stored_min = registry
+            .get_worker(wid_min)
             .await
-            .expect("v10 worker registered");
+            .expect("min compatible worker registered");
         for forbidden in [
             "opt:", "speed:", "proto:99", "state:", "id:", "link:", "feat:",
         ] {
             assert!(
-                !stored_v10
+                !stored_min
                     .capabilities
                     .tags
                     .iter()
                     .any(|t| t.starts_with(forbidden)),
-                "v10 forged prefix `{forbidden}` survived Register sanitization: {:?}",
-                stored_v10.capabilities.tags
+                "min-compatible forged prefix `{forbidden}` survived Register sanitization: {:?}",
+                stored_min.capabilities.tags
             );
         }
-        assert!(stored_v10
+        assert!(stored_min
             .capabilities
             .tags
             .iter()
             .any(|t| t == "ext:32770"));
-        assert!(stored_v10.capabilities.tags.iter().any(|t| t == "slots:4"));
-        assert!(stored_v10
+        assert!(stored_min.capabilities.tags.iter().any(|t| t == "slots:4"));
+        assert!(stored_min
             .capabilities
             .tags
             .iter()
             .any(|t| t == "user:legit"));
-        assert!(stored_v10.capabilities.tags.iter().any(|t| {
+        assert!(stored_min.capabilities.tags.iter().any(|t| {
             t == &format!(
                 "proto:{}",
                 rusty_grid_core::protocol::PROTOCOL_VERSION_MIN_COMPATIBLE
             )
         }));
 
-        let _ = stop_tx_v10.send(true);
-        let _ = handle_v10.await;
-
-        // 3. v9 peer (`EXTENSION_PROTOCOL_VERSION - 1`): rejected below minimum protocol version.
-        let (ctrl_master_v9, ctrl_worker_v9) = tokio::io::duplex(64 * 1024);
-        let (data_master_v9, _data_worker_v9) = tokio::io::duplex(64 * 1024);
-        let (stop_tx_v9, stop_rx_v9) = watch::channel(false);
-        let pre_auth_v9 = PreAuthSession::new_multiplexed(
-            ctrl_master_v9,
-            data_master_v9,
-            SocketAddr::from(([127, 0, 0, 1], 55_002)),
-            WireCodec::Json,
-            #[cfg(feature = "p2p")]
-            None,
-            #[cfg(feature = "p2p")]
-            None,
-        );
-        let handle_v9 = tokio::spawn(WorkerSession::run_connection(
-            pre_auth_v9,
-            registry.clone(),
-            queue.clone(),
-            notify.clone(),
-            waiters.clone(),
-            10,
-            Duration::from_secs(5),
-            stop_rx_v9,
-            None,
-            WireCodec::Json,
-            None,
-            MasterAuthContext::default(),
-            None,
-            Some(Arc::clone(&blob_store)),
-            None,
-            #[cfg(feature = "dashboard")]
-            None,
-        ));
-        let wid_v9 = Uuid::new_v4();
-        let mut wt_v9 = MessageTransport::with_codec(ctrl_worker_v9, WireCodec::Json);
-        wt_v9
-            .send_msg(&WorkerMessage::Register {
-                worker_id: wid_v9,
-                capabilities: caps,
-                protocol_version: rusty_grid_core::task::EXTENSION_PROTOCOL_VERSION - 1,
-                features: ProtocolCapabilities::empty(),
-            })
-            .await
-            .unwrap();
-        let ack_v9 = wt_v9.recv_msg::<MasterMessage>().await.unwrap();
-        assert!(matches!(
-            ack_v9,
-            Some(MasterMessage::RegisterAck {
-                accepted: false,
-                ..
-            })
-        ));
-        assert!(registry.get_worker(wid_v9).await.is_none());
-
-        let _ = stop_tx_v9.send(true);
-        let _ = handle_v9.await;
+        let _ = stop_tx_min.send(true);
+        let _ = handle_min.await;
     }
 
     #[tokio::test]

@@ -405,11 +405,11 @@ pub(super) async fn probe(level: IsolationLevel, sandbox_base: &Path) -> Result<
                 outside.to_string_lossy().into_owned(),
             ],
         )?;
-        let output = tokio::process::Command::new(program)
-            .args(args)
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
             .current_dir(&probe_dir)
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(std::process::Stdio::null());
+        let output = rusty_grid_core::process_spawn::output_tokio(&mut cmd)
             .await
             .map_err(|e| fail(format!("could not run {SANDBOX_EXEC}: {e}")))?;
         match output.status.code() {

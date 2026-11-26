@@ -1,7 +1,7 @@
 //! Cross-version tests of the compatibility window (design 0083 D7, design 0098).
 //!
 //! `tests/data/wire_layout_previous.txt` is the `wire_layout.txt` of the latest release that speaks
-//! `PROTOCOL_VERSION_CURRENT - 1` (`v0.4.4`, protocol 10), copied from its tag. It is the oracle:
+//! `PROTOCOL_VERSION_CURRENT - 1` (`v0.4.5`, protocol 10), copied from its tag. It is the oracle:
 //! the bytes a v10 peer really sent and really read, so no encoder written here can drift from
 //! them. Both the previous file and the current file record the trailing four-byte stamp of
 //! `ClientMessage` and `ClientResponse` as `0`.
@@ -126,7 +126,7 @@ fn peer_to_master_previous_bytes_decode_to_the_canonical_samples() {
     assert!(checked > 25, "only {checked} previous entries were decoded");
 }
 
-/// D7.2: what the master sends a v10 peer is exactly what v0.4.4 recorded (with `ClusterStatus`
+/// D7.2: what the master sends a v10 peer is exactly what v0.4.5 recorded (with `ClusterStatus`
 /// folding `cancelled_tasks` into `failed_tasks` and `Hello` reporting the master's current
 /// `PROTOCOL_VERSION_MIN_COMPATIBLE`), byte for byte.
 #[test]
@@ -205,11 +205,11 @@ fn master_to_peer_current_samples_encode_as_the_previous_bytes() {
             min_compatible_version,
         } = &resp
         {
-            // v0.4.4's canonical `Hello` carried `min_compatible_version = 9`; protocol 11's master
+            // v0.4.5's canonical `Hello` carried `min_compatible_version = 9`; protocol 11's master
             // reports its own `min_compatible_version = 10` in the unchanged field slot.
             let prev_body = without_stamp(recorded);
             let old_min = to_hex(&9u32.to_le_bytes());
-            assert!(prev_body.ends_with(&old_min), "{key}: v0.4.4 Hello min");
+            assert!(prev_body.ends_with(&old_min), "{key}: v0.4.5 Hello min");
             format!(
                 "{}{}",
                 &prev_body[..prev_body.len() - 8],

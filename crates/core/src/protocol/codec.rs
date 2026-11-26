@@ -312,7 +312,7 @@ pub fn serialize_message_for_peer<M: Serialize + 'static>(
 
 /// Serializes a [`ClientMessage`] as a v10 client sends it (design 0098, for tests): stamped 10.
 /// All `ClientMessage` layouts match between protocol 10 and 11, which `wire_layout_previous.txt`
-/// (`v0.4.4`) pins.
+/// (`v0.4.5`) pins.
 #[cfg(any(test, feature = "test-extensions"))]
 pub fn serialize_v10_client_message(
     msg: &ClientMessage,

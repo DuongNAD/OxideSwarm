@@ -954,11 +954,11 @@ impl GridBackend for RemoteMasterBackend {
                     running_tasks,
                     completed_tasks,
                     failed_tasks,
+                    cancelled_tasks,
                     workers,
                     active_bytes,
                     max_active_bytes,
                     store_error,
-                    cancelled_tasks,
                 } => {
                     let active_workers = workers
                         .iter()
@@ -983,6 +983,7 @@ impl GridBackend for RemoteMasterBackend {
                         running_tasks,
                         completed_tasks,
                         failed_tasks,
+                        cancelled_tasks,
                         queue_json,
                         workers_json,
                     })

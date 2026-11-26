@@ -52,6 +52,9 @@ pub const SID_ALL_APP_PACKAGES: &str = "S-1-15-2-1";
 /// `INHERIT_ONLY_ACE` (`ACE_HEADER.AceFlags`): the ACE propagates to children when inheritance is
 /// enabled, and does not grant access to the directory itself.
 pub const ACE_FLAG_INHERIT_ONLY: u8 = 0x08;
+/// `INHERITED_ACE` (`ACE_HEADER.AceFlags`): the ACE was inherited from a parent object rather than
+/// set explicitly on this object; `icacls /inheritance:r` removes all such ACEs.
+pub const ACE_FLAG_INHERITED: u8 = 0x10;
 
 /// Access-mask bits that make an entry a problem for a private file: read, write, append, change
 /// the DACL, take ownership, or generic read/write/all (`GENERIC_EXECUTE`-only and
@@ -274,28 +277,114 @@ fn append_icacls_remove_args(cmd: &mut String, offenders: &[String], user_sid: &
     }
 }
 
+/// Filters `offenders` to non-trusted SIDs that appear on at least one non-inherited ACE
+/// (`ace.flags & ACE_FLAG_INHERITED == 0`). Inherited-only ACEs are stripped automatically by
+/// `icacls /inheritance:r` and need not (and for unresolvable SIDs, must not) be passed to
+/// `/remove:g`.
+pub fn explicit_offending_sids(
+    aces: &[DaclAce],
+    offenders: &[String],
+    user_sid: &str,
+) -> Vec<String> {
+    offenders
+        .iter()
+        .filter(|sid| !is_trusted_owner_sid(sid, user_sid))
+        .filter(|sid| {
+            aces.iter()
+                .any(|ace| ace.flags & ACE_FLAG_INHERITED == 0 && ace.sid.eq_ignore_ascii_case(sid))
+        })
+        .cloned()
+        .collect()
+}
+
+fn build_icacls_private_command(
+    path: &Path,
+    explicit_offenders: &[String],
+    user_sid: &str,
+    directory: bool,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> String {
+    let grant_suffix = if directory { ":(OI)(CI)F" } else { ":F" };
+    let mut base = format!(
+        "icacls \"{path}\" /inheritance:r /grant:r \"*{user_sid}{grant_suffix}\" \
+         \"*S-1-5-18{grant_suffix}\" \"*S-1-5-32-544{grant_suffix}\"",
+        path = path.display(),
+    );
+    let explicit: Vec<String> = explicit_offenders
+        .iter()
+        .filter(|s| !is_trusted_owner_sid(s, user_sid))
+        .cloned()
+        .collect();
+    if explicit.iter().any(|s| !is_resolvable(s)) {
+        // `/remove:g "*<sid>"` exits 1332 (`ERROR_NONE_MAPPED`) when any explicit SID fails
+        // `LookupAccountSidW`. `/reset` replaces the explicit DACL with inherited ACEs without
+        // name/SID lookup, and `/inheritance:r /grant:r` then locks it cleanly (BUG-39).
+        return format!("icacls \"{path}\" /reset && {base}", path = path.display());
+    }
+    append_icacls_remove_args(&mut base, &explicit, user_sid);
+    base
+}
+
 /// Locale-independent `icacls` command that locks `path` (a file) to `user_sid`, `SYSTEM` and
 /// `Administrators`, removing any explicit grants to `offenders`.
 pub fn icacls_private_file_command(path: &Path, offenders: &[String], user_sid: &str) -> String {
-    let mut cmd = format!(
-        "icacls \"{path}\" /inheritance:r /grant:r \"*{user_sid}:F\" \
-         \"*S-1-5-18:F\" \"*S-1-5-32-544:F\"",
-        path = path.display(),
-    );
-    append_icacls_remove_args(&mut cmd, offenders, user_sid);
-    cmd
+    icacls_private_file_command_with_resolver(path, offenders, user_sid, |_| true)
+}
+
+/// Like [`icacls_private_file_command`], using `is_resolvable` to fall back to `icacls /reset &&`
+/// when any explicit offender SID does not resolve via `LookupAccountSidW` (`ERROR_NONE_MAPPED`).
+pub fn icacls_private_file_command_with_resolver(
+    path: &Path,
+    explicit_offenders: &[String],
+    user_sid: &str,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> String {
+    build_icacls_private_command(path, explicit_offenders, user_sid, false, is_resolvable)
+}
+
+/// Builds the private-file `icacls` remedy from parsed DACL ACEs, omitting inherited-only SIDs
+/// from `/remove:g` and falling back to `/reset &&` when an explicit offending SID does not
+/// resolve.
+pub fn icacls_private_file_command_for_aces(
+    path: &Path,
+    aces: &[DaclAce],
+    offenders: &[String],
+    user_sid: &str,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> String {
+    let explicit = explicit_offending_sids(aces, offenders, user_sid);
+    build_icacls_private_command(path, &explicit, user_sid, false, is_resolvable)
 }
 
 /// Locale-independent `icacls` command that locks `path` (a directory) to `user_sid`, `SYSTEM` and
 /// `Administrators` with `(OI)(CI)F`, removing any explicit grants to `offenders`.
 pub fn icacls_private_dir_command(path: &Path, offenders: &[String], user_sid: &str) -> String {
-    let mut cmd = format!(
-        "icacls \"{path}\" /inheritance:r /grant:r \"*{user_sid}:(OI)(CI)F\" \
-         \"*S-1-5-18:(OI)(CI)F\" \"*S-1-5-32-544:(OI)(CI)F\"",
-        path = path.display(),
-    );
-    append_icacls_remove_args(&mut cmd, offenders, user_sid);
-    cmd
+    icacls_private_dir_command_with_resolver(path, offenders, user_sid, |_| true)
+}
+
+/// Like [`icacls_private_dir_command`], using `is_resolvable` to fall back to `icacls /reset &&`
+/// when any explicit offender SID does not resolve via `LookupAccountSidW` (`ERROR_NONE_MAPPED`).
+pub fn icacls_private_dir_command_with_resolver(
+    path: &Path,
+    explicit_offenders: &[String],
+    user_sid: &str,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> String {
+    build_icacls_private_command(path, explicit_offenders, user_sid, true, is_resolvable)
+}
+
+/// Builds the private-directory `icacls` remedy from parsed DACL ACEs, omitting inherited-only
+/// SIDs from `/remove:g` and falling back to `/reset &&` when an explicit offending SID does not
+/// resolve.
+pub fn icacls_private_dir_command_for_aces(
+    path: &Path,
+    aces: &[DaclAce],
+    offenders: &[String],
+    user_sid: &str,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> String {
+    let explicit = explicit_offending_sids(aces, offenders, user_sid);
+    build_icacls_private_command(path, &explicit, user_sid, true, is_resolvable)
 }
 
 /// The warning for a private file whose DACL grants access to `offenders`, with a
@@ -320,6 +409,28 @@ pub fn open_acl_warning(
     ))
 }
 
+/// Like [`open_acl_warning`], using `aces` and `is_resolvable` so inherited-only SIDs and
+/// unresolvable explicit SIDs never cause `icacls /remove:g` to exit `1332` (`ERROR_NONE_MAPPED`).
+pub fn open_acl_warning_for_aces(
+    path: &Path,
+    what: &str,
+    aces: &[DaclAce],
+    offenders: &[String],
+    user_sid: &str,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if offenders.is_empty() {
+        return None;
+    }
+    let who: Vec<String> = offenders.iter().map(|s| sid_label(s)).collect();
+    let cmd = icacls_private_file_command_for_aces(path, aces, offenders, user_sid, is_resolvable);
+    Some(format!(
+        "{what} '{path}' is accessible by other accounts ({who}); to make it private run: {cmd}",
+        path = path.display(),
+        who = who.join(", "),
+    ))
+}
+
 /// The warning for an existing task directory whose DACL grants read access to `offenders`, with a
 /// locale-independent `icacls` command using `*<user_sid>`, `*S-1-5-18`, `*S-1-5-32-544` and
 /// `/remove:g` for each offender. `None` when `offenders` is empty.
@@ -329,6 +440,27 @@ pub fn open_dir_acl_warning(path: &Path, offenders: &[String], user_sid: &str) -
     }
     let who: Vec<String> = offenders.iter().map(|s| sid_label(s)).collect();
     let cmd = icacls_private_dir_command(path, offenders, user_sid);
+    Some(format!(
+        "'{path}' lets other accounts ({who}) read task files; to make it private run: {cmd}",
+        path = path.display(),
+        who = who.join(", "),
+    ))
+}
+
+/// Like [`open_dir_acl_warning`], using `aces` and `is_resolvable` so inherited-only SIDs and
+/// unresolvable explicit SIDs never cause `icacls /remove:g` to exit `1332` (`ERROR_NONE_MAPPED`).
+pub fn open_dir_acl_warning_for_aces(
+    path: &Path,
+    aces: &[DaclAce],
+    offenders: &[String],
+    user_sid: &str,
+    is_resolvable: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if offenders.is_empty() {
+        return None;
+    }
+    let who: Vec<String> = offenders.iter().map(|s| sid_label(s)).collect();
+    let cmd = icacls_private_dir_command_for_aces(path, aces, offenders, user_sid, is_resolvable);
     Some(format!(
         "'{path}' lets other accounts ({who}) read task files; to make it private run: {cmd}",
         path = path.display(),
@@ -394,8 +526,9 @@ pub use win::{
     create_or_open_private_dir_all, create_or_open_private_dir_all_with_hooks,
     create_private_dir_all, create_private_new, current_user_sid, ensure_volume_keeps_permissions,
     inspect_dir_security_no_follow, is_handle_trusted_owner, is_path_trusted_owner_no_follow,
-    open_acl_or_volume_message, read_dacl, volume_info, warn_if_readable_by_others,
-    write_private_replace, DirSecuritySnapshot, PrivateDirOutcome,
+    open_acl_or_volume_message, open_acl_or_volume_message_for_aces, read_dacl, sid_is_resolvable,
+    volume_info, warn_if_readable_by_others, write_private_replace, DirSecuritySnapshot,
+    PrivateDirOutcome,
 };
 
 /// Refuses `path` when its volume keeps no file permissions (BUG-24). Unix: not checked (design
@@ -409,8 +542,8 @@ pub fn ensure_volume_keeps_permissions(_path: &Path, _what: &str) -> Result<(), 
 mod win {
     use super::{
         claim_warning_for_path, is_trusted_owner_sid, no_permissions_volume_message,
-        open_acl_warning, open_grants, private_sddl, volume_keeps_permissions, DaclAce,
-        FILE_PERSISTENT_ACLS,
+        open_acl_warning, open_acl_warning_for_aces, open_grants, private_sddl,
+        volume_keeps_permissions, DaclAce, FILE_PERSISTENT_ACLS,
     };
     use std::ffi::c_void;
     use std::fs::File;
@@ -419,21 +552,24 @@ mod win {
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
-    use std::ptr::null_mut;
+    use std::ptr::{null, null_mut};
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, LocalFree, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
         AclSizeInformation, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-        GetTokenInformation, IsValidSid, TokenUser, ACE_HEADER, ACL, ACL_SIZE_INFORMATION,
-        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-        SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, IsValidSid, LookupAccountSidW, TokenUser, ACE_HEADER, ACL,
+        ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, SID_NAME_USE,
+        TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetVolumeInformationByHandleW,
@@ -1344,6 +1480,41 @@ mod win {
         }
     }
 
+    /// True when Windows can map SDDL string `sid` to an account via `LookupAccountSidW`.
+    /// Unresolvable SIDs (Deleted/orphaned accounts returning `ERROR_NONE_MAPPED` = `1332`)
+    /// return `false` so `icacls` remedy builders avoid `/remove:g "*<sid>"`, which fails with
+    /// exit code `1332` (BUG-39).
+    pub fn sid_is_resolvable(sid: &str) -> bool {
+        let wide_sid: Vec<u16> = sid.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut raw_sid: PSID = null_mut();
+        // SAFETY: `wide_sid` is NUL-terminated; on success `raw_sid` points to a system
+        // allocation owned and freed by `_guard`.
+        if unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &mut raw_sid) } == 0
+            || raw_sid.is_null()
+        {
+            return false;
+        }
+        let _guard = LocalBuf(raw_sid);
+        let mut name_len = 0u32;
+        let mut domain_len = 0u32;
+        let mut sid_use: SID_NAME_USE = 0;
+        // SAFETY: `raw_sid` points to the live SID allocation guarded by `_guard`; null output
+        // buffers with zero lengths probe resolvability without heap allocation.
+        let ok = unsafe {
+            LookupAccountSidW(
+                null(),
+                raw_sid,
+                null_mut(),
+                &mut name_len,
+                null_mut(),
+                &mut domain_len,
+                &mut sid_use,
+            )
+        };
+        ok != 0
+            || io::Error::last_os_error().raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER as i32)
+    }
+
     /// The message for a private file whose DACL grants access to `offenders`: on a volume that
     /// keeps no permissions, [`no_permissions_volume_message`] (no `icacls` command can fix that),
     /// otherwise [`open_acl_warning`]. `None` when `offenders` is empty.
@@ -1364,6 +1535,28 @@ mod win {
         }
     }
 
+    /// Like [`open_acl_or_volume_message`], using `aces` and [`sid_is_resolvable`] so inherited
+    /// and unresolvable SIDs yield an `icacls` command that exits `0` (BUG-39).
+    pub fn open_acl_or_volume_message_for_aces(
+        path: &Path,
+        what: &str,
+        aces: &[DaclAce],
+        offenders: &[String],
+        user_sid: &str,
+    ) -> Option<String> {
+        if offenders.is_empty() {
+            return None;
+        }
+        match volume_info(path) {
+            Ok((fs_name, flags)) if !volume_keeps_permissions(flags) => {
+                Some(no_permissions_volume_message(path, what, &fs_name))
+            }
+            _ => {
+                open_acl_warning_for_aces(path, what, aces, offenders, user_sid, sid_is_resolvable)
+            }
+        }
+    }
+
     /// Logs a warning (at most once per path per process, never an error) when the DACL of the
     /// existing file `path` grants access to an account other than the current user, `SYSTEM` and
     /// `Administrators`, or when reading the DACL fails. `what` names the file in the message
@@ -1371,11 +1564,14 @@ mod win {
     pub fn warn_if_readable_by_others(path: &Path, what: &str) {
         let checked = current_user_sid().and_then(|user_sid| {
             let (aces, _) = read_dacl(path)?;
-            Ok((open_grants(&aces, &user_sid), user_sid))
+            let offenders = open_grants(&aces, &user_sid);
+            Ok((aces, offenders, user_sid))
         });
         match checked {
-            Ok((offenders, user_sid)) => {
-                if let Some(msg) = open_acl_or_volume_message(path, what, &offenders, &user_sid) {
+            Ok((aces, offenders, user_sid)) => {
+                if let Some(msg) =
+                    open_acl_or_volume_message_for_aces(path, what, &aces, &offenders, &user_sid)
+                {
                     if claim_warning_for_path(path) {
                         tracing::warn!("{msg}");
                     }
@@ -1689,6 +1885,110 @@ mod tests {
             !msg.contains("\"SYSTEM:") && !msg.contains("\"Administrators:"),
             "icacls hint must use *S-1-5-18 and *S-1-5-32-544 rather than localized names: {msg}"
         );
+    }
+
+    #[test]
+    fn remedy_omits_inherited_only_aces_from_remove_g_including_unresolvable() {
+        const UNRES_SID: &str = "S-1-5-21-111111111-222222222-333333333-88888";
+        let dir_path = Path::new(r"C:\Temp\work");
+        let file_path = Path::new(r"C:\Temp\cluster.secret");
+        let aces = [
+            ace(ME, 0x001F_01FF),
+            ace_with_flags(SID_EVERYONE, 0x0012_00A9, ACE_FLAG_INHERITED | 0x03),
+            ace_with_flags(UNRES_SID, 0x0012_00A9, ACE_FLAG_INHERITED | 0x03),
+        ];
+
+        let dir_offenders = dir_open_grants(&aces, ME);
+        let dir_warn =
+            open_dir_acl_warning_for_aces(dir_path, &aces, &dir_offenders, ME, |s| s != UNRES_SID)
+                .unwrap();
+        assert!(dir_warn.contains("Everyone"), "{dir_warn}");
+        assert!(dir_warn.contains(UNRES_SID), "{dir_warn}");
+        assert!(dir_warn.contains("/inheritance:r"), "{dir_warn}");
+        assert!(
+            !dir_warn.contains("/remove:g") && !dir_warn.contains("/reset"),
+            "inherited-only ACEs are stripped by /inheritance:r and must omit /remove:g and /reset: {dir_warn}"
+        );
+
+        let file_offenders = open_grants(&aces, ME);
+        let file_warn = open_acl_warning_for_aces(
+            file_path,
+            "cluster secret file",
+            &aces,
+            &file_offenders,
+            ME,
+            |s| s != UNRES_SID,
+        )
+        .unwrap();
+        assert!(file_warn.contains(UNRES_SID), "{file_warn}");
+        assert!(file_warn.contains("/inheritance:r"), "{file_warn}");
+        assert!(
+            !file_warn.contains("/remove:g") && !file_warn.contains("/reset"),
+            "inherited-only ACEs on files must omit /remove:g and /reset: {file_warn}"
+        );
+    }
+
+    #[test]
+    fn remedy_keeps_mixed_inherited_and_explicit_resolvable_and_omits_inherited_only() {
+        const UNRES_SID: &str = "S-1-5-21-111111111-222222222-333333333-88888";
+        let dir_path = Path::new(r"C:\Temp\work");
+        let aces = [
+            ace(ME, 0x001F_01FF),
+            // Explicit + inherited ACE for SID_USERS -> must remain in /remove:g.
+            ace_with_flags(SID_USERS, 0x0012_00A9, ACE_FLAG_INHERITED | 0x03),
+            ace(SID_USERS, 0x0012_00A9),
+            // Inherited-only ACE for UNRES_SID -> must be omitted from /remove:g.
+            ace_with_flags(UNRES_SID, 0x0012_00A9, ACE_FLAG_INHERITED | 0x03),
+        ];
+
+        let offenders = dir_open_grants(&aces, ME);
+        let cmd = icacls_private_dir_command_for_aces(dir_path, &aces, &offenders, ME, |s| {
+            s != UNRES_SID
+        });
+        assert!(
+            cmd.contains(&format!("/remove:g \"*{SID_USERS}\"")),
+            "{cmd}"
+        );
+        assert!(!cmd.contains(UNRES_SID), "{cmd}");
+        assert!(!cmd.contains("/reset"), "{cmd}");
+    }
+
+    #[test]
+    fn remedy_uses_reset_chain_for_explicit_unresolvable_sid() {
+        const UNRES_SID: &str = "S-1-5-21-111111111-222222222-333333333-99999";
+        let dir_path = Path::new(r"C:\Temp\work");
+        let file_path = Path::new(r"C:\Temp\cluster.secret");
+        let aces = [
+            ace(ME, 0x001F_01FF),
+            ace(SID_USERS, 0x0012_00A9),
+            ace(UNRES_SID, 0x0012_00A9),
+        ];
+
+        let dir_offenders = dir_open_grants(&aces, ME);
+        let dir_cmd =
+            icacls_private_dir_command_for_aces(dir_path, &aces, &dir_offenders, ME, |s| {
+                s != UNRES_SID
+            });
+        assert_eq!(
+            dir_cmd,
+            format!(
+                "icacls \"C:\\Temp\\work\" /reset && icacls \"C:\\Temp\\work\" /inheritance:r /grant:r \"*{ME}:(OI)(CI)F\" \"*S-1-5-18:(OI)(CI)F\" \"*S-1-5-32-544:(OI)(CI)F\""
+            )
+        );
+        assert!(!dir_cmd.contains("/remove:g"), "{dir_cmd}");
+
+        let file_offenders = open_grants(&aces, ME);
+        let file_cmd =
+            icacls_private_file_command_for_aces(file_path, &aces, &file_offenders, ME, |s| {
+                s != UNRES_SID
+            });
+        assert_eq!(
+            file_cmd,
+            format!(
+                "icacls \"C:\\Temp\\cluster.secret\" /reset && icacls \"C:\\Temp\\cluster.secret\" /inheritance:r /grant:r \"*{ME}:F\" \"*S-1-5-18:F\" \"*S-1-5-32-544:F\""
+            )
+        );
+        assert!(!file_cmd.contains("/remove:g"), "{file_cmd}");
     }
 }
 
@@ -2122,7 +2422,14 @@ mod windows_tests {
         assert!(dir_offenders.contains(&SID_NETWORK.to_string()));
         assert!(dir_offenders.contains(&SID_EVERYONE.to_string()));
 
-        let dir_warn = open_dir_acl_warning(&dir, &dir_offenders, &user).unwrap();
+        let dir_warn = open_dir_acl_warning_for_aces(
+            &dir,
+            &before_dir_aces,
+            &dir_offenders,
+            &user,
+            sid_is_resolvable,
+        )
+        .unwrap();
         let dir_cmd = dir_warn
             .split("to make it private run: ")
             .nth(1)
@@ -2160,8 +2467,15 @@ mod windows_tests {
         let file_offenders = open_grants(&before_file_aces, &user);
         assert!(file_offenders.contains(&SID_NETWORK.to_string()));
 
-        let file_warn =
-            open_acl_warning(&secret, "cluster secret file", &file_offenders, &user).unwrap();
+        let file_warn = open_acl_warning_for_aces(
+            &secret,
+            "cluster secret file",
+            &before_file_aces,
+            &file_offenders,
+            &user,
+            sid_is_resolvable,
+        )
+        .unwrap();
         let file_cmd = file_warn
             .split("to make it private run: ")
             .nth(1)
@@ -2183,6 +2497,231 @@ mod windows_tests {
         assert!(
             open_grants(&after_file_aces, &user).is_empty(),
             "printed file remedy must leave zero foreign grants: {after_file_aces:?}"
+        );
+    }
+
+    fn grant_synthetic_sid_via_powershell(path: &Path, sid: &str, dir: bool) {
+        let inheritance = if dir {
+            "'ContainerInherit, ObjectInherit', 'None'"
+        } else {
+            "'None', 'None'"
+        };
+        let ps_path = path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$item = Get-Item -LiteralPath '{ps_path}' -Force; \
+             $acl = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access); \
+             $id = [Security.Principal.SecurityIdentifier]'{sid}'; \
+             $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(\
+                 $id, 'ReadAndExecute', {inheritance}, 'Allow'))); \
+             $item.SetAccessControl($acl)"
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .expect("run powershell SetAccessControl");
+        assert!(
+            out.status.success(),
+            "SetAccessControl failed for {sid} on {}: stdout={} stderr={}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn icacls_printed_remedy_handles_inherited_and_explicit_unresolvable_sids() {
+        use std::os::windows::process::CommandExt;
+
+        const UNRES_INH: &str = "S-1-5-21-111111111-222222222-333333333-88888";
+        const UNRES_EXP: &str = "S-1-5-21-111111111-222222222-333333333-99999";
+
+        let root = tempfile::tempdir().unwrap();
+        let user = current_user_sid().unwrap();
+
+        assert!(!sid_is_resolvable(UNRES_INH));
+        assert!(!sid_is_resolvable(UNRES_EXP));
+        assert!(sid_is_resolvable(SID_EVERYONE));
+        assert!(sid_is_resolvable(&user));
+
+        // Case A: Inherited-only unresolvable SID from a parent folder (BUG-39).
+        let inh_parent = root.path().join("inh_parent");
+        create_private_dir_all(&inh_parent).unwrap();
+        grant_synthetic_sid_via_powershell(&inh_parent, UNRES_INH, true);
+
+        let inh_dir = inh_parent.join("child_dir");
+        std::fs::create_dir(&inh_dir).unwrap();
+        let (inh_dir_aces, _) = read_dacl(&inh_dir).unwrap();
+        let inh_dir_offenders = dir_open_grants(&inh_dir_aces, &user);
+        assert!(
+            inh_dir_offenders.contains(&UNRES_INH.to_string()),
+            "{inh_dir_offenders:?}"
+        );
+        let inh_dir_warn = open_dir_acl_warning_for_aces(
+            &inh_dir,
+            &inh_dir_aces,
+            &inh_dir_offenders,
+            &user,
+            sid_is_resolvable,
+        )
+        .unwrap();
+        let inh_dir_cmd = inh_dir_warn
+            .split("to make it private run: ")
+            .nth(1)
+            .expect("remedy command in inherited dir warning");
+        assert!(
+            !inh_dir_cmd.contains("/remove:g") && !inh_dir_cmd.contains("/reset"),
+            "inherited-only dir must omit /remove:g and /reset: {inh_dir_cmd}"
+        );
+        let run_inh_dir = Command::new("cmd")
+            .arg("/C")
+            .raw_arg(inh_dir_cmd)
+            .output()
+            .expect("run inherited dir remedy");
+        assert!(
+            run_inh_dir.status.success(),
+            "inherited dir remedy failed (cmd={inh_dir_cmd}): stdout={} stderr={}",
+            String::from_utf8_lossy(&run_inh_dir.stdout),
+            String::from_utf8_lossy(&run_inh_dir.stderr)
+        );
+        let (after_inh_dir_aces, after_inh_dir_prot) = read_dacl(&inh_dir).unwrap();
+        assert!(after_inh_dir_prot);
+        assert!(
+            dir_open_grants(&after_inh_dir_aces, &user).is_empty(),
+            "{after_inh_dir_aces:?}"
+        );
+
+        let inh_file = inh_parent.join("cluster.secret");
+        std::fs::write(&inh_file, b"secret").unwrap();
+        let (inh_file_aces, _) = read_dacl(&inh_file).unwrap();
+        let inh_file_offenders = open_grants(&inh_file_aces, &user);
+        assert!(
+            inh_file_offenders.contains(&UNRES_INH.to_string()),
+            "{inh_file_offenders:?}"
+        );
+        let inh_file_warn = open_acl_warning_for_aces(
+            &inh_file,
+            "cluster secret file",
+            &inh_file_aces,
+            &inh_file_offenders,
+            &user,
+            sid_is_resolvable,
+        )
+        .unwrap();
+        let inh_file_cmd = inh_file_warn
+            .split("to make it private run: ")
+            .nth(1)
+            .expect("remedy command in inherited file warning");
+        assert!(
+            !inh_file_cmd.contains("/remove:g") && !inh_file_cmd.contains("/reset"),
+            "inherited-only file must omit /remove:g and /reset: {inh_file_cmd}"
+        );
+        let run_inh_file = Command::new("cmd")
+            .arg("/C")
+            .raw_arg(inh_file_cmd)
+            .output()
+            .expect("run inherited file remedy");
+        assert!(
+            run_inh_file.status.success(),
+            "inherited file remedy failed (cmd={inh_file_cmd}): stdout={} stderr={}",
+            String::from_utf8_lossy(&run_inh_file.stdout),
+            String::from_utf8_lossy(&run_inh_file.stderr)
+        );
+        let (after_inh_file_aces, after_inh_file_prot) = read_dacl(&inh_file).unwrap();
+        assert!(after_inh_file_prot);
+        assert!(
+            open_grants(&after_inh_file_aces, &user).is_empty(),
+            "{after_inh_file_aces:?}"
+        );
+
+        // Case B: Explicit unresolvable SID directly on dir and file (BUG-39).
+        let exp_parent = root.path().join("exp_parent");
+        create_private_dir_all(&exp_parent).unwrap();
+
+        let exp_dir = exp_parent.join("explicit_dir");
+        std::fs::create_dir(&exp_dir).unwrap();
+        grant_synthetic_sid_via_powershell(&exp_dir, UNRES_EXP, true);
+        let (exp_dir_aces, _) = read_dacl(&exp_dir).unwrap();
+        let exp_dir_offenders = dir_open_grants(&exp_dir_aces, &user);
+        assert!(
+            exp_dir_offenders.contains(&UNRES_EXP.to_string()),
+            "{exp_dir_offenders:?}"
+        );
+        let exp_dir_warn = open_dir_acl_warning_for_aces(
+            &exp_dir,
+            &exp_dir_aces,
+            &exp_dir_offenders,
+            &user,
+            sid_is_resolvable,
+        )
+        .unwrap();
+        let exp_dir_cmd = exp_dir_warn
+            .split("to make it private run: ")
+            .nth(1)
+            .expect("remedy command in explicit dir warning");
+        assert!(
+            exp_dir_cmd.contains("/reset && icacls") && !exp_dir_cmd.contains("/remove:g"),
+            "explicit unresolvable dir must use /reset chain: {exp_dir_cmd}"
+        );
+        let run_exp_dir = Command::new("cmd")
+            .arg("/C")
+            .raw_arg(exp_dir_cmd)
+            .output()
+            .expect("run explicit dir remedy");
+        assert!(
+            run_exp_dir.status.success(),
+            "explicit dir remedy failed (cmd={exp_dir_cmd}): stdout={} stderr={}",
+            String::from_utf8_lossy(&run_exp_dir.stdout),
+            String::from_utf8_lossy(&run_exp_dir.stderr)
+        );
+        let (after_exp_dir_aces, after_exp_dir_prot) = read_dacl(&exp_dir).unwrap();
+        assert!(after_exp_dir_prot);
+        assert!(
+            dir_open_grants(&after_exp_dir_aces, &user).is_empty(),
+            "{after_exp_dir_aces:?}"
+        );
+
+        let exp_file = exp_parent.join("explicit.secret");
+        std::fs::write(&exp_file, b"secret").unwrap();
+        grant_synthetic_sid_via_powershell(&exp_file, UNRES_EXP, false);
+        let (exp_file_aces, _) = read_dacl(&exp_file).unwrap();
+        let exp_file_offenders = open_grants(&exp_file_aces, &user);
+        assert!(
+            exp_file_offenders.contains(&UNRES_EXP.to_string()),
+            "{exp_file_offenders:?}"
+        );
+        let exp_file_warn = open_acl_warning_for_aces(
+            &exp_file,
+            "cluster secret file",
+            &exp_file_aces,
+            &exp_file_offenders,
+            &user,
+            sid_is_resolvable,
+        )
+        .unwrap();
+        let exp_file_cmd = exp_file_warn
+            .split("to make it private run: ")
+            .nth(1)
+            .expect("remedy command in explicit file warning");
+        assert!(
+            exp_file_cmd.contains("/reset && icacls") && !exp_file_cmd.contains("/remove:g"),
+            "explicit unresolvable file must use /reset chain: {exp_file_cmd}"
+        );
+        let run_exp_file = Command::new("cmd")
+            .arg("/C")
+            .raw_arg(exp_file_cmd)
+            .output()
+            .expect("run explicit file remedy");
+        assert!(
+            run_exp_file.status.success(),
+            "explicit file remedy failed (cmd={exp_file_cmd}): stdout={} stderr={}",
+            String::from_utf8_lossy(&run_exp_file.stdout),
+            String::from_utf8_lossy(&run_exp_file.stderr)
+        );
+        let (after_exp_file_aces, after_exp_file_prot) = read_dacl(&exp_file).unwrap();
+        assert!(after_exp_file_prot);
+        assert!(
+            open_grants(&after_exp_file_aces, &user).is_empty(),
+            "{after_exp_file_aces:?}"
         );
     }
 }

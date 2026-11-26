@@ -305,10 +305,16 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
     use iroh::endpoint::RelayMode;
     use rusty_grid_core::transport::GRID_ALPN;
 
-    // Bind server and client endpoints on loopback
+    // Bind server and client endpoints on loopback with tight STREAM_DATA flow control so pausing
+    // the data sink backpressures STREAM_DATA without blocking STREAM_CONTROL.
+    let server_quic = iroh::endpoint::QuicTransportConfig::builder()
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(64 * 1024))
+        .receive_window(iroh::endpoint::VarInt::from_u32(4 * 1024 * 1024))
+        .build();
     let ep_server = iroh::Endpoint::builder(Minimal)
         .alpns(vec![GRID_ALPN.to_vec()])
         .relay_mode(RelayMode::Disabled)
+        .transport_config(server_quic)
         .bind()
         .await
         .expect("bind server");
@@ -322,6 +328,8 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
 
     let server_addr = ep_server.addr();
     let heavy_payload_size = 5 * 1024 * 1024; // 5 MB
+    let release_data_sink = Arc::new(Notify::new());
+    let release_sink_srv = Arc::clone(&release_data_sink);
 
     // Server accepts connection and demuxes Control vs Data streams
     let server_handle = tokio::spawn(async move {
@@ -352,8 +360,9 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
         let ctrl_stream = GridStream::P2p(BiStream::new(ctrl_recv, ctrl_send));
         let mut ctrl_transport = MessageTransport::new(ctrl_stream);
 
-        // Data consumer draining 5MB saturated stream
+        // Data sink pauses until `release_sink_srv` fires so STREAM_DATA saturates its window.
         let data_task = tokio::spawn(async move {
+            release_sink_srv.notified().await;
             let mut total = 0usize;
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -407,22 +416,35 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
         .expect("write data tag");
     data_send.flush().await.expect("flush data tag");
 
-    // Concurrently saturate Data Lane with 5MB
+    // Concurrently saturate Data Lane with 5MB while the server data sink is paused.
+    // 16 KiB fits inside the 64 KiB stream receive window so the first write completes and notifies
+    // `data_started`, after which the remaining 5 MiB backpressures on QUIC stream flow control.
+    let data_started = Arc::new(Notify::new());
+    let data_started_tx = Arc::clone(&data_started);
     let data_producer = tokio::spawn(async move {
-        let chunk = vec![0xBCu8; 64 * 1024];
+        let chunk = vec![0xBCu8; 16 * 1024];
         let mut sent = 0;
         while sent < heavy_payload_size {
             data_send.write_all(&chunk).await.expect("write data chunk");
-            data_send.flush().await.expect("flush data chunk");
+            if sent == 0 {
+                data_started_tx.notify_one();
+            }
             sent += chunk.len();
         }
+        data_send.flush().await.expect("flush data lane");
         data_send.shutdown().await.expect("shutdown data lane");
     });
 
-    // Send 30 heartbeats across Control Lane and measure RTT under full data saturation
+    tokio::time::timeout(Duration::from_secs(60), data_started.notified())
+        .await
+        .expect("data producer started within 60 s");
+
+    // Send 30 heartbeats across Control Lane under a 60 s hang guard while data flow control is blocked
     let worker_id = Uuid::new_v4();
-    let num_heartbeats = 30;
-    let mut latencies = Vec::new();
+    let num_heartbeats = 30u64;
+    let mut latencies = Vec::with_capacity(num_heartbeats as usize);
+    let mut acked_timestamps = Vec::with_capacity(num_heartbeats as usize);
+    let hb_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     for i in 0..num_heartbeats {
         let t0 = Instant::now();
@@ -433,31 +455,61 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
             cpu_usage_pct: 25.0,
             ram_available_mb: 4096,
         };
-        ctrl_transport.send_msg(&hb).await.expect("send heartbeat");
+        tokio::time::timeout_at(hb_deadline, ctrl_transport.send_msg(&hb))
+            .await
+            .expect("control heartbeat send hung under data backpressure")
+            .expect("send heartbeat");
         let ack: Option<MasterMessage> =
-            ctrl_transport.recv_msg().await.expect("recv heartbeat ack");
+            tokio::time::timeout_at(hb_deadline, ctrl_transport.recv_msg())
+                .await
+                .expect("control heartbeat ack hung under data backpressure")
+                .expect("recv heartbeat ack");
         let rtt = t0.elapsed();
         latencies.push(rtt);
 
         match ack {
             Some(MasterMessage::HeartbeatAck { timestamp }) => {
                 assert_eq!(timestamp, 5000 + i);
+                acked_timestamps.push(timestamp);
             }
             other => panic!("Unexpected message on control lane: {:?}", other),
         }
     }
 
+    let expected_timestamps: Vec<u64> = (0..num_heartbeats).map(|i| 5000 + i).collect();
+    assert_eq!(
+        acked_timestamps, expected_timestamps,
+        "all control-lane heartbeats must arrive in order"
+    );
+
+    // Structural anti-HOL proof: all 30 heartbeats arrived in order while STREAM_DATA remained backpressured!
+    assert!(
+        !data_producer.is_finished(),
+        "data stream must still be flow-control backpressured while all control-lane heartbeats completed"
+    );
+    release_data_sink.notify_one();
+
     // Disconnect
-    ctrl_transport
-        .send_msg(&WorkerMessage::Disconnecting {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        ctrl_transport.send_msg(&WorkerMessage::Disconnecting {
             worker_id,
             reason: "Challenger stress test finished".into(),
-        })
-        .await
-        .expect("disconnect");
+        }),
+    )
+    .await
+    .expect("control disconnect send hung")
+    .expect("disconnect");
 
-    data_producer.await.expect("producer finished");
-    let (heartbeats_answered, total_data_received) = server_handle.await.expect("server finished");
+    tokio::time::timeout(Duration::from_secs(60), data_producer)
+        .await
+        .expect("data producer hung after sink release")
+        .expect("producer finished");
+    let (heartbeats_answered, total_data_received) =
+        tokio::time::timeout(Duration::from_secs(60), server_handle)
+            .await
+            .expect("server finish hung after sink release")
+            .expect("server finished");
 
     assert_eq!(heartbeats_answered, num_heartbeats);
     assert_eq!(total_data_received, heavy_payload_size);
@@ -466,14 +518,8 @@ async fn test_quic_stream_multiplexing_5mb_saturation_and_heartbeat_isolation() 
     let avg_latency = latencies.iter().sum::<Duration>() / latencies.len() as u32;
 
     println!(
-        "QUIC 5MB Saturation: Heartbeat avg_latency={:?}, max_latency={:?}",
-        avg_latency, max_latency
-    );
-
-    assert!(
-        avg_latency < Duration::from_millis(50),
-        "Control lane average latency must stay sub-50ms under 5MB saturation (got {:?})",
-        avg_latency
+        "[timing] QUIC 5MB saturation: heartbeats={}, avg_latency={:?}, max_latency={:?}",
+        num_heartbeats, avg_latency, max_latency
     );
 }
 

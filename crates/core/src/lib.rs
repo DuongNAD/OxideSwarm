@@ -20,6 +20,7 @@ pub mod placement;
 // LV-4: cfg(windows) / cfg(unix) ACL, descriptor, and file-identity syscalls for private key files.
 #[allow(unsafe_code)]
 pub mod private_file;
+pub mod process_spawn;
 pub mod protocol;
 pub mod task;
 pub mod transport;

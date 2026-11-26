@@ -50,6 +50,7 @@ pub struct GridClusterStatus {
     pub running_tasks: usize,
     pub completed_tasks: usize,
     pub failed_tasks: usize,
+    pub cancelled_tasks: usize,
     pub queue_json: serde_json::Value,
     pub workers_json: serde_json::Value,
 }
@@ -210,7 +211,7 @@ impl GridBackend for InProcessBackend {
                 .iter()
                 .filter(|w| w.status == WorkerStatus::Connected)
                 .count();
-            let (queued_tasks, running_tasks, completed_tasks, failed_tasks, _cancelled_tasks) =
+            let (queued_tasks, running_tasks, completed_tasks, failed_tasks, cancelled_tasks) =
                 stats.cluster_buckets();
             let queue_json = serde_json::to_value(&stats)?;
             let workers_json = serde_json::to_value(&workers)?;
@@ -221,6 +222,7 @@ impl GridBackend for InProcessBackend {
                 running_tasks,
                 completed_tasks,
                 failed_tasks,
+                cancelled_tasks,
                 queue_json,
                 workers_json,
             })

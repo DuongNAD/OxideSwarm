@@ -26,8 +26,31 @@ use tokio::net::TcpStream;
 const BIN: &str = env!("CARGO_BIN_EXE_rusty-grid");
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn preserve_toolchain_env(cmd: &mut Command) {
+    let real_home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(p) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".rustup"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", p);
+    }
+    if let Some(p) = std::env::var_os("CARGO_HOME").or_else(|| {
+        real_home
+            .as_ref()
+            .map(|h| PathBuf::from(h).join(".cargo"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.into_os_string())
+    }) {
+        cmd.env("CARGO_HOME", p);
+    }
+}
+
 fn isolated_cli(home: &Path) -> Command {
     let mut cmd = Command::new(BIN);
+    preserve_toolchain_env(&mut cmd);
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .current_dir(home)

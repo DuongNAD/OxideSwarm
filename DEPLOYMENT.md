@@ -273,7 +273,7 @@ This app runs the **compute-grid worker** (not the agent-mesh node) in-process v
 
 ### 3.5 Upgrading a running grid (master and workers)
 `Task`, `TaskResult`, and message frames are encoded positionally with bincode. Workers, clients, and the master
-exchange `PROTOCOL_VERSION_CURRENT` (version `11` on the protocol 11 train, `10` in releases `0.4.0` to `0.4.4`, `9` in `0.3.0`). **A master accepts one version back**
+exchange `PROTOCOL_VERSION_CURRENT` (version `11` on the protocol 11 train, `10` in releases `0.4.0` to `0.4.5`, `9` in `0.3.0`). **A master accepts one version back**
 (`PROTOCOL_VERSION_MIN_COMPATIBLE == PROTOCOL_VERSION_CURRENT - 1`, the window of `docs/design/0083-one-version-window.md`):
 a protocol `11` master serves `0.4.x` (`protocol 10`) workers and clients, which keep working unchanged while you
 upgrade them one at a time (a `ClusterStatus` reply sent to a protocol `10` client folds `cancelled_tasks` into

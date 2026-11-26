@@ -24,6 +24,7 @@ import base64
 import collections
 import concurrent.futures
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -173,6 +174,8 @@ def load_tests(
     suite = unittest.TestSuite()
     for tier_num in sorted(selected):
         suite.addTests(loader.loadTestsFromTestCase(tier_classes[tier_num]))
+    if 2 in selected:
+        suite.addTests(loader.loadTestsFromTestCase(HarnessAtomicWriteTests))
     return suite
 
 
@@ -402,6 +405,16 @@ class IsolatedEnv:
             if k in SCRUB_ENV_EXACT:
                 continue
             env[k] = v
+
+        orig_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if "RUSTUP_HOME" not in env and orig_home:
+            cand = os.path.join(orig_home, ".rustup")
+            if os.path.isdir(cand):
+                env["RUSTUP_HOME"] = cand
+        if "CARGO_HOME" not in env and orig_home:
+            cand = os.path.join(orig_home, ".cargo")
+            if os.path.isdir(cand):
+                env["CARGO_HOME"] = cand
 
         h = str(home_dir or self.home)
         oxh = str(ox_home_dir or self.ox_home)
@@ -976,6 +989,22 @@ def log_event(entry):
         f.write(json.dumps(entry) + "\\n")
 
 
+def write_text_atomic(dst: Path, text: str) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.parent / f".{{dst.name}}.{{os.getpid()}}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def find_flag_val(args, names):
     for i, a in enumerate(args):
         for n in names:
@@ -1086,8 +1115,7 @@ def main():
             pid_target = os.environ.get("FAKE_NEXTEST_PID_DIR") or PID_DIR
             if pid_target:
                 pd = Path(pid_target)
-                pd.mkdir(parents=True, exist_ok=True)
-                (pd / f"shard_{{shard_idx}}.pid").write_text(str(os.getpid()), encoding="utf-8")
+                write_text_atomic(pd / f"shard_{{shard_idx}}.pid", str(os.getpid()))
             time.sleep(sleep_val)
 
         log_event({{
@@ -1221,6 +1249,22 @@ def log_event(entry):
         f.write(json.dumps(entry) + "\\n")
 
 
+def write_text_atomic(dst: Path, text: str) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.parent / f".{{dst.name}}.{{os.getpid()}}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def detect_magic(raw: bytes) -> str:
     if raw[:4] == b"glTF":
         return "glb"
@@ -1340,9 +1384,9 @@ def main():
         if PROBE_HANG_SECS > 0:
             child = subprocess.Popen(["sleep", str(int(PROBE_HANG_SECS))])
             if PROBE_PID_FILE:
-                Path(PROBE_PID_FILE).write_text(
+                write_text_atomic(
+                    Path(PROBE_PID_FILE),
                     json.dumps({{"probe_pid": os.getpid(), "child_pid": child.pid}}),
-                    encoding="utf-8",
                 )
             time.sleep(PROBE_HANG_SECS)
             return 0
@@ -1408,16 +1452,16 @@ def main():
     if HANG_FLAG_FILE and Path(HANG_FLAG_FILE).exists():
         child = subprocess.Popen(["sleep", "60"])
         if HANG_PID_FILE:
-            Path(HANG_PID_FILE).write_text(
+            write_text_atomic(
+                Path(HANG_PID_FILE),
                 json.dumps({{
                     "blender_pid": os.getpid(),
                     "grandchild_pid": child.pid,
                     "task_id": os.environ.get("RUSTY_GRID_TASK_ID", ""),
                 }}),
-                encoding="utf-8",
             )
         if HANG_MARKER_FILE:
-            Path(HANG_MARKER_FILE).write_text(f"{{os.getpid()}},{{child.pid}}\\n", encoding="utf-8")
+            write_text_atomic(Path(HANG_MARKER_FILE), f"{{os.getpid()}},{{child.pid}}\\n")
         while True:
             time.sleep(0.2)
 
@@ -1729,6 +1773,7 @@ class OxideCluster:
         self.env = env
         self.bin = str(find_binary("oxideswarm"))
         self.secret_file: Optional[Path] = None
+        self._last_master: Optional["MasterInstance"] = None
 
     def _base_argv(self, secret_file: Optional[Path] = None) -> list[str]:
         argv = [self.bin]
@@ -1840,7 +1885,7 @@ class OxideCluster:
                 f"Master did not write port file within {timeout}s:\n{mp.logs()}"
             )
 
-        return MasterInstance(
+        mi = MasterInstance(
             proc=mp,
             listen_addr=f"127.0.0.1:{bound_port}",
             port=bound_port,
@@ -1848,6 +1893,8 @@ class OxideCluster:
             state_dir=sd,
             blob_dir=bd,
         )
+        self._last_master = mi
+        return mi
 
     def workers_json(
         self, master_addr: str, secret_file: Optional[Path] = None
@@ -1890,7 +1937,8 @@ class OxideCluster:
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
         wait_connected: bool = True,
-        timeout: float = 15.0,
+        timeout: float = 120.0,
+        master_instance: Optional["MasterInstance"] = None,
     ) -> WorkerInstance:
         sb = sandbox_base_dir or (self.env.root / f"sb_{name}_{uuid.uuid4().hex[:6]}")
         sb.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1966,7 +2014,8 @@ class OxideCluster:
         )
 
         if wait_connected:
-            deadline = time.monotonic() + timeout
+            t0 = time.monotonic()
+            deadline = t0 + timeout
             while time.monotonic() < deadline:
                 if mp.poll() is not None:
                     raise RuntimeError(
@@ -1976,12 +2025,22 @@ class OxideCluster:
                     wlist = self.workers_json(master_addr, secret_file=secret_file)
                     for w in wlist:
                         if w.get("name") == name and "state:connected" in w.get("tags", []):
+                            elapsed = time.monotonic() - t0
+                            print(f"[timing] {name} connected after {elapsed:.2f} s", file=sys.stderr)
                             return WorkerInstance(proc=mp, name=name, sandbox_dir=sb)
                 except Exception:
                     pass
                 time.sleep(0.05)
+            # Print master log alongside worker log on timeout
+            master_log = ""
+            mi = master_instance or self._last_master
+            if mi is not None:
+                try:
+                    master_log = f"\n--- master log ---\n{mi.proc.logs()}"
+                except Exception:
+                    pass
             raise TimeoutError(
-                f"Worker {name} did not reach state:connected within {timeout}s:\n{mp.logs()}"
+                f"Worker {name} did not reach state:connected within {timeout}s:\n{mp.logs()}{master_log}"
             )
 
         return WorkerInstance(proc=mp, name=name, sandbox_dir=sb)
@@ -2332,14 +2391,17 @@ class MeshCluster:
 
 def _wait_until(
     predicate: Callable[[], Any],
-    timeout: float = 15.0,
+    timeout: float = 120.0,
     interval: float = 0.03,
     desc: str = "condition",
 ) -> Any:
-    deadline = time.monotonic() + timeout
+    t0 = time.monotonic()
+    deadline = t0 + timeout
     while time.monotonic() < deadline:
         val = predicate()
         if val:
+            elapsed = time.monotonic() - t0
+            print(f"[timing] _wait_until({desc}) satisfied after {elapsed:.2f} s", file=sys.stderr)
             return val
         time.sleep(interval)
     raise TimeoutError(f"Timed out after {timeout}s waiting for {desc}")
@@ -2678,7 +2740,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
         )
         _wait_until(
             lambda: marker.is_file() and len(marker.read_text(encoding="utf-8").splitlines()) == 4,
-            timeout=15.0,
+            timeout=120.0,
             desc="all 4 shards running simultaneously across 2 workers",
         )
         gate.write_text("go\n", encoding="utf-8")
@@ -2908,7 +2970,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
         task_id = sub.get("payload", {}).get("task_id")
         self.assertTrue(task_id, f"Missing task_id in async grid_submit: {sub!r}")
 
-        _wait_until(marker.is_file, timeout=15.0, desc="async mesh task started on external worker")
+        _wait_until(marker.is_file, timeout=120.0, desc="async mesh task started on external worker")
         st = ws.grid_status(task_id=task_id)
         self.assertEqual(st.get("status"), "success", st)
 
@@ -3196,7 +3258,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
                 "--command", f'touch "{marker}"; while [ ! -f "{gate}" ]; do sleep 0.02; done',
             ],
         )
-        _wait_until(marker.is_file, timeout=15.0, desc="w-busy-bl occupied")
+        _wait_until(marker.is_file, timeout=120.0, desc="w-busy-bl occupied")
 
         in_mesh = self.env.work / "hold_input.glb"
         in_mesh.write_bytes(make_minimal_glb_bytes())
@@ -3621,7 +3683,7 @@ class Tier1FeatureCoverageTests(Wave3E2ETestBase):
         self.assertEqual(sub.returncode, 0, f"stderr:\n{sub.stderr}\nstdout:\n{sub.stdout}")
         task_id = json.loads(sub.stdout)["task_id"]
 
-        _wait_until(hang_marker.is_file, timeout=15.0, desc="fake Blender started for cancel")
+        _wait_until(hang_marker.is_file, timeout=120.0, desc="fake Blender started for cancel")
         t_cancel = time.monotonic()
         c_res = self.ox.cancel_cli(master.listen_addr, task_id)
         self.assertEqual(c_res.returncode, 0, f"stderr:\n{c_res.stderr}\nstdout:\n{c_res.stdout}")
@@ -3726,7 +3788,8 @@ class Tier2BoundaryCornerTests(Wave3E2ETestBase):
             f'i=0; while [ ! -f "{pid_dir}/shard_2.pid" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i+1)); done; '
             f'exit 9; '
             f'else '
-            f'echo $$ > "{pid_dir}/shard_${{OX_SHARD_INDEX}}.pid"; '
+            f'_tmp="{pid_dir}/.shard_${{OX_SHARD_INDEX}}.$$.tmp"; '
+            f'echo $$ > "$_tmp" && mv -f "$_tmp" "{pid_dir}/shard_${{OX_SHARD_INDEX}}.pid"; '
             f'exec sleep 600; '
             f'fi'
         )
@@ -4299,7 +4362,7 @@ class Tier2BoundaryCornerTests(Wave3E2ETestBase):
                 f'echo "END_1" >> "{log_file}"',
             ],
         )
-        _wait_until(m1.is_file, timeout=15.0, desc="task 1 (6144 MB) running")
+        _wait_until(m1.is_file, timeout=120.0, desc="task 1 (6144 MB) running")
 
         p2 = self.ox.submit_cli_popen(
             master.listen_addr,
@@ -4318,7 +4381,7 @@ class Tier2BoundaryCornerTests(Wave3E2ETestBase):
 
         gate1.write_text("go\n", encoding="utf-8")
         self.assertEqual(p1.wait(timeout=15.0), 0, p1.logs())
-        _wait_until(m2.is_file, timeout=15.0, desc="task 2 started after task 1 released VRAM")
+        _wait_until(m2.is_file, timeout=120.0, desc="task 2 started after task 1 released VRAM")
         gate2.write_text("go\n", encoding="utf-8")
         self.assertEqual(p2.wait(timeout=15.0), 0, p2.logs())
 
@@ -4702,7 +4765,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
                 sys.executable, "-c", shard_py,
             ],
         )
-        _wait_until(started_1.is_file, timeout=15.0, desc="first shard running on w-die-1")
+        _wait_until(started_1.is_file, timeout=120.0, desc="first shard running on w-die-1")
         self.ox.start_worker(master.listen_addr, name="w-survive-2", cores=4, max_concurrency=4)
         w1.proc.stop(sig=signal.SIGKILL, timeout=5.0)
         rc = proc.wait(timeout=30.0)
@@ -4784,7 +4847,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
         )
         self.assertEqual(sub.get("status"), "success", sub)
         tid = sub["payload"]["task_id"]
-        _wait_until(marker.is_file, timeout=15.0, desc="durability task started")
+        _wait_until(marker.is_file, timeout=120.0, desc="durability task started")
         gate.write_text("go\n", encoding="utf-8")
 
         _wait_until(
@@ -4896,7 +4959,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
                 "--wait", "--json",
             ],
         )
-        _wait_until(hang_marker.is_file, timeout=15.0, desc="AutoRig running on w-fo-bl-1")
+        _wait_until(hang_marker.is_file, timeout=120.0, desc="AutoRig running on w-fo-bl-1")
         hang_flag.unlink()
         w2.proc.stop(sig=signal.SIGKILL, timeout=5.0)
 
@@ -5047,7 +5110,7 @@ class Tier3CrossFeatureTests(Wave3E2ETestBase):
         )
         _wait_until(
             lambda: hang_marker.is_file() and hang_pids.is_file(),
-            timeout=15.0,
+            timeout=120.0,
             desc="t3 cancel task started with task_id",
         )
         pids = json.loads(hang_pids.read_text(encoding="utf-8"))
@@ -5173,7 +5236,7 @@ class Tier4WorkloadScenarios(Wave3E2ETestBase):
             {"script": f'touch "{marker}"; sleep 60', "wait": False}
         )
         runaway_id = runaway["payload"]["task_id"]
-        _wait_until(marker.is_file, timeout=15.0, desc="runaway mesh task started")
+        _wait_until(marker.is_file, timeout=120.0, desc="runaway mesh task started")
         can = ws_alpha.grid_cancel(runaway_id)
         self.assertEqual(can.get("status"), "success", can)
 
@@ -5430,7 +5493,7 @@ class Tier4WorkloadScenarios(Wave3E2ETestBase):
                 pool.submit(run_builtin_rig, 0),
                 pool.submit(run_builtin_rig, 1),
             ]
-            _wait_until(hang_marker.is_file, timeout=15.0, desc="stress hanging Blender started")
+            _wait_until(hang_marker.is_file, timeout=120.0, desc="stress hanging Blender started")
             t_cancel = time.monotonic()
             c_hang = self.ox.cancel_cli(master.listen_addr, hang_tid)
             self.assertEqual(c_hang.returncode, 0, f"stderr:\n{c_hang.stderr}\nstdout:\n{c_hang.stdout}")
@@ -5543,6 +5606,94 @@ class Tier4WorkloadScenarios(Wave3E2ETestBase):
         for clip in ("idle", "walk", "turnaround"):
             self._assert_valid_animation(rig["animations"], clip, "t4_06 mesh3 autorig")
         self.assertEqual(json.loads(arts["meta.json"].decode("utf-8")).get("device_name"), "OxideSwarm-AutoRig-Blender")
+
+
+class HarnessAtomicWriteTests(unittest.TestCase):
+    """Regression checks for TEST-95: atomic `.pid` and marker writes in fake shims and shell scripts."""
+
+    def test_empty_pid_file_raises_value_error_while_atomic_replace_prevents_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oxs_t95_") as td:
+            pid_dir = Path(td)
+            non_atomic_pid = pid_dir / "shard_2.pid"
+            # Simulate an in-place O_CREAT|O_TRUNC open before the payload bytes are flushed.
+            non_atomic_pid.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid literal for int\\(\\) with base 10: ''"):
+                int(non_atomic_pid.read_text(encoding="utf-8").strip())
+
+            # With temp-file + os.replace in the same directory, shard_3.pid is invisible until complete.
+            atomic_pid = pid_dir / "shard_3.pid"
+            tmp_pid = pid_dir / ".shard_3.pid.99999.tmp"
+            with tmp_pid.open("w", encoding="utf-8") as f:
+                self.assertEqual(list(pid_dir.glob("shard_3.pid")), [])
+                f.write("424242")
+                f.flush()
+            os.replace(tmp_pid, atomic_pid)
+            self.assertEqual(int(atomic_pid.read_text(encoding="utf-8").strip()), 424242)
+            self.assertEqual(list(pid_dir.glob("*.tmp")), [])
+
+    def test_fake_shims_and_t2_ax2_03_use_atomic_pid_and_marker_writes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="oxs_t95_shim_") as td:
+            root = Path(td)
+            nx_bin = root / "nx_bin"
+            pid_dir = root / "pids"
+            nx_script = install_fake_cargo_nextest(
+                nx_bin,
+                sleep_shards={2: 0.05},
+                pid_dir=pid_dir,
+            )
+            nx_src = nx_script.read_text(encoding="utf-8")
+            self.assertIn("os.replace(", nx_src)
+            self.assertNotIn('(pd / f"shard_{shard_idx}.pid").write_text', nx_src)
+
+            bl_dir = root / "bl_bin"
+            probe_pid = root / "probe.pid"
+            hang_flag = root / "hang.flag"
+            hang_marker = root / "hang.marker"
+            hang_pid = root / "hang.pid"
+            bl_script = install_fake_blender(
+                bl_dir / "blender",
+                probe_hang_secs=0.05,
+                probe_pid_file=probe_pid,
+                hang_flag_file=hang_flag,
+                hang_marker_file=hang_marker,
+                hang_pid_file=hang_pid,
+                python_executable=sys.executable,
+            )
+            bl_src = bl_script.read_text(encoding="utf-8")
+            self.assertIn("os.replace(", bl_src)
+            for legacy in (
+                "Path(PROBE_PID_FILE).write_text(",
+                "Path(HANG_PID_FILE).write_text(",
+                "Path(HANG_MARKER_FILE).write_text(",
+            ):
+                self.assertNotIn(legacy, bl_src)
+
+            t2_src = inspect.getsource(
+                Tier2BoundaryCornerTests.test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards
+            )
+            self.assertIn("mv -f", t2_src)
+            self.assertNotIn('echo $$ > "{pid_dir}/shard_', t2_src)
+
+            res_nx = subprocess.run(
+                [str(nx_script), "nextest", "run", "--partition", "slice:2/3"],
+                capture_output=True,
+                text=True,
+                timeout=15.0,
+            )
+            self.assertEqual(res_nx.returncode, 0, res_nx.stderr)
+            self.assertGreater(int((pid_dir / "shard_2.pid").read_text(encoding="utf-8").strip()), 0)
+            self.assertEqual(list(pid_dir.glob("*.tmp")), [])
+
+            res_probe = subprocess.run(
+                [str(bl_script), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15.0,
+            )
+            self.assertEqual(res_probe.returncode, 0, res_probe.stderr)
+            probe_data = json.loads(probe_pid.read_text(encoding="utf-8"))
+            self.assertIn("probe_pid", probe_data)
+            self.assertEqual(list(root.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

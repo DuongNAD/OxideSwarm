@@ -1,8 +1,8 @@
 //! A v11 master with peers one protocol version back (design 0083, design 0098).
 //!
 //! The v10 peers here speak the v10 layouts that `crates/core/tests/data/wire_layout_previous.txt`
-//! (the layout file of release v0.4.4) pins: `deserialize_message_as_v10` is the frozen v10 reader,
-//! `serialize_v10_client_message` the v10 writer, and both are checked against the recorded v0.4.4
+//! (the layout file of release v0.4.5) pins: `deserialize_message_as_v10` is the frozen v10 reader,
+//! `serialize_v10_client_message` the v10 writer, and both are checked against the recorded v0.4.5
 //! bytes by `crates/core/src/window_tests.rs`. `ClientResponse::ClusterStatus` is the one variant
 //! whose wire layout changed in protocol 11 (`cancelled_tasks`, BUG-22); for a v10 peer the master
 //! folds `cancelled_tasks` back into `failed_tasks` and omits the new field. The real released
@@ -28,7 +28,11 @@ use rusty_grid_core::task::{
     Bytes, Extension, Task, TaskId, TaskRequirements, TaskResult, TaskSpec,
 };
 use rusty_grid_master::queue::TaskState;
-use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
+use rusty_grid_master::scheduler::SchedulerConfig;
+use rusty_grid_master::server::{
+    MasterHandle, MasterServer, ServerConfig, DEFAULT_MASTER_MAX_BATCH_SIZE,
+};
+use rusty_grid_master::ReaperConfig;
 use rusty_grid_worker::client::WorkerClient;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -65,9 +69,16 @@ fn master_limit() -> Extension {
 }
 
 async fn spawn_master() -> MasterHandle {
-    MasterServer::spawn(ServerConfig::new("127.0.0.1:0".parse().unwrap()))
-        .await
-        .expect("master starts")
+    let sched_cfg = SchedulerConfig::default()
+        .with_max_batch_size(DEFAULT_MASTER_MAX_BATCH_SIZE)
+        .without_host_cpu_backpressure();
+    MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap()),
+        sched_cfg,
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master starts")
 }
 
 fn echo_task(extensions: Vec<Extension>) -> Task {

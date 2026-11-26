@@ -25,9 +25,12 @@ Nothing here touches the real ~/.oxideswarm, needs a built binary, the network o
 import fnmatch
 import glob
 import hashlib
+import http.server
+import io
 import json
 import os
 import pathlib
+import platform
 import re
 import shlex
 import shutil
@@ -36,7 +39,9 @@ import socket
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -1780,6 +1785,7 @@ class StaticRepositoryChecks(unittest.TestCase):
                 OXIDESWARM_USB_RUN_VALUE=test_run_val,
                 OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
                 OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+                OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT=tmp,
             )
             pids_log = os.path.join(tmp, "spawned_workers.pids")
             ps_env["FAKE_OXIDE_PIDS_LOG"] = pids_log
@@ -2051,6 +2057,42 @@ public class Program {
                 self.assertIn("Refusing SDDL restore on non-sandbox/workspace base path", uninst_fs.stdout)
                 self.assertFalse(os.path.exists(inst_root_fs))
                 self.assertFalse(os.path.exists(usb_temp_root), "%TEMP%\\oxideswarm-usb must be removed by uninstall.ps1")
+
+                # Verify scope filtering still refuses ACL revocation when a worker inside $OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT runs.
+                scoped_dir = os.path.join(tmp, "scoped_worker_check")
+                os.makedirs(scoped_dir, exist_ok=True)
+                scoped_bin = os.path.join(scoped_dir, "oxideswarm.exe")
+                shutil.copyfile(fake_exe, scoped_bin)
+                scoped_manifest = os.path.join(scoped_dir, "windows_acl_grants.txt")
+                with open(scoped_manifest, "w", encoding="utf-8") as smf:
+                    smf.write(os.path.join(tmp, "already-deleted-sandbox-base") + "\n")
+                scoped_proc = subprocess.Popen(
+                    [scoped_bin, "worker"],
+                    env=ps_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    rev_scoped_busy = subprocess.run(
+                        [
+                            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", revoke_ps1,
+                            "-ManifestPath", scoped_manifest, "-RemoveManifest",
+                        ],
+                        env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, timeout=60,
+                    )
+                    self.assertEqual(rev_scoped_busy.returncode, 2, rev_scoped_busy.stdout)
+                    self.assertIn("while another worker is running", rev_scoped_busy.stdout)
+                    self.assertTrue(os.path.isfile(scoped_manifest))
+                finally:
+                    scoped_proc.terminate()
+                    try:
+                        scoped_proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        scoped_proc.kill()
+                        scoped_proc.wait(timeout=5)
 
                 # 2b. Install with explicit -Isolation off overriding baked isolation=fs.
                 inst_root_off = os.path.join(tmp_localappdata, "installed-off")
@@ -3563,6 +3605,486 @@ public class Program {
             )
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell USB kit test")
+    def test_windows_usb_bug39_sandbox_base_fix_unresolvable_sid(self):
+        install_ps1 = os.path.join(ROOT, "packaging", "usb", "install.ps1")
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_usb_bug39_"))
+        try:
+            inh_dir = os.path.join(tmp, "inh_dir")
+            exp_dir = os.path.join(tmp, "exp_dir")
+            os.makedirs(inh_dir, exist_ok=True)
+            os.makedirs(exp_dir, exist_ok=True)
+            unres_sid = "S-1-5-21-111111111-222222222-333333333-99999"
+            ps_script = "\n".join([
+                f"$src = Get-Content -LiteralPath '{install_ps1.replace(chr(39), chr(39)*2)}' -Raw",
+                "$errs = $null; $toks = $null",
+                "$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$toks, [ref]$errs)",
+                "if ($errs.Count -gt 0) { throw 'parse failed' }",
+                "foreach ($fnAst in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {",
+                "    if ($fnAst.Name -in @('Get-AccountName', 'Test-SidResolvable', 'Get-SandboxBaseFix')) {",
+                "        . ([scriptblock]::Create($fnAst.Extent.Text))",
+                "    }",
+                "}",
+                f"if (Test-SidResolvable '{unres_sid}') {{ throw 'synthetic SID should not resolve' }}",
+                "if (-not (Test-SidResolvable 'S-1-1-0')) { throw 'S-1-1-0 should resolve' }",
+                f"$fixInh = Get-SandboxBaseFix @{{ dir = '{inh_dir.replace(chr(39), chr(39)*2)}'; holders = @(@{{ sid = '{unres_sid}'; inherited = $true; resolvable = $false }}) }}",
+                "if ($fixInh -ne $null) { throw \"expected null for inherited-only holder, got: $fixInh\" }",
+                f"$fixRes = Get-SandboxBaseFix @{{ dir = '{inh_dir.replace(chr(39), chr(39)*2)}'; holders = @(@{{ sid = 'S-1-1-0'; inherited = $false; resolvable = $true }}) }}",
+                "if ($fixRes -notmatch '/remove:g \"\\*S-1-1-0\"') { throw \"expected /remove:g for resolvable holder, got: $fixRes\" }",
+                f"$expPath = '{exp_dir.replace(chr(39), chr(39)*2)}'",
+                "$driveRoot = [IO.Path]::GetPathRoot($expPath)",
+                f"$fixDrive = Get-SandboxBaseFix @{{ dir = $driveRoot; holders = @(@{{ sid = '{unres_sid}'; inherited = $false; resolvable = $false }}) }}",
+                "if ($fixDrive -ne $null) { throw \"expected null for unresolvable explicit SID on drive root, got: $fixDrive\" }",
+                "$item = Get-Item -LiteralPath $expPath -Force",
+                "$acl = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)",
+                f"$id = [Security.Principal.SecurityIdentifier]'{unres_sid}'",
+                "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))",
+                "$item.SetAccessControl($acl)",
+                "$fixExp = Get-SandboxBaseFix @{ dir = $expPath; holders = @(@{ sid = '" + unres_sid + "'; inherited = $false; resolvable = $false }) }",
+                "if ($fixExp -notmatch '/reset' -or $fixExp -match '/remove:g') { throw \"expected icacls /reset for unresolvable explicit SID, got: $fixExp\" }",
+                "$cmdOut = & cmd.exe /C $fixExp 2>&1",
+                "if ($LASTEXITCODE -ne 0) { throw \"icacls /reset fix exited $LASTEXITCODE : $cmdOut\" }",
+                "$after = (Get-Item -LiteralPath $expPath -Force).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)",
+                f"$rem = @($after.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {{ $_.IdentityReference.Value -eq '{unres_sid}' }})",
+                "if ($rem.Count -ne 0) { throw 'unresolvable explicit SID was not removed' }",
+                "Write-Output 'BUG39_USB_FIX_OK'",
+            ])
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout)
+            self.assertIn("BUG39_USB_FIX_OK", res.stdout)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_windows_usb_bug38_static_prompt_and_update_wait(self):
+        uninstall_text = read(os.path.join(ROOT, "packaging", "usb", "uninstall.ps1"))
+        self.assertIn("in ${InstallRoot}? [y/N]", uninstall_text)
+        self.assertNotIn("in $InstallRoot? [y/N]", uninstall_text)
+
+        install_text = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        self.assertIn("OXIDESWARM_USB_STOP_WAIT_MS", install_text)
+        self.assertIn("OXIDESWARM_USB_COPY_WAIT_MS", install_text)
+        self.assertIn("did not exit within", install_text)
+        self.assertIn("could not replace $dst after waiting", install_text)
+        self.assertLess(
+            install_text.index("Get-Process -Id $spid"),
+            install_text.index("Remove-Item $pidFile"),
+        )
+
+    @unittest.skipUnless(IS_WINDOWS, "Windows PowerShell USB kit test")
+    def test_windows_usb_bug38_uninstall_prompt_and_update_retry_live(self):
+        import ctypes
+        from ctypes import wintypes
+
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_usb_bug38_"))
+        tmp_home = os.path.join(tmp, "home")
+        tmp_localappdata = os.path.join(tmp, "localappdata")
+        tmp_appdata = os.path.join(tmp, "appdata")
+        tmp_temp = os.path.join(tmp, "tmp")
+        for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+            os.makedirs(d, exist_ok=True)
+        suffix = f"Bug38_{os.getpid()}"
+        test_run_val = f"OxideSwarmUsbWorkerLiveTest{suffix}"
+        test_pointer_key = f"HKCU:\\Software\\OxideSwarm\\UsbKitLiveTest{suffix}"
+        pids_log = os.path.join(tmp, "worker_pids.log")
+        args_log = os.path.join(tmp, "args.log")
+        ps_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "OXIDESWARM_HOME")
+        }
+        ps_env.update(
+            USERPROFILE=tmp_home,
+            HOME=tmp_home,
+            LOCALAPPDATA=tmp_localappdata,
+            APPDATA=tmp_appdata,
+            TEMP=tmp_temp,
+            TMP=tmp_temp,
+            OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+            FAKE_OXIDE_PIDS_LOG=pids_log,
+            FAKE_ARGS_LOG=args_log,
+            FAKE_WORKER_NAME="bug38-win-worker",
+        )
+        if not shutil.which("cargo", path=ps_env.get("PATH")):
+            fake_cargo_dir = os.path.join(tmp, "fake_cargo_bin")
+            os.makedirs(fake_cargo_dir, exist_ok=True)
+            with open(os.path.join(fake_cargo_dir, "cargo.cmd"), "w", encoding="utf-8") as cf:
+                cf.write("@echo off\r\necho cargo 1.90.0\r\n")
+            ps_env["PATH"] = fake_cargo_dir + os.pathsep + ps_env.get("PATH", "")
+        root = os.path.join(tmp_localappdata, "OxideSwarm-USB")
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class STARTUPINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("lpReserved", wintypes.LPWSTR),
+                ("lpDesktop", wintypes.LPWSTR),
+                ("lpTitle", wintypes.LPWSTR),
+                ("dwX", wintypes.DWORD),
+                ("dwY", wintypes.DWORD),
+                ("dwXSize", wintypes.DWORD),
+                ("dwYSize", wintypes.DWORD),
+                ("dwXCountChars", wintypes.DWORD),
+                ("dwYCountChars", wintypes.DWORD),
+                ("dwFillAttribute", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("wShowWindow", wintypes.WORD),
+                ("cbReserved2", wintypes.WORD),
+                ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+                ("hStdInput", wintypes.HANDLE),
+                ("hStdOutput", wintypes.HANDLE),
+                ("hStdError", wintypes.HANDLE),
+            ]
+
+        class STARTUPINFOEXW(ctypes.Structure):
+            _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+        class PROCESS_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("hProcess", wintypes.HANDLE),
+                ("hThread", wintypes.HANDLE),
+                ("dwProcessId", wintypes.DWORD),
+                ("dwThreadId", wintypes.DWORD),
+            ]
+
+        kernel32.CreatePipe.argtypes = [ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p, wintypes.DWORD]
+        kernel32.CreatePipe.restype = wintypes.BOOL
+        kernel32.CreatePseudoConsole.argtypes = [COORD, wintypes.HANDLE, wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+        kernel32.CreatePseudoConsole.restype = ctypes.c_long
+        kernel32.ClosePseudoConsole.argtypes = [ctypes.c_void_p]
+        kernel32.ClosePseudoConsole.restype = None
+        kernel32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
+        kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+        kernel32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+        kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+        kernel32.DeleteProcThreadAttributeList.restype = None
+        kernel32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(PROCESS_INFORMATION)]
+        kernel32.CreateProcessW.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        kernel32.ReadFile.restype = wintypes.BOOL
+        kernel32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        kernel32.WriteFile.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+
+        def run_conpty_prompt(cmd_args, env_dict, wait_for, reply_bytes, timeout_sec=60):
+            cmd_line = subprocess.list2cmdline(cmd_args)
+            env_bytes = ("\0".join(f"{k}={v}" for k, v in env_dict.items()) + "\0\0").encode("utf-16-le")
+            env_buf = ctypes.create_string_buffer(env_bytes)
+            in_r, in_w, out_r, out_w = wintypes.HANDLE(), wintypes.HANDLE(), wintypes.HANDLE(), wintypes.HANDLE()
+            if not kernel32.CreatePipe(ctypes.byref(in_r), ctypes.byref(in_w), None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.CreatePipe(ctypes.byref(out_r), ctypes.byref(out_w), None, 0):
+                raise ctypes.WinError(ctypes.get_last_error())
+            hpc = ctypes.c_void_p()
+            hr = kernel32.CreatePseudoConsole(COORD(260, 40), in_r, out_w, 0, ctypes.byref(hpc))
+            kernel32.CloseHandle(in_r)
+            kernel32.CloseHandle(out_w)
+            if hr != 0:
+                kernel32.CloseHandle(in_w)
+                kernel32.CloseHandle(out_r)
+                raise OSError(f"CreatePseudoConsole failed HRESULT=0x{hr & 0xffffffff:08x}")
+            attr_size = ctypes.c_size_t(0)
+            kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
+            attr_buf = (ctypes.c_byte * attr_size.value)()
+            if not kernel32.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(attr_size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.UpdateProcThreadAttribute(attr_buf, 0, 0x00020016, hpc.value, ctypes.sizeof(ctypes.c_void_p), None, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            si = STARTUPINFOEXW()
+            si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
+            si.StartupInfo.dwFlags = 0x00000100
+            si.lpAttributeList = ctypes.cast(attr_buf, ctypes.c_void_p)
+            pi = PROCESS_INFORMATION()
+            cmd_buf = ctypes.create_unicode_buffer(cmd_line)
+            ok = kernel32.CreateProcessW(
+                None, cmd_buf, None, None, False,
+                0x00080000 | 0x00000400,
+                ctypes.cast(env_buf, ctypes.c_void_p),
+                tmp, ctypes.byref(si), ctypes.byref(pi),
+            )
+            kernel32.DeleteProcThreadAttributeList(attr_buf)
+            if not ok:
+                err = ctypes.get_last_error()
+                kernel32.ClosePseudoConsole(hpc)
+                kernel32.CloseHandle(in_w)
+                kernel32.CloseHandle(out_r)
+                raise ctypes.WinError(err)
+            chunks = []
+            chunks_lock = threading.Lock()
+
+            def _reader():
+                buf = ctypes.create_string_buffer(4096)
+                n = wintypes.DWORD(0)
+                while kernel32.ReadFile(out_r, buf, 4096, ctypes.byref(n), None) and n.value > 0:
+                    with chunks_lock:
+                        chunks.append(buf.raw[:n.value])
+
+            rd = threading.Thread(target=_reader, daemon=True)
+            rd.start()
+            vt_re = re.compile(r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")
+            sent = False
+            deadline = time.monotonic() + timeout_sec
+            rc = 255
+            try:
+                while True:
+                    with chunks_lock:
+                        raw = b"".join(chunks).decode("utf-8", errors="replace")
+                    cleaned = vt_re.sub("", raw).replace("\r\n", "\n").replace("\r", "")
+                    if not sent and wait_for in cleaned:
+                        written = wintypes.DWORD(0)
+                        kernel32.WriteFile(in_w, reply_bytes, len(reply_bytes), ctypes.byref(written), None)
+                        sent = True
+                    w = kernel32.WaitForSingleObject(pi.hProcess, 50)
+                    if w == 0:
+                        code = wintypes.DWORD(0)
+                        kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
+                        rc = int(code.value)
+                        break
+                    if time.monotonic() >= deadline:
+                        kernel32.TerminateProcess(pi.hProcess, 1)
+                        raise AssertionError(f"ConPTY timed out waiting on uninstall prompt; output={cleaned!r}")
+            finally:
+                kernel32.ClosePseudoConsole(hpc)
+                kernel32.CloseHandle(in_w)
+                rd.join(timeout=5)
+                kernel32.CloseHandle(out_r)
+                kernel32.CloseHandle(pi.hThread)
+                kernel32.CloseHandle(pi.hProcess)
+            with chunks_lock:
+                raw = b"".join(chunks).decode("utf-8", errors="replace")
+            return rc, vt_re.sub("", raw).replace("\r\n", "\n").replace("\r", "")
+
+        def open_write_blocking_handle(path):
+            GENERIC_READ = 0x80000000
+            FILE_SHARE_READ = 0x00000001
+            FILE_SHARE_DELETE = 0x00000004
+            OPEN_EXISTING = 3
+            handle = kernel32.CreateFileW(
+                path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                0,
+                None,
+            )
+            if handle == INVALID_HANDLE_VALUE or not handle:
+                raise OSError(f"CreateFileW lock failed for {path}: winerr={ctypes.get_last_error()}")
+            return handle
+
+        lock_handle = None
+        try:
+            kit_dir = os.path.join(tmp, "kit")
+            os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+            for name in ("install.ps1", "uninstall.ps1"):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+            shutil.copyfile(
+                os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1"),
+                os.path.join(kit_dir, "revoke-isolation-acls.ps1"),
+            )
+            with open(os.path.join(kit_dir, "invite.oxs"), "wb") as f:
+                f.write(b"OXSINV01fake-encrypted-payload")
+            with open(os.path.join(kit_dir, "isolation"), "w", encoding="utf-8") as f:
+                f.write("off\n")
+            meta = {
+                "kit_format": 1,
+                "version": "9.9.9",
+                "created_at": 1700000000,
+                "expires_at": 1900000000,
+                "machines": 2,
+                "roles": ["worker"],
+                "workspaces": False,
+                "gpu": False,
+                "require_approval": True,
+                "invite_id": "0123456789abcdef0123456789abcdef",
+            }
+            with open(os.path.join(kit_dir, "kit.json"), "w", encoding="utf-8") as mf:
+                json.dump(meta, mf)
+
+            fake_exe = os.path.join(tmp, "oxideswarm.exe")
+            cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string argsLog = Environment.GetEnvironmentVariable("FAKE_ARGS_LOG");
+        if (!string.IsNullOrEmpty(argsLog)) {
+            try { File.AppendAllText(argsLog, string.Join(" ", args) + Environment.NewLine); } catch {}
+        }
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            string pass = Console.In.ReadLine() ?? "";
+            if (string.IsNullOrEmpty(pass)) {
+                Console.Error.WriteLine("empty passphrase");
+                return 3;
+            }
+            string oxHome = Environment.GetEnvironmentVariable("OXIDESWARM_HOME");
+            if (string.IsNullOrEmpty(oxHome)) {
+                oxHome = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".oxideswarm");
+            }
+            Directory.CreateDirectory(oxHome);
+            File.WriteAllText(Path.Combine(oxHome, "node.key"), "fake-node-key\n");
+            File.WriteAllText(Path.Combine(oxHome, "rusty-grid.toml"), "[worker]\nmaster_key = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'\n");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            Thread.Sleep(60000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            string wname = Environment.GetEnvironmentVariable("FAKE_WORKER_NAME") ?? "bug38-win-worker";
+            Console.WriteLine("[{\"name\":\"" + wname + "\",\"tags\":[\"state:connected\"]}]");
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+            cs_file = os.path.join(tmp, "FakeOxideBug38.cs")
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(cs_code)
+            compile_res = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=30,
+            )
+            self.assertEqual(compile_res.returncode, 0, compile_res.stdout)
+
+            zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+            zip_path = os.path.join(kit_dir, "archives", zip_name)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.write(fake_exe, "oxideswarm.exe")
+            zip_sha = hashlib.sha256(read_bytes(zip_path)).hexdigest()
+            with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8") as f:
+                f.write(f"{zip_sha}  {zip_name}\n")
+
+            install_ps1 = os.path.join(kit_dir, "install.ps1")
+            uninstall_ps1 = os.path.join(kit_dir, "uninstall.ps1")
+            bin_exe = os.path.join(root, "bin", "oxideswarm.exe")
+            pid_file = os.path.join(root, "run", "worker.pid")
+
+            # 1. Fresh install starts worker cleanly.
+            res_install = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-Name", "bug38-win-worker", "-InstallRoot", root, "-NoAutostart"],
+                env=ps_env, input="correct horse battery staple\r\ny\r\n",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            self.assertEqual(res_install.returncode, 0, res_install.stdout)
+            self.assertTrue(os.path.isfile(bin_exe), res_install.stdout)
+            self.assertTrue(os.path.isfile(pid_file), res_install.stdout)
+            pid1 = read(pid_file).strip()
+            self.assertTrue(pid1.isdigit(), pid1)
+
+            # 2. Interactive uninstall prompt in a real console renders full $InstallRoot before "? [y/N]" and aborts on "n".
+            prompt_rc, prompt_out = run_conpty_prompt(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", uninstall_ps1, "-InstallRoot", root],
+                ps_env,
+                "[y/N]",
+                b"n\r",
+            )
+            self.assertEqual(prompt_rc, 0, prompt_out)
+            self.assertIn(f"Remove the OxideSwarm install in {root}? [y/N]", prompt_out)
+            self.assertIn("Nothing removed.", prompt_out)
+            self.assertTrue(os.path.isfile(bin_exe))
+
+            # 3. Update succeeds over live worker + ~1.5s write-blocking lock held past Stop-Process.
+            lock_handle = open_write_blocking_handle(bin_exe)
+
+            def release_after_worker_stop():
+                deadline = time.time() + 45.0
+                while os.path.exists(pid_file) and time.time() < deadline:
+                    time.sleep(0.1)
+                time.sleep(1.5)
+                nonlocal lock_handle
+                if lock_handle is not None:
+                    kernel32.CloseHandle(lock_handle)
+                    lock_handle = None
+
+            releaser = threading.Thread(target=release_after_worker_stop, daemon=True)
+            releaser.start()
+            res_upd = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-InstallRoot", root, "-Update", "-NoAutostart"],
+                env=ps_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            releaser.join(timeout=10)
+            self.assertEqual(res_upd.returncode, 0, res_upd.stdout)
+            self.assertTrue(os.path.isfile(pid_file), res_upd.stdout)
+            pid2 = read(pid_file).strip()
+            self.assertTrue(pid2.isdigit() and pid2 != pid1, (pid1, pid2, res_upd.stdout))
+
+            # 4. Bounded Copy-Item wait fails cleanly when lock outlives OXIDESWARM_USB_COPY_WAIT_MS.
+            lock_handle = open_write_blocking_handle(bin_exe)
+            fail_env = dict(ps_env, OXIDESWARM_USB_COPY_WAIT_MS="1000")
+            res_fail = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", install_ps1,
+                 "-InstallRoot", root, "-Update", "-NoAutostart"],
+                env=fail_env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+            )
+            kernel32.CloseHandle(lock_handle)
+            lock_handle = None
+            self.assertNotEqual(res_fail.returncode, 0, res_fail.stdout)
+            self.assertIn("could not replace", res_fail.stdout)
+            self.assertIn("file still in use", res_fail.stdout)
+        finally:
+            if lock_handle is not None:
+                try:
+                    kernel32.CloseHandle(lock_handle)
+                except Exception:
+                    pass
+            for pid_candidate in (pids_log, os.path.join(root, "run", "worker.pid")):
+                if os.path.isfile(pid_candidate):
+                    for line in read(pid_candidate).splitlines():
+                        if line.strip().isdigit():
+                            subprocess.run(
+                                ["powershell", "-NoProfile", "-Command",
+                                 f"Stop-Process -Id {line.strip()} -Force -ErrorAction SilentlyContinue"],
+                                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=30,
+                            )
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue",
+                ],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_windows_ci_feat3_dedup_cannot_drop_step7_or_new_tests(self):
         ci_text = read(os.path.join(ROOT, ".github", "workflows", "ci.yml"))
         step7_marker = "- name: Windows AppContainer isolation tests (--test-threads=1 --nocapture)"
@@ -3824,6 +4346,624 @@ class AgentNodeCleartextTokenWarningTests(unittest.TestCase):
     def test_connect_does_not_warn_on_loopback(self):
         text = self._connect_logs("ws://127.0.0.1:8088/ws", "tok")
         self.assertNotIn("plain ws://", text)
+
+
+class _FakeReleaseServer:
+    """In-process HTTP server on 127.0.0.1 serving /v<version>/<file> from memory."""
+
+    def __init__(self, routes):
+        self.routes = dict(routes)
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.requests.append(self.path)
+                payload = outer.routes.get(self.path)
+                if payload is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base_url = "http://127.0.0.1:%d" % self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+def _make_tar_gz_bytes(folder_name, files_bytes):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, data in files_bytes.items():
+            info = tarfile.TarInfo(name="%s/%s" % (folder_name, name))
+            info.size = len(data)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _make_zip_bytes(folder_name, files_bytes):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files_bytes.items():
+            zf.writestr("%s/%s" % (folder_name, name), data)
+    return buf.getvalue()
+
+
+class Adopt3StaticChecks(unittest.TestCase):
+    """ADOPT-3 static rules for scripts/install.{sh,ps1} and README.md."""
+
+    def test_install_scripts_follow_adopt3_rules(self):
+        sh_path = os.path.join(ROOT, "scripts", "install.sh")
+        ps_path = os.path.join(ROOT, "scripts", "install.ps1")
+        readme_path = os.path.join(ROOT, "README.md")
+        self.assertTrue(os.path.isfile(sh_path), "scripts/install.sh must exist")
+        self.assertTrue(os.path.isfile(ps_path), "scripts/install.ps1 must exist")
+
+        sh_text = read(sh_path)
+        ps_text = read(ps_path)
+        for path, text in ((sh_path, sh_text), (ps_path, ps_text)):
+            code_lines = [
+                ln for ln in text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")
+            ]
+            joined = "\n".join(code_lines)
+            self.assertNotIn("sudo", joined, path)
+            self.assertNotIn("launchctl", joined, path)
+            self.assertNotIn("systemctl", joined, path)
+            self.assertNotIn("New-Service", joined, path)
+            self.assertNotIn("sc.exe", joined, path)
+            self.assertNotIn(".oxideswarm", joined, path)
+            self.assertIn("OXIDESWARM_DOWNLOAD_BASE", text, path)
+            self.assertIn("gh attestation verify", text, path)
+
+        if not IS_WINDOWS and shutil.which("bash"):
+            res = subprocess.run(
+                ["bash", "-n", sh_path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout)
+
+        readme = read(readme_path)
+        self.assertIn("scripts/install.sh", readme)
+        self.assertIn("scripts/install.ps1", readme)
+        self.assertIn("OXIDESWARM_DOWNLOAD_BASE", readme)
+        pipe_patterns = (
+            r"(?i)\b(curl|wget)\b[^\n|]*\|\s*(sh|bash|zsh)\b",
+            r"(?i)\b(irm|iwr|Invoke-RestMethod|Invoke-WebRequest)\b[^\n|]*\|\s*(iex|Invoke-Expression)\b",
+        )
+        for pat in pipe_patterns:
+            self.assertIsNone(re.search(pat, readme), "README must not show pipe-into-shell: %s" % pat)
+
+
+@unittest.skipIf(IS_WINDOWS, "install.sh runs on macOS and Linux")
+class InstallShTests(unittest.TestCase):
+    """ADOPT-3 behavioral tests for scripts/install.sh in a private HOME against a local HTTP server."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ox_install_sh_")
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+        self.script = os.path.join(ROOT, "scripts", "install.sh")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _detect_target_or_shim(self):
+        sysname = platform.system()
+        mach = platform.machine().lower()
+        mapping = {
+            ("Darwin", "arm64"): "aarch64-apple-darwin",
+            ("Darwin", "aarch64"): "aarch64-apple-darwin",
+            ("Darwin", "x86_64"): "x86_64-apple-darwin",
+            ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+            ("Linux", "amd64"): "x86_64-unknown-linux-gnu",
+        }
+        target = mapping.get((sysname, mach))
+        if target:
+            return target, None
+        shim = os.path.join(self.tmp, "uname_shim")
+        os.makedirs(shim, exist_ok=True)
+        p = os.path.join(shim, "uname")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nif [ "$1" = "-s" ]; then echo Linux; else echo x86_64; fi\n')
+        os.chmod(p, 0o755)
+        return "x86_64-unknown-linux-gnu", shim
+
+    def _make_fake_gh(self, exit_code=0):
+        d = os.path.join(self.tmp, "fake_gh_%d" % exit_code)
+        os.makedirs(d, exist_ok=True)
+        log = os.path.join(self.tmp, "fake_gh.log")
+        open(log, "w", encoding="utf-8").close()
+        gh = os.path.join(d, "gh")
+        with open(gh, "w", encoding="utf-8") as f:
+            f.write(
+                '#!/bin/sh\n'
+                'if [ "$1" = "auth" ]; then\n'
+                '  exit "${FAKE_GH_AUTH_EXIT:-0}"\n'
+                'fi\n'
+                'printf "%s\\n" "$*" >> "${FAKE_GH_LOG:?}"\n'
+                'exit "${FAKE_GH_EXIT:-0}"\n'
+            )
+        os.chmod(gh, 0o755)
+        return d, log
+
+    def _no_gh_path(self):
+        orig = os.environ.get("PATH", "/usr/bin:/bin")
+        tool_dir = os.path.join(self.tmp, "no_gh_bin")
+        os.makedirs(tool_dir, exist_ok=True)
+        for cmd in (
+            "sh", "bash", "uname", "mktemp", "rm", "mkdir", "cp", "mv", "chmod",
+            "tar", "gzip", "gunzip", "tr", "awk", "sed", "grep", "cut", "cat",
+            "dirname", "basename", "curl", "wget", "sha256sum", "shasum", "openssl",
+            "head", "tail",
+        ):
+            found = shutil.which(cmd, path=orig)
+            if found and not os.path.exists(os.path.join(tool_dir, cmd)):
+                os.symlink(found, os.path.join(tool_dir, cmd))
+        kept = [tool_dir]
+        for entry in orig.split(os.pathsep):
+            if not entry or not os.path.isdir(entry):
+                continue
+            if os.path.exists(os.path.join(entry, "gh")):
+                continue
+            kept.append(entry)
+        res = os.pathsep.join(kept)
+        self.assertIsNone(shutil.which("gh", path=res))
+        return res
+
+    def _build_release_routes(self, version, target, marker, gpu=False, corrupt_sum=False):
+        stem = "oxideswarm-%s-%s%s" % (version, target, "-gpu" if gpu else "")
+        archive_name = stem + ".tar.gz"
+        files = {
+            "oxideswarm": ("#!/bin/sh\necho oxideswarm-%s\n" % marker).encode("utf-8"),
+            "rusty-grid": ("#!/bin/sh\necho rusty-grid-%s\n" % marker).encode("utf-8"),
+            "ox-mode": ("#!/bin/sh\necho ox-mode-%s\n" % marker).encode("utf-8"),
+        }
+        tgz = _make_tar_gz_bytes(stem, files)
+        digest = hashlib.sha256(tgz).hexdigest()
+        if corrupt_sum:
+            digest = ("0" if digest[0] != "0" else "1") + digest[1:]
+        sums = ("%s  %s\n" % (digest, archive_name)).encode("utf-8")
+        return {
+            "/v%s/%s" % (version, archive_name): tgz,
+            "/v%s/SHA256SUMS" % version: sums,
+        }
+
+    def _run(self, args, env_extra):
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": self.home,
+            "TMPDIR": self.tmp,
+        }
+        env.update(env_extra)
+        return subprocess.run(
+            ["bash", self.script] + list(args),
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=60,
+        )
+
+    def test_matching_checksum_installs_with_gh_attestation(self):
+        target, shim = self._detect_target_or_shim()
+        gh_dir, gh_log = self._make_fake_gh(0)
+        path = os.pathsep.join([p for p in (gh_dir, shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        routes = self._build_release_routes("0.4.4", target, "V1")
+        dest = os.path.join(self.tmp, "dest")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url, "FAKE_GH_LOG": gh_log, "FAKE_GH_EXIT": "0"},
+            )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".oxideswarm")))
+        for b in ("oxideswarm", "rusty-grid", "ox-mode"):
+            p = os.path.join(dest, b)
+            self.assertTrue(os.path.isfile(p), p)
+            self.assertTrue(os.access(p, os.X_OK), p)
+            self.assertIn("V1", read(p))
+        gh_calls = read(gh_log)
+        self.assertIn("attestation verify", gh_calls)
+        self.assertIn("--repo DuongNAD/OxideSwarm", gh_calls)
+        self.assertIn("--source-ref refs/tags/v0.4.4", gh_calls)
+        self.assertIn("oxideswarm master", res.stdout)
+
+    def test_without_gh_installs_after_sha256_and_prints_notice(self):
+        target, shim = self._detect_target_or_shim()
+        no_gh = self._no_gh_path()
+        path = os.pathsep.join([p for p in (shim, no_gh) if p])
+        routes = self._build_release_routes("0.4.4", target, "NOGH")
+        dest = os.path.join(self.tmp, "dest_nogh")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url},
+            )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("skipping provenance attestation", res.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "oxideswarm")))
+
+    def test_unauthenticated_gh_skips_attestation_with_warning(self):
+        target, shim = self._detect_target_or_shim()
+        gh_dir, gh_log = self._make_fake_gh(99)
+        path = os.pathsep.join([p for p in (gh_dir, shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        routes = self._build_release_routes("0.4.4", target, "UNAUTH_GH")
+        dest_dry = os.path.join(self.tmp, "dest_unauth_dry")
+        dest = os.path.join(self.tmp, "dest_unauth")
+        with _FakeReleaseServer(routes) as srv:
+            dry = self._run(
+                ["--version", "0.4.4", "--dir", dest_dry, "--dry-run"],
+                {
+                    "PATH": path,
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_AUTH_EXIT": "1",
+                    "FAKE_GH_EXIT": "99",
+                },
+            )
+            self.assertEqual(srv.requests, [])
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {
+                    "PATH": path,
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_AUTH_EXIT": "1",
+                    "FAKE_GH_EXIT": "99",
+                },
+            )
+        self.assertEqual(dry.returncode, 0, dry.stdout)
+        self.assertIn("not authenticated", dry.stdout)
+        self.assertFalse(os.path.exists(dest_dry))
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("Warning:", res.stdout)
+        self.assertIn("not authenticated", res.stdout)
+        self.assertIn("skipping provenance attestation", res.stdout)
+        self.assertEqual(read(gh_log).strip(), "", "unauthenticated gh must not call gh attestation verify")
+        for b in ("oxideswarm", "rusty-grid", "ox-mode"):
+            self.assertTrue(os.path.isfile(os.path.join(dest, b)))
+
+    def test_attestation_failure_refuses_and_leaves_no_file(self):
+        target, shim = self._detect_target_or_shim()
+        gh_dir, gh_log = self._make_fake_gh(1)
+        path = os.pathsep.join([p for p in (gh_dir, shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        routes = self._build_release_routes("0.4.4", target, "BADATT")
+        dest = os.path.join(self.tmp, "dest_bad_att")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url, "FAKE_GH_LOG": gh_log, "FAKE_GH_EXIT": "1"},
+            )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertFalse(os.path.exists(dest), "failed attestation must leave no files or dir")
+
+    def test_checksum_mismatch_refuses_before_attestation_and_leaves_no_file(self):
+        target, shim = self._detect_target_or_shim()
+        gh_dir, gh_log = self._make_fake_gh(0)
+        path = os.pathsep.join([p for p in (gh_dir, shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        routes = self._build_release_routes("0.4.4", target, "CORRUPT", corrupt_sum=True)
+        dest = os.path.join(self.tmp, "dest_bad_sum")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url, "FAKE_GH_LOG": gh_log, "FAKE_GH_EXIT": "0"},
+            )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn("checksum mismatch", res.stdout.lower())
+        self.assertEqual(read(gh_log).strip(), "", "checksum mismatch must abort before gh attestation verify")
+        self.assertFalse(os.path.exists(dest), "checksum mismatch must leave no files or dir")
+
+    def test_unknown_architecture_is_named(self):
+        shim = os.path.join(self.tmp, "uname_riscv")
+        os.makedirs(shim)
+        p = os.path.join(shim, "uname")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nif [ "$1" = "-s" ]; then echo Linux; else echo riscv64; fi\n')
+        os.chmod(p, 0o755)
+        dest = os.path.join(self.tmp, "dest_arch")
+        with _FakeReleaseServer({}) as srv:
+            res = self._run(
+                ["--dir", dest],
+                {"PATH": shim + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), "OXIDESWARM_DOWNLOAD_BASE": srv.base_url},
+            )
+            reqs = list(srv.requests)
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn("Linux", res.stdout)
+        self.assertIn("riscv64", res.stdout)
+        self.assertEqual(reqs, [])
+        self.assertFalse(os.path.exists(dest))
+
+    def test_dry_run_writes_nothing(self):
+        target, shim = self._detect_target_or_shim()
+        path = os.pathsep.join([p for p in (shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        dest = os.path.join(self.tmp, "dest_dry")
+        with _FakeReleaseServer({}) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest, "--dry-run"],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url},
+            )
+            reqs = list(srv.requests)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(reqs, [])
+        self.assertIn("Dry run", res.stdout)
+        self.assertIn(target, res.stdout)
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".oxideswarm")))
+
+    def test_second_run_replaces_binaries(self):
+        target, shim = self._detect_target_or_shim()
+        gh_dir, gh_log = self._make_fake_gh(0)
+        path = os.pathsep.join([p for p in (gh_dir, shim, os.environ.get("PATH", "/usr/bin:/bin")) if p])
+        dest = os.path.join(self.tmp, "dest_replace")
+        routes1 = self._build_release_routes("0.4.3", target, "MARKER_V1")
+        routes2 = self._build_release_routes("0.4.4", target, "MARKER_V2")
+        merged = dict(routes1, **routes2)
+        with _FakeReleaseServer(merged) as srv:
+            r1 = self._run(
+                ["--version", "0.4.3", "--dir", dest],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url, "FAKE_GH_LOG": gh_log, "FAKE_GH_EXIT": "0"},
+            )
+            self.assertEqual(r1.returncode, 0, r1.stdout)
+            self.assertIn("MARKER_V1", read(os.path.join(dest, "oxideswarm")))
+            r2 = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {"PATH": path, "OXIDESWARM_DOWNLOAD_BASE": srv.base_url, "FAKE_GH_LOG": gh_log, "FAKE_GH_EXIT": "0"},
+            )
+            self.assertEqual(r2.returncode, 0, r2.stdout)
+        for b in ("oxideswarm", "rusty-grid", "ox-mode"):
+            text = read(os.path.join(dest, b))
+            self.assertIn("MARKER_V2", text)
+            self.assertNotIn("MARKER_V1", text)
+
+
+@unittest.skipUnless(IS_WINDOWS and shutil.which("powershell"), "install.ps1 runs under Windows PowerShell")
+class InstallPs1Tests(unittest.TestCase):
+    """ADOPT-3 behavioral tests for scripts/install.ps1 in a private HOME against a local HTTP server."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ox_install_ps1_")
+        self.home = os.path.join(self.tmp, "home")
+        self.localappdata = os.path.join(self.tmp, "localappdata")
+        os.makedirs(self.home)
+        os.makedirs(self.localappdata)
+        self.script = os.path.join(ROOT, "scripts", "install.ps1")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _make_fake_gh(self, exit_code=0):
+        d = os.path.join(self.tmp, "fake_gh_%d" % exit_code)
+        os.makedirs(d, exist_ok=True)
+        log = os.path.join(self.tmp, "fake_gh.log")
+        open(log, "w", encoding="utf-8").close()
+        gh = os.path.join(d, "gh.cmd")
+        with open(gh, "w", encoding="ascii", newline="\r\n") as f:
+            f.write(
+                "@echo off\r\n"
+                "if /I \"%~1\"==\"auth\" goto :do_auth\r\n"
+                ">> \"%FAKE_GH_LOG%\" echo %*\r\n"
+                "exit /b %FAKE_GH_EXIT%\r\n"
+                ":do_auth\r\n"
+                "if not \"%FAKE_GH_AUTH_EXIT%\"==\"\" exit /b %FAKE_GH_AUTH_EXIT%\r\n"
+                "exit /b 0\r\n"
+            )
+        return d, log
+
+    def _no_gh_path(self):
+        parts = []
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry:
+                continue
+            if any(os.path.isfile(os.path.join(entry, name)) for name in ("gh.exe", "gh.cmd", "gh.bat")):
+                continue
+            parts.append(entry)
+        res = os.pathsep.join(parts)
+        self.assertIsNone(shutil.which("gh", path=res))
+        return res
+
+    def _build_release_routes(self, version, marker, gpu=False, corrupt_sum=False):
+        stem = "oxideswarm-%s-x86_64-pc-windows-msvc%s" % (version, "-gpu" if gpu else "")
+        archive_name = stem + ".zip"
+        files = {
+            "oxideswarm.exe": ("OX_FAKE_OXIDESWARM_" + marker).encode("ascii"),
+            "rusty-grid.exe": ("OX_FAKE_RUSTY_GRID_" + marker).encode("ascii"),
+            "ox-mode.exe": ("OX_FAKE_OX_MODE_" + marker).encode("ascii"),
+        }
+        zdata = _make_zip_bytes(stem, files)
+        digest = hashlib.sha256(zdata).hexdigest()
+        if corrupt_sum:
+            digest = ("0" if digest[0] != "0" else "1") + digest[1:]
+        sums = ("%s  %s\n" % (digest, archive_name)).encode("utf-8")
+        return {
+            "/v%s/%s" % (version, archive_name): zdata,
+            "/v%s/SHA256SUMS" % version: sums,
+        }
+
+    def _run(self, args, env_extra=None, remove_keys=()):
+        env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "GH_TOKEN", "GITHUB_TOKEN")
+        }
+        env.update({
+            "HOME": self.home,
+            "USERPROFILE": self.home,
+            "LOCALAPPDATA": self.localappdata,
+            "TEMP": self.tmp,
+            "TMP": self.tmp,
+        })
+        for rk in remove_keys:
+            env.pop(rk, None)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", self.script] + list(args),
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=60,
+        )
+
+    def test_matching_checksum_installs_with_gh_attestation(self):
+        gh_dir, gh_log = self._make_fake_gh(0)
+        routes = self._build_release_routes("0.4.4", "WIN_V1")
+        dest = os.path.join(self.tmp, "dest")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {
+                    "PATH": gh_dir + os.pathsep + os.environ.get("PATH", ""),
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_EXIT": "0",
+                },
+            )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".oxideswarm")))
+        for b in ("oxideswarm.exe", "rusty-grid.exe", "ox-mode.exe"):
+            p = os.path.join(dest, b)
+            self.assertTrue(os.path.isfile(p), p)
+            self.assertIn("WIN_V1", read(p))
+        gh_calls = read(gh_log)
+        self.assertIn("attestation verify", gh_calls)
+        self.assertIn("--repo DuongNAD/OxideSwarm", gh_calls)
+        self.assertIn("--source-ref refs/tags/v0.4.4", gh_calls)
+        self.assertIn("oxideswarm master", res.stdout)
+
+    def test_without_gh_installs_after_sha256_and_prints_notice(self):
+        routes = self._build_release_routes("0.4.4", "WIN_NOGH")
+        dest = os.path.join(self.tmp, "dest_nogh")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["-Version", "0.4.4", "-Dir", dest],
+                {"PATH": self._no_gh_path(), "OXIDESWARM_DOWNLOAD_BASE": srv.base_url},
+            )
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("skipping provenance attestation", res.stdout)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "oxideswarm.exe")))
+
+    def test_unauthenticated_gh_skips_attestation_with_warning(self):
+        gh_dir, gh_log = self._make_fake_gh(99)
+        routes = self._build_release_routes("0.4.4", "WIN_UNAUTH_GH")
+        dest_dry = os.path.join(self.tmp, "dest_unauth_dry")
+        dest = os.path.join(self.tmp, "dest_unauth")
+        env_extra = {
+            "PATH": gh_dir + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_GH_LOG": gh_log,
+            "FAKE_GH_AUTH_EXIT": "1",
+            "FAKE_GH_EXIT": "99",
+        }
+        with _FakeReleaseServer(routes) as srv:
+            env_extra["OXIDESWARM_DOWNLOAD_BASE"] = srv.base_url
+            dry = self._run(["--version", "0.4.4", "--dir", dest_dry, "--dry-run"], env_extra)
+            self.assertEqual(srv.requests, [])
+            res = self._run(["--version", "0.4.4", "--dir", dest], env_extra)
+        self.assertEqual(dry.returncode, 0, dry.stdout)
+        self.assertIn("not authenticated", dry.stdout)
+        self.assertFalse(os.path.exists(dest_dry))
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("Warning:", res.stdout)
+        self.assertIn("not authenticated", res.stdout)
+        self.assertIn("skipping provenance attestation", res.stdout)
+        self.assertEqual(read(gh_log).strip(), "", "unauthenticated gh must not call gh attestation verify")
+        for b in ("oxideswarm.exe", "rusty-grid.exe", "ox-mode.exe"):
+            self.assertTrue(os.path.isfile(os.path.join(dest, b)))
+
+    def test_attestation_failure_refuses_and_leaves_no_file(self):
+        gh_dir, gh_log = self._make_fake_gh(1)
+        routes = self._build_release_routes("0.4.4", "WIN_BADATT")
+        dest = os.path.join(self.tmp, "dest_bad_att")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {
+                    "PATH": gh_dir + os.pathsep + os.environ.get("PATH", ""),
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_EXIT": "1",
+                },
+            )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertFalse(os.path.exists(dest), "failed attestation must leave no files or dir")
+
+    def test_checksum_mismatch_refuses_before_attestation_and_leaves_no_file(self):
+        gh_dir, gh_log = self._make_fake_gh(0)
+        routes = self._build_release_routes("0.4.4", "WIN_BADSUM", corrupt_sum=True)
+        dest = os.path.join(self.tmp, "dest_bad_sum")
+        with _FakeReleaseServer(routes) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest],
+                {
+                    "PATH": gh_dir + os.pathsep + os.environ.get("PATH", ""),
+                    "OXIDESWARM_DOWNLOAD_BASE": srv.base_url,
+                    "FAKE_GH_LOG": gh_log,
+                    "FAKE_GH_EXIT": "0",
+                },
+            )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn("checksum mismatch", res.stdout.lower())
+        self.assertEqual(read(gh_log).strip(), "", "checksum mismatch must abort before gh attestation verify")
+        self.assertFalse(os.path.exists(dest), "checksum mismatch must leave no files or dir")
+
+    def test_unknown_architecture_is_named(self):
+        dest = os.path.join(self.tmp, "dest_arch")
+        with _FakeReleaseServer({}) as srv:
+            res = self._run(
+                ["--dir", dest],
+                {"OXIDESWARM_DOWNLOAD_BASE": srv.base_url, "PROCESSOR_ARCHITECTURE": "ARM64"},
+                remove_keys=("PROCESSOR_ARCHITEW6432",),
+            )
+            reqs = list(srv.requests)
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn("Windows", res.stdout)
+        self.assertIn("ARM64", res.stdout)
+        self.assertEqual(reqs, [])
+        self.assertFalse(os.path.exists(dest))
+
+    def test_dry_run_writes_nothing(self):
+        dest = os.path.join(self.tmp, "dest_dry")
+        with _FakeReleaseServer({}) as srv:
+            res = self._run(
+                ["--version", "0.4.4", "--dir", dest, "--dry-run"],
+                {"OXIDESWARM_DOWNLOAD_BASE": srv.base_url},
+            )
+            reqs = list(srv.requests)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertEqual(reqs, [])
+        self.assertIn("Dry run", res.stdout)
+        self.assertIn("x86_64-pc-windows-msvc", res.stdout)
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".oxideswarm")))
+
+    def test_second_run_replaces_binaries(self):
+        gh_dir, gh_log = self._make_fake_gh(0)
+        dest = os.path.join(self.tmp, "dest_replace")
+        routes1 = self._build_release_routes("0.4.3", "MARKER_V1")
+        routes2 = self._build_release_routes("0.4.4", "MARKER_V2")
+        merged = dict(routes1, **routes2)
+        env = {
+            "PATH": gh_dir + os.pathsep + os.environ.get("PATH", ""),
+            "FAKE_GH_LOG": gh_log,
+            "FAKE_GH_EXIT": "0",
+        }
+        with _FakeReleaseServer(merged) as srv:
+            env["OXIDESWARM_DOWNLOAD_BASE"] = srv.base_url
+            r1 = self._run(["--version", "0.4.3", "--dir", dest], env)
+            self.assertEqual(r1.returncode, 0, r1.stdout)
+            self.assertIn("MARKER_V1", read(os.path.join(dest, "oxideswarm.exe")))
+            r2 = self._run(["--version", "0.4.4", "--dir", dest], env)
+            self.assertEqual(r2.returncode, 0, r2.stdout)
+        for b in ("oxideswarm.exe", "rusty-grid.exe", "ox-mode.exe"):
+            text = read(os.path.join(dest, b))
+            self.assertIn("MARKER_V2", text)
+            self.assertNotIn("MARKER_V1", text)
 
 
 if __name__ == "__main__":
