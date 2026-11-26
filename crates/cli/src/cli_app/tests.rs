@@ -1770,4 +1770,62 @@ fn test_plan_lease_and_check_diff_subcommands_parse_cleanly() {
         Some(std::path::Path::new("/tmp/hub"))
     );
     assert!(vargs.json);
+
+    let pr_body_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "pr-body",
+        "--task",
+        "TEAM-5",
+        "--plan",
+        ".oxideswarm/plan.toml",
+        "--repo",
+        ".",
+        "--base",
+        "master",
+        "--remote",
+        "origin",
+        "--record",
+        ".oxideswarm/verify/TEAM-5.json",
+        "--branch",
+        "team/TEAM-5",
+        "--summary",
+        "Render PR body",
+        "--require-fresh",
+        "--json",
+    ])
+    .expect("parse plan pr-body");
+    let Commands::Plan(pr_body_args) = pr_body_cli.command else {
+        panic!("expected Plan");
+    };
+    assert!(matches!(
+        pr_body_args.command,
+        crate::plan::PlanSubcommand::PrBody {
+            require_fresh: true,
+            json: true,
+            ..
+        }
+    ));
+
+    let done_cli = Cli::try_parse_from([
+        "oxideswarm",
+        "plan",
+        "done",
+        "TEAM-5",
+        "--plan",
+        ".oxideswarm/plan.toml",
+        "--repo",
+        ".",
+        "--remote",
+        "origin",
+        "--json",
+    ])
+    .expect("parse plan done");
+    let Commands::Plan(done_args) = done_cli.command else {
+        panic!("expected Plan");
+    };
+    assert!(matches!(
+        done_args.command,
+        crate::plan::PlanSubcommand::Done { json: true, .. }
+    ));
 }
