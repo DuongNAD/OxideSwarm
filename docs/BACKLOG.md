@@ -467,7 +467,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEAM-3 | Verify gate: sync a worktree, run the task's profiles, return compact failure JSON | P2 | M | TEAM-1, AX-2 |  | Planned | Out | (design 0111) |
 | TEAM-4 | Circuit breaker after three identical failures, notice to the person | P2 | S | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
 | TEAM-5 | Merge flow with a verify table; this project's first wave on the plan | P2 | M | TEAM-2, TEAM-3 |  | Planned | Out | (design 0111) |
-| TEAM-6 | Grid mailbox in the master: messages, events and files between machines, long-poll wait (protocol 11) | P2 | L | TEAM-1, PROTO-4 |  | Planned | Out | (design 0111) |
+| TEAM-6 | Grid mailbox in the master: messages, events and files between machines, long-poll wait (protocol 11, release 0.5.0, Q101) | P2 | L | TEAM-1, PROTO-4 | Q101 | Planned | Out | (design 0111) |
 | TEAM-7 | Wake-ups for idle agents (`mail watch --hook`, MCP `mail_wait`) and an `agent_bridge.py` grid backend | P2 | M | TEAM-6 |  | Planned | Out | (design 0111) |
 | BUG-36 | `shard` and `submit --matrix` give the whole run one deadline equal to the task timeout | P2 | S | AX-1, AX-2 |  | Planned | Out |  |
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |

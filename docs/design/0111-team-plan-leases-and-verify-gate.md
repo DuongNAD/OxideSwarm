@@ -331,4 +331,7 @@ content-addressed blob store and a journal that survives restarts.
   which the 0.4.x line does not allow; it goes into the first release with protocol 11, and the owner decides
   whether that release is 0.5.0 (with language model serving moved after it) or 0.5.0 stays as planned.
   Until then the Drive hub remains the mailbox (D8.6).
+- 2026-11-26: The owner decided Q101 ("Là 0.5.0"): the first release with protocol 11 is `0.5.0`, and it carries
+  this record (TEAM-1 to TEAM-7) with bet A of design 0056; language model serving moves to `0.6.0`
+  (`docs/ROADMAP.md`). TEAM-1 to TEAM-5 may still ship in `0.4.x` after the stability release.
 
