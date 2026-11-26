@@ -272,7 +272,8 @@ impl Mailbox {
             id
         };
 
-        if !attachments.is_empty() {
+        let had_attachments = !attachments.is_empty();
+        if had_attachments {
             let Some(ref bstore) = self.blob_store else {
                 return Err("master has no blob store configured for mail attachments".to_string());
             };
@@ -295,8 +296,15 @@ impl Mailbox {
             created_at_utc,
         };
 
-        let (evicted, acks) = {
+        let (evicted, acks, persist_err) = {
             let mut st = self.state.lock().unwrap();
+            let rollback = st.store.is_some().then(|| {
+                (
+                    st.messages.clone(),
+                    st.total_bytes,
+                    st.journal_records_since_compact,
+                )
+            });
             st.total_bytes = st.total_bytes.saturating_add(mail_message_bytes(&message));
             st.messages.push_back(message.clone());
             st.journal_records_since_compact += 1;
@@ -310,30 +318,63 @@ impl Mailbox {
                     st.snapshot_image()
                 });
             let mut acks = Vec::new();
+            let mut persist_err = None;
             if let Some(ref store) = st.store {
                 match store.append_durable(&MailJournalRecord::Send { message }) {
                     Ok(ack) => acks.push(ack),
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => persist_err = Some(e.to_string()),
                 }
-                if !evicted.is_empty() {
+                if persist_err.is_none() && !evicted.is_empty() {
                     match store.append_durable(&MailJournalRecord::Evict {
                         ids: evicted.clone(),
                     }) {
                         Ok(ack) => acks.push(ack),
-                        Err(e) => return Err(e.to_string()),
+                        Err(e) => persist_err = Some(e.to_string()),
                     }
                 }
-                if let Some(image) = image_if_compact {
-                    if let Ok(ack) = store.compact(image) {
-                        acks.push(ack);
+                if persist_err.is_none() {
+                    if let Some(image) = image_if_compact {
+                        if let Ok(ack) = store.compact(image) {
+                            acks.push(ack);
+                        }
                     }
                 }
             }
-            (evicted, acks)
+            if persist_err.is_some() {
+                if let Some((msgs, bytes, recs)) = rollback {
+                    st.messages = msgs;
+                    st.total_bytes = bytes;
+                    st.journal_records_since_compact = recs;
+                }
+            }
+            (evicted, acks, persist_err)
         };
+
+        if let Some(err) = persist_err {
+            if had_attachments {
+                if let Some(ref bstore) = self.blob_store {
+                    bstore.unpin_mail(msg_id).await;
+                }
+            }
+            return Err(err);
+        }
 
         for ack in acks {
             if let Err(e) = ack.await {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(pos) = st.messages.iter().position(|m| m.id == msg_id) {
+                        if let Some(removed) = st.messages.remove(pos) {
+                            st.total_bytes =
+                                st.total_bytes.saturating_sub(mail_message_bytes(&removed));
+                        }
+                    }
+                }
+                if had_attachments {
+                    if let Some(ref bstore) = self.blob_store {
+                        bstore.unpin_mail(msg_id).await;
+                    }
+                }
                 return Err(e.to_string());
             }
         }
@@ -375,6 +416,12 @@ impl Mailbox {
 
         let (cursor, unpin_ids, ack) = {
             let mut st = self.state.lock().unwrap();
+            let latest_id = st.next_id.saturating_sub(1);
+            if up_to_id > latest_id {
+                return Err(format!(
+                    "cannot acknowledge future message #{up_to_id} (latest message is #{latest_id})"
+                ));
+            }
             let prev = st.cursors.get(&consumer).copied().unwrap_or(0);
             let next = prev.max(up_to_id);
             let mut unpin_ids = Vec::new();
@@ -525,5 +572,42 @@ mod tests {
         assert!(!timed_out);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].id, sent_id);
+    }
+
+    #[tokio::test]
+    async fn ack_rejects_future_message_id_without_advancing_cursor() {
+        let mailbox = Mailbox::in_memory_default();
+
+        // When no messages exist yet, acking any id > 0 fails and leaves cursor at 0.
+        assert!(mailbox.ack("agent-win-2".into(), 1).await.is_err());
+        assert!(mailbox.ack("agent-win-2".into(), u64::MAX).await.is_err());
+        assert_eq!(mailbox.ack("agent-win-2".into(), 0).await.unwrap(), 0);
+
+        let id1 = mailbox
+            .send(
+                "agent-mac".into(),
+                vec!["agent-win-2".into()],
+                "ping".into(),
+                "hello".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(id1, 1);
+
+        // Acking past the latest issued id must fail and leave #1 unacknowledged.
+        assert!(mailbox.ack("agent-win-2".into(), 2).await.is_err());
+        assert!(mailbox.ack("agent-win-2".into(), u64::MAX).await.is_err());
+
+        let (msgs, cursor) = mailbox.fetch("agent-win-2", &[], 0).unwrap();
+        assert_eq!(cursor, 0);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, id1);
+
+        // Valid ack up to id1 succeeds and advances the cursor.
+        assert_eq!(mailbox.ack("agent-win-2".into(), id1).await.unwrap(), id1);
+        let (msgs_after, cursor_after) = mailbox.fetch("agent-win-2", &[], 0).unwrap();
+        assert_eq!(cursor_after, id1);
+        assert!(msgs_after.is_empty());
     }
 }

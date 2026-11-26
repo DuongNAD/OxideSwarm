@@ -231,13 +231,27 @@ fn is_symlink_or_reparse(meta: &std::fs::Metadata) -> bool {
     false
 }
 
+fn is_unix_system_alias_ancestor(prefix: &Path, full_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        prefix != full_dir && matches!(prefix.to_str(), Some("/tmp" | "/var" | "/etc"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (prefix, full_dir);
+        false
+    }
+}
+
 /// Validates `--save <DIR>` without traversing symbolic links or Windows junctions, creating the
 /// final directory if it does not yet exist.
 pub fn validate_safe_save_dir(dir: &Path) -> Result<(), String> {
     let mut prefix = PathBuf::new();
     for component in dir.components() {
         prefix.push(component.as_os_str());
-        if matches!(component, Component::Prefix(_) | Component::RootDir) {
+        if matches!(component, Component::Prefix(_) | Component::RootDir)
+            || is_unix_system_alias_ancestor(&prefix, dir)
+        {
             continue;
         }
         match std::fs::symlink_metadata(&prefix) {
@@ -906,6 +920,11 @@ mod tests {
                 .is_ok_and(|o| o.status.success());
         if linked {
             assert!(validate_safe_save_dir(&link).is_err());
+            assert!(validate_safe_save_dir(&link.join("nested")).is_err());
         }
+
+        let nested_ok = dir.path().join("nested").join("save_out");
+        assert!(validate_safe_save_dir(&nested_ok).is_ok());
+        assert!(nested_ok.is_dir());
     }
 }

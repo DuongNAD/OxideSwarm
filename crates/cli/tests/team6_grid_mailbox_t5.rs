@@ -14,7 +14,6 @@
 //! 6. CLI `oxideswarm mail send --file`, `mail fetch --save`, and `mail ack` (plus symlink/junction
 //!    `--save` dir refusal).
 
-use std::process::Command;
 use std::time::Duration;
 
 use rusty_grid_cli::blobs::BlobConnection;
@@ -92,7 +91,7 @@ fn create_symlink_or_junction(link: &std::path::Path, target: &std::path::Path) 
         if std::os::windows::fs::symlink_dir(target, link).is_ok() {
             return true;
         }
-        Command::new("cmd")
+        std::process::Command::new("cmd")
             .args([
                 "/C",
                 "mklink",
