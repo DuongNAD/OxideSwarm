@@ -86,7 +86,15 @@ function Get-OptionalFileSha256([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return $null
     }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $bytes = $sha.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant())
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
 }
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {

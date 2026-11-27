@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit and dry-run smoke tests for benchmarks/host-1 scripts."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -96,6 +97,8 @@ class TestHost1Scripts(unittest.TestCase):
                 facts = json.loads(raw_text)
                 for key in ("cpu_model", "physical_cores", "logical_processors", "ram_mib", "thread_sweep", "planned_commands"):
                     self.assertIn(key, facts)
+                self.assertEqual(facts["models"]["qwen3_0_6b"]["sha256"], hashlib.sha256(b"dummy06b").hexdigest())
+                self.assertEqual(facts["models"]["qwen3_8b"]["sha256"], hashlib.sha256(b"dummy8b").hexdigest())
                 filtered_stdout = "\n".join(
                     line for line in proc.stdout.splitlines() if not line.startswith("OUT_DIR=")
                 )
@@ -206,6 +209,7 @@ class TestHost1Scripts(unittest.TestCase):
             with open(os.path.join(out_dir, "machine_facts.json"), "r", encoding="utf-8") as fh:
                 facts = json.load(fh)
             self.assertTrue(facts["cpu_only"])
+            self.assertEqual(facts["models"]["qwen3_0_6b"]["sha256"], hashlib.sha256(b"dummy06b").hexdigest())
             self.assertIsNotNone(facts["planned_commands"]["cpu"])
             self.assertIsNone(facts["planned_commands"]["gpu_cuda"])
             self.assertIsNone(facts["planned_commands"]["gpu_vulkan"])
