@@ -5,6 +5,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-11-28
+
+The stability release, with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` to `0.4.5`. It is the first `0.4.x` release that passes the exit check of Phase 12 (Q80, as revised by Q103): `master` ran at least three days and more than 30 runs for pushes in a row with every job green on Linux, macOS and Windows. It fixes a worker that holds only a P2P ticket (`BUG-40`) and `doctor` C8 on a relayed worker (`BUG-41`), and closes the open test items `TEST-86`, `TEST-90`, `TEST-93`, `TEST-95` and `TEST-100` to `TEST-102`.
+
+### Upgrading from 0.4.5
+
+- Replace the binaries in any order; no clean stop is needed.
+- A worker started with only a P2P ticket (`--p2p-ticket`, `RUSTY_GRID_P2P_TICKET` or `[worker].p2p_ticket`, and no `--master`) no longer tries TCP `127.0.0.1:8088` after a failed P2P dial; give it `--master` as well if you relied on that fallback (`BUG-40`).
+- `scripts/install.sh` and `scripts/install.ps1` install `0.4.6` by default (`--version` picks another release).
+
+### Fixed
+- Worker: a worker with only a P2P ticket no longer falls back to TCP `127.0.0.1:8088` after each failed P2P dial, and its connect logs name `iroh://<node_id>` instead of a loopback address or the raw ticket (`BUG-40`).
+- `doctor` C8: on a relayed worker the throughput check sends a 1 MiB probe and reports a warning with the measured rate instead of failing after 60 s; direct workers keep the 8 MiB probe (`BUG-41`).
+
+### Tests and benchmarks
+- Endurance soak: the `soak` subcommand runs again (`TEST-100`), its directories are created with mode `0700` (`TEST-90`), its probe p99 check samples densely and has a floor so one shared-runner outlier no longer fails it (`TEST-102`), and it has a remote-worker mode (`--master-only`, `worker-agent`) for runs across machines (`TEST-25`).
+- `cluster_auth` default-path tests no longer depend on the caller's `OXIDESWARM_HOME` (`TEST-101`).
+- Loop records for the macOS QUIC heartbeat stress test (`TEST-93`), the wave 3 end-to-end marker files (`TEST-95`) and the macOS shard stall (`TEST-86`).
+
+### Documentation
+- Governance files: `GOVERNANCE.md`, `CODE_OF_CONDUCT.md` and a note on the build process (`LV-14`).
+- Design records 0110 (developer toolset on USB kit machines) and 0111 (shared plan, path leases, verify gate and grid mailbox for coding agents); the plan of the `0.4.x` releases and Q103.
+
 ## [0.4.5] - 2026-11-25
 
 A patch release with no wire change: it still speaks protocol 10 with the one-version window of `0.4.0`, uses the same master store format (4), and mixes freely with `0.4.0` to `0.4.4`. It fixes the update of a running Windows USB kit worker and the uninstall prompt (`BUG-38`), the available RAM that macOS workers under-reported and the `doctor` GPU probe it left queued (`BUG-37`), the macOS spawn stall under concurrent tasks (`BUG-35`), the printed Windows `icacls` remedy (`BUG-39`) and console windows of Windows tasks (`TEST-88`); it adds the user-local install scripts (`ADOPT-3`), client-side `submit --matrix` and `shard` runs (`AX-1`, `AX-2`), process-task checkpoints (`FEAT-5`), verified Agent Mesh delivery and the remote master bridge (`MESH-2`, `MESH-3`), 3D routing fixes (`3D-2`, `3D-3`), the endurance harness and its records (`TEST-24` to `TEST-26`), and removes wall-clock windows from the test suites (`TEST-57` to `TEST-99`; `TEST-70` to `TEST-72`, `TEST-75` and `TEST-76` did not land).

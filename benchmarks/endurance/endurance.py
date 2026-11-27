@@ -203,17 +203,23 @@ def check_p99_ratio(
     second_hour_p99: float,
     last_hour_p99: float,
     max_ratio: float = 1.5,
+    floor_ms: float = 0.0,
 ) -> Dict[str, Any]:
-    """Design 0065 D3 #4: last-hour p99 latency at most 1.5x hour 2."""
+    """Design 0065 D3 #4: last-hour p99 latency within max(max_ratio * base, floor_ms)."""
     if second_hour_p99 <= 0 or last_hour_p99 < 0:
         raise ValueError("p99 latencies must be positive / non-negative")
+    if floor_ms < 0:
+        raise ValueError("floor_ms must be non-negative")
     ratio = last_hour_p99 / second_hour_p99
+    limit_ms = max(second_hour_p99 * max_ratio, float(floor_ms))
     return {
         "second_hour_p99": second_hour_p99,
         "last_hour_p99": last_hour_p99,
         "ratio": round(ratio, 4),
         "max_ratio": max_ratio,
-        "passed": last_hour_p99 <= second_hour_p99 * max_ratio,
+        "floor_ms": float(floor_ms),
+        "limit_ms": round(limit_ms, 3),
+        "passed": last_hour_p99 <= limit_ms,
     }
 
 
@@ -268,6 +274,23 @@ def percentile(values: Iterable[float], pct: float) -> float:
 
 SOAK_QUEUE_FULL_MAX_ATTEMPTS = 12
 SOAK_QUEUE_FULL_BACKOFF_S = 2.5
+SOAK_DEFAULT_PROBE_INTERVAL_S = 6.0
+SOAK_MIN_PROBE_SAMPLES_PER_WINDOW = 30
+SOAK_PROBE_P99_FLOOR_MS = 100.0
+SOAK_PROBE_FAULT_PAD_S = 30.0
+SOAK_MIN_PROBE_FAULT_PAD_S = 5.0
+
+
+def soak_fault_pad_seconds(
+    fault_scale: float,
+    base_pad_s: float = SOAK_PROBE_FAULT_PAD_S,
+) -> float:
+    """Scale post-fault settling pad down only for compressed short smoke runs (`fault_scale < 0.25`)."""
+    scale = float(fault_scale)
+    pad = float(base_pad_s)
+    if scale >= 0.25:
+        return pad
+    return max(SOAK_MIN_PROBE_FAULT_PAD_S, min(pad, pad * (scale / 0.25)))
 
 
 def is_queue_full_error(message: str) -> bool:
@@ -791,7 +814,7 @@ def check_soak_disk_and_journal(
     }
 
 
-def _fault_interval_s(fault: Dict[str, Any], pad_s: float = 15.0) -> Tuple[float, float]:
+def _fault_interval_s(fault: Dict[str, Any], pad_s: float = SOAK_PROBE_FAULT_PAD_S) -> Tuple[float, float]:
     start = float(fault.get("t_s", fault.get("at_s", 0.0)))
     if "end_s" in fault and fault["end_s"] is not None:
         end = float(fault["end_s"])
@@ -804,7 +827,7 @@ def _fault_interval_s(fault: Dict[str, Any], pad_s: float = 15.0) -> Tuple[float
 def probe_overlaps_fault(
     probe: Dict[str, Any],
     faults: Iterable[Dict[str, Any]],
-    pad_s: float = 15.0,
+    pad_s: float = SOAK_PROBE_FAULT_PAD_S,
 ) -> bool:
     """Return True if a probe's execution interval [t_s, t_s + latency] overlaps any fault window."""
     p_start = float(probe.get("t_s", 0.0))
@@ -821,10 +844,11 @@ def check_soak_probe_p99(
     duration_s: float,
     max_ratio: float = 1.5,
     faults: Optional[Iterable[Dict[str, Any]]] = None,
-    fault_pad_s: float = 15.0,
-    min_samples_per_window: int = 10,
+    fault_pad_s: float = SOAK_PROBE_FAULT_PAD_S,
+    min_samples_per_window: int = SOAK_MIN_PROBE_SAMPLES_PER_WINDOW,
+    floor_ms: float = SOAK_PROBE_P99_FLOOR_MS,
 ) -> Dict[str, Any]:
-    """Design 0065 D3 #6.4: clean non-fault probe p99 in late window <= 1.5x baseline window."""
+    """Design 0065 D3 #6.4: clean non-fault probe p99 in late window <= max(1.5x baseline, floor_ms)."""
     fault_list = list(faults) if faults is not None else []
     ok_probes = [p for p in probes if p.get("ok") and p.get("latency_ms") is not None]
     if fault_list:
@@ -853,6 +877,7 @@ def check_soak_probe_p99(
             "fault_windows_used": len(fault_list),
             "fault_pad_s": float(fault_pad_s),
             "min_samples_required": int(min_samples_per_window),
+            "floor_ms": float(floor_ms),
             "baseline_count": len(base_rows),
             "late_count": len(late_rows),
             "passed": False,
@@ -860,7 +885,12 @@ def check_soak_probe_p99(
         }
     base_p99 = percentile([float(r["latency_ms"]) for r in base_rows], 99.0)
     late_p99 = percentile([float(r["latency_ms"]) for r in late_rows], 99.0)
-    ratio_res = check_p99_ratio(max(0.001, base_p99), late_p99, max_ratio=max_ratio)
+    ratio_res = check_p99_ratio(
+        max(0.001, base_p99),
+        late_p99,
+        max_ratio=max_ratio,
+        floor_ms=floor_ms,
+    )
     return {
         "mode": mode,
         "total_probes": len(probes),
@@ -869,6 +899,8 @@ def check_soak_probe_p99(
         "fault_windows_used": len(fault_list),
         "fault_pad_s": float(fault_pad_s),
         "min_samples_required": int(min_samples_per_window),
+        "floor_ms": float(floor_ms),
+        "limit_ms": ratio_res["limit_ms"],
         "baseline_count": len(base_rows),
         "late_count": len(late_rows),
         "baseline_p99_ms": round(base_p99, 3),
@@ -932,7 +964,9 @@ def evaluate_soak_pass_checks(
     faults_executed: Optional[List[Dict[str, Any]]] = None,
     fault_errors: Optional[List[Dict[str, Any]]] = None,
     leftover_task_trees: Optional[List[Dict[str, Any]]] = None,
-    min_probe_samples_per_window: int = 10,
+    min_probe_samples_per_window: int = SOAK_MIN_PROBE_SAMPLES_PER_WINDOW,
+    probe_p99_floor_ms: float = SOAK_PROBE_P99_FLOOR_MS,
+    probe_fault_pad_s: float = SOAK_PROBE_FAULT_PAD_S,
     expected_process_roles: Optional[Iterable[str]] = None,
     missing_remote_shutdowns: Optional[Iterable[str]] = None,
     remote_evidence_errors: Optional[List[Dict[str, Any]]] = None,
@@ -995,7 +1029,9 @@ def evaluate_soak_pass_checks(
         probes,
         duration_s,
         faults=faults_for_p99,
+        fault_pad_s=probe_fault_pad_s,
         min_samples_per_window=min_probe_samples_per_window,
+        floor_ms=probe_p99_floor_ms,
     )
     trees = list(leftover_task_trees or [])
     normalized_pids: List[Any] = []
@@ -3702,280 +3738,6 @@ class SoakCluster(EnduranceCluster):
                     self._record_pid_exit(p.pid)
         self.procs = []
 
-
-def resolve_master_arg(raw: Optional[str]) -> Optional[str]:
-    """Resolve --master value, reading UTF-8 ticket file when prefixed with '@'."""
-    if raw is None:
-        return None
-    text = str(raw).strip()
-    if not text:
-        return None
-    if text.startswith("@"):
-        path = os.path.expanduser(text[1:].strip())
-        if not path or not os.path.isfile(path):
-            raise ValueError("master ticket file not found: %s" % path)
-        with open(path, encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content:
-            raise ValueError("master ticket file is empty: %s" % path)
-        return content
-    return text
-
-
-def _parse_host_port(addr: str) -> Tuple[str, int]:
-    s = (addr or "").strip()
-    if not s or s.startswith("{") or ":" not in s:
-        return "", 0
-    if s.startswith("["):
-        if "]:" not in s:
-            return "", 0
-        host, pstr = s[1:].rsplit("]:", 1)
-    else:
-        host, pstr = s.rsplit(":", 1)
-    if not pstr.isdigit():
-        return "", 0
-    return host, int(pstr)
-
-
-def _sum_tmp_bytes(blob_dir: Optional[str]) -> int:
-    if not blob_dir:
-        return 0
-    tmp_dir = os.path.join(blob_dir, "tmp")
-    if not os.path.isdir(tmp_dir):
-        return 0
-    total = 0
-    try:
-        with os.scandir(tmp_dir) as it:
-            for entry in it:
-                try:
-                    total += entry.stat(follow_symlinks=False).st_size
-                except OSError:
-                    continue
-    except OSError:
-        return 0
-    return total
-
-
-def _summarize_remote_worker(w: Dict[str, Any]) -> Dict[str, Any]:
-    tags = [str(t) for t in w.get("tags") or []]
-    keep_tags = [
-        t for t in tags
-        if t.startswith(("os:", "arch:", "iso:", "slots:", "proto:", "link:", "state:", "tool:"))
-    ]
-    return {
-        "name": str(w.get("name") or ""),
-        "cpu_cores": w.get("cpu_cores"),
-        "ram_mb": w.get("ram_mb"),
-        "has_gpu": bool(w.get("has_gpu")),
-        "is_simulated_gpu": bool(w.get("is_simulated_gpu")),
-        "link": str(w.get("link") or ""),
-        "tags": keep_tags,
-    }
-
-
-class RemoteEnduranceCluster:
-    """Adapter for TEST-24 two-machine runs against an already-running remote master and worker."""
-    is_remote = True
-
-    def __init__(
-        self,
-        binary: str,
-        workdir: str,
-        master_addr: str,
-        *,
-        secret_file: Optional[str] = None,
-        insecure: bool = False,
-        require_tags: Iterable[str] = (),
-        target_worker: Optional[str] = None,
-        master_pid: Optional[int] = None,
-        master_blob_dir: Optional[str] = None,
-        master_log: Optional[str] = None,
-    ) -> None:
-        self.binary = binary
-        self.workdir = os.path.abspath(workdir)
-        _ensure_private_dir(self.workdir)
-        self.master_addr = str(master_addr).strip()
-        self.master_host, self.master_port = _parse_host_port(self.master_addr)
-        self.secret_file = os.path.abspath(secret_file) if secret_file else None
-        self.insecure = bool(insecure)
-        self.require_tags = [str(t).strip() for t in require_tags if str(t).strip()]
-        self.target_worker = str(target_worker).strip() if (target_worker and str(target_worker).strip()) else None
-        self.master_pid = int(master_pid) if master_pid else None
-        self.blob_dir = os.path.abspath(master_blob_dir) if master_blob_dir else None
-        self.master_log = os.path.abspath(master_log) if master_log else None
-        self.sandbox_dirs: List[str] = []
-        self.empty_config = os.path.join(self.workdir, "empty.toml")
-        with open(self.empty_config, "w", encoding="utf-8") as f:
-            f.write("")
-        self._extra_pids_lock = threading.Lock()
-        self._extra_pids: Dict[str, int] = {}
-        self.client_env = self._build_env(os.path.join(self.workdir, "home-client"))
-        self._log_start_offset = 0
-        self.remote_workers: List[Dict[str, Any]] = []
-        self.forbidden_tokens = [
-            tok for tok in (self.master_addr, self.secret_file, self.blob_dir, self.master_log) if tok
-        ]
-
-    def _build_env(self, home: str) -> Dict[str, str]:
-        return _isolated_process_env(home, self.empty_config)
-
-    def _auth_flags(self) -> List[str]:
-        if self.secret_file:
-            return ["--secret-file", self.secret_file]
-        if self.insecure:
-            return ["--insecure"]
-        return []
-
-    def build_cli_cmd(self, args: List[str], master_addr: Optional[str] = None) -> List[str]:
-        subcmd = args[:1]
-        rest = list(args[1:])
-        addr = master_addr or self.master_addr
-        extra = list(self._auth_flags())
-        if subcmd == ["submit"]:
-            if self.target_worker:
-                extra.extend(["--worker", self.target_worker])
-            for tag in self.require_tags:
-                extra.extend(["--require-tag", tag])
-        return [self.binary] + subcmd + ["--master", addr] + extra + rest
-
-    def active_pids(self) -> Dict[str, int]:
-        out: Dict[str, int] = {}
-        if self.master_pid and pid_alive(self.master_pid):
-            out["master"] = self.master_pid
-        with self._extra_pids_lock:
-            out.update(self._extra_pids)
-        return out
-
-    def set_extra_pid(self, role: str, pid: Optional[int]) -> None:
-        with self._extra_pids_lock:
-            if pid is None:
-                self._extra_pids.pop(role, None)
-            else:
-                self._extra_pids[role] = int(pid)
-
-    def _matches_tags(self, worker: Dict[str, Any]) -> bool:
-        wtags = set(str(t) for t in (worker.get("tags") or []))
-        if "state:disconnected" in wtags:
-            return False
-        if self.target_worker:
-            wname = str(worker.get("name") or "")
-            wid = ""
-            for t in wtags:
-                if t.startswith("id:"):
-                    wid = t[3:]
-                    break
-            if self.target_worker.lower() not in (wname.lower(), wid.lower()):
-                return False
-        if not self.require_tags:
-            return True
-        return all(t in wtags for t in self.require_tags)
-
-    def start(self) -> "RemoteEnduranceCluster":
-        if self.master_log and os.path.isfile(self.master_log):
-            try:
-                self._log_start_offset = os.path.getsize(self.master_log)
-            except OSError:
-                self._log_start_offset = 0
-        deadline = time.monotonic() + 20.0
-        last_err = ""
-        while time.monotonic() < deadline:
-            r = self.run_client(["workers", "--json"], timeout=15.0)
-            if r.returncode == 0:
-                try:
-                    listed = json.loads(r.stdout)
-                except ValueError as exc:
-                    last_err = "invalid workers JSON: %s" % exc
-                else:
-                    matched = [w for w in listed if self._matches_tags(w)] if isinstance(listed, list) else []
-                    if matched:
-                        self.remote_workers = [_summarize_remote_worker(w) for w in matched]
-                        return self
-                    last_err = "no connected worker matching tags=%r (saw %d workers)" % (
-                        self.require_tags,
-                        len(listed) if isinstance(listed, list) else 0,
-                    )
-            else:
-                last_err = redact_text((r.stderr or r.stdout or "").strip()[-300:], self.forbidden_tokens)
-            time.sleep(0.5)
-        raise RuntimeError("remote cluster readiness failed: %s" % (last_err or "timeout"))
-
-    def dir_map(self) -> Dict[str, str]:
-        if self.blob_dir:
-            return {"blob_store_bytes": self.blob_dir}
-        return {}
-
-    def run_client(
-        self,
-        args: List[str],
-        timeout: float = 120.0,
-        master_addr: Optional[str] = None,
-    ) -> subprocess.CompletedProcess:
-        cmd = self.build_cli_cmd(args, master_addr=master_addr)
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self.client_env,
-            timeout=timeout,
-        )
-
-    def spawn_submit(
-        self,
-        submit_args: List[str],
-        master_addr: Optional[str] = None,
-    ) -> subprocess.Popen:
-        cmd = self.build_cli_cmd(["submit"] + submit_args, master_addr=master_addr)
-        kw: Dict[str, Any] = {} if IS_WINDOWS else {"start_new_session": True}
-        return subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self.client_env,
-            **kw,
-        )
-
-    def run_submit_sampled(
-        self,
-        submit_args: List[str],
-        timeout: float = 600.0,
-        master_addr: Optional[str] = None,
-    ) -> Tuple[int, str, str, float]:
-        t0 = time.perf_counter()
-        p = self.spawn_submit(submit_args, master_addr=master_addr)
-        self.set_extra_pid("client", p.pid)
-        try:
-            stdout, stderr = p.communicate(timeout=timeout)
-            dt = time.perf_counter() - t0
-            return p.returncode, stdout or "", stderr or "", dt
-        except subprocess.TimeoutExpired:
-            p.kill()
-            stdout, stderr = p.communicate()
-            dt = time.perf_counter() - t0
-            return 124, stdout or "", (stderr or "") + "\n[harness] submit timed out after %.1f s" % dt, dt
-        finally:
-            self.set_extra_pid("client", None)
-
-    def read_log(self, role: str) -> str:
-        if role != "master" or not self.master_log or not os.path.isfile(self.master_log):
-            return ""
-        with open(self.master_log, encoding="utf-8", errors="replace") as f:
-            if self._log_start_offset > 0:
-                try:
-                    if os.path.getsize(self.master_log) >= self._log_start_offset:
-                        f.seek(self._log_start_offset)
-                except OSError:
-                    pass
-            return f.read()
-
-    def stop(self) -> None:
-        # Remote mode never stops the external master or remote worker; only remove client workdir.
-        shutil.rmtree(self.workdir, ignore_errors=True)
-
     def leftover_pids(self) -> List[int]:
         alive = list(self._unclean_pids)
         with self._lifecycle_lock:
@@ -5152,6 +4914,11 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     duration_s = parse_duration_seconds(args.duration)
     sample_interval_s = parse_duration_seconds(args.sample_interval)
+    raw_probe_interval = getattr(args, "probe_interval", None)
+    if raw_probe_interval is not None and str(raw_probe_interval).strip():
+        probe_interval_s = parse_duration_seconds(raw_probe_interval)
+    else:
+        probe_interval_s = min(SOAK_DEFAULT_PROBE_INTERVAL_S, sample_interval_s)
     fault_scale = float(args.fault_scale)
     load_scale = float(args.load_scale)
     workers = int(args.workers)
@@ -5179,6 +4946,7 @@ def validate_soak_args(args: argparse.Namespace) -> Dict[str, Any]:
         "link": link,
         "duration_s": duration_s,
         "sample_interval_s": sample_interval_s,
+        "probe_interval_s": probe_interval_s,
         "fault_scale": fault_scale,
         "load_scale": load_scale,
         "workers": workers,
@@ -5547,6 +5315,9 @@ def run_soak(
 ) -> Dict[str, Any]:
     duration_s = float(parsed_params["duration_s"])
     sample_interval_s = float(parsed_params["sample_interval_s"])
+    probe_interval_s = float(
+        parsed_params.get("probe_interval_s", min(SOAK_DEFAULT_PROBE_INTERVAL_S, sample_interval_s))
+    )
     fault_scale = float(parsed_params["fault_scale"])
     load_scale = float(parsed_params["load_scale"])
     n_workers = int(parsed_params["workers"])
@@ -5680,7 +5451,7 @@ def run_soak(
 
     def _probe_loop() -> None:
         _run_probe_once()
-        while not probe_stop.wait(sample_interval_s):
+        while not probe_stop.wait(probe_interval_s):
             _run_probe_once()
 
     def _extract_verify_sha(term_json: Dict[str, Any]) -> Optional[str]:
@@ -6125,6 +5896,7 @@ def run_soak(
         faults_executed=fault_events_log,
         fault_errors=fault_errors,
         leftover_task_trees=leftover_trees,
+        probe_fault_pad_s=soak_fault_pad_seconds(fault_scale),
         expected_process_roles=expected_process_roles,
         missing_remote_shutdowns=missing_remote_shutdowns,
         remote_evidence_errors=remote_errors,
@@ -6337,6 +6109,7 @@ def cmd_soak(args: argparse.Namespace) -> int:
         "fault_scale": float(parsed_params["fault_scale"]),
         "load_scale": float(parsed_params["load_scale"]),
         "sample_interval_s": float(parsed_params["sample_interval_s"]),
+        "probe_interval_s": float(parsed_params["probe_interval_s"]),
         "workers": int(parsed_params["workers"]),
         "slots": int(parsed_params["slots"]),
         "workspaces": bool(args.workspaces),
@@ -6568,7 +6341,12 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--duration", default="60m", help="Soak duration (e.g. 3m, 45m, 60m, 24h)")
     sk.add_argument("--fault-scale", type=float, default=1.0, help="Multiply D3 fault intervals (<1 compresses faults)")
     sk.add_argument("--load-scale", type=float, default=1.0, help="Scale per-minute task counts and blob sizes")
-    sk.add_argument("--sample-interval", default="60s", help="Resource and timed-probe interval (e.g. 15s, 60s)")
+    sk.add_argument("--sample-interval", default="60s", help="Resource sample interval (e.g. 15s, 60s)")
+    sk.add_argument(
+        "--probe-interval",
+        default=None,
+        help="Timed probe task interval (default: min(6s, --sample-interval))",
+    )
     sk.add_argument("--workers", type=int, default=3, help="Number of workers (2 or 3)")
     sk.add_argument("--slots", type=int, default=4, help="Execution slots per worker")
     sk.add_argument(

@@ -11,6 +11,7 @@ Run:   python3 tests/test_endurance_harness.py
 
 from __future__ import annotations
 
+import ast
 import copy
 import datetime
 import hashlib
@@ -195,6 +196,19 @@ class DiskAndThresholdTests(unittest.TestCase):
 
         self.assertTrue(endurance.check_p99_ratio(10.0, 15.0)["passed"])
         self.assertFalse(endurance.check_p99_ratio(10.0, 15.1)["passed"])
+
+        # Absolute floor avoids failing on tiny-baseline ratios while preserving 1.5x above floor
+        small_jit = endurance.check_p99_ratio(32.0, 85.0, max_ratio=1.5, floor_ms=100.0)
+        self.assertTrue(small_jit["passed"])
+        self.assertEqual(small_jit["floor_ms"], 100.0)
+        self.assertEqual(small_jit["limit_ms"], 100.0)
+        self.assertFalse(endurance.check_p99_ratio(32.0, 100.1, max_ratio=1.5, floor_ms=100.0)["passed"])
+        big_pass = endurance.check_p99_ratio(80.0, 120.0, max_ratio=1.5, floor_ms=100.0)
+        self.assertTrue(big_pass["passed"])
+        self.assertEqual(big_pass["limit_ms"], 120.0)
+        self.assertFalse(endurance.check_p99_ratio(80.0, 120.1, max_ratio=1.5, floor_ms=100.0)["passed"])
+        with self.assertRaises(ValueError):
+            endurance.check_p99_ratio(10.0, 15.0, floor_ms=-1.0)
 
         self.assertEqual(endurance.theoretical_single_blob_bound_mib_per_s(100.0), 40.0)
         self.assertIsNone(endurance.theoretical_single_blob_bound_mib_per_s(0.0))
@@ -608,8 +622,8 @@ class SoakHarnessTests(unittest.TestCase):
                 + [3600.0 + i * 300.0 for i in range(12)]
                 + [82800.0 + i * 300.0 for i in range(12)]
             )
-            base_probes = [{"t_s": 3600.0 + i * 240.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
-            late_probes = [{"t_s": 82800.0 + i * 240.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
+            base_probes = [{"t_s": 3600.0 + i * 95.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
+            late_probes = [{"t_s": 82800.0 + i * 95.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
         else:
             duration_s = 2700.0
             times = (
@@ -617,8 +631,8 @@ class SoakHarnessTests(unittest.TestCase):
                 + [420.0 + i * 70.0 for i in range(12)]
                 + [1900.0 + i * 70.0 for i in range(12)]
             )
-            base_probes = [{"t_s": 300.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
-            late_probes = [{"t_s": 1520.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
+            base_probes = [{"t_s": 300.0 + i * 28.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
+            late_probes = [{"t_s": 1520.0 + i * 32.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
 
         samples = [
             {
@@ -740,20 +754,21 @@ class SoakHarnessTests(unittest.TestCase):
         self.assertFalse(r3d["checks"]["3_disk_and_journal"]["worker_cache_peak_ok"])
         self.assertFalse(r3d["checks"]["3_disk_and_journal"]["passed"])
 
-        # 4) Probe p99 ratio > 1.5x fails 4_probe_p99; fault-window probe is excluded from baseline
+        # 4) Probe p99 > max(1.5x, 100 ms floor) fails 4_probe_p99; fault-window probe is excluded
         bad4 = self._make_recorded_soak(hours_24=False)
-        bad4["fault_plan"] = [{"kind": "queue_burst", "seq": 0, "worker_index": None, "at_s": 900.0, "down_s": 0.0}]
-        bad4["faults_executed"] = [{"kind": "queue_burst", "seq": 0, "worker_index": None, "t_s": 900.0, "end_s": 905.0, "ok": True}]
-        # Huge spike during fault window at t=902 does NOT hide a late slowdown at t=2400
-        bad4["probes"].append({"t_s": 902.0, "latency_ms": 11098.0, "ok": True})
-        bad4["probes"].append({"t_s": 2400.0, "latency_ms": 40.0, "ok": True})
+        bad4["fault_plan"] = [{"kind": "queue_burst", "seq": 0, "worker_index": None, "at_s": 1360.0, "down_s": 0.0}]
+        bad4["faults_executed"] = [{"kind": "queue_burst", "seq": 0, "worker_index": None, "t_s": 1360.0, "end_s": 1365.0, "ok": True}]
+        # Huge spike during fault window at t=1362 is excluded without hiding late slowdown > 100 ms floor
+        bad4["probes"].append({"t_s": 1362.0, "latency_ms": 11098.0, "ok": True})
+        bad4["probes"].append({"t_s": 2400.0, "latency_ms": 200.0, "ok": True})
+        bad4["probes"].append({"t_s": 2430.0, "latency_ms": 200.0, "ok": True})
         r4 = endurance.evaluate_soak_pass_checks(**bad4)
         self.assertEqual(r4["checks"]["4_probe_p99"]["excluded_fault_probes"], 1)
         self.assertFalse(r4["checks"]["4_probe_p99"]["passed"])
 
-        # 4b) Too few probes in a window fails 4_probe_p99 with insufficient_probes_per_window
+        # 4b) Too few probes in a window (< 30) fails 4_probe_p99 with insufficient_probes_per_window
         bad4b = self._make_recorded_soak(hours_24=False)
-        bad4b["probes"] = bad4b["probes"][:4] + bad4b["probes"][-12:]
+        bad4b["probes"] = bad4b["probes"][:12] + bad4b["probes"][-36:]
         r4b = endurance.evaluate_soak_pass_checks(**bad4b)
         self.assertFalse(r4b["checks"]["4_probe_p99"]["passed"])
         self.assertEqual(r4b["checks"]["4_probe_p99"]["reason"], "insufficient_probes_per_window")
@@ -969,6 +984,193 @@ class SoakHarnessTests(unittest.TestCase):
                     self.assertEqual(mode, 0o700, "expected 0o700 on %s, got %s" % (path, oct(mode)))
         finally:
             os.umask(old_umask)
+
+    def test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract(self):
+        with open(SCRIPT, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=SCRIPT)
+
+        top_defs: dict[str, list[int]] = {}
+        classes: dict[str, ast.ClassDef] = {}
+        funcs: dict[str, ast.FunctionDef] = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                top_defs.setdefault(node.name, []).append(node.lineno)
+                if isinstance(node, ast.ClassDef):
+                    classes[node.name] = node
+                    method_defs: dict[str, list[int]] = {}
+                    for child in node.body:
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            method_defs.setdefault(child.name, []).append(child.lineno)
+                    dups = {m: ls for m, ls in method_defs.items() if len(ls) > 1}
+                    self.assertEqual(dups, {}, f"duplicate methods in {node.name}: {dups}")
+                elif isinstance(node, ast.FunctionDef):
+                    funcs[node.name] = node
+
+        dup_top = {name: lines for name, lines in top_defs.items() if len(lines) > 1}
+        self.assertEqual(dup_top, {}, f"duplicate top-level definitions in endurance.py: {dup_top}")
+
+        def collect_attrs(cls_name: str) -> set[str]:
+            cls_node = classes[cls_name]
+            attrs: set[str] = set()
+            for child in cls_node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    attrs.add(child.name)
+                    for sub in ast.walk(child):
+                        if (
+                            isinstance(sub, ast.Attribute)
+                            and isinstance(sub.value, ast.Name)
+                            and sub.value.id == "self"
+                            and isinstance(sub.ctx, ast.Store)
+                        ):
+                            attrs.add(sub.attr)
+            for base in cls_node.bases:
+                if isinstance(base, ast.Name) and base.id in classes:
+                    attrs |= collect_attrs(base.id)
+            return attrs
+
+        soak_attrs = collect_attrs("SoakCluster")
+        # `run_soak` checks these optional RemoteSoakCluster hooks via `hasattr(cluster, ...)`.
+        hasattr_guarded = {
+            "expected_sample_roles",
+            "missing_remote_shutdowns",
+            "remote_evidence_errors",
+        }
+        used_on_cluster: set[str] = set()
+        for fn_name in (
+            "run_soak",
+            "_wait_for_soak_result",
+            "_run_async_soak_task",
+            "_run_cancel_soak_task",
+            "_run_output_soak_task",
+        ):
+            fn_node = funcs[fn_name]
+            for sub in ast.walk(fn_node):
+                if (
+                    isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "cluster"
+                ):
+                    used_on_cluster.add(sub.attr)
+        missing = sorted((used_on_cluster - hasattr_guarded) - soak_attrs)
+        self.assertEqual(missing, [], f"SoakCluster missing attributes called by run_soak: {missing}")
+        self.assertTrue(hasattr(endurance.SoakCluster, "leftover_pids"))
+        self.assertFalse(hasattr(endurance.RemoteEnduranceCluster, "leftover_pids"))
+
+        with tempfile.TemporaryDirectory(prefix="ox_t100_") as td:
+            cluster = endurance.SoakCluster("/usr/bin/true", os.path.join(td, "cluster"), workers=2)
+            live_master = mock.MagicMock()
+            live_master.pid = 2001
+            live_master.poll.return_value = None
+            dead_worker = mock.MagicMock()
+            dead_worker.pid = 2002
+            dead_worker.poll.return_value = 0
+            live_worker = mock.MagicMock()
+            live_worker.pid = 2003
+            live_worker.poll.return_value = None
+            live_client = mock.MagicMock()
+            live_client.pid = 2004
+            live_client.poll.return_value = None
+            cluster._unclean_pids = [2003, 2000]
+            cluster._master_entry = (None, live_master)
+            cluster._worker_entries = {0: (dead_worker, mock.MagicMock()), 1: (live_worker, mock.MagicMock())}
+            cluster._tracked_clients = [live_client]
+            self.assertEqual(cluster.leftover_pids(), [2000, 2001, 2003, 2004])
+
+    def test_soak_probe_p99_shared_runner_hardening_test102(self):
+        # 1) Too few probes (e.g. 14 baseline / 16 late from 60 s cadence in CI run 45821686282) is refused for p99
+        base_ci_lats = [
+            33.745, 30.636, 30.363, 30.614, 31.009, 71.816, 33.396,
+            32.195, 32.574, 31.667, 32.752, 33.693, 31.388, 37.864,
+        ]
+        late_ci_lats = [
+            32.954, 32.425, 369.801, 33.455, 32.134, 32.500, 29.929, 31.346,
+            31.215, 110.443, 29.476, 28.510, 28.688, 24.592, 26.115, 28.040,
+        ]
+        ci_probes = (
+            [{"t_s": 360.0 + i * 70.0, "latency_ms": lat, "ok": True} for i, lat in enumerate(base_ci_lats)]
+            + [{"t_s": 1560.0 + i * 70.0, "latency_ms": lat, "ok": True} for i, lat in enumerate(late_ci_lats)]
+        )
+        low_res = endurance.check_soak_probe_p99(ci_probes, 2700.0)
+        self.assertFalse(low_res["passed"])
+        self.assertEqual(low_res["reason"], "insufficient_probes_per_window")
+        self.assertEqual(low_res["min_samples_required"], 30)
+
+        # 2) Even with explicit low min_samples_per_window, the raw 14/16-sample 45821686282 record
+        #    (67.402 -> 330.897 ms) still fails under the 100 ms floor (1.5x = 101.103 ms) — floor does not mask 331 ms.
+        ci_eval = endurance.check_soak_probe_p99(ci_probes, 2700.0, min_samples_per_window=10)
+        self.assertFalse(ci_eval["passed"], ci_eval)
+        self.assertEqual(ci_eval["floor_ms"], 100.0)
+        self.assertEqual(ci_eval["limit_ms"], 101.103)
+        self.assertEqual(ci_eval["late_p99_ms"], 330.897)
+
+        # 3) Coordinator regression test: a uniform late-window shift from ~30 ms to ~200 ms (or ~110 ms) MUST fail
+        base_uniform = [{"t_s": 300.0 + i * 8.0, "latency_ms": 30.0, "ok": True} for i in range(120)]
+        late_200 = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 200.0, "ok": True} for i in range(120)]
+        res_200 = endurance.check_soak_probe_p99(base_uniform + late_200, 2700.0)
+        self.assertFalse(res_200["passed"], res_200)
+        self.assertEqual(res_200["floor_ms"], 100.0)
+        self.assertEqual(res_200["limit_ms"], 100.0)
+        self.assertEqual(res_200["late_p99_ms"], 200.0)
+
+        late_110 = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 110.0, "ok": True} for i in range(120)]
+        res_110 = endurance.check_soak_probe_p99(base_uniform + late_110, 2700.0)
+        self.assertFalse(res_110["passed"], res_110)
+
+        # 4) Higher cadence (~160 clean probes/window at 6 s across 45 m) makes p99 immune to the two
+        #    isolated shared-runner outliers seen in CI run 45821686282 (369.801 ms + 110.443 ms -> p99 < 100 ms),
+        #    while catching >=3 sustained 200 ms probes in 120 late samples.
+        base_160 = [{"t_s": 280.0 + i * 6.5, "latency_ms": 32.0, "ok": True} for i in range(160)]
+        late_ci_cadence = [{"t_s": 1500.0 + i * 7.0, "latency_ms": 31.5, "ok": True} for i in range(160)]
+        late_ci_cadence[40]["latency_ms"] = 369.801
+        late_ci_cadence[90]["latency_ms"] = 110.443
+        res_1 = endurance.check_soak_probe_p99(base_160 + late_ci_cadence, 2700.0)
+        self.assertTrue(res_1["passed"], res_1)
+        self.assertEqual(res_1["floor_ms"], 100.0)
+        self.assertLess(res_1["late_p99_ms"], 100.0)
+
+        late_3_glitches = [{"t_s": 1500.0 + i * 8.0, "latency_ms": 32.0, "ok": True} for i in range(120)]
+        for idx in (30, 60, 90):
+            late_3_glitches[idx]["latency_ms"] = 200.0
+        res_3 = endurance.check_soak_probe_p99(base_uniform + late_3_glitches, 2700.0)
+        self.assertFalse(res_3["passed"])
+        self.assertEqual(res_3["late_p99_ms"], 200.0)
+
+        # 4) Default 30 s post-fault settling pad excludes recovery tails 20 s after end_s (but keeps >=35 s)
+        faults = [{"kind": "worker_kill", "seq": 0, "worker_index": 0, "t_s": 1600.0, "end_s": 1615.0, "ok": True}]
+        base_35 = [{"t_s": 300.0 + i * 25.0, "latency_ms": 30.0, "ok": True} for i in range(35)]
+        late_clean = [{"t_s": 1660.0 + i * 25.0, "latency_ms": 30.0, "ok": True} for i in range(35)]
+        within_pad_spikes = [
+            {"t_s": 1635.0, "latency_ms": 950.0, "ok": True},  # 20 s after end_s -> excluded under 30 s pad
+            {"t_s": 1636.0, "latency_ms": 950.0, "ok": True},
+        ]
+        tail_res = endurance.check_soak_probe_p99(base_35 + late_clean + within_pad_spikes, 2700.0, faults=faults)
+        self.assertEqual(tail_res["fault_pad_s"], 30.0)
+        self.assertEqual(tail_res["excluded_fault_probes"], 2)
+        self.assertTrue(tail_res["passed"], tail_res)
+
+        beyond_pad_spikes = [
+            {"t_s": 1650.0, "latency_ms": 950.0, "ok": True},  # 35 s after end_s -> NOT excluded
+            {"t_s": 1651.0, "latency_ms": 950.0, "ok": True},
+        ]
+        beyond_res = endurance.check_soak_probe_p99(base_35 + late_clean + beyond_pad_spikes, 2700.0, faults=faults)
+        self.assertEqual(beyond_res["excluded_fault_probes"], 0)
+        self.assertFalse(beyond_res["passed"])
+
+        self.assertEqual(endurance.soak_fault_pad_seconds(1.0), 30.0)
+        self.assertEqual(endurance.soak_fault_pad_seconds(0.25), 30.0)
+        self.assertEqual(endurance.soak_fault_pad_seconds(0.03), 5.0)
+
+        # 5) Decoupled --probe-interval validation
+        ap = endurance.build_parser()
+        p_default = endurance.validate_soak_args(ap.parse_args(["soak", "--duration", "45m", "--fault-scale", "0.25"]))
+        self.assertEqual(p_default["sample_interval_s"], 60.0)
+        self.assertEqual(p_default["probe_interval_s"], 6.0)
+        p_fast_sample = endurance.validate_soak_args(ap.parse_args(["soak", "--sample-interval", "1s"]))
+        self.assertEqual(p_fast_sample["probe_interval_s"], 1.0)
+        p_explicit = endurance.validate_soak_args(ap.parse_args(["soak", "--sample-interval", "60s", "--probe-interval", "15s"]))
+        self.assertEqual(p_explicit["probe_interval_s"], 15.0)
+        with self.assertRaises(ValueError):
+            endurance.validate_soak_args(ap.parse_args(["soak", "--probe-interval", "0"]))
 
 
 class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
@@ -1920,8 +2122,8 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
             "untracked_master_results": [],
         }
         probes = (
-            [{"t_s": 300.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
-            + [{"t_s": 1520.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
+            [{"t_s": 300.0 + i * 28.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
+            + [{"t_s": 1520.0 + i * 32.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
         )
         common_kw = dict(
             ledger_audit=lg.audit(),
@@ -2216,8 +2418,8 @@ class RemoteSoakCryptoAndValidationTests(unittest.TestCase):
             "untracked_master_results": [],
         }
         probes = (
-            [{"t_s": 300.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
-            + [{"t_s": 1520.0 + i * 80.0, "latency_ms": 20.0, "ok": True} for i in range(12)]
+            [{"t_s": 300.0 + i * 28.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
+            + [{"t_s": 1520.0 + i * 32.0, "latency_ms": 20.0, "ok": True} for i in range(36)]
         )
         return dict(
             ledger_audit=lg.audit(),
@@ -3310,6 +3512,7 @@ class EnduranceCiWorkflowTests(unittest.TestCase):
         self.assertIn("--t2-files 20000", block)
         self.assertRegex(block, r"endurance\.py\s+soak\b")
         self.assertIn("--duration 45m", block)
+        self.assertIn("--probe-interval 6s", block)
         self.assertRegex(block, r"if:\s*always\(\)\s*\n\s*uses:\s*actions/upload-artifact@[0-9a-f]{40}\s+#")
 
 
