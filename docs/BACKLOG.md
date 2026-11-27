@@ -554,7 +554,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | HOST-3 | Process profile for model services on an opted-in worker: priority, pinned cores, huge pages | P2 | M | HOST-1, LLM-9 | Q106 | Planned | Out | (design 0114) |
 | HOST-5 | Headless Linux worker image booted from the USB kit | P2 | L | HOST-1, HOST-3 | Q106, Q107 | Planned | Out | (design 0114) |
 | ECO-9 | Per-participant quotas: running tasks, slots and priority | P2 | L | ENROLL-1 | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
-| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
+| NET-9 | Contributor controls on each machine: CPU, hours, battery, metered network, a local stop | P2 | M |  | Q97 (decided 2026-11-19) | Planned | Out | (design 0094), (design 0113) |
 | NET-10 | Contribution credits per participant, display only | P2 | M | ECO-9 | Q96, Q97 (decided 2026-11-19) | Planned | Out | (design 0094) |
 | APP-6 | Pilot campaign: an Anima Engine sweep on several owners' machines, every result verified | P2 | M | ENROLL-1, APP-4, NET-9, NET-10 | Q94, Q95 (decided 2026-11-19) | Planned | Out | 376, 383 (open), (design 0094) |
 
@@ -3007,6 +3007,12 @@ The owner decided Q94 to Q97 on 2026-11-19 at the recommended answers ("Approve 
   and the task completes on another worker with its retry count unchanged. The record of APP-6 lists
   the controls each contributor set.
 
+- **Design (2026-11-26):** [Design 0113](design/0113-contributor-controls.md), for release 0.4.7 with no wire change.
+  NET-9a: pause/resume (running tasks rerun elsewhere within 5 s, uncharged), the same-user local control channel
+  (`oxideswarm worker pause|resume|status|limits`, also used by the tray app of design 0112) and a master
+  hold-back with `state:paused`, so a paused worker is not offered tasks it would bounce. NET-9b: the limits
+  (`--local-max-cpu-pct`, `--hours`, `--max-task-hours-per-day`, `--no-tasks-on-battery`, `--no-tasks-on-metered`,
+  `--no-gpu-tasks`).
 ### NET-10: Contribution credits per participant, display only
 
 - **Evidence:** Read on 2026-11-19 at `master` `f77eabd`. A task result carries the worker id and the
