@@ -220,6 +220,12 @@ Recounted on 2026-11-24 from the rows with pull request 464: 292 items, 202 Impl
 Recounted on 2026-11-24 from the rows with pull request 465: 298 items, 202 Implemented, 22 Partial and 74 Planned; 22 open items are In and 74 are Out.
 Recounted on 2026-11-24 from the rows with pull request 466: 305 items, 202 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 467: 306 items, 203 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 468: 307 items, 204 Implemented, 22 Partial and 81 Planned; 22 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 471: 307 items, 205 Implemented, 21 Partial and 81 Planned; 21 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 470: 307 items, 206 Implemented, 20 Partial and 81 Planned; 20 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 476: 307 items, 207 Implemented, 20 Partial and 80 Planned; 19 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 474: 307 items, 208 Implemented, 20 Partial and 79 Planned; 18 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 489: 308 items, 210 Implemented, 19 Partial and 79 Planned; 17 open items are In and 81 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -332,17 +338,19 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Implemented |  | 429 |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
-| TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Partial | In | (unlanded claim `TEST-70`) |
-| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Partial | In |  |
+| TEST-93 | macOS CI (`run 45261621774`): `m2_challenger_1_stress` QUIC heartbeat `avg_latency < 50 ms` wall-clock bound fails under saturation | P1 | S |  |  | Implemented |  | (unlanded claim `TEST-70`) |
+| TEST-90 | Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700` | P2 | S |  |  | Implemented |  |  |
 | TEST-91 | Windows case PC: S9 real GPU stability and VRAM routing record | P2 | M | FEAT-9a |  | Implemented |  | 434 |
 | TEST-94 | `rusty_grid_cli --lib`: parallel env-var race between `runtime_tests` (`RUSTY_GRID_WIRE_CODEC=xml`) and `test_resolve_no_battery` | P2 | S |  |  | Implemented |  | Stage E (`E-W3`) |
 | TEST-92 | Preserve `RUSTUP_HOME` and `CARGO_HOME` in isolated E2E harnesses to prevent 3 s `cargo`/`rustc` probe timeouts | P2 | S |  |  | Implemented |  | 433 |
-| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Partial | In |  |
+| TEST-95 | CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast` | P2 | S |  |  | Implemented |  |  |
 | TEST-96 | CI: `agent_mesh` `client::tests::test_corrupt_and_multi_chunk_data_delivery` times out (`Elapsed`) waiting 5 s for the multi-chunk `DeliveryAck` on master | P2 | S |  |  | Implemented |  | 449, 455 |
 | TEST-98 | Scope `revoke-isolation-acls.ps1` worker detection in isolated `test_launcher_scripts.py` runs | P2 | S |  |  | Implemented |  |  |
 | TEST-97 | Isolate `test_agent_bridge.py` from host Windows `G:\` / `H:\` / `D:\` Google Drive discovery | P2 | S |  |  | Implemented |  |  |
 | TEST-99 | Windows: 8 `rusty_grid_master` `members`/`registry` unit tests pass `tempfile::tempdir()` directly to `MemberStore::load_from_dir` and fail when `%TEMP%` has foreign ACEs | P2 | S |  |  | Implemented |  |  |
+| TEST-101 | Make `rusty_grid_core` `cluster_auth::tests::default_path_lives_under_home` independent of caller `OXIDESWARM_HOME` | P2 | S |  |  | Implemented |  |  |
 | TEST-100 | CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'` | P1 | S | TEST-26 |  | Implemented |  |  |
+| TEST-102 | CI `endurance (loopback)`: `4_probe_p99` fails on shared-runner single-sample jitter (`67.4 -> 330.9 ms` across `14`/`16` probes) | P1 | S | TEST-26 |  | Implemented |  |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -483,8 +491,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | BUG-37 | `doctor` C5 GPU probe stays `Queued` when macOS `sysinfo 0.30.13` under-reports available RAM (`ram_mb: 1024` vs `submit` `0`) | P2 | S |  |  | Implemented |  |  |
 | BUG-38 | Windows USB kit 0.4.4: `Update OxideSwarm.cmd` fails replacing locked `oxideswarm.exe` and `uninstall.ps1` drops `$InstallRoot` in prompt | P1 | S |  |  | Implemented |  |  |
 | BUG-39 | Windows: printed `icacls /remove:g` remedy exits `1332` (`ERROR_NONE_MAPPED`) when DACL contains an unresolvable SID | P2 | S |  |  | Implemented |  |  |
-| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Planned | In |  |
-| BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Planned | In |  |
+| BUG-41 | `doctor` C8 fails after 60 s on a relayed worker instead of reporting the slow rate | P3 | S |  |  | Implemented |  |  |
+| BUG-40 | A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails | P2 | S |  |  | Implemented |  |  |
 | LV-4 | An inventory of `unsafe`, with comments, a lint and Miri | P2 | M |  |  | Implemented |  | 324, 330, 336, 337, 340, (design 0058) |
 | LV-15 | Release runbook, secret inventory and a second releaser | P2 | M | LV-5 | Yes | Partial | In | 351, (design 0058) |
 | LV-18 | Fuzz targets for the remaining parsers of untrusted bytes | P1 | M | LV-1 |  | Implemented |  | 326, 335, (design 0058) |
@@ -796,6 +804,7 @@ The full suite must pass on a clean machine before CI can require it.
       total): slowest `test_cli_and_mcp_matrix_huge_timeout_and_delimiter_validation` (`1.568 s`),
       `test_mcp_task_result_and_doctor_huge_timeout_do_not_panic` (`0.510 s`),
       `test_cli_matrix_input_dedup_output_dir_isolation_and_workspace_sync` (`0.204 s`).
+  - **2026-11-26 CI check (`master` push runs since `2026-11-24T00:00:00Z`):** `33/33` `workspace tests (macos-latest)` jobs passed (`45297098266` `2026-11-24T00:25:56Z` through `45781445276` `2026-11-26T08:14:09Z`, `b253f601`), with `0` `test_ax2_shard` or `test_ax1_matrix` stalls. Stays `Partial | In` until the `TEST-86` streak holds and the owner closes it.
 
 ### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
 
@@ -886,6 +895,8 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** `tests/m2_challenger_1_stress.rs` uses structural multiplexing proofs instead of `< 50 ms` and passes `20/20` loaded runs.
 - **Update (2026-11-24):** Audited `tests/m2_challenger_1_stress.rs` (line 472 was the sole Category 1 wall-clock bound across 1,098 lines), replaced `avg_latency < 50 ms` with the structural QUIC `STREAM_DATA` flow-control backpressure + in-order `HeartbeatAck` proof (`60 s` hang guard) and `[timing]` printout, and verified `10/10` sequential Windows passes (`-j 4`, no busy loops during Stage C `S7`, `12 passed; 0 failed` per run). Stays `Partial` pending post-S7 `20/20` loaded runs (`loop after S7`).
 - **Update (2026-11-25):** Verified `20/20` sequential loaded passes on clean `origin/master` `d88083f2` (`Windows 11 x86_64`, `rustc 1.96.0`, `cargo +1.96.0 test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture`) alongside `2` Python CPU busy loops (`x = (x * 1664525 + 1013904223) & 0xFFFFFFFF`): `12 passed; 0 failed` on every run (`min 1.891 s`, `median 3.312 s`, `max 3.922 s`, `total 64.125 s` after `107.687 s` `--no-run` prebuild; `[timing] QUIC 5MB saturation` `heartbeats=30`: `avg_latency` `679.700 µs–1.65159 ms`, `max_latency` `7.5054–16.1910 ms`). Stays `Partial | In` pending `Do` step 3 (`20/20` runs under `6` Python CPU busy loops on macOS).
+- **Update (2026-11-26):** Verified `20/20` sequential loaded passes on clean `origin/master` `b253f601` (`macOS arm64`, `nice -n 10`, `cargo test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture` with isolated per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR` and `6` Python CPU busy loops): `12 passed; 0 failed` on every run (`min 0.516 s`, `median 0.569 s`, `max 1.184 s`, `total 12.042 s` after `36.39 s` `--no-run` prebuild). `[timing] QUIC 5MB saturation` (`heartbeats=30`) across the `20` runs: `avg_latency` `498.505 µs–750.279 µs`, `max_latency` `2.4885 ms–7.825583 ms`:
+  `1: 498.505 µs / 2.4885 ms`, `2: 691.686 µs / 7.825583 ms`, `3: 643.066 µs / 5.352375 ms`, `4: 740.905 µs / 4.832833 ms`, `5: 674.661 µs / 6.121458 ms`, `6: 576.05 µs / 4.888917 ms`, `7: 670.432 µs / 6.807917 ms`, `8: 587.744 µs / 5.052583 ms`, `9: 657.695 µs / 7.086916 ms`, `10: 552.623 µs / 4.318125 ms`, `11: 669.197 µs / 7.476958 ms`, `12: 644.115 µs / 7.697834 ms`, `13: 589.976 µs / 4.307084 ms`, `14: 570.583 µs / 4.8565 ms`, `15: 617.276 µs / 5.836708 ms`, `16: 567.79 µs / 4.887542 ms`, `17: 750.279 µs / 6.793042 ms`, `18: 670.311 µs / 5.900583 ms`, `19: 682.43 µs / 5.689209 ms`, `20: 609.077 µs / 5.450583 ms`. All `Do` and `Done when` steps are met.
 
 ### TEST-90: Linux: scheduled endurance soak fails because `workspaces-w0` is created with mode `0755` instead of `0700`
 
@@ -906,6 +917,10 @@ The full suite must pass on a clean machine before CI can require it.
   smoke run waits until after Stage C `S7` (`loop after S7` / Linux verification).
 - **Done when:** `tests/test_endurance_harness.py` verifies `0o700` permissions on created soak directories under
   a `0o022` umask, and a Linux `endurance.py soak` smoke run starts and connects workers cleanly.
+- **Update (2026-11-26):** Verified on Linux in `master` CI `workflow_dispatch` run `45821686282` (`034f5725`,
+  `ubuntu-latest`, job `endurance (loopback)` with `--workspaces`): the 45-minute soak started all 3
+  workers cleanly, passed `3_disk_and_journal` with `sandbox_ok = true`, and reported zero `workspaces-w0`
+  mode errors. All `Do` and `Done when` steps are met.
 
 ### TEST-95: CI: `tests/test_wave3_e2e.py` fake nextest/blender `.pid` writes are non-atomic and raise empty-file `ValueError` under `--fail-fast`
 
@@ -923,14 +938,23 @@ The full suite must pass on a clean machine before CI can require it.
   line `1430`). When `--fail-fast` tears down remaining shards while a sibling child is creating/truncating
   or writing `shard_<N>.pid`, the test's reader (`line 4784`, and `line 3777` in `test_t2_ax2_03`) can observe
   a zero-byte `.pid` file and raise `ValueError`.
-- **Do:** (Code fix landed on `mac/test-95-atomic-pid-writes`; 20-run loaded loop under busy loops waits until after the Stage C `S7` 24-hour soak finishes — `loop after S7`.)
+- **Do:** (Code fix landed on `mac/test-95-atomic-pid-writes`; 20-run loaded loop completed 2026-11-26.)
   1. Failing check first: `HarnessAtomicWriteTests` reproduced empty `shard_2.pid` `ValueError: invalid literal for int() with base 10: ''` and failed before the fix (`AssertionError: 'os.replace(' not found`).
   2. Write all `.pid` and marker files via a temporary file in the same directory followed by atomic
      rename (`write_text_atomic` with `os.replace` in `install_fake_cargo_nextest` `shard_<N>.pid` and
      `install_fake_blender` `PROBE_PID_FILE` / `HANG_PID_FILE` / `HANG_MARKER_FILE`; temp file + `mv -f`
      in `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards`), so readers only see complete `*.pid`
      and marker files.
-  3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`. Remaining: `20/20` runs under busy loops (`loop after S7`).
+  3. Verified `20/20` sequential unloaded runs (`65` tests/run, `84.263–144.108 s`, total `1,901.534 s`, `0` failures) during `S7`.
+  4. Verified `20/20` sequential loaded runs on clean `origin/master` `fc95e4c9` (2026-11-26, macOS `arm64`,
+     `python3 -B -m unittest tests/test_wave3_e2e.py -v` under `nice -n 10` with `4` Python CPU busy loops,
+     `OXIDESWARM_PROFILE=debug`, `OXIDESWARM_E2E_TIER=all`, private `HOME`/`OXIDESWARM_HOME`/`TMPDIR` per run):
+     `65/65` tests passed in every run (including both `--fail-fast` tests
+     `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` and
+     `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards`), `0` failures, `min 113.933 s`,
+     `median 119.161 s`, `max 126.237 s`, `total 2,398.919 s` (`113.933`, `118.678`, `122.782`, `126.237`,
+     `125.351`, `125.249`, `123.664`, `122.912`, `121.222`, `118.611`, `117.813`, `120.043`, `116.871`,
+     `116.273`, `117.953`, `117.490`, `116.683`, `117.865`, `119.644`, `119.645 s`).
 - **Done when:** All `.pid` and marker writers in `tests/test_wave3_e2e.py` use temp-file + atomic rename
   and `python3 -B -m unittest tests/test_wave3_e2e.py` passes `20/20` runs under busy loops.
 
@@ -971,6 +995,16 @@ The full suite must pass on a clean machine before CI can require it.
 - **Done when:** all 8 tests pass on Windows with foreign `%TEMP%` ACEs (`cargo test --locked -p rusty_grid_master
   --lib` passes `436/436` locally) and CI stays green.
 
+### TEST-101: Make `rusty_grid_core` `cluster_auth::tests::default_path_lives_under_home` independent of caller `OXIDESWARM_HOME`
+
+- **Status (2026-11-26):** Implemented (`win2/test-101-default-path-oxideswarm-home`).
+- **Evidence:** Discovered during `E-D2` on Windows 11 (`d88083f2`, `test_runs/win-2_e-d2_2026-11-25.md`) and reproduced on `origin/master` `fc95e4c9` (claim `claims/item/TEST-101__win__20261126T080448414890Z__9d72ebc8.json`): running `cargo test --locked -j 2 -p rusty_grid_core --lib cluster_auth::tests::default_path_lives_under_home -- --exact` with `OXIDESWARM_HOME` set failed (`rc=101`) at `crates/core/src/cluster_auth.rs:1217:13`, while running with `OXIDESWARM_HOME` unset passed (`rc=0`).
+- **Problem:** `ClusterSecret::default_path()` returns `<OXIDESWARM_HOME>/cluster.secret` when `OXIDESWARM_HOME` is non-empty, whereas `cluster_auth::tests::default_path_lives_under_home` asserted `.oxideswarm/cluster.secret` against `ClusterSecret::default_path()` directly, causing deterministic failures in isolated test harnesses that export `OXIDESWARM_HOME`.
+- **Do:**
+  1. Factor `ClusterSecret::default_path()` in `crates/core/src/cluster_auth.rs` through a private injectable `default_path_with(env)` helper with zero change to product behaviour and no `std::env::set_var` in tests.
+  2. Update `default_path_lives_under_home` to test the `HOME` / `USERPROFILE` branch via `default_path_with`, and test the `OXIDESWARM_HOME` override branch separately in `default_path_honours_oxideswarm_home_override`.
+- **Done when:** `cluster_auth::tests::default_path_lives_under_home` (and `default_path_honours_oxideswarm_home_override`) pass `20/20` both with and without `OXIDESWARM_HOME` set on Windows, and CI stays green.
+
 ### TEST-100: CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'`
 
 - **Evidence:** CI run `45657051728` (`workflow_dispatch` on `master` `60e18cdd`, 2026-11-25), job `endurance (loopback)`: after the 45-minute soak finished, `run_soak` (`benchmarks/endurance/endurance.py:5809` / `:6068` on `fc95e4c9`) failed with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'`. Claimed via `agent_bridge.py claim` (`claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`).
@@ -980,6 +1014,63 @@ The full suite must pass on a clean machine before CI can require it.
   2. Removed the duplicate block (`lines 3705-3978`) so `leftover_pids` sits back inside `SoakCluster` right after `stop()`, keeping every real change of both copies.
   3. Verified `python3 -B -m unittest tests/test_endurance_harness.py -v` (`40` tests: `39` ok, `1` skipped without `OXIDESWARM_TEST_BIN`) and a 5-minute loopback soak (`endurance.py soak --duration 5m --fault-scale 0.1 --sample-interval 5s`, debug binary under `nice -n 10` with private temp home/work-dir): `exit 0`, `all_passed = True` (`1_accounting PASS` `280/280`, `2_resource_plateau PASS`, `3_disk_and_journal PASS` `277342 -> 24 B`, `4_probe_p99 PASS` `60/60` ok / `ratio 0.9801`, `5_clean_stop PASS` `leftover_pids=[]`, `6_fault_injection PASS` `3/3`). (An initial `--sample-interval 30s` 5-minute run had `1_accounting`/`2`/`3`/`5_clean_stop`/`6` `PASS` and failed `4_probe_p99` only with `insufficient_probes_per_window` because 30 s intervals yield at most 4 probes per window against `min_samples_per_window = 10`.)
 - **Done when:** `benchmarks/endurance/endurance.py` has no duplicate top-level definitions, `SoakCluster.leftover_pids` is restored, `tests/test_endurance_harness.py` and a short loopback soak pass locally, and `workflow_dispatch` `endurance (loopback)` passes on `master` after merge.
+
+### TEST-102: CI `endurance (loopback)`: `4_probe_p99` fails on shared-runner single-sample jitter (`67.4 -> 330.9 ms` across `14`/`16` probes)
+
+- **Evidence:** `master` CI `workflow_dispatch` run `45821686282` (`2026-11-26T16:39:22Z`, `034f5725`), job
+  `endurance (loopback)` on `ubuntu-latest` (claimed via `agent_bridge.py claim`,
+  `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): `transfer-loopback.json`
+  (`T1,T2,T4,T6,T7,T8` `6/6`) and `soak-45m-loopback.json` checks `1_accounting` (`2,185/2,185`, `0` lost,
+  `0` duplicates, `0` retries), `2_resource_plateau` (master RSS `76.4 -> 92.6 MiB <= 109.9 MiB`, workers
+  bounded), `3_disk_and_journal` (Linux `--workspaces` `0700` clean, journal `1,503,065 -> 24 B` and
+  `790,063 -> 24 B`), `5_clean_stop`, and `6_fault_injection` (`16/16`) ALL PASSED; only `4_probe_p99`
+  failed (`baseline_p99_ms = 67.402`, `late_p99_ms = 330.897`, `ratio = 4.9093 > 1.5`). Inspection of all
+  `45` `probe_summary.samples` showed zero latency degradation: clean baseline (`[270, 1350)`, `n=14`,
+  `4` fault-excluded) had median `32.38 ms` (`13/14` in `30.36–37.86 ms` + one `[12]=71.816 ms`); clean
+  late (`>= 1485 s`, `n=16`, `4` fault-excluded) had median `31.28 ms` (lower than baseline), last 6
+  probes `24.59–28.69 ms` (`mean = 27.11 ms`, faster than early), `14/16 <= 33.45 ms`, and failed solely
+  from one `369.801 ms` sample (`[28]` at `1695.77 s`) plus `[37]=110.443 ms`.
+- **Problem:** `check_soak_probe_p99` and `check_p99_ratio` in `benchmarks/endurance/endurance.py` were
+  unsound on shared runners for three compounding reasons:
+  1. `run_soak` coupled probes to `--sample-interval 60s`, leaving only `14–16` clean probes per window
+     (`min_samples_per_window = 10`), where `p99` (`0.85 * max + 0.15 * second_max`) equals the single worst
+     sample (`> 6%` weight per sample).
+  2. `check_p99_ratio` lacked an absolute floor (unlike `check_memory_plateau`'s `max(10%, 32 MiB)`), so a
+     sub-second host glitch on a `~30–67 ms` loopback baseline triggers `1.5x`.
+  3. Default `fault_pad_s = 15.0` after `end_s` can let worker reconnect / failover drain tails reach clean
+     windows once probe cadence increases.
+- **Do:** (Per [design 0065](design/0065-large-transfer-and-long-run-tests.md#d3-soak-scenario-endurancepy-soak) D3 #4 / #6.4):
+  1. Failing check first: added `test_threshold_arithmetic` `floor_ms` assertions,
+     `test_soak_probe_p99_shared_runner_hardening_test102` (including `45821686282` replay, uniform
+     `~30 ms -> ~200 ms` and `~30 -> ~110 ms` regression failure checks, high-cadence outlier immunity, and
+     `30 s` pad checks), and CI `--probe-interval 6s` check in `tests/test_endurance_harness.py`; before the
+     initial fix `tests/test_endurance_harness.py` failed (`Ran 41 tests: FAILED (failures=1, errors=2,
+     skipped=1)` — `TypeError` on `floor_ms`, `KeyError: 'reason'` at `14/16` samples, missing
+     `--probe-interval 6s`), and tightening `500 ms -> 100 ms` tests before updating
+     `SOAK_PROBE_P99_FLOOR_MS` failed (`Ran 41 tests: FAILED (failures=2, skipped=1)` — `200 ms` slowdown
+     and `330.897 ms` `45821686282` replay accepted under `500 ms`).
+  2. In `benchmarks/endurance/endurance.py` and `.github/workflows/ci.yml`: added decoupled `--probe-interval`
+     (default `min(6s, --sample-interval)`, `--probe-interval 6s` in CI `endurance` job -> `~140–160` clean
+     probes/window in `45m`), raised `SOAK_MIN_PROBE_SAMPLES_PER_WINDOW = 30`, added `floor_ms = 100.0` ms
+     in `check_p99_ratio` / `check_soak_probe_p99` (`max(1.5x baseline, 100 ms)` tied to measured `32 ms`
+     median / `+39–79 ms` runner noise while catching `30 -> 200 ms`), and widened `SOAK_PROBE_FAULT_PAD_S`
+     from `15.0` to `30.0` (with `soak_fault_pad_seconds` scaling to `>= 5 s` when `fault_scale < 0.25`);
+     updated `docs/design/0065-large-transfer-and-long-run-tests.md` (documenting both the `100 ms`
+     noise justification and the `worker_kill`, `link_cut`, and `queue_burst`/`master_restart` post-`end_s`
+     recovery tails) and `benchmarks/endurance/README.md`.
+  3. Verified `tests/test_endurance_harness.py` (`41` tests: `40` ok, `1` skipped without
+     `OXIDESWARM_TEST_BIN`), `tests/test_m1_challenger_hygiene.py` (`5/5 OK`),
+     `f2_t2_backlog_no_duplicate_ids_and_valid_lines` (`1/1`), and a `3m` live loopback soak
+     (`--duration 3m --fault-scale 0.1 --load-scale 0.1 --sample-interval 5s --probe-interval 2s --out ...`,
+     debug binary under `nice -n 10`): `all_passed = True` (`6/6` checks: `1_accounting` `112/112`,
+     `2_resource_plateau` `PASS`, `3_disk_and_journal` `95,042 -> 24 B`, `4_probe_p99` `88/88` ok / `9`
+     fault-excluded / `baseline_count = 35` `78.15 ms` / `late_count = 31` `79.512 ms` / `ratio = 1.0174` /
+     `floor_ms = 100.0` / `limit_ms = 117.225`, `5_clean_stop` `leftover_pids=[]`, `6_fault_injection`
+     `1/1`).
+- **Done when:** `tests/test_endurance_harness.py` (including CI run `45821686282` replay, uniform
+  `30 -> 200 ms` regression failure, single-outlier high-cadence immunity, 30-sample minimum, 100 ms floor,
+  30 s fault pad, and CI YAML check), `tests/test_m1_challenger_hygiene.py`, backlog hygiene tests, and a
+  short loopback soak pass locally, and CI `endurance (loopback)` passes `4_probe_p99` after merge.
 
 ## Phase 3: make the documents true
 
@@ -1680,6 +1771,18 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
   link (a smaller payload) or report the measured rate as a warning when the task is still running and has made
   progress; keep FAIL for a worker without blob support or with no progress.
 - **Done when:** A relayed worker that moves data slowly gets a WARN with its rate, and the existing C8 tests pass.
+- **Update (2026-11-26, `mac/bug-41-doctor-c8-relay-warn`):**
+  1. Failing check first: `doctor::tests::test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate`
+     failed before the fix (`left: Pass`, `right: Warn`, sending `8 MiB` to a relayed worker).
+  2. Added `THROUGHPUT_PROBE_RELAY_BYTES` (`1 MiB`) and `throughput_probe_bytes_for_worker` /
+     `format_throughput_mbps` (`{:.2}` below `1.0 MB/s`) / `judge_throughput` in `crates/cli/src/doctor.rs` so
+     relayed workers (`worker.relayed()`) fetch a `1 MiB` probe and report `Outcome::Warn` with their measured
+     rate (`!report.failed()`), while timeouts, refusals, and non-zero exits stay `Outcome::Fail` and direct/TCP
+     workers keep the `8 MiB` `Outcome::Pass` probe; updated `docs/design/0001-two-node-readiness.md` and
+     `docs/reference.md`.
+  3. Verified `doctor::tests` (`11/11`), `cli_doctor_e2e` (`7/7`), `f2_t2_backlog_no_duplicate_ids_and_valid_lines`
+     (`1/1`), `tests/test_m1_challenger_hygiene.py` (`5/5`), `fmt`, workspace `clippy` (`0` warnings), and
+     `ox-mode test size`.
 
 ### BUG-40: A worker that has only a P2P ticket falls back to TCP `127.0.0.1:8088` when the P2P dial fails
 
@@ -1713,6 +1816,11 @@ The Windows smoke test of 0.3.0 passed 9 of 9 steps at `3ecc926`, and the macOS 
 - **Done when:** a worker started with only a ticket never dials `127.0.0.1:8088`, its P2P failure lines name the
   ticket target, the Android-style ticket-plus-address fallback still works (existing tests), and the change is in
   a 0.4.x patch.
+- **Fix (`win/bug-40-ticket-only-no-tcp-fallback`):**
+  - `crates/cli/src/cli_app/worker.rs`: `resolve_worker_target_from` now resolves `p2p_ticket` first and sets `master_addr` to `""` (instead of `DEFAULT_MASTER_ADDR`) when a ticket is configured without an explicit `--master`, `RUSTY_GRID_MASTER_ADDR` / `RUSTY_GRID_MASTER`, or `[worker].master`, while preserving explicit master+ticket fallback (including Android's `start_worker_impl`) and ticketless `DEFAULT_MASTER_ADDR`. `run_worker` also passes `iroh://<node_id>` (via `peer_announce_target`) to `announce_peer_secret` instead of `""` (`"auto"`).
+  - `crates/worker/src/client/session.rs`: `establish_p2p_with_ticket` and `establish_stream` now log `master=iroh://<node_id>` on P2P dial attempts, stale-ticket errors, `no TCP fallback address configured` warnings, and explicit TCP fallback warnings (`tcp_fallback=<addr>`).
+  - `docs/reference.md`: documented the ticket-only no-TCP-fallback rule under `oxideswarm worker`.
+  - Failing-first tests added in `crates/cli/src/cli_app/worker.rs` (`bug40_ticket_only_has_no_tcp_fallback_while_explicit_master_keeps_it`) and `crates/worker/src/client/tests.rs` (`test_bug40_ticket_only_has_no_tcp_fallback_and_logs_node_id`, `test_bug40_ticket_plus_explicit_address_falls_back_to_tcp_and_logs_p2p_target`). Verified on Windows 11 (`origin/master` `b253f601`, `cargo +1.96.0 --locked`).
 
 ## Phase 13: the path to finished
 
@@ -3477,4 +3585,10 @@ Add one dated line per finished item, newest last.
 - 2026-11-25: Release 0.4.5 prepared (no wire change: protocol 10, store format 4): the Windows USB kit update (BUG-38),
   the macOS RAM reading and `doctor` probes (BUG-37), BUG-33 to BUG-35, BUG-39, TEST-88, ADOPT-3, AX-1, AX-2, FEAT-5,
   MESH-2, MESH-3, 3D-2, 3D-3, TEST-24 to TEST-26 and test fixes up to TEST-99; approved by the owner in chat.
+- 2026-11-26: BUG-41 Implemented (`mac/bug-41-doctor-c8-relay-warn`): added `THROUGHPUT_PROBE_RELAY_BYTES` (`1 MiB`), `throughput_probe_bytes_for_worker`, `format_throughput_mbps` (`{:.2}` below `1.0 MB/s`), and `judge_throughput` in `crates/cli/src/doctor.rs` (plus `docs/design/0001-two-node-readiness.md` and `docs/reference.md`) so relayed workers fetch `1 MiB` and report `WARN` with their measured rate instead of timing out at `60 s` on `8 MiB`, while timeouts/refusals/failures stay `FAIL` and direct/TCP probes stay `8 MiB` `PASS`; verified failing-first resolved: `test_bug41_relayed_worker_c8_uses_smaller_probe_and_warns_with_rate` -> `doctor::tests` (`11/11`), `cli_doctor_e2e` (`7/7`), `f2_t2_backlog_no_duplicate_ids_and_valid_lines` (`1/1`), `test_m1_challenger_hygiene.py` (`5/5`), `fmt`, workspace `clippy` (`0` warnings), and `ox-mode test size`.
+- 2026-11-26: BUG-40 Implemented (`win/bug-40-ticket-only-no-tcp-fallback`): `resolve_worker_target_from` (`crates/cli/src/cli_app/worker.rs`) now resolves `master_addr` to `""` when a P2P ticket is set without an explicit `--master` / `RUSTY_GRID_MASTER[_ADDR]` / `[worker].master` (keeping explicit master+ticket fallback and Android unchanged, and passing `iroh://<node_id>` to `announce_peer_secret`); `WorkerClient::establish_stream` and `establish_p2p_with_ticket` (`crates/worker/src/client/session.rs`) now log `master=iroh://<node_id>` on P2P attempts, stale errors, ticket-only failure warnings, and explicit TCP fallback warnings (`tcp_fallback=<addr>`); updated `docs/reference.md`. Verified failing-first tests before fix and post-fix Windows 11 passes (`rusty_grid_cli --lib` `231/231`, `rusty_grid_worker --lib client::tests` `85/85`, `worker_connection_lifecycle` `12/12`, `rusty_grid_android_bridge --lib` `16/16`, workspace `clippy` `0` warnings, `fmt`, live `oxideswarm.exe` smoke check, `test_m1_challenger_hygiene.py`, `f2_t2_backlog_no_duplicate_ids_and_valid_lines`).
+- 2026-11-26: TEST-95 Implemented (`mac/test-95-loaded-loop`): verified `20/20` sequential loaded runs of `python3 -B -m unittest tests/test_wave3_e2e.py -v` on clean `origin/master` `fc95e4c9` (`macOS arm64`, `nice -n 10`, `4` Python CPU busy loops, private per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR`, `OXIDESWARM_PROFILE=debug`, `OXIDESWARM_E2E_TIER=all`): `65/65` tests passed per run (including both `--fail-fast` tests `test_t2_ax2_03_fail_fast_cancels_slow_remaining_shards` and `test_t3_03_build_once_with_fail_fast_cancels_remaining_shards`), `0` failures (`min 113.933 s`, `median 119.161 s`, `max 126.237 s`, `total 2,398.919 s`).
+- 2026-11-26: TEST-93 Implemented and TEST-86 updated (`mac/test-93-macos-loaded-loop`): verified `20/20` sequential loaded macOS runs of `cargo test --locked -j 4 -p rusty_grid_master --test m2_challenger_1_stress -- --nocapture` on clean `origin/master` `b253f601` (`nice -n 10`, `6` Python CPU busy loops, isolated per-run `HOME`/`OXIDESWARM_HOME`/`TMPDIR`): `12 passed; 0 failed` per run (`min 0.516 s`, `median 0.569 s`, `max 1.184 s`, `total 12.042 s`; `[timing] QUIC 5MB saturation` `avg_latency 498.505 µs–750.279 µs`, `max_latency 2.4885 ms–7.825583 ms`); updated `TEST-86` (`Partial | In`) with `33/33` passing `workspace tests (macos-latest)` jobs across all `master` push CI runs since `2026-11-24T00:00:00Z` (`45297098266` through `45781445276`, `0` `test_ax2_shard`/`test_ax1_matrix` stalls).
+- 2026-11-26: TEST-101 Implemented (`win2/test-101-default-path-oxideswarm-home`, claim `claims/item/TEST-101__win__20261126T080448414890Z__9d72ebc8.json`): refactored `ClusterSecret::default_path()` in `crates/core/src/cluster_auth.rs` to delegate to private `default_path_with(env)` without changing product behaviour or calling `std::env::set_var`, updated `default_path_lives_under_home` to test the `HOME`/`USERPROFILE` branch deterministically, and added `default_path_honours_oxideswarm_home_override`; verified `20/20` with `OXIDESWARM_HOME` set and `20/20` without `OXIDESWARM_HOME` on Windows.
 - 2026-11-26: TEST-100 added and Implemented (`mac/test-100-endurance-soak-leftover-pids`, claim `claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`): added failing-first `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` in `tests/test_endurance_harness.py` (failed before fix on the 5 duplicate top-level definitions from `751be5b5` and detached `SoakCluster.leftover_pids`), removed the identical duplicate `resolve_master_arg..RemoteEnduranceCluster` block (`lines 3705-3978`) in `benchmarks/endurance/endurance.py` so `leftover_pids` returns to `SoakCluster`, and verified `tests/test_endurance_harness.py` (`40` tests: `39` ok, `1` skipped), `tests/test_m1_challenger_hygiene.py`, `fmt`, workspace `clippy`, and a 5-minute loopback soak (`--duration 5m --fault-scale 0.1 --sample-interval 5s`, `6/6 PASS`, `280/280` tasks, `leftover_pids=[]`).
+- 2026-11-26: TEST-102 Implemented and TEST-90 Implemented (`mac/test-102-soak-probe-p99`, claim `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): CI run `45821686282` (`034f5725`, `ubuntu-latest` `endurance (loopback)`) passed `transfer` (`6/6`), `1_accounting` (`2,185/2,185`), `2_resource_plateau`, `3_disk_and_journal` (Linux `--workspaces` `0700` confirmed, closing `TEST-90`), `5_clean_stop`, and `6_fault_injection` (`16/16`), failing only `4_probe_p99` (`67.402 -> 330.897 ms`, `ratio 4.9093` on `14`/`16` probes despite lower late median `31.28 vs 32.38 ms`) due to 60 s probe cadence, missing latency floor, and 15 s fault pad; added `--probe-interval 6s` (`min(6s, --sample-interval)`), `30` clean probes/window minimum, `100 ms` floor (`max(1.5x baseline, 100 ms)`, catching `30 -> 200 ms` uniform regressions), `30 s` post-fault exclusion pad (`soak_fault_pad_seconds`), failing-first tests in `tests/test_endurance_harness.py`, and design `0065` status-log update.
