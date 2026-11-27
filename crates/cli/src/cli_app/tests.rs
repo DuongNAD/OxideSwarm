@@ -1550,3 +1550,45 @@ async fn test_cli_env_lock_serializes_wire_codec_mutation_and_restores_on_panic(
         r2.unwrap();
     }
 }
+
+#[test]
+fn bug36_submit_and_shard_parse_wait_secs_flag() {
+    let default_submit = submit_args(&["--wait", "--", "true"]);
+    assert_eq!(default_submit.wait_secs, None);
+
+    let matrix_wait = submit_args(&[
+        "--matrix",
+        "os=linux,windows",
+        "--wait-secs",
+        "125",
+        "--",
+        "true",
+    ]);
+    assert_eq!(matrix_wait.wait_secs, Some(125));
+
+    let default_shard = match parse(&["shard", "--count", "4", "--", "true"]).command {
+        Commands::Shard(a) => a,
+        other => panic!("expected shard, got {other:?}"),
+    };
+    assert_eq!(default_shard.timeout_secs, None);
+    assert_eq!(default_shard.wait_secs, None);
+
+    let custom_shard = match parse(&[
+        "shard",
+        "--count",
+        "4",
+        "--timeout-secs",
+        "30",
+        "--wait-secs",
+        "90",
+        "--",
+        "true",
+    ])
+    .command
+    {
+        Commands::Shard(a) => a,
+        other => panic!("expected shard, got {other:?}"),
+    };
+    assert_eq!(custom_shard.timeout_secs, Some(30));
+    assert_eq!(custom_shard.wait_secs, Some(90));
+}

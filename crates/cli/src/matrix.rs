@@ -40,6 +40,28 @@ pub const HARD_MAX_MATRIX_CELLS: usize = 256;
 /// Default per-cell inline stdout/stderr escaped-JSON byte budget for CLI `--json`.
 pub const DEFAULT_CELL_OUTPUT_BYTES: usize = 16_384;
 
+/// Default margin added beyond `tasks * timeout_secs` when deriving the whole-run client wait
+/// budget so worker-side task timeouts complete before the client gives up.
+pub const DEFAULT_WAIT_MARGIN_SECS: u64 = 5;
+
+/// Resolves the whole-run client wait budget in seconds (`--wait-secs` / MCP `wait_secs`).
+///
+/// When `explicit_wait_secs` is provided, returns it clamped to at least `1` s. Otherwise computes
+/// `task_count.max(1) * per_task_timeout_secs.max(1) + DEFAULT_WAIT_MARGIN_SECS` using saturating
+/// arithmetic so queued runs behind limited worker slots do not time out at `per_task_timeout_secs`.
+pub fn resolve_run_wait_secs(
+    explicit_wait_secs: Option<u64>,
+    task_count: usize,
+    per_task_timeout_secs: u64,
+) -> u64 {
+    match explicit_wait_secs {
+        Some(wait_secs) => wait_secs.max(1),
+        None => (task_count.max(1) as u64)
+            .saturating_mul(per_task_timeout_secs.max(1))
+            .saturating_add(DEFAULT_WAIT_MARGIN_SECS),
+    }
+}
+
 /// Cap concurrent TCP/Noise handshakes under the master's default `max_pending_handshakes` (64).
 const MAX_CONCURRENT_HANDSHAKES: usize = 32;
 
@@ -745,7 +767,7 @@ pub async fn execute_matrix<C, Fut>(
     workers: &[WorkerCapabilities],
     placeability: Vec<Option<String>>,
     template: &Task,
-    timeout: Duration,
+    wait_budget: Duration,
     cancel_rx: Option<watch::Receiver<bool>>,
     progress_tx: Option<mpsc::UnboundedSender<MatrixProgressEvent>>,
     connect: Arc<C>,
@@ -764,7 +786,7 @@ where
     let total = cells.len();
     let mut outcomes: Vec<Option<CellExecution>> = vec![None; total];
     let handshake_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-    let deadline = safe_deadline(timeout);
+    let deadline = safe_deadline(wait_budget);
     let mut set = tokio::task::JoinSet::new();
 
     for (cell, unplaced_reason) in cells.into_iter().zip(placeability) {
@@ -832,7 +854,10 @@ where
                             task_id: Some(task_id),
                             worker_name: None,
                             result: None,
-                            error: Some(format!("timed out after {}s", timeout.as_secs())),
+                            error: Some(format!(
+                                "timed out after {}s (wait budget)",
+                                wait_budget.as_secs()
+                            )),
                             saved_outputs: None,
                             saved_artifacts: None,
                             download_error: None,
@@ -872,8 +897,8 @@ where
                             worker_name: None,
                             result: None,
                             error: Some(format!(
-                                "timed out connecting to master after {}s",
-                                timeout.as_secs()
+                                "timed out connecting to master after {}s (wait budget)",
+                                wait_budget.as_secs()
                             )),
                             saved_outputs: None,
                             saved_artifacts: None,
@@ -902,7 +927,7 @@ where
                     Ok(Err(err)) => Err((CellStatus::Error, format!("could not submit cell: {err}"))),
                     Err(_) => Err((
                         CellStatus::TimedOut,
-                        format!("timed out submitting cell after {}s", timeout.as_secs()),
+                        format!("timed out submitting cell after {}s (wait budget)", wait_budget.as_secs()),
                     )),
                 }
             };
@@ -1059,7 +1084,10 @@ where
                             task_id: Some(task_id),
                             worker_name: None,
                             result: None,
-                            error: Some(format!("timed out after {}s", timeout.as_secs())),
+                            error: Some(format!(
+                                "timed out after {}s (wait budget)",
+                                wait_budget.as_secs()
+                            )),
                             saved_outputs: None,
                             saved_artifacts: None,
                             download_error: None,
@@ -1843,6 +1871,128 @@ mod tests {
         let _ = cancel_task.await;
         assert_eq!(execs.len(), 1);
         assert_eq!(execs[0].status, CellStatus::Cancelled);
+    }
+
+    #[test]
+    fn resolve_run_wait_secs_scales_with_tasks_or_honors_explicit_cap() {
+        assert_eq!(resolve_run_wait_secs(None, 1, 60), 65);
+        assert_eq!(resolve_run_wait_secs(None, 0, 60), 65);
+        assert_eq!(resolve_run_wait_secs(None, 4, 10), 45);
+        assert_eq!(resolve_run_wait_secs(None, 2, 0), 7);
+        assert_eq!(resolve_run_wait_secs(Some(25), 4, 10), 25);
+        assert_eq!(resolve_run_wait_secs(Some(0), 4, 10), 1);
+        assert_eq!(resolve_run_wait_secs(None, 8, u64::MAX), u64::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bug36_queued_matrix_cells_within_per_task_timeout_do_not_time_out() {
+        use rusty_grid_core::protocol::WireCodec;
+        use tokio::net::TcpListener;
+
+        async fn run_with_budget(explicit_wait_secs: Option<u64>) -> (usize, usize, Vec<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let worker_slots = Arc::new(Semaphore::new(1));
+
+            let srv_handle = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let slots = Arc::clone(&worker_slots);
+                    tokio::spawn(async move {
+                        let mut transport = MessageTransport::with_codec(
+                            GridStream::Tcp(stream),
+                            WireCodec::Bincode,
+                        );
+                        let Ok(Some(msg)) = transport.recv_msg::<ClientMessage>().await else {
+                            return;
+                        };
+                        if let ClientMessage::SubmitTask { task, .. } = msg {
+                            let _slot = slots.acquire().await.unwrap();
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            let _ = transport
+                                .send_msg(&ClientResponse::TaskCompleted {
+                                    task_id: task.id,
+                                    result: rusty_grid_core::task::TaskResult::success(
+                                        Uuid::nil(),
+                                        task.id,
+                                        rusty_grid_core::task::Bytes::new(),
+                                        4000,
+                                        false,
+                                    ),
+                                })
+                                .await;
+                        }
+                    });
+                }
+            });
+
+            let w = worker("w-1", &["c1", "c2", "c3", "c4"], false);
+            let spec = MatrixSpec::parse(&["tag=c1,c2,c3,c4".to_string()], 64).unwrap();
+            let cells = expand_cells(&spec, &Placement::default(), true).unwrap();
+            let per_task_timeout_secs = 10u64;
+            let reqs = TaskRequirements::new(1, 0, false, per_task_timeout_secs);
+            let placeability = check_placeability(&cells, std::slice::from_ref(&w), &reqs, false);
+            let placeable_count = placeability.iter().filter(|r| r.is_none()).count();
+            let tpl = Task::new(
+                TaskSpec::Command {
+                    program: "echo".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    working_dir: None,
+                    stdin: None,
+                },
+                reqs,
+            );
+            let connect = Arc::new(move || async move {
+                let stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(MessageTransport::with_codec(
+                    GridStream::Tcp(stream),
+                    WireCodec::Bincode,
+                ))
+            });
+
+            let wait_secs =
+                resolve_run_wait_secs(explicit_wait_secs, placeable_count, per_task_timeout_secs);
+            let execs = execute_matrix(
+                cells,
+                &[w],
+                placeability,
+                &tpl,
+                Duration::from_secs(wait_secs),
+                None,
+                None,
+                connect,
+            )
+            .await;
+            srv_handle.abort();
+
+            let completed = execs
+                .iter()
+                .filter(|e| e.status == CellStatus::Completed)
+                .count();
+            let timed_out_errors: Vec<String> = execs
+                .iter()
+                .filter(|e| e.status == CellStatus::TimedOut)
+                .filter_map(|e| e.error.clone())
+                .collect();
+            (completed, timed_out_errors.len(), timed_out_errors)
+        }
+
+        let (completed, timed_out, _) = run_with_budget(None).await;
+        assert_eq!(completed, 4);
+        assert_eq!(timed_out, 0);
+
+        let (capped_completed, capped_timed_out, capped_errors) = run_with_budget(Some(10)).await;
+        assert!(capped_completed < 4);
+        assert!(capped_timed_out > 0);
+        assert!(
+            capped_errors.iter().any(|e| e.contains("wait budget")),
+            "expected wait budget error message, got: {capped_errors:?}"
+        );
     }
 
     use std::collections::HashMap;

@@ -16,7 +16,9 @@ use rusty_grid_core::task::{StagedFile, Task, TaskRequirements, TaskSpec, Worksp
 
 use crate::blobs::{BlobConnection, PreparedInputs, UploadReport};
 use crate::connect::{connect_master, save_output_artifacts};
-use crate::matrix::{ensure_non_symlink_cell_dir, CellStatus};
+use crate::matrix::{
+    ensure_non_symlink_cell_dir, resolve_run_wait_secs, safe_deadline, CellStatus,
+};
 use crate::shard::{
     blob_matches_junit, check_build_once_path_collision, execute_build_once, execute_shards,
     filter_eligible_workers, junit, normalize_build_once_workers, plan_build_once_groups,
@@ -313,9 +315,9 @@ pub(super) async fn tool_shard(
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
-        .or_else(|| args.get("wait_secs").and_then(Value::as_u64))
         .unwrap_or(default_timeout)
         .max(1);
+    let explicit_wait_secs = args.get("wait_secs").and_then(Value::as_u64);
     let max_retries = args
         .get("max_retries")
         .and_then(Value::as_u64)
@@ -659,6 +661,7 @@ pub(super) async fn tool_shard(
     let mut build_once_map = None;
     let mut build_once_list: Vec<BuildOnceOutcome> = Vec::new();
     let mut nextest_config_staged: Option<StagedFile> = None;
+    let mut run_deadline: Option<tokio::time::Instant> = None;
 
     if let Some(ref scan) = build_source_scan {
         let manifest_input = TaskInput::tree(SANDBOX_ROOT, scan.manifest_id, scan.manifest_len);
@@ -703,6 +706,16 @@ pub(super) async fn tool_shard(
             }
         }
 
+        let run_wait_secs = resolve_run_wait_secs(
+            explicit_wait_secs,
+            groups.len() + assignments.len(),
+            timeout_secs,
+        );
+        let shared_deadline = safe_deadline(Duration::from_secs(run_wait_secs));
+        run_deadline = Some(shared_deadline);
+        let build_once_budget =
+            shared_deadline.saturating_duration_since(tokio::time::Instant::now());
+
         let outcomes = match execute_build_once(
             &groups,
             &manifest_input,
@@ -712,7 +725,7 @@ pub(super) async fn tool_shard(
             &env_for_build,
             repeatable,
             &workers,
-            Duration::from_secs(timeout_secs),
+            build_once_budget,
             Some(ctx.cancel_rx.clone()),
             Arc::clone(&connect),
         )
@@ -739,6 +752,14 @@ pub(super) async fn tool_shard(
         template = template.with_workspace(ws);
     }
 
+    let shard_wait_budget = match run_deadline {
+        Some(dl) => dl.saturating_duration_since(tokio::time::Instant::now()),
+        None => Duration::from_secs(resolve_run_wait_secs(
+            explicit_wait_secs,
+            assignments.len(),
+            timeout_secs,
+        )),
+    };
     let (prog_tx, mut prog_rx) = mpsc::unbounded_channel::<ShardProgressEvent>();
     let exec_fut = execute_shards(
         assignments,
@@ -747,7 +768,7 @@ pub(super) async fn tool_shard(
         build_once_map.as_ref(),
         nextest_config_staged.as_ref(),
         &extra_args,
-        Duration::from_secs(timeout_secs),
+        shard_wait_budget,
         fail_fast,
         Some(ctx.cancel_rx.clone()),
         Some(prog_tx),

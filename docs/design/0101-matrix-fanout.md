@@ -61,6 +61,12 @@ Created: 2026-11-21    Updated: 2026-11-21
 - `MatrixReport::to_json` emits `matrix: true`, `status` (`"completed"` or `"failed"`), cell count fields (`total_cells`, `completed_cells`, `failed_cells`, `unplaced_cells`, `timed_out_cells`, `error_cells`, `cancelled_cells`), `RunSummary` fields (`machines`, `waited_ms`, `task_time_sum_ms`), ordered `cells` records (`index`, `cell`, `label`, `slug`, `axes`, `require_tags`, `status`, `unplaced`, `task_id`, `worker`, `worker_id`, `worker_name`, `exit_code`, `duration_ms`, `stdout`, `stderr`, truncation metadata, `error`, `outputs`, `saved_outputs`, `saved_artifacts`), and optional `input_upload` / `workspace` summaries.
 - CLI exits non-zero and MCP sets `isError: true` whenever any cell fails, times out, errors, is cancelled, or is unplaced. Invalid MCP `matrix` arguments fail validation in `validate_tool_arguments` with JSON-RPC `-32602` while keeping the stdio server loop alive.
 
+### D5: Whole-run wait budget vs per-cell task timeout (`BUG-36`)
+
+- `--timeout-secs` (MCP `timeout_secs`) sets only `TaskRequirements::timeout_secs`, enforced by the worker per executing cell (`60` s default, `1800` s with `--workspace`).
+- `--wait-secs` on CLI `submit` and `wait_secs` on MCP `submit` set the client's whole-run wait budget passed to `execute_matrix` (`resolve_run_wait_secs` in `crates/cli/src/matrix.rs`). When omitted, the default wait budget is `max(1, tasks) * max(1, timeout_secs) + DEFAULT_WAIT_MARGIN_SECS` (`DEFAULT_WAIT_MARGIN_SECS = 5`), where `tasks` is `placeable_count` for `--matrix` runs (`1` for single-task `--wait`).
+- A matrix run whose placeable cells wait in queue behind fewer worker slots therefore no longer times out at `timeout_secs` on the client while each cell stays within its per-task timeout, while an explicit `--wait-secs` / `wait_secs` still caps the whole run with zero wire changes.
+
 ## Compatibility
 
 - Zero wire protocol changes (`PROTOCOL_VERSION_CURRENT = 10`, `PROTOCOL_VERSION_MIN_COMPATIBLE = 9`).
@@ -88,3 +94,4 @@ Created: 2026-11-21    Updated: 2026-11-21
 ## Status log
 
 - 2026-11-21: Created design record `0101` and implemented client-side matrix fan-out across CLI `submit` and MCP `submit` (`AX-1`).
+- 2026-11-26: Amended (`BUG-36`): separated per-task `--timeout-secs` from the client's whole-run `--wait-secs` / MCP `wait_secs` wait budget (`placeable_cells * timeout_secs + 5` default) via `matrix::resolve_run_wait_secs`.

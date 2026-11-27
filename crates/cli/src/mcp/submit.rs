@@ -867,10 +867,9 @@ pub(super) async fn tool_submit(
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(default_timeout_secs);
-    let wait_secs = args
-        .get("wait_secs")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| timeout_secs.saturating_add(DEFAULT_WAIT_MARGIN_SECS));
+    let explicit_wait_secs = args.get("wait_secs").and_then(Value::as_u64);
+    let wait_secs =
+        explicit_wait_secs.unwrap_or_else(|| timeout_secs.saturating_add(DEFAULT_WAIT_MARGIN_SECS));
 
     let mut requirements = TaskRequirements::new(cores, ram_mb, gpu, timeout_secs);
     if let Some(vram) = vram_mb {
@@ -1106,7 +1105,7 @@ pub(super) async fn tool_submit(
             prepared_inputs,
             ws_uploads,
             ws_meta,
-            wait_secs,
+            explicit_wait_secs,
             max_output_bytes,
             submit_started,
         )

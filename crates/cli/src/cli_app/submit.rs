@@ -1218,6 +1218,7 @@ async fn run_submit_with_secret_inner(
     let task_id = task.id;
     let verify_template = args.verify.map(|_| task.clone());
     let wait = args.wait || args.output.is_some() || !output_globs.is_empty() || is_compile;
+    let wait_secs = crate::matrix::resolve_run_wait_secs(args.wait_secs, 1, timeout_secs);
     let submit_msg = ClientMessage::SubmitTask { task, wait };
 
     let response = if wait {
@@ -1230,7 +1231,7 @@ async fn run_submit_with_secret_inner(
             );
         }
         match tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
+            Duration::from_secs(wait_secs),
             transport.recv_msg::<ClientResponse>(),
         )
         .await
@@ -1253,9 +1254,8 @@ async fn run_submit_with_secret_inner(
                 );
             }
             Err(_) => {
-                let msg = format!(
-                    "Timed out after {timeout_secs}s waiting for task {task_id} to complete"
-                );
+                let msg =
+                    format!("Timed out after {wait_secs}s waiting for task {task_id} to complete");
                 eprintln!("{msg}");
                 if args.json {
                     println!(
@@ -1689,12 +1689,17 @@ async fn run_matrix_submit(
         }
     });
 
+    let wait_secs = crate::matrix::resolve_run_wait_secs(
+        args.wait_secs,
+        placeable_count,
+        requirements.timeout_secs,
+    );
     let mut executions = crate::matrix::execute_matrix(
         cells,
         &workers,
         placeability,
         &template,
-        Duration::from_secs(requirements.timeout_secs),
+        Duration::from_secs(wait_secs),
         None,
         None,
         connect,

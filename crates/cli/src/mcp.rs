@@ -227,7 +227,7 @@ pub struct ToolDefinition {
 pub const DEFAULT_MASTER_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default margin added to `timeout_secs` when `wait_secs` is omitted on `submit {wait: true}`
 /// so the worker's execution timeout (`exit_code: 124`) completes before the client wait deadline.
-pub const DEFAULT_WAIT_MARGIN_SECS: u64 = 5;
+pub use crate::matrix::DEFAULT_WAIT_MARGIN_SECS;
 
 /// Maximum number of async task submission timestamps retained for `task_result` wait timing.
 const MAX_SUBMITTED_TIMESTAMPS: usize = 4096;
@@ -643,7 +643,7 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     },
                     "wait_secs": {
                         "type": "integer",
-                        "description": "Client wait deadline in seconds when wait is true (default: timeout_secs + 5)"
+                        "description": "Whole-run client wait budget in seconds when wait is true or matrix is set (default: tasks * timeout_secs + 5)"
                     },
                     "max_retries": {
                         "type": "integer",
@@ -801,8 +801,8 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                     "isolation": { "type": "string", "description": "Minimum worker isolation level (fs, fs+net)" },
                     "require_tags": { "type": "array", "items": { "type": "string" }, "description": "Required worker user tags" },
                     "tools": { "type": "array", "items": { "type": "string" }, "description": "Required host tool tags" },
-                    "timeout_secs": { "type": "integer", "description": "Per-shard execution timeout in seconds (default: 60, or 1800 with build_once)" },
-                    "wait_secs": { "type": "integer", "description": "Alias for timeout_secs" },
+                    "timeout_secs": { "type": "integer", "description": "Per-shard execution timeout in seconds (default: 300, or 1800 with build_once)" },
+                    "wait_secs": { "type": "integer", "description": "Whole-run client wait budget in seconds (default: tasks * timeout_secs + 5)" },
                     "max_retries": { "type": "integer", "description": "Maximum retries per shard" },
                     "repeatable": { "type": "boolean", "description": "Attach opt:repeatable for speculative straggler re-run" },
                     "files": { "type": "array", "items": { "type": "string" }, "description": "Local files/directories inside working directory to stage as Task::inputs" },
@@ -2593,6 +2593,31 @@ mod tests {
             &json!({"count": 3, "command": "echo", "junit_glob": "**/junit.xml"})
         )
         .is_err());
+        assert!(validate_tool_arguments(
+            "shard",
+            &json!({"count": 3, "command": "echo", "timeout_secs": 10, "wait_secs": 45})
+        )
+        .is_ok());
+        let tools_list = available_tools();
+        let shard_tool = tools_list
+            .iter()
+            .find(|t| t.name == "shard")
+            .expect("shard tool registered");
+        let shard_wait_desc = shard_tool.input_schema["properties"]["wait_secs"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            shard_wait_desc.contains("Whole-run client wait budget"),
+            "unexpected shard wait_secs description: {shard_wait_desc}"
+        );
+        let shard_timeout_desc = shard_tool.input_schema["properties"]["timeout_secs"]
+            ["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            shard_timeout_desc.contains("default: 300"),
+            "unexpected shard timeout_secs description: {shard_timeout_desc}"
+        );
         assert!(validate_tool_arguments(
             "submit",
             &json!({
