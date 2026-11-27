@@ -15,6 +15,7 @@ REPS=5
 PROMPT_TOKENS=512
 GEN_TOKENS=128
 TUNED=0
+CPU_ONLY=0
 CPU_MASK=""
 PRIO=2
 DRY_RUN=0
@@ -33,6 +34,7 @@ Usage: run_host1.sh [options]
   --prompt <n>                     Prompt tokens -p (default: 512)
   --gen <n>                        Generated tokens -n (default: 128)
   --tuned                          Enable CPU mask, strict affinity, priority, and -lm none/mlock variants
+  --cpu-only                       Run Qwen3-0.6B CPU rows only (skip GPU CUDA/Vulkan; no GPU downloads needed)
   --cpu-mask <hex>                 Override auto-detected physical-core hex mask (with --tuned)
   --prio <n>                       llama-bench --prio value when --tuned (default: 2)
   --dry-run                        Write machine_facts.json only without running llama-bench
@@ -53,6 +55,7 @@ while [ "$#" -gt 0 ]; do
         --prompt) PROMPT_TOKENS="$2"; shift 2 ;;
         --gen) GEN_TOKENS="$2"; shift 2 ;;
         --tuned) TUNED=1; shift ;;
+        --cpu-only) CPU_ONLY=1; shift ;;
         --cpu-mask) CPU_MASK="$2"; shift 2 ;;
         --prio) PRIO="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -268,9 +271,14 @@ if [ -n "$GPU_LINE" ]; then
 fi
 
 MODEL06B_NAME="$(basename "$MODEL_06B")"
-MODEL8B_NAME="$(basename "$MODEL_8B")"
 MODEL06B_SHA="$(file_sha256_or_null "$MODEL_06B")"
-MODEL8B_SHA="$(file_sha256_or_null "$MODEL_8B")"
+if [ "$CPU_ONLY" -eq 1 ]; then
+    MODEL8B_NAME=""
+    MODEL8B_SHA="null"
+else
+    MODEL8B_NAME="$(basename "$MODEL_8B")"
+    MODEL8B_SHA="$(file_sha256_or_null "$MODEL_8B")"
+fi
 
 TUNED_CPU_FLAGS=""
 TUNED_GPU_FLAGS=""
@@ -284,8 +292,17 @@ if [ "$TUNED" -eq 1 ]; then
 fi
 
 PLANNED_CPU="llama-bench -m $MODEL06B_NAME -ngl 0 -t $THREAD_SWEEP -p $PROMPT_TOKENS -n $GEN_TOKENS -r $REPS -o json${TUNED_CPU_FLAGS:+ $TUNED_CPU_FLAGS}"
-PLANNED_CUDA="llama-bench -m $MODEL8B_NAME -ngl 99 -p $PROMPT_TOKENS -n $GEN_TOKENS -r $REPS -o json${TUNED_GPU_FLAGS:+ $TUNED_GPU_FLAGS}"
-PLANNED_VULKAN="llama-bench -m $MODEL8B_NAME -ngl 99 -p $PROMPT_TOKENS -n $GEN_TOKENS -r $REPS -o json${TUNED_GPU_FLAGS:+ $TUNED_GPU_FLAGS}"
+if [ "$CPU_ONLY" -eq 1 ]; then
+    PLANNED_CUDA_JSON="null"
+    PLANNED_VULKAN_JSON="null"
+    MODEL8B_JSON="null"
+else
+    PLANNED_CUDA="llama-bench -m $MODEL8B_NAME -ngl 99 -p $PROMPT_TOKENS -n $GEN_TOKENS -r $REPS -o json${TUNED_GPU_FLAGS:+ $TUNED_GPU_FLAGS}"
+    PLANNED_VULKAN="llama-bench -m $MODEL8B_NAME -ngl 99 -p $PROMPT_TOKENS -n $GEN_TOKENS -r $REPS -o json${TUNED_GPU_FLAGS:+ $TUNED_GPU_FLAGS}"
+    PLANNED_CUDA_JSON="\"$(json_escape "$PLANNED_CUDA")\""
+    PLANNED_VULKAN_JSON="\"$(json_escape "$PLANNED_VULKAN")\""
+    MODEL8B_JSON="{\"filename\": \"$(json_escape "$MODEL8B_NAME")\", \"sha256\": ${MODEL8B_SHA}}"
+fi
 
 VRAM_FREE_CUDA="null"
 VRAM_FREE_VULKAN="null"
@@ -295,6 +312,7 @@ write_machine_facts() {
 {
   "utc_timestamp": "$(json_escape "$UTC_NOW")",
   "state": "$(json_escape "$STATE")",
+  "cpu_only": $([ "$CPU_ONLY" -eq 1 ] && printf 'true' || printf 'false'),
   "tuned": $([ "$TUNED" -eq 1 ] && printf 'true' || printf 'false'),
   "dry_run": $([ "$DRY_RUN" -eq 1 ] && printf 'true' || printf 'false'),
   "engine_tag": "b12810",
@@ -319,15 +337,12 @@ write_machine_facts() {
       "filename": "$(json_escape "$MODEL06B_NAME")",
       "sha256": ${MODEL06B_SHA}
     },
-    "qwen3_8b": {
-      "filename": "$(json_escape "$MODEL8B_NAME")",
-      "sha256": ${MODEL8B_SHA}
-    }
+    "qwen3_8b": ${MODEL8B_JSON}
   },
   "planned_commands": {
     "cpu": "$(json_escape "$PLANNED_CPU")",
-    "gpu_cuda": "$(json_escape "$PLANNED_CUDA")",
-    "gpu_vulkan": "$(json_escape "$PLANNED_VULKAN")"
+    "gpu_cuda": ${PLANNED_CUDA_JSON},
+    "gpu_vulkan": ${PLANNED_VULKAN_JSON}
   }
 }
 EOF
@@ -356,14 +371,16 @@ find_bench_bin() {
     exit 1
 }
 
-if [ ! -r "$MODEL_06B" ] || [ ! -r "$MODEL_8B" ]; then
-    echo "Missing model file(s): expected $(basename "$MODEL_06B") and $(basename "$MODEL_8B")" >&2
+if [ ! -r "$MODEL_06B" ]; then
+    echo "Missing model file: expected $(basename "$MODEL_06B")" >&2
+    exit 1
+fi
+if [ "$CPU_ONLY" -eq 0 ] && [ ! -r "$MODEL_8B" ]; then
+    echo "Missing model file: expected $(basename "$MODEL_8B")" >&2
     exit 1
 fi
 
 CPU_BIN="$(find_bench_bin "$CPU_DIR")"
-CUDA_BIN="$(find_bench_bin "$CUDA_DIR")"
-VULKAN_BIN="$(find_bench_bin "$VULKAN_DIR")"
 
 run_bench() {
     bin="$1"
@@ -422,17 +439,24 @@ run_gpu_suite() {
 
 run_cpu_suite
 
-g_cuda="$(query_nvidia_smi)"
-if [ -n "$g_cuda" ]; then
-    VRAM_FREE_CUDA="$(printf '%s' "$g_cuda" | awk -F, '{gsub(/[^0-9]/, "", $4); print ($4!=""?$4:"null")}')"
-fi
-run_gpu_suite "CUDA" "$CUDA_BIN" "gpu_cuda_qwen3_8b_q4_k_m"
+if [ "$CPU_ONLY" -eq 0 ]; then
+    CUDA_BIN="$(find_bench_bin "$CUDA_DIR")"
+    VULKAN_BIN="$(find_bench_bin "$VULKAN_DIR")"
 
-g_vulk="$(query_nvidia_smi)"
-if [ -n "$g_vulk" ]; then
-    VRAM_FREE_VULKAN="$(printf '%s' "$g_vulk" | awk -F, '{gsub(/[^0-9]/, "", $4); print ($4!=""?$4:"null")}')"
+    g_cuda="$(query_nvidia_smi)"
+    if [ -n "$g_cuda" ]; then
+        VRAM_FREE_CUDA="$(printf '%s' "$g_cuda" | awk -F, '{gsub(/[^0-9]/, "", $4); print ($4!=""?$4:"null")}')"
+    fi
+    run_gpu_suite "CUDA" "$CUDA_BIN" "gpu_cuda_qwen3_8b_q4_k_m"
+
+    g_vulk="$(query_nvidia_smi)"
+    if [ -n "$g_vulk" ]; then
+        VRAM_FREE_VULKAN="$(printf '%s' "$g_vulk" | awk -F, '{gsub(/[^0-9]/, "", $4); print ($4!=""?$4:"null")}')"
+    fi
+    run_gpu_suite "Vulkan" "$VULKAN_BIN" "gpu_vulkan_qwen3_8b_q4_k_m"
+else
+    echo "[cpu-only] Skipped CUDA and Vulkan GPU benchmarks."
 fi
-run_gpu_suite "Vulkan" "$VULKAN_BIN" "gpu_vulkan_qwen3_8b_q4_k_m"
 
 write_machine_facts
 printf 'HOST-1 Linux run finished (%s).\n' "$STATE"

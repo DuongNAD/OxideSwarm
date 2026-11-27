@@ -105,3 +105,36 @@ ulimit -l unlimited || true
 ## 6. Copy the JSON folders back cleanly
 
 Copy `/tmp/host1-results/state2` and `/tmp/host1-results/state3` back to the Windows workspace / hub handoff location. Verify zero host names, user names, or IP addresses appear in the JSON files before handing them back to `agent-win` to update `benchmarks/host-1/README.md` and run `summarize_host1.py`.
+
+## 7. CPU-only Linux run on the Dell laptop (second machine)
+
+For a CPU-only machine without a discrete NVIDIA GPU (such as the Dell laptop), skip the GPU driver and GPU downloads cleanly:
+
+1. Boot Ubuntu Server LTS from a **spare USB stick or disk** (not the OxideSwarm developer kit stick and not the internal Windows disk).
+2. Download and verify only two upstream artifacts into `/tmp/host1`:
+   - `llama-b12810-bin-ubuntu-x64.tar.gz` (`63b94be37dcc34cb4933554d4f998e9649841b23da7ffc71d1f66d63762464d7`)
+   - `Qwen3-0.6B-Q8_0.gguf` (`9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`)
+3. Extract `llama-b12810-bin-ubuntu-x64.tar.gz` to `/tmp/host1/bin/ubuntu-x64`.
+4. Run **State 2 (defaults)** and **State 3 (tuned)** with `--cpu-only`:
+   ```bash
+   /tmp/host1/run_host1.sh \
+     --state state2 \
+     --cpu-only \
+     --cpu-dir /tmp/host1/bin/ubuntu-x64 \
+     --model-06b /tmp/host1/models/Qwen3-0.6B-Q8_0.gguf \
+     --out-dir /tmp/host1-results/dell-state2
+
+   sudo sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g"; done'
+   echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+   echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+   ulimit -l unlimited || true
+
+   /tmp/host1/run_host1.sh \
+     --state state3 \
+     --tuned \
+     --cpu-only \
+     --cpu-dir /tmp/host1/bin/ubuntu-x64 \
+     --model-06b /tmp/host1/models/Qwen3-0.6B-Q8_0.gguf \
+     --out-dir /tmp/host1-results/dell-state3
+   ```
+5. Copy `dell-state2` and `dell-state3` back without any hostname, username, or IP address.

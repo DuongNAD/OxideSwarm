@@ -53,7 +53,11 @@ Every asset comes from `https://github.com/ggml-org/llama.cpp/releases/tag/b1281
   ```powershell
   .\benchmarks\host-1\run_host1.ps1 -State state1b
   ```
-- **State 2 (Headless Linux defaults)** and **State 3 (Headless Linux tuned):** see [LINUX_STEPS.md](LINUX_STEPS.md) and [`run_host1.sh`](run_host1.sh). Note that in `b12810`, `llama-bench` exposes `-lm none` (`--load-mode none`) rather than `--no-mmap`.
+- **Second machine, CPU-only (Dell laptop via `run_host1.ps1 -CpuOnly`):**
+  ```powershell
+  .\benchmarks\host-1\run_host1.ps1 -State state1 -CpuOnly -CpuBenchDir <CPU_DIR> -Model06B <MODEL_06B>
+  ```
+- **State 2 (Headless Linux defaults)** and **State 3 (Headless Linux tuned):** see [LINUX_STEPS.md](LINUX_STEPS.md) and [`run_host1.sh`](run_host1.sh) (including `--cpu-only` for a CPU-only laptop). Note that in `b12810`, `llama-bench` exposes `-lm none` (`--load-mode none`) rather than `--no-mmap`.
 
 Each state executes `llama-bench -p 512 -n 128 -r 5 -o json`:
 - CPU: `-ngl 0 -t 1,4,8,14` on `Qwen3-0.6B-Q8_0.gguf`
@@ -78,6 +82,17 @@ Status: **Planned / Pending** (scripts prepared; awaiting completion of Task 20 
 | `state3` | Qwen3-0.6B Q8_0 (CPU) | CPU | `auto` / `none` / `mlock` | `1,4,8,14` | Pending (Linux) | Pending (Linux) |
 | `state3` | Qwen3-8B Q4_K_M (GPU) | CUDA 13.5 | `auto` / `none` | default | Pending (Linux) | Pending (Linux) |
 | `state3` | Qwen3-8B Q4_K_M (GPU) | Vulkan | `auto` / `none` | default | Pending (Linux) | Pending (Linux) |
+
+### Second machine (Dell laptop, CPU-only, `-CpuOnly`)
+
+Results from the Dell laptop (run by `agent-win-2` and folded from hub `test_runs/host1_win-2/`):
+
+| State | Workload | Backend | Load mode | Threads | pp512 tok/s (mean ± stddev) | tg128 tok/s (mean ± stddev) |
+|---|---|---|---|---|---|---|
+| `state1` | Qwen3-0.6B Q8_0 (CPU) | CPU | `auto` | `1,4,8,<phys>` | Pending | Pending |
+| `state1b` | Qwen3-0.6B Q8_0 (CPU) | CPU | `auto` | `1,4,8,<phys>` | Pending | Pending |
+| `state2` | Qwen3-0.6B Q8_0 (CPU) | CPU | `auto` | `1,4,8,<phys>` | Pending (Linux) | Pending (Linux) |
+| `state3` | Qwen3-0.6B Q8_0 (CPU) | CPU | `auto` / `none` / `mlock` | `1,4,8,<phys>` | Pending (Linux) | Pending (Linux) |
 
 ## Q106 Gate (10 % Threshold)
 

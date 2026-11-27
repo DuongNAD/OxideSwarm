@@ -23,6 +23,7 @@ param(
     [int]$GenTokens = 128,
 
     [switch]$Tuned,
+    [switch]$CpuOnly,
     [string]$CpuMask = '',
     [int]$Prio = 2,
     [switch]$DryRun
@@ -152,17 +153,18 @@ function Format-SafeCommand([string]$ExeLeaf, [string[]]$ArgList, [string]$Model
 }
 
 $Model06BName = [System.IO.Path]::GetFileName($Model06B)
-$Model8BName = [System.IO.Path]::GetFileName($Model8B)
+$Model8BName = $(if ($CpuOnly) { $null } else { [System.IO.Path]::GetFileName($Model8B) })
 
 $Planned = [ordered]@{
     cpu = Format-SafeCommand 'llama-bench.exe' $CpuArgs $Model06B
-    gpu_cuda = Format-SafeCommand 'llama-bench.exe' $GpuArgs $Model8B
-    gpu_vulkan = Format-SafeCommand 'llama-bench.exe' $GpuArgs $Model8B
+    gpu_cuda = $(if ($CpuOnly) { $null } else { Format-SafeCommand 'llama-bench.exe' $GpuArgs $Model8B })
+    gpu_vulkan = $(if ($CpuOnly) { $null } else { Format-SafeCommand 'llama-bench.exe' $GpuArgs $Model8B })
 }
 
 $Facts = [ordered]@{
     utc_timestamp = $UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     state = $State
+    cpu_only = [bool]$CpuOnly
     tuned = [bool]$Tuned
     dry_run = [bool]$DryRun
     engine_tag = 'b12810'
@@ -187,10 +189,14 @@ $Facts = [ordered]@{
             filename = $Model06BName
             sha256 = Get-OptionalFileSha256 $Model06B
         }
-        qwen3_8b = [ordered]@{
-            filename = $Model8BName
-            sha256 = Get-OptionalFileSha256 $Model8B
-        }
+        qwen3_8b = $(if ($CpuOnly) {
+            $null
+        } else {
+            [ordered]@{
+                filename = $Model8BName
+                sha256 = Get-OptionalFileSha256 $Model8B
+            }
+        })
     }
     planned_commands = $Planned
 }
@@ -217,15 +223,14 @@ function Resolve-BenchExe([string]$Dir) {
     throw "llama-bench.exe not found under '$Dir'"
 }
 
-foreach ($ReqFile in @($Model06B, $Model8B)) {
-    if (-not (Test-Path -LiteralPath $ReqFile -PathType Leaf)) {
-        throw "Model file not found: $([System.IO.Path]::GetFileName($ReqFile))"
-    }
+if (-not (Test-Path -LiteralPath $Model06B -PathType Leaf)) {
+    throw "Model file not found: $([System.IO.Path]::GetFileName($Model06B))"
+}
+if (-not $CpuOnly -and -not (Test-Path -LiteralPath $Model8B -PathType Leaf)) {
+    throw "Model file not found: $([System.IO.Path]::GetFileName($Model8B))"
 }
 
 $CpuExe = Resolve-BenchExe $CpuBenchDir
-$CudaExe = Resolve-BenchExe $CudaBenchDir
-$VulkanExe = Resolve-BenchExe $VulkanBenchDir
 
 function Invoke-BenchRun([string]$ExePath, [string]$ExtraPathDir, [string[]]$BenchArgs, [string]$JsonOutPath) {
     $PrevPath = $env:PATH
@@ -250,15 +255,22 @@ function Invoke-BenchRun([string]$ExePath, [string]$ExtraPathDir, [string[]]$Ben
 Write-Output "[1/3] Running CPU benchmark ($Model06BName, threads=$ThreadCsv)..."
 Invoke-BenchRun $CpuExe (Split-Path -Parent $CpuExe) $CpuArgs (Join-Path $OutDir 'cpu_qwen3_0.6b_q8_0.json')
 
-$VramCuda = Get-NvidiaSmiInfo
-if ($VramCuda) { $Facts.vram_free_before_cuda_mib = $VramCuda.vram_free_mib }
-Write-Output "[2/3] Running CUDA benchmark ($Model8BName, ngl=99)..."
-Invoke-BenchRun $CudaExe (Split-Path -Parent $CudaExe) $GpuArgs (Join-Path $OutDir 'gpu_cuda_qwen3_8b_q4_k_m.json')
+if (-not $CpuOnly) {
+    $CudaExe = Resolve-BenchExe $CudaBenchDir
+    $VulkanExe = Resolve-BenchExe $VulkanBenchDir
 
-$VramVulkan = Get-NvidiaSmiInfo
-if ($VramVulkan) { $Facts.vram_free_before_vulkan_mib = $VramVulkan.vram_free_mib }
-Write-Output "[3/3] Running Vulkan benchmark ($Model8BName, ngl=99)..."
-Invoke-BenchRun $VulkanExe (Split-Path -Parent $VulkanExe) $GpuArgs (Join-Path $OutDir 'gpu_vulkan_qwen3_8b_q4_k_m.json')
+    $VramCuda = Get-NvidiaSmiInfo
+    if ($VramCuda) { $Facts.vram_free_before_cuda_mib = $VramCuda.vram_free_mib }
+    Write-Output "[2/3] Running CUDA benchmark ($Model8BName, ngl=99)..."
+    Invoke-BenchRun $CudaExe (Split-Path -Parent $CudaExe) $GpuArgs (Join-Path $OutDir 'gpu_cuda_qwen3_8b_q4_k_m.json')
+
+    $VramVulkan = Get-NvidiaSmiInfo
+    if ($VramVulkan) { $Facts.vram_free_before_vulkan_mib = $VramVulkan.vram_free_mib }
+    Write-Output "[3/3] Running Vulkan benchmark ($Model8BName, ngl=99)..."
+    Invoke-BenchRun $VulkanExe (Split-Path -Parent $VulkanExe) $GpuArgs (Join-Path $OutDir 'gpu_vulkan_qwen3_8b_q4_k_m.json')
+} else {
+    Write-Output "[CpuOnly] Skipped CUDA and Vulkan GPU benchmarks."
+}
 
 Write-Utf8NoBom $FactsPath ($Facts | ConvertTo-Json -Depth 8)
 Write-Output "HOST-1 Windows run finished ($State)."

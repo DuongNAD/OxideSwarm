@@ -99,6 +99,45 @@ class TestHost1Scripts(unittest.TestCase):
                 combined = proc.stdout + "\n" + raw_text
                 self.assertEqual(SUMMARIZE.find_pii_leaks(combined, forbidden), [])
 
+    def test_cpu_only_dry_run_skips_gpu(self):
+        if os.name != "nt":
+            self.skipTest("PowerShell -CpuOnly dry-run runs on Windows")
+        ps = shutil.which("powershell")
+        self.assertIsNotNone(ps)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out-cpuonly")
+            m06 = os.path.join(tmp, "Qwen3-0.6B-Q8_0.gguf")
+            with open(m06, "wb") as fh:
+                fh.write(b"dummy06b")
+            proc = subprocess.run(
+                [
+                    ps,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    PS1_PATH,
+                    "-State",
+                    "state1",
+                    "-CpuOnly",
+                    "-Model06B",
+                    m06,
+                    "-OutDir",
+                    out_dir,
+                    "-DryRun",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"ps1 -CpuOnly dry-run failed: {proc.stderr}\n{proc.stdout}")
+            with open(os.path.join(out_dir, "machine_facts.json"), "r", encoding="utf-8") as fh:
+                facts = json.load(fh)
+            self.assertTrue(facts["cpu_only"])
+            self.assertIsNotNone(facts["planned_commands"]["cpu"])
+            self.assertIsNone(facts["planned_commands"]["gpu_cuda"])
+            self.assertIsNone(facts["planned_commands"]["gpu_vulkan"])
+            self.assertIsNone(facts["models"]["qwen3_8b"])
+
     def test_sanitize_and_q106_gate_math(self):
         sample = [
             {"model_filename": r"C:\secret_user_dir\Qwen3-0.6B-Q8_0.gguf"},
