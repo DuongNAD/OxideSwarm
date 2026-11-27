@@ -15,9 +15,9 @@ Fan out a Rust test matrix across multiple isolated workers with a single `oxide
 
 ### 1. Start a cluster with isolated state and `--isolation fs`
 
-To practice on one machine without touching `~/.oxideswarm` or default ports, set `OXIDESWARM_HOME` to a temporary directory, generate a cluster secret first (always keep cluster authentication enabled), and use ephemeral ports (`127.0.0.1:0` with `--port-file`).
+To practice on one machine without touching `~/.oxideswarm` (`%USERPROFILE%\.oxideswarm` on Windows) or default ports, set `OXIDESWARM_HOME` to a temporary directory, generate a cluster secret first (always keep cluster authentication enabled), and use ephemeral ports (`127.0.0.1:0` with `--port-file`). Keep `LOCALAPPDATA` unchanged on Windows `--isolation fs` workers so per-task AppContainer profiles retain valid temporary storage.
 
-On the master machine (Terminal 1):
+On a macOS or Linux master machine (Terminal 1):
 
 ```bash
 export OXIDESWARM_HOME="$(mktemp -d)"
@@ -29,9 +29,22 @@ oxideswarm master \
   --dashboard-port 0
 ```
 
-Read the bound master port printed on stdout or in `"$OXIDESWARM_HOME/master.port"`, then start two workers with distinct `--name`, `--tag`, and `--sandbox-base-dir` values (`--no-portal` avoids port `8080` collisions when two workers share one host).
+On a Windows master machine (PowerShell, Terminal 1):
 
-On worker machine A (Terminal 2, using the same `OXIDESWARM_HOME` or copy of `cluster.secret`):
+```powershell
+$env:OXIDESWARM_HOME = "$env:LOCALAPPDATA\OxideSwarm\matrix-demo"
+New-Item -ItemType Directory -Force $env:OXIDESWARM_HOME | Out-Null
+oxideswarm.exe secret generate
+oxideswarm.exe master `
+  --listen 127.0.0.1:0 `
+  --port-file "$env:OXIDESWARM_HOME\master.port" `
+  --discovery-port 0 `
+  --dashboard-port 0
+```
+
+Read the bound master port printed on stdout or in `master.port`, then start two workers with distinct `--name`, `--tag`, and `--sandbox-base-dir` values (`--no-portal` avoids port `8080` collisions when two workers share one host).
+
+On macOS or Linux worker machine A (Terminal 2, using the same `OXIDESWARM_HOME` or copy of `cluster.secret`):
 
 ```bash
 export OXIDESWARM_HOME="<RUN_HOME>"
@@ -46,7 +59,7 @@ oxideswarm worker \
   --sandbox-base-dir "$OXIDESWARM_HOME/sb-worker-a"
 ```
 
-On worker machine B (Terminal 3, using the same `OXIDESWARM_HOME` or copy of `cluster.secret`):
+On macOS or Linux worker machine B (Terminal 3, using the same `OXIDESWARM_HOME` or copy of `cluster.secret`):
 
 ```bash
 export OXIDESWARM_HOME="<RUN_HOME>"
@@ -61,20 +74,57 @@ oxideswarm worker \
   --sandbox-base-dir "$OXIDESWARM_HOME/sb-worker-b"
 ```
 
+On Windows worker machines A and B (PowerShell, Terminals 2 and 3, sharing `$env:OXIDESWARM_HOME` or `cluster.secret`):
+
+```powershell
+$env:OXIDESWARM_HOME = "$env:LOCALAPPDATA\OxideSwarm\matrix-demo"
+oxideswarm.exe worker `
+  --master "127.0.0.1:<MASTER_PORT>" `
+  --isolation fs `
+  --no-portal `
+  --no-gpu `
+  --max-concurrency 2 `
+  --name worker-a `
+  --tag lane-a `
+  --sandbox-base-dir "$env:LOCALAPPDATA\OxideSwarm\sandboxes-a"
+```
+
+```powershell
+$env:OXIDESWARM_HOME = "$env:LOCALAPPDATA\OxideSwarm\matrix-demo"
+oxideswarm.exe worker `
+  --master "127.0.0.1:<MASTER_PORT>" `
+  --isolation fs `
+  --no-portal `
+  --no-gpu `
+  --max-concurrency 2 `
+  --name worker-b `
+  --tag lane-b `
+  --sandbox-base-dir "$env:LOCALAPPDATA\OxideSwarm\sandboxes-b"
+```
+
 Confirm both workers advertise `state:connected`, `iso:fs`, and `tool:cargo` before submitting.
 
-On the client machine (from the repository root):
+On a macOS or Linux client machine (from the repository root):
 
 ```bash
 export OXIDESWARM_HOME="<RUN_HOME>"
 oxideswarm workers --master "127.0.0.1:<MASTER_PORT>" --json
 ```
 
+On a Windows client machine (PowerShell, from the repository root):
+
+```powershell
+$env:OXIDESWARM_HOME = "$env:LOCALAPPDATA\OxideSwarm\matrix-demo"
+oxideswarm.exe workers --master "127.0.0.1:<MASTER_PORT>" --json
+```
+
 ### 2. Fan out a 2D test matrix with `submit --matrix`
 
 `--matrix` takes `KEY=V1,V2,...` axes (`os`, `arch`, `worker`, `iso`, `tool`, `tag`, and `env:<VAR>`) and submits the Cartesian product concurrently (`--matrix` implies `--wait`). Pass `--timeout-secs 300` so fresh per-task Cargo builds in `--input` sandboxes do not hit the `60` s default `submit` timeout. Use `--input .:.` rather than `--workspace` when fanning out across multiple workers (`--workspace` serializes onto one workspace affinity worker at a time).
 
-On the client machine (from the repository root):
+Notice `--type shell` and `shard --shell` invoke POSIX `sh` (`$TEST_FILTER`, `$OX_SHARD_INDEX`), which is present on **macOS and Linux** workers; on **Windows `--isolation fs`** workers, omit `--type shell` for direct executables (`-- cargo --version`) or invoke `-- cmd.exe /c "... %TEST_FILTER% ..."` because POSIX `sh.exe` lies outside AppContainer read paths.
+
+On a macOS or Linux client machine (from the repository root):
 
 ```bash
 oxideswarm submit \
@@ -88,9 +138,22 @@ oxideswarm submit \
   -- 'cargo test --offline -p rusty_grid_core --lib "$TEST_FILTER"'
 ```
 
+On a Windows client machine, substitute `cmd.exe /c` when environment expansion is needed (keeping `LOCALAPPDATA` un-overridden on `--isolation fs` workers so MSVC `link.exe` temporary files resolve inside the AppContainer profile):
+
+```powershell
+oxideswarm.exe submit `
+  --master "127.0.0.1:<MASTER_PORT>" `
+  --require-tool cargo `
+  --timeout-secs 300 `
+  --input .:. `
+  --matrix tag=lane-a,lane-b `
+  --matrix env:TEST_FILTER=placement::tests::test_aliases,placement::tests::test_matches `
+  -- cmd.exe /c "cargo test --offline -p rusty_grid_core --lib %TEST_FILTER%"
+```
+
 To fan out independent test slices with `OX_SHARD_INDEX` / `OX_SHARD_TOTAL` instead of a Cartesian grid, use `oxideswarm shard` ([sharded-runs.md](sharded-runs.md)):
 
-On the client machine (from the repository root):
+On a macOS or Linux client machine (from the repository root):
 
 ```bash
 oxideswarm shard \
@@ -128,7 +191,7 @@ oxideswarm submit \
 
 When one cell fails, identify its tag/environment (and its `task_id` from `--json` or `oxideswarm status --json`), optionally fetch its full output with `oxideswarm result <TASK_ID>`, then re-run only that cell with `submit --wait`.
 
-On the client machine (re-running only the `lane-b` cell):
+On the client machine (re-running only the `lane-b` cell directly without `--type shell`):
 
 ```bash
 oxideswarm result <TASK_ID> --master "127.0.0.1:<MASTER_PORT>"
@@ -139,25 +202,23 @@ oxideswarm submit \
   --timeout-secs 300 \
   --input .:. \
   --wait \
-  --type shell \
-  -- 'cargo test --offline -p rusty_grid_core --lib placement::tests::test_aliases'
+  -- cargo test --offline -p rusty_grid_core --lib placement::tests::test_aliases
 ```
 
 When finished, stop the workers and master cleanly and remove the temporary `OXIDESWARM_HOME` directory.
 
 ## Verify
 
-Run a fast 2-cell check across the matrix (including an intentionally unplaced cell `missing-lane` to verify pre-flight rejection returns immediately instead of hanging) or verify the passing 2-worker `rusty_grid_core` matrix from Step 2.
+Run a direct command check across both matrix workers (omitting `--type shell` so the same command works on macOS, Linux, and Windows `--isolation fs` workers). You can also add a non-existent tag such as `missing-lane` to confirm pre-flight rejection returns immediately instead of waiting for `--timeout-secs`.
 
-On the client machine:
+On the client machine (use `oxideswarm.exe` on Windows):
 
 ```bash
 oxideswarm submit \
   --master "127.0.0.1:<MASTER_PORT>" \
   --require-tool cargo \
   --matrix tag=lane-a,lane-b \
-  --type shell \
-  -- 'cargo --version'
+  -- cargo --version
 ```
 
 Expected output:
@@ -174,7 +235,9 @@ Waited: <W> s    Sum of task times: <S> s
 
 ### Recorded run
 
-Recorded on `2026-11-27` on `rusty-grid 0.4.5` (commit `07caa5ae`) on one Apple Silicon M5 Mac (`10` cores, `32768` MiB RAM, `macOS 27.2.1`, `aarch64`) running one loopback master (`127.0.0.1:59585`, generated cluster secret, ephemeral port, authentication enabled) and two `--isolation fs --no-portal --no-gpu --max-concurrency 2` workers (`worker-a` tagged `lane-a`, `worker-b` tagged `lane-b`):
+Recorded on `2026-11-27` on `rusty-grid 0.4.5` (commit `07caa5ae`):
+
+- **macOS (`mac_adopt4_matrix_2026-11-27`):** one Apple Silicon M5 Mac (`10` cores, `32768` MiB RAM, `macOS 27.2.1`, `aarch64`) running one loopback master (`127.0.0.1:59585`, generated cluster secret, ephemeral port, authentication enabled) and two `--isolation fs --no-portal --no-gpu --max-concurrency 2` workers (`worker-a` tagged `lane-a`, `worker-b` tagged `lane-b`):
 
 | Check | Outcome (from this one run) | Recorded summary and timings (from this one run) |
 |---|---|---|
@@ -185,10 +248,14 @@ Recorded on `2026-11-27` on `rusty-grid 0.4.5` (commit `07caa5ae`) on one Apple 
 | Unplaced cell pre-flight (`tag=lane-a,missing-lane`) | `exit 1` (`1 completed, 0 failed, 1 unplaced`) | `[0]` `worker-a` `exit 0` (`27ms`); `[1] tag=missing-lane -> unplaced: no connected worker matches cell constraints (tool=cargo, tag=missing-lane)`; `Waited: 0.029 s`, `Sum of task times: 0.027 s` (`wall 0.036 s`) |
 | Companion `oxideswarm shard --count 2` (`test_aliases` / `test_matches`) | `exit 0` (`Shards: 2 completed, 0 failed (2 total)`) | `[1/2]` `worker-a` (`46358ms`), `[2/2]` `worker-b` (`46366ms`); `Tasks: 2 finished, 0 failed, on 2 machines`; `Waited: 46.783 s`, `Sum of task times: 92.724 s` (`wall 46.790 s`) |
 
+- **Windows 11 cross-check (`win-2_rev491_matrix_2026-11-27`, `rusty-grid 0.4.5` @ `07caa5ae`):** direct `-- cargo --version` across two Windows 11 Home x86_64 `--isolation fs` workers (`lane-a`, `lane-b`) returned `exit 0` (`2 completed, 0 failed, 0 unplaced`, `Waited: 20.524 s`, `Sum of task times: 40.989 s`).
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `Cannot run '...\sh.exe' with --isolation fs: program '...' lies outside the task sandbox...` | `--type shell` / `shard --shell` invokes POSIX `sh`, which sits outside Windows AppContainer read paths | Omit `--type shell` for direct executables (`-- cargo --version`) or pass `-- cmd.exe /c "..."` on Windows workers |
+| `LINK : fatal error LNK1104` when compiling inside Windows `--isolation fs` | Overriding `LOCALAPPDATA` moves AppContainer temp directories away from the real user profile | Set only `OXIDESWARM_HOME` and `--sandbox-base-dir`, keeping `LOCALAPPDATA` unchanged on Windows workers |
 | `timed out: timed out after 60s` on fresh Cargo cells | Default `submit` task timeout is `60` s while clean per-task `--input` sandboxes compile dependencies from scratch | Pass `--timeout-secs 300` (or higher for larger crates) |
 | `--input .:.` uploads hundreds of MiB of build artifacts | `scan_inputs` sends all files under `--input` including `target/` if it exists in `.` | Run `cargo clean` before submitting (keeping the `oxideswarm` binary outside `.`), or pass source directories explicitly (`--input Cargo.toml --input crates:crates`) |
 | `unplaced: no connected worker matches cell constraints` | Pre-flight `ListWorkers` found no connected worker satisfying that cell's `--os`, `--arch`, `--require-tool`, or `--tag` | Run `oxideswarm workers --json` and fix the axis values or worker `--tag` flags |
