@@ -42,6 +42,8 @@ pub struct WorkerLimitsConfig {
     pub no_tasks_on_metered: Option<bool>,
     #[serde(default)]
     pub no_gpu_tasks: bool,
+    #[serde(default)]
+    pub hold_ends_tasks: bool,
 }
 
 impl WorkerLimitsConfig {
@@ -110,9 +112,12 @@ impl WorkerLimitsConfig {
             "no_gpu_tasks" => {
                 self.no_gpu_tasks = parse_bool_flag(val, "no_gpu_tasks")?;
             }
+            "hold_ends_tasks" => {
+                self.hold_ends_tasks = parse_bool_flag(val, "hold_ends_tasks")?;
+            }
             _ => {
                 return Err(format!(
-                    "unknown worker limit key '{key}' (expected one of: local_max_cpu_pct, hours, max_task_hours_per_day, no_tasks_on_battery, no_tasks_on_metered, no_gpu_tasks)"
+                    "unknown worker limit key '{key}' (expected one of: local_max_cpu_pct, hours, max_task_hours_per_day, no_tasks_on_battery, no_tasks_on_metered, no_gpu_tasks, hold_ends_tasks)"
                 ));
             }
         }
@@ -1571,5 +1576,41 @@ mod tests {
         let gpu_snap2 = handle.pause_rejection_snapshot();
         handle.clear_session_pause_rejection_on_completed_result(gpu_snap2, true);
         assert!(!handle.take_session_reconnect_needed());
+    }
+
+    #[test]
+    fn limits_set_and_get_hold_ends_tasks_round_trip() {
+        let handle = test_handle(WorkerLimitsConfig::default(), None);
+
+        match handle.handle_request(ControlRequest::LimitsGet) {
+            ControlResponse::Limits { limits, .. } => assert!(!limits.hold_ends_tasks),
+            other => panic!("expected LimitsGet response, got {other:?}"),
+        }
+
+        let set_true = handle.handle_request(ControlRequest::LimitsSet {
+            key: "hold_ends_tasks".into(),
+            value: "true".into(),
+        });
+        assert!(
+            matches!(set_true, ControlResponse::Ok { .. }),
+            "expected Ok setting hold_ends_tasks=true, got {set_true:?}"
+        );
+        match handle.handle_request(ControlRequest::LimitsGet) {
+            ControlResponse::Limits { limits, .. } => assert!(limits.hold_ends_tasks),
+            other => panic!("expected LimitsGet after setting true, got {other:?}"),
+        }
+
+        let set_false = handle.handle_request(ControlRequest::LimitsSet {
+            key: "hold-ends-tasks".into(),
+            value: "false".into(),
+        });
+        assert!(
+            matches!(set_false, ControlResponse::Ok { .. }),
+            "expected Ok setting hold-ends-tasks=false, got {set_false:?}"
+        );
+        match handle.handle_request(ControlRequest::LimitsGet) {
+            ControlResponse::Limits { limits, .. } => assert!(!limits.hold_ends_tasks),
+            other => panic!("expected LimitsGet after setting false, got {other:?}"),
+        }
     }
 }

@@ -690,6 +690,48 @@ async fn net9b_live_limits_set_hours_cpu_daily_budget_and_manual_resume_while_he
     assert_eq!(res.exit_code, 0);
     let _ = w_lim;
 
+    match send_control_request(&ep_lim, &ControlRequest::LimitsGet)
+        .await
+        .unwrap()
+    {
+        ControlResponse::Limits { limits, .. } => assert!(!limits.hold_ends_tasks),
+        other => panic!("expected LimitsGet before setting hold_ends_tasks, got {other:?}"),
+    }
+    let set_hold = send_control_request(
+        &ep_lim,
+        &ControlRequest::LimitsSet {
+            key: "hold_ends_tasks".into(),
+            value: "true".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(set_hold, ControlResponse::Ok { .. }));
+    match send_control_request(&ep_lim, &ControlRequest::LimitsGet)
+        .await
+        .unwrap()
+    {
+        ControlResponse::Limits { limits, .. } => assert!(limits.hold_ends_tasks),
+        other => panic!("expected hold_ends_tasks=true in LimitsGet, got {other:?}"),
+    }
+    let clear_hold = send_control_request(
+        &ep_lim,
+        &ControlRequest::LimitsSet {
+            key: "hold-ends-tasks".into(),
+            value: "false".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(clear_hold, ControlResponse::Ok { .. }));
+    match send_control_request(&ep_lim, &ControlRequest::LimitsGet)
+        .await
+        .unwrap()
+    {
+        ControlResponse::Limits { limits, .. } => assert!(!limits.hold_ends_tasks),
+        other => panic!("expected hold_ends_tasks=false in LimitsGet, got {other:?}"),
+    }
+
     let _ = send_control_request(
         &ep_lim,
         &ControlRequest::LimitsSet {

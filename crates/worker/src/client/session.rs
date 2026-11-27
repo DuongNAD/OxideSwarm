@@ -438,10 +438,7 @@ impl WorkerClient {
     /// and updates [`ControlHandle::set_held_with_detail`].
     pub(super) async fn sync_and_evaluate_limits(&self, sync_from_control: bool) {
         if sync_from_control {
-            let latest = crate::limits::WorkerLimits::from_control_config(
-                &self.control.limits(),
-                self.config.hold_ends_tasks,
-            );
+            let latest = crate::limits::WorkerLimits::from_control_config(&self.control.limits());
             if let Ok(mut eval) = self.limits_evaluator.lock() {
                 if let Err(err) = eval.update_limits(latest) {
                     warn!(error = %err, "Failed to apply updated contributor limits");

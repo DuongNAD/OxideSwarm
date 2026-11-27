@@ -630,6 +630,7 @@ pub(super) async fn run_worker(
                 no_tasks_on_battery: lim.no_tasks_on_battery,
                 no_tasks_on_metered: lim.no_tasks_on_metered,
                 no_gpu_tasks: Some(lim.no_gpu_tasks),
+                hold_ends_tasks: Some(lim.hold_ends_tasks),
                 ..Default::default()
             })
     });
@@ -660,6 +661,7 @@ pub(super) async fn run_worker(
         no_tasks_on_battery: resolved_limits.no_tasks_on_battery.then_some(true),
         no_tasks_on_metered: resolved_limits.no_tasks_on_metered.then_some(true),
         no_gpu_tasks: resolved_limits.no_gpu_tasks,
+        hold_ends_tasks: resolved_limits.hold_ends_tasks,
     };
 
     let control_socket_override = resolve_opt_string(
@@ -953,6 +955,7 @@ pub(crate) async fn run_worker_control_action(
             println!("  no_tasks_on_battery = {:?}", limits.no_tasks_on_battery);
             println!("  no_tasks_on_metered = {:?}", limits.no_tasks_on_metered);
             println!("  no_gpu_tasks = {}", limits.no_gpu_tasks);
+            println!("  hold_ends_tasks = {}", limits.hold_ends_tasks);
             if let Some(p) = config_path {
                 println!("  config = {p}");
             }
@@ -1020,6 +1023,10 @@ pub(crate) fn load_worker_limits_from_toml(
             .and_then(|v| v.as_bool()),
         no_gpu_tasks: worker_tbl
             .get("no_gpu_tasks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        hold_ends_tasks: worker_tbl
+            .get("hold_ends_tasks")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     })
@@ -1093,6 +1100,11 @@ pub(crate) fn persist_worker_limits_to_toml(
         worker_tbl["no_gpu_tasks"] = toml_edit::value(true);
     } else {
         worker_tbl.remove("no_gpu_tasks");
+    }
+    if limits.hold_ends_tasks {
+        worker_tbl["hold_ends_tasks"] = toml_edit::value(true);
+    } else {
+        worker_tbl.remove("hold_ends_tasks");
     }
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -1237,6 +1249,14 @@ mod tests {
                 "no_gpu_tasks",
                 "true",
             ],
+            vec![
+                "oxideswarm",
+                "worker",
+                "limits",
+                "set",
+                "hold_ends_tasks",
+                "true",
+            ],
         ] {
             let cli = Cli::try_parse_from(argv).expect("parse worker control CLI");
             assert!(matches!(cli.command, Commands::Worker(_)));
@@ -1257,6 +1277,7 @@ mod tests {
             no_tasks_on_battery: Some(true),
             no_tasks_on_metered: Some(true),
             no_gpu_tasks: true,
+            hold_ends_tasks: true,
         };
         persist_worker_limits_to_toml(&cfg_path, &limits).unwrap();
         let raw = std::fs::read_to_string(&cfg_path).unwrap();
@@ -1264,5 +1285,25 @@ mod tests {
         assert!(raw.contains("name = \"mac-box\""));
         let loaded = load_worker_limits_from_toml(&cfg_path).unwrap();
         assert_eq!(loaded, limits);
+
+        // Matches fallback_file_cfg construction when no startup rusty-grid.toml existed.
+        let fallback_cfg = WorkerFileConfig {
+            local_max_cpu_pct: loaded.local_max_cpu_pct,
+            hours: loaded.hours.clone(),
+            max_task_hours_per_day: loaded.max_task_hours_per_day,
+            no_tasks_on_battery: loaded.no_tasks_on_battery,
+            no_tasks_on_metered: loaded.no_tasks_on_metered,
+            no_gpu_tasks: Some(loaded.no_gpu_tasks),
+            hold_ends_tasks: Some(loaded.hold_ends_tasks),
+            ..Default::default()
+        };
+        let resolved = crate::config::resolve_worker_limits_from(
+            &crate::config::WorkerLimitsCliOverrides::default(),
+            Some(&fallback_cfg),
+            |_| None,
+        )
+        .unwrap();
+        assert!(resolved.hold_ends_tasks);
+        assert!(resolved.no_gpu_tasks);
     }
 }

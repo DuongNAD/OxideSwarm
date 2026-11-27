@@ -68,11 +68,8 @@ pub struct WorkerLimits {
 }
 
 impl WorkerLimits {
-    /// Converts control/CLI persisted limits plus `--hold-ends-tasks` into an evaluator config.
-    pub fn from_control_config(
-        cfg: &crate::control::WorkerLimitsConfig,
-        hold_ends_tasks: bool,
-    ) -> Self {
+    /// Converts control/CLI persisted limits into an evaluator config.
+    pub fn from_control_config(cfg: &crate::control::WorkerLimitsConfig) -> Self {
         Self {
             local_max_cpu_pct: cfg.local_max_cpu_pct,
             hours: cfg.hours.clone(),
@@ -80,7 +77,7 @@ impl WorkerLimits {
             no_tasks_on_battery: cfg.no_tasks_on_battery.unwrap_or(false),
             no_tasks_on_metered: cfg.no_tasks_on_metered.unwrap_or(false),
             no_gpu_tasks: cfg.no_gpu_tasks,
-            hold_ends_tasks,
+            hold_ends_tasks: cfg.hold_ends_tasks,
         }
     }
 

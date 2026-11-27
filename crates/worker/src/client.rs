@@ -735,6 +735,7 @@ impl WorkerConfig {
 
     /// Configures the initial contributor limits state (`design 0113` D1/D2).
     pub fn with_initial_limits(mut self, limits: crate::control::WorkerLimitsConfig) -> Self {
+        self.hold_ends_tasks = limits.hold_ends_tasks;
         self.initial_limits = limits;
         self
     }
@@ -757,6 +758,7 @@ impl WorkerConfig {
     /// Configures `--hold-ends-tasks`: hand back running tasks on automatic limit holds (`NET-9b`).
     pub fn with_hold_ends_tasks(mut self, enabled: bool) -> Self {
         self.hold_ends_tasks = enabled;
+        self.initial_limits.hold_ends_tasks = enabled;
         self
     }
 
@@ -1253,10 +1255,9 @@ impl WorkerClient {
             .cpu_probe
             .clone()
             .unwrap_or_else(|| Arc::new(crate::limits::SystemHostCpuProbe));
-        let init_limits = crate::limits::WorkerLimits::from_control_config(
-            &config.initial_limits,
-            config.hold_ends_tasks,
-        );
+        let mut initial_limits = config.initial_limits.clone();
+        initial_limits.hold_ends_tasks |= config.hold_ends_tasks;
+        let init_limits = crate::limits::WorkerLimits::from_control_config(&initial_limits);
         let init_day = local_clock.local_now().date();
         let limits_evaluator = crate::limits::LimitsEvaluator::new(init_limits, init_day)
             .unwrap_or_else(|e| {
@@ -1272,7 +1273,7 @@ impl WorkerClient {
             worker_id,
             capabilities.name.clone(),
             Arc::clone(&active_tasks),
-            config.initial_limits.clone(),
+            initial_limits,
             config.control_config_path.clone(),
             config.limit_persist_hook.clone(),
         );
