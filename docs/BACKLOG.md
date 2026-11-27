@@ -230,6 +230,7 @@ Recounted on 2026-11-24 from the rows with pull request 474: 307 items, 208 Impl
 Recounted on 2026-11-24 from the rows with pull request 489: 308 items, 210 Implemented, 19 Partial and 79 Planned; 17 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 492: 308 items, 210 Implemented, 19 Partial and 79 Planned; 15 open items are In and 83 are Out.
 Recounted on 2026-11-27 from the rows with pull request 495 (HOST-1 to HOST-5, design 0114): 313 items, 210 Implemented, 19 Partial and 84 Planned; 15 open items are In and 88 are Out.
+Recounted on 2026-11-27 from the rows after TEST-26 and TEST-86 Implemented and TEST-103 and TEST-104 added: 315 items, 212 Implemented, 17 Partial and 86 Planned; 15 open items are In and 88 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -283,7 +284,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Implemented |  | 305, 357 |
 | TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | Out | 374, (design 0065) |
 | TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | Out | (design 0065) |
-| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Partial | In | 382, (design 0065) |
+| TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Implemented |  | 382, (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
 | TEST-29 | Find why `workspace tests (windows-latest)` loses its runner at 60 minutes | P1 | M |  |  | Implemented |  | 283, 358 (open) |
@@ -338,7 +339,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Implemented |  | 417, 430 |
-| TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Partial | In | 418, 409 (open) |
+| TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Implemented |  | 418, 409 |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Implemented |  | 429 |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
@@ -355,6 +356,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-101 | Make `rusty_grid_core` `cluster_auth::tests::default_path_lives_under_home` independent of caller `OXIDESWARM_HOME` | P2 | S |  |  | Implemented |  |  |
 | TEST-100 | CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'` | P1 | S | TEST-26 |  | Implemented |  |  |
 | TEST-102 | CI `endurance (loopback)`: `4_probe_p99` fails on shared-runner single-sample jitter (`67.4 -> 330.9 ms` across `14`/`16` probes) | P1 | S | TEST-26 |  | Implemented |  |  |
+| TEST-103 | CI `endurance (loopback)`: `4_probe_p99` still fails after TEST-102 on two isolated `~400 ms` probes among `160` late probes | P2 | S | TEST-102 |  | Planned | In |  |
+| TEST-104 | Windows CI: `test_a_task_cannot_signal_or_inspect_foreign_processes` gets no output from its PowerShell task within the capped `35 s` | P2 | S | TEST-69 |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -752,6 +755,10 @@ The full suite must pass on a clean machine before CI can require it.
   `endurance-records` (`transfer-loopback.json` and `soak-45m-loopback.json`, `if: always()`).
   Static checks in `tests/test_endurance_harness.py` (`EnduranceCiWorkflowTests`) verify trigger,
   pins, commands, and upload step. Stays Partial until green on two scheduled runs.
+- **Implemented (2026-11-27):** Green on two runs on `master` under the Q103 rule: `45889278688` and
+  `45946160149`, plus later green runs `45963013877` and `45988260366`. The started run `45975322901`
+  (`a255c3c7`) failed only `4_probe_p99`; that is TEST-103, a check that is still too sensitive, not a
+  regression of the cluster.
 
 ### TEST-86: macOS: `shard` tests stall for 60 s when run beside other shard tests
 
@@ -815,6 +822,10 @@ The full suite must pass on a clean machine before CI can require it.
       `test_cli_matrix_input_dedup_output_dir_isolation_and_workspace_sync` (`0.204 s`).
   - **2026-11-26 CI check (`master` push runs since `2026-11-24T00:00:00Z`):** `33/33` `workspace tests (macos-latest)` jobs passed (`45297098266` `2026-11-24T00:25:56Z` through `45781445276` `2026-11-26T08:14:09Z`, `b253f601`), with `0` `test_ax2_shard` or `test_ax1_matrix` stalls. Stays `Partial | In` until the `TEST-86` streak holds and the owner closes it.
 
+- **Implemented (2026-11-27, Q103):** `51/51` `workspace tests (macos-latest)` jobs passed on `master` `ci.yml` runs
+  (push and `workflow_dispatch`) created from `2026-11-24T00:00:00Z` to `46000945497` (`2026-11-27T12:42:52Z`,
+  `a255c3c7`), with no stall of `test_ax2_shard` or `test_ax1_matrix`. The cause of the one stall in run
+  `45054272288` stays unknown; a new stall reopens this item.
 ### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
 
 - **Evidence:** Incident `INC-20261123-001` (case PC, Windows 11 Pro, commit `8e55dac9`). The S9 loop ran
@@ -1086,6 +1097,57 @@ The full suite must pass on a clean machine before CI can require it.
 The standard in `docs/README.md` requires "only what the code does". These items apply it.
 
 ## Phase 4: finish partial features
+
+
+### TEST-103: CI `endurance (loopback)`: `4_probe_p99` still fails after TEST-102 on two isolated `~400 ms` probes
+
+- **Evidence:** `master` CI `workflow_dispatch` run `45975322901` (`2026-11-27T09:37:59Z`, `a255c3c7`, which
+  contains the TEST-102 fix), job `endurance (loopback)` on `ubuntu-latest` (4 cores): checks
+  `1_accounting`, `2_resource_plateau`, `3_disk_and_journal`, `5_clean_stop` and `6_fault_injection` passed;
+  `4_probe_p99` failed with `baseline_p99_ms = 131.578` (`n = 138`), `late_p99_ms = 296.324` (`n = 160`),
+  `limit_ms = 197.367`, `ratio = 2.2521 > 1.5`. All `439` probes succeeded. The median per 5-minute bucket
+  stayed between `26.7` and `28.9 ms` for the whole 45 minutes, so latency did not drift. The late p99 comes
+  from two isolated samples, `419.5 ms` at `2377 s` (23 s before the worker kill at `2400 s`, which the
+  30 s pad after a fault does not cover) and `386.1 ms` at `2607 s`; with `160` samples p99 is about the
+  second worst sample. The baseline p99 also rests on single samples (`196.7 ms` at `760 s`, `154.2 ms` at
+  `730 s`). The endurance job passed on `master` runs `45963013877` and `45988260366` with the same code.
+- **Problem:** A ratio of two p99 values from about 150 samples on a shared runner is decided by the two
+  worst samples of each window, so two host stalls fail the job even when the cluster is unchanged.
+  TEST-102 lowered the floor from `500` to `100 ms` on purpose, so a uniform slowdown to about `200 ms`
+  is caught; the fix must keep that.
+- **Do:**
+  1. Failing check first: replay the samples of run `45975322901` in `tests/test_endurance_harness.py`
+     and show that the current check fails them.
+  2. Make the check robust to a few isolated spikes while it still fails the TEST-102 slowdown cases, for
+     example by comparing a lower percentile (p90 or p95) or by trimming the worst `k` samples per window,
+     and by also padding the time just before a fault starts. Record the choice in design 0065 D3 #6.4.
+  3. Keep `--probe-interval 6s` and the `100 ms` floor unless the design record explains a change.
+- **Done when:** The replay of `45975322901` and the TEST-102 replay of `45821686282` pass, the uniform
+  slowdown tests of TEST-102 still fail as they should, `python3 tests/test_endurance_harness.py` passes,
+  and the job is green on two later runs on `master`.
+
+
+### TEST-104: Windows CI: `test_a_task_cannot_signal_or_inspect_foreign_processes` gets no output from its PowerShell task within the capped `35 s`
+
+- **Evidence:** `master` CI `workflow_dispatch` run `46014247326` (`2026-11-27T14:15:17Z`, `a255c3c7`), job
+  `workspace tests (windows-latest)`: `crates/worker/tests/test_feat3_os_isolation.rs:4675`
+  (`windows::test_a_task_cannot_signal_or_inspect_foreign_processes`) failed with
+  `fs: task did not start: [] (stderr: Task timed out after 35s)`; the other `30` tests of the binary passed.
+  The task printed nothing, not even `TASK_STARTED`, and stderr was empty. This is the first failure of the
+  job in `52` `ci.yml` runs on `master` since `2026-11-24T00:00:00Z`.
+- **Problem:** The test asks `win_task` for `60 s`, and `win_task` silently caps a request of exactly `60`
+  to `35 s`. A PowerShell start inside a fresh AppContainer profile with a private desktop on a starved
+  runner can take that long, so the test decides on a wall-clock window (the lesson of TEST-36 to TEST-38).
+  One run cannot tell a slow start from a hang in the AppContainer or desktop set-up.
+- **Do:**
+  1. Reproduce on Windows 11: run the test 50 times alone and 50 times under 4 to 6 CPU busy loops, and
+     record the time to `TASK_STARTED` per run.
+  2. If the start is only slow, remove the special `60 -> 35` cap in `win_task` and `win_cmd_task` for
+     this test (or use `WIN_WAIT_TIMEOUT`), and print the elapsed time instead of asserting a window.
+  3. If a run hangs past `90 s`, it is a BUG in the Windows isolation start-up: capture the process tree and
+     file it.
+- **Done when:** The cause is written here, the test passes `50/50` under busy loops on Windows 11, and the
+  next `20` `workspace tests (windows-latest)` jobs on `master` pass.
 
 ### AND-1: Make the Android app build
 
@@ -3596,3 +3658,5 @@ Add one dated line per finished item, newest last.
 - 2026-11-26: TEST-100 added and Implemented (`mac/test-100-endurance-soak-leftover-pids`, claim `claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`): added failing-first `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` in `tests/test_endurance_harness.py` (failed before fix on the 5 duplicate top-level definitions from `751be5b5` and detached `SoakCluster.leftover_pids`), removed the identical duplicate `resolve_master_arg..RemoteEnduranceCluster` block (`lines 3705-3978`) in `benchmarks/endurance/endurance.py` so `leftover_pids` returns to `SoakCluster`, and verified `tests/test_endurance_harness.py` (`40` tests: `39` ok, `1` skipped), `tests/test_m1_challenger_hygiene.py`, `fmt`, workspace `clippy`, and a 5-minute loopback soak (`--duration 5m --fault-scale 0.1 --sample-interval 5s`, `6/6 PASS`, `280/280` tasks, `leftover_pids=[]`).
 - 2026-11-26: TEST-102 Implemented and TEST-90 Implemented (`mac/test-102-soak-probe-p99`, claim `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): CI run `45821686282` (`034f5725`, `ubuntu-latest` `endurance (loopback)`) passed `transfer` (`6/6`), `1_accounting` (`2,185/2,185`), `2_resource_plateau`, `3_disk_and_journal` (Linux `--workspaces` `0700` confirmed, closing `TEST-90`), `5_clean_stop`, and `6_fault_injection` (`16/16`), failing only `4_probe_p99` (`67.402 -> 330.897 ms`, `ratio 4.9093` on `14`/`16` probes despite lower late median `31.28 vs 32.38 ms`) due to 60 s probe cadence, missing latency floor, and 15 s fault pad; added `--probe-interval 6s` (`min(6s, --sample-interval)`), `30` clean probes/window minimum, `100 ms` floor (`max(1.5x baseline, 100 ms)`, catching `30 -> 200 ms` uniform regressions), `30 s` post-fault exclusion pad (`soak_fault_pad_seconds`), failing-first tests in `tests/test_endurance_harness.py`, and design `0065` status-log update.
 - 2026-11-27: HOST-1 to HOST-5 added (Planned, Out) from [design 0114](design/0114-llm-worker-host.md), pull request 495; the owner decided Q104 to Q107 at the recommended defaults (no OxideSwarm OS, no own engine, measure first, normal priority only in the headless image).
+- 2026-11-27: TEST-86 Implemented under the Q103 rule (`51/51` green `workspace tests (macos-latest)` jobs on `master` since 2026-11-24). TEST-26 Implemented under the Q103 rule (green on `master` runs `45889278688` and `45946160149`). TEST-103 added (Planned, In): the started run `45975322901` failed only `4_probe_p99` on two isolated `~400 ms` probes while the median stayed at `27-28 ms`; the owner decided in chat that 0.4.6 is tagged with this recorded as a false failure of the check.
+- 2026-11-27: TEST-104 added (Planned, In): the started run `46014247326` failed only `workspace tests (windows-latest)`, one Windows isolation test whose PowerShell task printed nothing within the capped `35 s`; first failure of that job in `52` `master` runs since 2026-11-24. The owner decided in chat to tag 0.4.6 with TEST-104 recorded as well.
