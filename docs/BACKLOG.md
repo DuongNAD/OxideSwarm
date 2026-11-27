@@ -230,7 +230,7 @@ Recounted on 2026-11-24 from the rows with pull request 474: 307 items, 208 Impl
 Recounted on 2026-11-24 from the rows with pull request 489: 308 items, 210 Implemented, 19 Partial and 79 Planned; 17 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 492: 308 items, 210 Implemented, 19 Partial and 79 Planned; 15 open items are In and 83 are Out.
 Recounted on 2026-11-27 from the rows with pull request 495 (HOST-1 to HOST-5, design 0114): 313 items, 210 Implemented, 19 Partial and 84 Planned; 15 open items are In and 88 are Out.
-Recounted on 2026-11-27 from the rows after TEST-26 Implemented and TEST-103 added: 314 items, 211 Implemented, 18 Partial and 85 Planned; 15 open items are In and 88 are Out.
+Recounted on 2026-11-27 from the rows after TEST-26 and TEST-86 Implemented and TEST-103 added: 314 items, 212 Implemented, 17 Partial and 85 Planned; 14 open items are In and 88 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -339,7 +339,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-83 | Replace wall-clock upper bounds in master and core tests with structural proofs and 60 s hang guards | P2 | M |  |  | Implemented |  | 406 (open) |
 | TEST-84 | Replace wall-clock upper bounds in `android_bridge`, `cli`, `agent_mesh`, and Python tests with structural checks and 60 s guards | P2 | M |  |  | Implemented |  | 407 |
 | TEST-85 | Windows: the `submit --type compile` runtime test times out after 60 s | P1 | S |  |  | Implemented |  | 417, 430 |
-| TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Partial | In | 418, 409 (open) |
+| TEST-86 | macOS: `shard` tests stall for 60 s when run beside other shard tests | P1 | S | BUG-35 |  | Implemented |  | 418, 409 |
 | TEST-87 | macOS: worker portal loopback test fails when its LAN-side bind finds the port in use | P2 | S |  |  | Implemented |  | 429 |
 | TEST-88 | Windows: worker tests open console windows and leave `PING.EXE` running | P2 | S |  |  | Implemented |  | 424 |
 | TEST-89 | macOS: `test_wave3_e2e.py` worker does not reach `state:connected` within 15 s | P2 | S |  |  | Implemented |  | 425, 427 |
@@ -821,6 +821,10 @@ The full suite must pass on a clean machine before CI can require it.
       `test_cli_matrix_input_dedup_output_dir_isolation_and_workspace_sync` (`0.204 s`).
   - **2026-11-26 CI check (`master` push runs since `2026-11-24T00:00:00Z`):** `33/33` `workspace tests (macos-latest)` jobs passed (`45297098266` `2026-11-24T00:25:56Z` through `45781445276` `2026-11-26T08:14:09Z`, `b253f601`), with `0` `test_ax2_shard` or `test_ax1_matrix` stalls. Stays `Partial | In` until the `TEST-86` streak holds and the owner closes it.
 
+- **Implemented (2026-11-27, Q103):** `51/51` `workspace tests (macos-latest)` jobs passed on `master` `ci.yml` runs
+  (push and `workflow_dispatch`) created from `2026-11-24T00:00:00Z` to `46000945497` (`2026-11-27T12:42:52Z`,
+  `a255c3c7`), with no stall of `test_ax2_shard` or `test_ax1_matrix`. The cause of the one stall in run
+  `45054272288` stays unknown; a new stall reopens this item.
 ### TEST-88: Windows worker tests open console windows and leave `PING.EXE` running
 
 - **Evidence:** Incident `INC-20261123-001` (case PC, Windows 11 Pro, commit `8e55dac9`). The S9 loop ran
@@ -3630,4 +3634,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-26: TEST-100 added and Implemented (`mac/test-100-endurance-soak-leftover-pids`, claim `claims/item/TEST-100__mac-ag__20261126T075303895610Z__d9eab88c.json`): added failing-first `test_endurance_no_duplicate_top_level_defs_and_soak_cluster_contract` in `tests/test_endurance_harness.py` (failed before fix on the 5 duplicate top-level definitions from `751be5b5` and detached `SoakCluster.leftover_pids`), removed the identical duplicate `resolve_master_arg..RemoteEnduranceCluster` block (`lines 3705-3978`) in `benchmarks/endurance/endurance.py` so `leftover_pids` returns to `SoakCluster`, and verified `tests/test_endurance_harness.py` (`40` tests: `39` ok, `1` skipped), `tests/test_m1_challenger_hygiene.py`, `fmt`, workspace `clippy`, and a 5-minute loopback soak (`--duration 5m --fault-scale 0.1 --sample-interval 5s`, `6/6 PASS`, `280/280` tasks, `leftover_pids=[]`).
 - 2026-11-26: TEST-102 Implemented and TEST-90 Implemented (`mac/test-102-soak-probe-p99`, claim `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): CI run `45821686282` (`034f5725`, `ubuntu-latest` `endurance (loopback)`) passed `transfer` (`6/6`), `1_accounting` (`2,185/2,185`), `2_resource_plateau`, `3_disk_and_journal` (Linux `--workspaces` `0700` confirmed, closing `TEST-90`), `5_clean_stop`, and `6_fault_injection` (`16/16`), failing only `4_probe_p99` (`67.402 -> 330.897 ms`, `ratio 4.9093` on `14`/`16` probes despite lower late median `31.28 vs 32.38 ms`) due to 60 s probe cadence, missing latency floor, and 15 s fault pad; added `--probe-interval 6s` (`min(6s, --sample-interval)`), `30` clean probes/window minimum, `100 ms` floor (`max(1.5x baseline, 100 ms)`, catching `30 -> 200 ms` uniform regressions), `30 s` post-fault exclusion pad (`soak_fault_pad_seconds`), failing-first tests in `tests/test_endurance_harness.py`, and design `0065` status-log update.
 - 2026-11-27: HOST-1 to HOST-5 added (Planned, Out) from [design 0114](design/0114-llm-worker-host.md), pull request 495; the owner decided Q104 to Q107 at the recommended defaults (no OxideSwarm OS, no own engine, measure first, normal priority only in the headless image).
-- 2026-11-27: TEST-26 Implemented under the Q103 rule (green on `master` runs `45889278688` and `45946160149`). TEST-103 added (Planned, In): the started run `45975322901` failed only `4_probe_p99` on two isolated `~400 ms` probes while the median stayed at `27-28 ms`; the owner decided in chat that 0.4.6 is tagged with this recorded as a false failure of the check.
+- 2026-11-27: TEST-86 Implemented under the Q103 rule (`51/51` green `workspace tests (macos-latest)` jobs on `master` since 2026-11-24). TEST-26 Implemented under the Q103 rule (green on `master` runs `45889278688` and `45946160149`). TEST-103 added (Planned, In): the started run `45975322901` failed only `4_probe_p99` on two isolated `~400 ms` probes while the median stayed at `27-28 ms`; the owner decided in chat that 0.4.6 is tagged with this recorded as a false failure of the check.
