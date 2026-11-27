@@ -158,7 +158,7 @@ oxideswarm.exe submit `
   -- certutil.exe -hashfile incoming\does-not-exist.txt SHA256
 ```
 
-- **Graceful worker stop (`Ctrl+C`):** sends `WorkerMessage::Disconnecting` so the master returns any running task to `Queued` immediately without waiting out the session-resume hold and without charging `retry_count`, unless `--max-retries 0` is in effect (`TaskQueue::handle_session_evacuated` in `crates/master/src/queue.rs`, [design 0036](../design/0036-bounded-uncharged-worker-evacuations.md)).
+- **Graceful worker stop (`Ctrl+C`, not part of the recorded run):** sends `WorkerMessage::Disconnecting` so the master returns any running task to `Queued` immediately without waiting out the session-resume hold and without charging `retry_count`, unless `--max-retries 0` is in effect (`TaskQueue::handle_session_evacuated` in `crates/master/src/queue.rs`, [design 0036](../design/0036-bounded-uncharged-worker-evacuations.md)).
 - **Sudden worker stop (`Stop-Process -Force`, crash, or dropped connection) with `--max-retries 2`:** by default `oxideswarm master` holds running tasks for `--session-resume-hold-secs 30` ([design 0046](../design/0046-master-durability.md)) so a quickly reconnecting worker can resume its session. Once that `30` s hold expires (or immediately when the master runs with `--session-resume-hold-secs 0`), the master re-queues the task onto another matching worker (`failover_count`), up to the `--max-retries` limit.
 - **Sudden worker stop with `--max-retries 0` ("run at most once"):** once the hold expires, the master transitions the task to `Failed` (`maximum retry limit (0) reached after worker eviction`) and never re-dispatches it to a second worker.
 
