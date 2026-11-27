@@ -1,6 +1,6 @@
 # 0114: A worker host tuned for local models: measure first, then huge pages, pinned cores and a headless Linux image
 
-Status: Draft (plan; builds nothing; Q104 to Q107 open)
+Status: Accepted (plan; builds nothing; Q104 to Q107 decided on 2026-11-27)
 Created: 2026-11-27    Updated: 2026-11-27
 
 ## Summary
@@ -9,7 +9,7 @@ On 2026-11-27 the owner asked whether OxideSwarm needs an operating system of it
 models faster, after reading about `llm.asm`, a 24 KB bare-metal x86-64 kernel that runs Qwen3-0.6B.
 The author's own figures show that most of its speed comes from a hand-tuned engine that is just as
 fast as a plain Linux program, and that dropping the OS adds about 10 %. This record keeps the OS
-question closed (Q104), uses upstream engines (Q105), and plans five items: measure the gap on our own
+question closed (Q104), uses upstream engines (Q105), and plans five items, now in `docs/BACKLOG.md`: measure the gap on our own
 machines first (HOST-1), then report host factors (HOST-2), give model services a tuned process
 profile (HOST-3), write a guide (HOST-4), and build a headless Linux worker image (HOST-5).
 
@@ -195,12 +195,13 @@ unless the person adds one.
 | HOST-5 | Headless Linux worker image | `packaging/linux-image/` | Image boots, joins from the kit, serves a model on the case PC | Planned |
 
 Order: HOST-1 and HOST-4 need no code and can run in 0.4.x; HOST-2, HOST-3 and HOST-5 go with
-model serving in 0.6.0 (Q101), after `LLM-9`. `docs/BACKLOG.md` stays unchanged until the owner
-decides Q104 to Q107.
+model serving in 0.6.0 (Q101), after `LLM-9`, and only if HOST-1 passes the bar of Q106.
 
 ## Decisions for the owner
 
-| ID | Question | Recommended |
+The owner decided all four at the recommended default on 2026-11-27 ("Chốt theo đề xuất").
+
+| ID | Question | Decision |
 |---|---|---|
 | Q104 | Build an OxideSwarm operating system or bare-metal kernel? | No. Reopen only if HOST-1 shows a gap of more than 25 % that a tuned headless Linux does not close |
 | Q105 | Write our own inference engine? | No: run upstream engines (`llama.cpp`, vLLM on Linux GPUs) through `LLM-12`; custom kernels only as ordinary tasks for a given research problem |
@@ -212,3 +213,5 @@ decides Q104 to Q107.
 - 2026-11-27: Draft. Written after the owner's question about a dedicated OS; `llm.asm` and `zero`
   READMEs read on GitHub the same day. Design 0114, Q104 to Q107 and HOST-1 to HOST-5 claimed on the
   hub.
+- 2026-11-27: Accepted. The owner decided Q104 to Q107 at the recommended defaults; HOST-1 to
+  HOST-5 added to the `docs/BACKLOG.md` Index (Planned, Out) in pull request 495.
