@@ -487,7 +487,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | ADOPT-4 | Guides for common jobs, each with a recorded run | P2 | M | ADOPT-1, AX-1, AX-2 |  | Planned | In | (design 0059) |
 | AX-1 | Matrix fan-out in `submit` and in MCP | P1 | M | ADOPT-1 |  | Implemented |  | (design 0056), (design 0101), 0e13d69d, 58c41543, 36a2d647 |
 | AX-2 | Sharded runs, with a build-once mode for Rust | P2 | M | AX-1 |  | Partial | In | (design 0056), (design 0103) |
-| AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056) |
+| AX-3 | Live output, `logs`, and MCP tasks | P2 | L | PROTO-4 | Q55 | Planned | In | (design 0056), (draft design 0109) |
 | TEAM-1 | Shared plan file `.oxideswarm/plan.toml`, `plan check` and a 30-line snapshot | P2 | M | AX-1 |  | Planned | Out | (design 0111) |
 | TEAM-2 | Task claims and path leases as git refs, worktrees, `plan check-diff` | P2 | M | TEAM-1 | Q100 | Planned | Out | (design 0111) |
 | TEAM-3 | Verify gate: sync a worktree, run the task's profiles, return compact failure JSON | P2 | M | TEAM-1, AX-2 |  | Planned | Out | (design 0111) |
@@ -2029,6 +2029,12 @@ Every "Evidence" below was read on 2026-11-17 at `master` `16b2a38`, unless it s
 - **Done when:** A client sees the first output line while the task runs. An MCP client polls a
   running task and reads an output tail. The `2024-11-05` test in `mcp_server_e2e` still passes,
   and the `release skew` job passes against the previous release.
+- **Note (2026-11-26, `agent-mac-ag` draft):** [Design 0109](design/0109-ax3-live-output-and-mcp-tasks.md) targets
+  `0.5.0` / protocol `11` (`Q101`), specifies per-task opt-in via [design 0082](design/0082-task-extension-slot.md)
+  `Task::extensions`, QUIC lane + low-priority writer isolation off `Session::data_tx`, bounded `32 MiB` broker
+  accounting with `TaskQueue` eviction coupling and master-monotonic `broker_seq`, `SubscribeTaskOutput` stream /
+  OXS-AUTH v3 lifecycle, CLI `logs` / `submit --wait --follow`, and MCP `2026-07-28` + `2024-11-05` compatibility
+  (**Q55** open; stays `Planned` with no code merge in `0.4.x`).
 
 ### TEAM-1 to TEAM-7: One project, several coding agents and machines
 
