@@ -226,6 +226,7 @@ Recounted on 2026-11-24 from the rows with pull request 470: 307 items, 206 Impl
 Recounted on 2026-11-24 from the rows with pull request 476: 307 items, 207 Implemented, 20 Partial and 80 Planned; 19 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 474: 307 items, 208 Implemented, 20 Partial and 79 Planned; 18 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 489: 308 items, 210 Implemented, 19 Partial and 79 Planned; 17 open items are In and 81 are Out.
+Recounted on 2026-11-24 from the rows with pull request 492: 308 items, 210 Implemented, 19 Partial and 79 Planned; 15 open items are In and 83 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -277,8 +278,8 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-22 | Ignore UUID and metric `4090` tokens in `workflow_modes_test` | P1 | S | TEST-19 |  | Implemented |  | 200 |
 | TEST-21 | Fix Windows `m6_challenger_1_stress` and `test_sec6_mesh_sandbox` flakes | P1 | S | TEST-20 |  | Implemented |  | 198 |
 | TEST-23 | Find why `master_restart_recovery` loses `out.txt` on Windows | P1 | M | FEAT-1 |  | Implemented |  | 305, 357 |
-| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | In | 374, (design 0065) |
-| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | In | (design 0065) |
+| TEST-24 | Test large transfers between machines | P2 | M | BENCH-1 | Yes | Partial | Out | 374, (design 0065) |
+| TEST-25 | Run a cluster for 24 hours under load and faults | P2 | L | TEST-24 | Yes | Partial | Out | (design 0065) |
 | TEST-26 | Run short versions of TEST-24 and TEST-25 on a schedule in CI | P3 | S | TEST-24, TEST-25 |  | Partial | In | 382, (design 0065) |
 | TEST-27 | Find why the `mesh_auth` slow-consumer test times out on macOS | P2 | S | |  | Implemented |  | 263, 303 |
 | TEST-28 | Make the group-commit timing test meaningful on slow runners | P1 | S |  |  | Implemented |  | 265 |
@@ -733,7 +734,7 @@ The full suite must pass on a clean machine before CI can require it.
   schedule, never for pull requests. It runs T1 at 1 GiB, T2 at 20,000 files, T4, T6, T7 and T8 on
   loopback and a soak of 45 minutes, and uploads the JSON record as an artifact. It is not a
   required check.
-- **Done when:** The job is green on two scheduled runs.
+- **Done when:** The job is green on two runs on `master`, scheduled or started by hand (Q103, 2026-11-27; it was two scheduled runs).
 - **Partial (2026-11-19, branch `win/test-26-ci-endurance`):** Added the `endurance` job on
   `ubuntu-latest` (`timeout-minutes: 150`, pinned action commit SHAs) to
   `.github/workflows/ci.yml` for `schedule` (`cron: "17 3 * * 1"`) and `workflow_dispatch` only
