@@ -21,6 +21,8 @@
 //! 5. `cancel`: Cancel a queued or running task by its UUID.
 //! 6. `doctor`: Run cluster diagnostics (checks C1-C8) and return a structured report.
 //! 7. `workspaces`: List persistent agent workspaces and their worker affinities.
+//! 8. `shard`: Run commands or `cargo nextest` build-once suites across parallel shards.
+//! 9. `plan_snapshot`: Render the compact `<= 30`-line shared plan snapshot.
 //!
 //! # Stdout Hygiene
 //!
@@ -52,6 +54,7 @@ use crate::secret_cmd::SecretOpts;
 
 mod cancel;
 mod doctor;
+mod plan;
 mod shard;
 mod status;
 pub(crate) mod submit;
@@ -918,6 +921,28 @@ pub fn available_tools() -> Vec<ToolDefinition> {
                 "required": []
             }),
         },
+        ToolDefinition {
+            name: "plan_snapshot",
+            description: "Render a compact snapshot (at most 30 lines) of .oxideswarm/plan.toml combined with git lease refs (refs/oxideswarm/lease/<task>), contract hashes, and recent base commits.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_path": {
+                        "type": "string",
+                        "description": "Optional path inside the server working directory to the plan TOML file (default: .oxideswarm/plan.toml)"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Optional repository subdirectory inside the server working directory (default: current directory)"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional base git branch or ref overriding [project].base"
+                    }
+                },
+                "required": []
+            }),
+        },
     ]
 }
 
@@ -1514,6 +1539,31 @@ pub fn validate_tool_arguments(name: &str, args: &Value) -> Result<(), String> {
             Ok(())
         }
         "workspaces" => Ok(()),
+        "plan_snapshot" => {
+            for field in ["plan_path", "repo_dir"] {
+                if let Some(p) = check_opt_str(obj, field)? {
+                    if p.trim().is_empty()
+                        || std::path::Path::new(p)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return Err(format!(
+                            "Property '{field}' ('{p}') must be non-empty and must not contain '..'"
+                        ));
+                    }
+                }
+            }
+            if let Some(base) = check_opt_str(obj, "base")? {
+                if base.trim().is_empty()
+                    || base.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err(format!(
+                        "Property 'base' ('{base}') must be a non-empty git ref without whitespace"
+                    ));
+                }
+            }
+            Ok(())
+        }
         other => Err(format!("Unknown tool: '{other}'")),
     }
 }
@@ -1541,6 +1591,7 @@ pub async fn call_tool_with_context(
         "cancel" => cancel::tool_cancel(state, args).await,
         "doctor" => doctor::tool_doctor(state, args).await,
         "workspaces" => workspaces::tool_workspaces(state).await,
+        "plan_snapshot" => plan::tool_plan_snapshot(args).await,
         other => ToolCallResult::error(format!("Unknown tool: '{other}'")),
     }
 }
@@ -2504,7 +2555,7 @@ mod tests {
     #[test]
     fn test_mcp3_tool_schemas_and_argument_validation() {
         let tools = available_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         for t in &tools {
             assert!(
                 t.input_schema.get("required").is_some_and(|r| r.is_array()),

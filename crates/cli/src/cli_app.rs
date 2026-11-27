@@ -180,6 +180,9 @@ pub enum Commands {
     /// Workflow modes and presets (test, dev, doc, research)
     Mode(mode_cli::ModeCliArgs),
 
+    /// Validate `.oxideswarm/plan.toml` and view the team wave snapshot
+    Plan(crate::plan::PlanArgs),
+
     /// Model Context Protocol (MCP) server for external AI coding agents (Claude Desktop, Cline, Cursor)
     Mcp(crate::mcp::McpArgs),
 
@@ -1340,6 +1343,7 @@ pub async fn run_cli_with(cli: Cli) -> ExitCode {
                 ExitCode::from(code as u8)
             }
         }
+        Commands::Plan(args) => crate::plan::run_plan_command(args),
         Commands::Mcp(args) => crate::mcp::run_mcp(args, config_file, secret_opts).await,
         Commands::Rendezvous(args) => {
             crate::rendezvous_cmd::run_rendezvous(args, secret_opts).await
