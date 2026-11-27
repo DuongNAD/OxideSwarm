@@ -946,20 +946,25 @@ pub(crate) async fn run_worker_control_action(
 }
 
 pub(crate) fn resolve_config_write_path(config_file: Option<&ConfigFile>) -> Option<PathBuf> {
+    resolve_config_write_path_with(
+        config_file,
+        std::env::var_os("RUSTY_GRID_CONFIG").as_deref(),
+        crate::config::default_oxideswarm_dir(),
+    )
+}
+
+fn resolve_config_write_path_with(
+    config_file: Option<&ConfigFile>,
+    env_config: Option<&std::ffi::OsStr>,
+    oxideswarm_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
     if let Some(p) = config_file.and_then(|c| c.source_path.0.as_ref()) {
         return Some(p.clone());
     }
-    if let Some(env_path) = std::env::var_os("RUSTY_GRID_CONFIG").filter(|v| !v.is_empty()) {
+    if let Some(env_path) = env_config.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(env_path));
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|v| !v.is_empty())?;
-    Some(
-        PathBuf::from(home)
-            .join(".oxideswarm")
-            .join("rusty-grid.toml"),
-    )
+    oxideswarm_dir.map(|dir| dir.join("rusty-grid.toml"))
 }
 
 pub(crate) fn load_worker_limits_from_toml(
@@ -1320,5 +1325,38 @@ mod tests {
         assert!(raw.contains("name = \"mac-box\""));
         let loaded = load_worker_limits_from_toml(&cfg_path).unwrap();
         assert_eq!(loaded, limits);
+    }
+
+    #[test]
+    fn resolve_config_write_path_honours_oxideswarm_home() {
+        use std::ffi::OsStr;
+
+        let mut cfg = ConfigFile::default();
+        cfg.source_path.0 = Some(PathBuf::from("/explicit/rusty-grid.toml"));
+
+        assert_eq!(
+            resolve_config_write_path_with(
+                Some(&cfg),
+                Some(OsStr::new("/env/rusty-grid.toml")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/explicit/rusty-grid.toml"))
+        );
+        assert_eq!(
+            resolve_config_write_path_with(
+                None,
+                Some(OsStr::new("/env/rusty-grid.toml")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/env/rusty-grid.toml"))
+        );
+        assert_eq!(
+            resolve_config_write_path_with(
+                None,
+                Some(OsStr::new("")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/custom/ox/rusty-grid.toml"))
+        );
     }
 }
