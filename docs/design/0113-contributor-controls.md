@@ -10,7 +10,7 @@ a pause by hand, a CPU threshold of its own, hours, no new task on battery or on
 no GPU task. Paused or limited, the worker stays connected; running tasks go back to the master within
 5 s without a retry charged, and the master stops offering work to that worker for a while instead of
 bouncing tasks off it. A same-user local control channel (`oxideswarm worker pause|resume|status|limits`)
-serves the command line and the tray app of [design 0112](0112-tray-app-for-contributors.md). No wire
+serves the command line and the tray app of design 0112 (#469). No wire
 change: release 0.4.7. Item NET-9 ([design 0094](0094-road-to-a-shared-research-grid.md)), split into
 NET-9a (pause, hand-back, control channel, master hold-back) and NET-9b (the limits).
 
@@ -68,38 +68,68 @@ precedence (`crates/cli/src/config.rs`):
 | `--no-tasks-on-metered` | No new task while the operating system reports a metered connection |
 | `--no-gpu-tasks` | Refuse GPU tasks (CPU tasks still run) |
 
-Metered detection: Windows `INetworkCostManager` (`NLM_CONNECTION_COST_*`), macOS `NWPath.isExpensive` /
-`isConstrained`, Linux NetworkManager's `Metered` property; where none answers, the worker logs once at
-start that it cannot tell and treats the network as unmetered.
+Metered detection: Windows `INetworkCostManager` (`NLM_CONNECTION_COST_*`), Linux NetworkManager's
+`Metered` property; where none answers, the worker logs once at start that it cannot tell and treats the
+network as unmetered. macOS (`NWPath.isExpensive` / `isConstrained`) needs a Network.framework binding
+that NET-9b does not add: until a follow-up item does, macOS always answers "cannot tell", so
+`--no-tasks-on-metered` has no effect there and the start-up notice says so.
+
+`--hold-ends-tasks` (D2.3) is a setting of the same kind: a flag, `RUSTY_GRID_HOLD_ENDS_TASKS` and a
+`[worker]` key that `worker limits get|set` shows and changes like the others.
 
 ### D2 Pause, hand-back and the control channel (NET-9a)
 
 1. **States.** `running`, `paused` (by hand, with an optional end time), `held` (a limit applies, with its
-   reason). The worker re-evaluates limits every 10 s and on events (power, network change).
+   reason). The worker re-evaluates limits every 10 s, at once after `limits set`, and when a task
+   ends. Power and network-change events from the operating system are not subscribed to: the 10 s poll
+   covers them.
 2. **New tasks.** In `paused` or `held`, every assignment is refused at once with
-   `Task rejected by worker: paused: <reason>` (or `...: no gpu tasks` for a GPU task under
-   `--no-gpu-tasks`), exit 1, zero run time: an older master already hands it back without a retry.
+   `Task rejected by worker: paused: <reason>`, exit 1, zero run time: an older master already hands it
+   back without a retry. A GPU task under `--no-gpu-tasks` is refused with
+   `Task rejected by worker: no gpu tasks`, deliberately without `paused:`, so a master never holds the
+   whole worker back for it (D3.2). `<reason>` is a generic category (`on battery`, `metered network`,
+   `outside allowed hours`, `daily task-hours cap reached`, `host cpu above limit`, or the text given to
+   a hand pause), never the schedule itself.
 3. **Running tasks.** A hand pause ends running tasks within 5 s (process tree kill,
    `crates/worker/src/process_tree.rs`) and reports each with the same refusal text, so they rerun
    elsewhere uncharged. A limit (battery, hours, metered, CPU) only stops new tasks and lets running ones
    finish, unless the contributor sets `--hold-ends-tasks`.
-4. **Control channel.** The worker serves a local channel only the same user can open: a named pipe
-   `\\.\pipe\oxideswarm-<user>-<worker-name>` with a DACL for the user on Windows, a Unix socket
-   `<state dir>/control.sock` with mode 600 elsewhere. Requests are one JSON line each: `status`,
-   `pause [until]`, `resume`, `limits get`, `limits set <key> <value>` (written back to the configuration
-   file). `oxideswarm worker pause|resume|status|limits` are thin clients; the tray app (design 0112) uses
-   the same channel.
+4. **Control channel.** The worker serves a local channel only the same user can open
+   (`crates/worker/src/control.rs`):
+   - **Windows:** a named pipe `\\.\pipe\oxideswarm-<user>-<name>`, where `<name>` is the worker's
+     `--name` or `default`, with the DACL `D:P(A;;GA;;;OW)` (owner only) and remote clients refused.
+   - **Elsewhere:** a Unix socket `[<name>.]control.sock` (mode 600) in `$XDG_RUNTIME_DIR/oxideswarm/`
+     when that variable is set, else in the OxideSwarm home (`$OXIDESWARM_HOME`, default
+     `~/.oxideswarm`); the directory is mode 700, owned by the user and not a link, and the peer's uid is
+     checked.
+   - `--control-socket <PATH>` / `RUSTY_GRID_CONTROL_SOCKET` names the endpoint instead.
+
+   One request per connection, one tagged JSON line of at most 8 KiB each way. Requests (`op`):
+   `status`, `pause` (`until_epoch_ms`, `reason`, both optional), `resume`, `limits_get`,
+   `limits_set` (`key`, `value`, written back to the `[worker]` table of the configuration file, rolled
+   back if the write fails). Replies (`status`): `status` (a snapshot), `ok` (message and snapshot),
+   `limits` (the limits and the configuration path), `error` (message). `oxideswarm worker
+   pause|resume|status|limits` are thin clients (`worker pause --until <WHEN>` takes `30s`, `5m`, `2h`,
+   `1d`, `HH:MM` or RFC 3339, plus `--reason`, `--name`, `--control-socket`, `--json`); the tray app
+   (design 0112) uses the same channel.
 
 ### D3 Master hold-back (NET-9a, master side)
 
 1. A refusal whose text holds `rejected by worker: paused` puts that worker session in a hold-back set
-   for 60 s (doubling to at most 10 minutes while refusals continue; cleared by a heartbeat that shows a
-   finished task or by a new session). The scheduler skips held-back workers in `view_fits`; their tasks
-   go to other workers or wait in the queue.
-2. `--no-gpu-tasks` refusals hold back only GPU tasks on that worker.
-3. `workers` and `ClusterStatus` show `state:paused` for a held-back worker (a master-added tag, so no
-   wire change); `doctor` reports a paused worker as a warning, not a failure.
-4. An older master without D3 still hands tasks back; it may offer them to the paused worker again, which
+   for 60 s (doubling to at most 10 minutes while refusals continue). It is cleared by a task result
+   from that worker that is not a refusal, or by a new session: a worker that resumes or whose limit
+   clears while idle registers again at once, so its hold-back ends without waiting. The scheduler leaves
+   held-back workers out of the schedulable set (`list_schedulable_workers`, the worker attribute index
+   and the placement engine); their tasks go to other workers or wait in the queue.
+2. `--no-gpu-tasks` refusals hold back only GPU tasks on that worker; CPU tasks still go to it and it
+   keeps `state:connected`.
+3. `workers` and `ClusterStatus` show `state:paused` for a worker under a full hold-back (a master-added
+   tag, so no wire change); `doctor` reports a paused worker as a warning, not a failure, and skips its
+   active probes.
+4. A held-back or GPU-paused worker is still a *registered* worker that can take the task later, so
+   `fail_unfulfillable_tasks` never fails a task because the only workers able to run it are paused:
+   the task waits.
+5. An older master without D3 still hands tasks back; it may offer them to the paused worker again, which
    costs a round trip per offer, not a failed task. Release notes say to upgrade the master first.
 
 ## Compatibility
@@ -140,3 +170,8 @@ start that it cannot tell and treats the network as unmetered.
 - 2026-11-26: Draft, the design record that NET-9 asks for, written for release 0.4.7 (owner's plan of
   the 0.4.x milestones the same day: 0.4.7 = the developer toolset of design 0110 and contributor
   controls). It is the base of the tray app of design 0112.
+- 2026-11-27: Revised after agent-win-2's design-vs-code review (comment on #472 against #478 at
+  `c6542ee9` and #481 at `79305f35`): D2.4 now records the endpoints and the JSON-line schema the code
+  uses, D2.2 the separate GPU refusal text, D2.1 the polling, D3.1 how a hold-back clears; D3.4 is new
+  (the code still failed such tasks; fixed in #478); macOS metered detection is a follow-up;
+  `--hold-ends-tasks` is listed with the settings (missing from `limits get|set` in #481; fixed there).
