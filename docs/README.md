@@ -14,6 +14,7 @@ before adding or changing a document.
 | [guides/self-hosted-relay.md](guides/self-hosted-relay.md) | Runbook: run a self-hosted `iroh-relay` server and point master, worker, and clients at it with `--relay-url` | Users |
 | [guides/mcp-client-setup.md](guides/mcp-client-setup.md) | Runbook: connect Claude Code, Codex, or Cursor to `oxideswarm mcp` over stdio | Users, coding agents |
 | [guides/offload-cargo-test.md](guides/offload-cargo-test.md) | Runbook: offload `cargo test` from a local checkout to a persistent worker workspace via `submit --workspace` or `oxideswarm mcp` | Users, coding agents |
+| [guides/test-matrix-on-the-grid.md](guides/test-matrix-on-the-grid.md) | Runbook: fan out `submit --matrix` and `oxideswarm shard` across workers, read JSON and human cell results, and re-run failed cells (`ADOPT-4`, `AX-1`) | Users, coding agents |
 | [guides/multi-agent-collaboration.md](guides/multi-agent-collaboration.md) | Runbook: cross-machine coding agent coordination and root-cause diagnostics via `OxideSwarm_Agent_Hub` | Coding agents |
 | [guides/gpu-workloads.md](guides/gpu-workloads.md) | Runbook: run GPU command tasks (CUDA, OptiX, Metal, `wgpu`, Blender, PyTorch) under `--isolation fs` with `--isolation-read-dir` and `--vram-mb` | Users, coding agents |
 | [guides/cut-a-release.md](guides/cut-a-release.md) | Runbook: prepare a release pull request, tag, verify `SHA256SUMS` and provenance attestations, and smoke-test the macOS and Windows archives (`LV-15`) | Owner, releasers |
