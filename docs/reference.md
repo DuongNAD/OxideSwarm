@@ -30,7 +30,7 @@ writing standard in [docs/README.md](README.md#writing-standard)).
 
 Use the two-step installer scripts (`scripts/install.sh` on macOS/Linux, `scripts/install.ps1` on
 Windows), download the archives by hand from the
-[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.5`), or
+[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.6`), or
 [build from source](#build-from-source).
 
 `scripts/install.sh` (bash 3.2 compatible) and `scripts/install.ps1` (Windows PowerShell) install
@@ -38,13 +38,13 @@ Windows), download the archives by hand from the
 service setup, no daemon start, and no edits to `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`):
 
 ```bash
-# macOS / Linux (defaults: --version 0.4.5, --dir "$HOME/.local/bin")
+# macOS / Linux (defaults: --version 0.4.6, --dir "$HOME/.local/bin")
 curl -fsSLO https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.sh
 bash install.sh [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
 ```
 
 ```powershell
-# Windows (defaults: --version 0.4.5, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
+# Windows (defaults: --version 0.4.6, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
 Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
 # PowerShell flag names (-Version, -Dir, -Gpu, -DryRun, -Help) are also accepted.
@@ -70,21 +70,21 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
-tar -xzf oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz
+gh attestation verify oxideswarm-0.4.6-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
+tar -xzf oxideswarm-0.4.6-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.4.5-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.4.5-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.6-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.6-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-gh attestation verify .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
-Expand-Archive .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
+Expand-Archive .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.5-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.6-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
@@ -401,7 +401,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.4.5` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.6` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
@@ -711,8 +711,8 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 #### `oxideswarm worker` Flags
 | Flag / Alias | Default / Env / Config | Description |
 | :--- | :--- | :--- |
-| `--master <ADDR\|auto>` | `127.0.0.1:8088` (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`) |
-| `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN |
+| `--master <ADDR\|auto>` | `127.0.0.1:8088` when no P2P ticket is set (`RUSTY_GRID_MASTER_ADDR`, `RUSTY_GRID_MASTER`, `[worker].master`) | Master grid port address (`HOST:8088`, bare `HOST`, or `auto` for LAN discovery; passing a P2P ticket here fails upfront with a hint to use `--p2p-ticket`; when set alongside `--p2p-ticket`, acts as TCP fallback if P2P dial fails) |
+| `--p2p-ticket <TICKET>` | `RUSTY_GRID_P2P_TICKET`, `[worker].p2p_ticket` | Iroh P2P connection ticket for joining a remote master across NAT/WAN (dials P2P only with no TCP fallback to `127.0.0.1:8088` unless an explicit `--master` / env / `[worker].master` address is also configured) |
 | `--relay-url <URL>` | n0 public relays (`RUSTY_GRID_RELAY_URL`, `[worker].relay_url`) | Custom `https://` iroh relay URL (`RelayMode::Custom` on `presets::Minimal`; refused without `https://`, with `user:password` credentials, or when `RUSTY_GRID_P2P_MINIMAL` is enabled, [design 0049](design/0049-custom-relay.md)) |
 | `--name <NAME>` | Hostname (`RUSTY_GRID_WORKER_NAME`, `RUSTY_GRID_NAME`, `[worker].name`) | Worker node name override; persists worker UUID in `~/.oxideswarm/worker_id.<NAME>` |
 | `--tag <TAG>` | Repeatable (`RUSTY_GRID_WORKER_TAGS`, `[worker].tags`) | User tag advertised to the master and matched by `submit --require-tag` (`os:`, `arch:`, `slots:`, `link:`, `id:`, `state:`, `iso:`, `tool:`, `feat:`, `ext:`, `proto:`, `opt:`, and `speed:` are reserved) |
@@ -816,7 +816,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `oxideswarm result <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `-w` / `--wait`, `--json`, `--output-dir <DIR>`, `--insecure` | Fetch stdout/stderr, exit code, and output blobs for task `<ID>` |
 | `oxideswarm cancel <ID>` | `<ID>`, `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | Cancel a queued or running task `<ID>` and terminate its worker process tree |
 | `oxideswarm mapreduce` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--input <FILE_OR_TEXT>` (required, repeatable), `--mapper <NAME_OR_SCRIPT>` (default `word_count`), `--map-cmd <CMD>`, `--reducer <NAME_OR_SCRIPT>` (default `sum`), `--reduce-cmd <CMD>`, `--chunks <N>` (default `4`), `--timeout-secs <SECS>` (default `60`, `[submit].timeout_secs`), `--json`, `--insecure` | Partition inputs across workers, run built-in (`word_count`, `line_count`, `identity` / `sum`, `count`, `max`, `min`, `concat`), local script (`--mapper` / `--reducer`), or worker command (`--map-cmd` / `--reduce-cmd`) stages |
-| `oxideswarm doctor` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
+| `oxideswarm doctor` | `--master <ADDR\|auto\|TICKET>`, `--relay-url <URL>`, `--expect-workers <N>` (default `1`), `--probe-timeout-secs <SECS>` (default `60`), `--gpu-dim <N>` (default `512`), `--spread-tasks <N>`, `--skip-gpu`, `--skip-spread`, `--skip-throughput`, `--json`, `--insecure` | End-to-end cluster verification across C1 (master reachable), C2 (worker count), C3 (pinned echo per worker), C4 (shell script per worker), C5 (GPU GEMM probe), C6 (multi-worker spread), C7 (link kind: warns for a relayed worker) and C8 (an 8 MiB blob moved to each direct/TCP worker, or 1 MiB as a warning with rate for a relayed worker, MB/s). The worker table has a `LINK` column (`direct`, `relay`, `tcp` plus the round-trip time) |
 | `oxideswarm secret generate` | `--out <PATH>`, `--force`, `--print` | Generate a 256-bit random cluster secret file (`0600` permissions; default `~/.oxideswarm/cluster.secret`) |
 | `oxideswarm secret show` | `--raw`, `--dashboard-token` | Show the resolved secret source + fingerprint, raw 64-char hex (`--raw`), or derived dashboard admin bearer token (`--dashboard-token`) |
 | `oxideswarm secret join-token` | `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>` | Print a join token (`oxs1-join:...`: the master address, an optional P2P ticket and the cluster secret, with an integrity tag) to stdout, with a warning on stderr. The token is as sensitive as the secret. Without `--master`, the `[master] listen` of the config file is used unless it is a wildcard |

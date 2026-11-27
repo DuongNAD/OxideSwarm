@@ -90,13 +90,15 @@ stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.
   0.2.0 and before the model items of design 0062. The plan is in
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 were decided by the owner on 2026-11-19; TEST-24 step 1 (harness and loopback record) is in pull request 374.
-- Releases (2026-11-25): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
+- Releases (2026-11-28): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
   released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, `0.4.2` adds
   `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes, `0.4.3` closes every lane of a
   revoked member (ENROLL-1c), `0.4.4` fixes the Windows USB kit (BUG-29 to BUG-32) and hardens the
   Windows workspace root (SEC-17), and `0.4.5` fixes the USB kit update on Windows (BUG-38), the macOS
   RAM reading (BUG-37) and the macOS spawn stall (BUG-35), with the test campaign of TEST-57 to TEST-99
-  (TEST-70 to TEST-72, TEST-75 and TEST-76 did not land). Stability releases with no wire change
+  (TEST-70 to TEST-72, TEST-75 and TEST-76 did not land), and `0.4.6` is the stability release: the exit
+  check of Q80 as revised by Q103 holds, with BUG-40 and BUG-41 and the test items TEST-86 to TEST-102.
+  Stability releases with no wire change
   continue as `0.4.x` (Q80). `0.5.0` is the protocol 11 release for coding agents and machines working on one
   project: bet A of design 0056 with the shared plan, path leases, verify gate and grid mailbox of design 0111
   (Q101, which replaces the order of Q81). `0.6.0`, language model serving across machines, is Design only. The
@@ -179,10 +181,10 @@ number does not fix its content in advance.
 | `0.4.3` | Revocation closes every connection lane of a member (ENROLL-1c), fuzz targets for every untrusted parser (LV-1, LV-18), SAFETY comments for every `unsafe` site (LV-4), BUG-27, BUG-28, the launcher start race (TEST-35) and test fixes (TEST-50 to TEST-54) | Released on 2026-11-18, no wire change | Nothing |
 | `0.4.4` | The Windows USB kit: the folder menu, uninstall of older kits, the worker check, and `-Isolation fs` with `--workspaces` (BUG-29 to BUG-32); the Windows workspace root refuses junctions and symbolic links in every folder from home down and hard-linked marker or lock files (SEC-17); the run summary of `submit --wait` (ADOPT-2); build provenance for every archive (LV-5); `ox-mode dev cluster` on OS-picked ports (TEST-52) and test fixes (TEST-29, TEST-31, TEST-55, TEST-56) | Released on 2026-11-19, no wire change | Nothing |
 | `0.4.5` | The Windows USB kit update replaces a running worker's binary and the uninstall prompt names the folder (BUG-38); macOS available RAM read correctly with `sysinfo` 0.38 and `doctor` probes without a RAM floor (BUG-37); macOS task spawns serialised (BUG-35) and the worker supervisor fixes BUG-33 and BUG-34; the printed Windows `icacls` remedy (BUG-39); Windows tasks without console windows (TEST-88); install scripts (ADOPT-3); client-side `submit --matrix` and `shard` (AX-1, AX-2 Partial), process-task checkpoints (FEAT-5), Agent Mesh verified delivery (MESH-2, MESH-3), 3D routing (3D-2, 3D-3); endurance harness and records (TEST-24 to TEST-26) and test fixes (TEST-57 to TEST-99; TEST-70 to TEST-72, TEST-75 and TEST-76 did not land) | Released on 2026-11-25, no wire change | Nothing |
-| `0.4.6` | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md): the open test items (TEST-86, TEST-90, TEST-93, TEST-95, TEST-100, TEST-101), TEST-26 green, the TEST-24 and TEST-25 records, BUG-40 and BUG-41 | Planned for about 2026-12-01. The owner kept the seven days of clean `master` runs on 2026-11-26 | The exit check under "Stability" (Q80) |
-| `0.4.7` | Machines set up from a USB kit take every task kind, and their owners control them: the developer toolset of [design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1, TOOL-3, TOOL-4, TOOL-5) and the contributor controls of design 0113 (pull request 472) (NET-9a, NET-9b) | Planned for about 2026-12-08. Prepared as draft pull requests while `0.4.6` waits; merged after its tag | `0.4.6` |
-| `0.4.8` | Several coding agents on one project without a wire change: TEAM-1 to TEAM-5 of [design 0111](design/0111-team-plan-leases-and-verify-gate.md) (shared plan and snapshot, path leases, verify gate, circuit breaker, merge flow) and the rest of AX-2; this project runs one wave on the plan | Planned for about 2026-12-15. Prepared as draft pull requests while `0.4.6` waits | `0.4.7` |
-| `0.4.9` | The tray app of design 0112 (TRAY-1 to TRAY-3, and TRAY-4 when it needs no wire change): the worker in the background with its state in view, Pause, limits, first-run join and updates | Planned for about 2026-12-22; it may merge into `0.4.8` if both are ready | `0.4.8` and NET-9a |
+| `0.4.6` | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md): the open test items (TEST-86, TEST-90, TEST-93, TEST-95, TEST-100, TEST-101), TEST-26 green, BUG-40 and BUG-41 | Released on 2026-11-28 at protocol 10 (release pull request; no wire change, store format 4) | Nothing |
+| `0.4.7` | Machines set up from a USB kit take every task kind, and their owners control them: the developer toolset of [design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1, TOOL-3, TOOL-4, TOOL-5) and the contributor controls of design 0113 (pull request 472) (NET-9a, NET-9b); the TEST-24 and TEST-25 records (Q103) | Planned for about 2026-11-30. Prepared as draft pull requests while `0.4.6` waits; merged after its tag | `0.4.6` |
+| `0.4.8` | Several coding agents on one project without a wire change: TEAM-1 to TEAM-5 of [design 0111](design/0111-team-plan-leases-and-verify-gate.md) (shared plan and snapshot, path leases, verify gate, circuit breaker, merge flow) and the rest of AX-2; this project runs one wave on the plan | Planned for about 2026-12-03. Prepared as draft pull requests while `0.4.6` waits | `0.4.7` |
+| `0.4.9` | The tray app of design 0112 (TRAY-1 to TRAY-3, and TRAY-4 when it needs no wire change): the worker in the background with its state in view, Pause, limits, first-run join and updates | Planned for about 2026-12-10; it may merge into `0.4.8` if both are ready | `0.4.8` and NET-9a |
 | `0.5.0` | Coding agents and machines on one project (Q101): AX-1 to AX-3 and CACHE-1 of design 0056, TEAM-1 to TEAM-7 of [design 0111](design/0111-team-plan-leases-and-verify-gate.md), with protocol 11 for the grid mailbox (TEAM-6). The toolset of [design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1 to TOOL-5) and TEAM-1 to TEAM-5 need no wire change and may ship in `0.4.x` first | Planned. AX-1 and the client part of AX-2 shipped in `0.4.5`; the TEAM and TOOL items are in the BACKLOG Index | The stability release (Q80) |
 | `0.6.0` | Language model serving across machines ([design 0067](design/0067-multi-node-llm-serving-and-admission.md)) | Design only. No item of it is in the BACKLOG Index | `0.5.0`, and the steps under "Before 0.6.0 has items" |
 
@@ -231,9 +233,13 @@ that run stably, is not reached.
 Release `0.4.0` ships the first goal. Its notes in pull request 280 describe the upgrade path and
 make no statement about stability.
 
-**Exit check (Q80):** every failing test above has an item, and each of those
-items is Implemented with its loop of runs recorded; TEST-24 and TEST-25 each have one dated record;
-and `master` has seven days of runs for pushes in which no test fails.
+**Exit check (Q80, revised by Q103 on 2026-11-27):** every failing test above has an item, and each of
+those items is Implemented with its loop of runs recorded; and `master` has at least three days since
+its last run for a push in which a test failed, with at least 30 runs for pushes in a row, each with
+every job on Linux, macOS and Windows green. Runs started by hand (`workflow_dispatch`) on the `master`
+head may add to the loops of TEST-26 and TEST-86 but not to the 30 runs for pushes. The TEST-24 and
+TEST-25 records move to `0.4.7`. Between later `0.4.x` releases, one to two days of green runs after
+the last merge are enough when the code was reviewed as a draft before.
 
 ### Before 0.6.0 has items
 
@@ -784,6 +790,7 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
 | Q97 | Does Stage 1 of design 0094 run in parallel with release `0.5.0`? | Yes, decided by the owner on 2026-11-19 at the recommended answer: one lane at most beside `0.5.0` and bet A, with implementation merged after the stability release (Q80) and docs-only or test-only work before it |
 | Q98 | Does trial APP-1 run with another application while LIVA is on hold (design 0061)? | Yes, decided by the owner on 2026-11-24: a coding agent that uses an OpenAI-compatible endpoint (for example aider or opencode); LIVA follows as the second application once it starts on macOS and has its Cloud provider |
 | Q101 | What does `0.5.0` carry: language model serving (design 0067), or coding agents and machines on one project (bet A and design 0111)? | Coding agents and machines on one project, with protocol 11; language model serving moves to `0.6.0`. Decided by the owner on 2026-11-26 ("Là 0.5.0"). It replaces the release order of Q81 |
+| Q103 | Can the wait for `0.4.6` and the releases after it be shorter? | Yes, decided by the owner on 2026-11-27 ("làm cả ba"): (1) the exit check counts runs (three days, 30 green runs for pushes in a row) instead of seven days; (2) the TEST-24 and TEST-25 records move to `0.4.7`; (3) `0.4.7`, `0.4.8` and `0.4.9` follow two to four days apart, since their code waits as reviewed drafts. On 2026-11-27 `master` had 60 green runs for pushes in a row since the last failure (2026-11-24 18:43 UTC) |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to from any network, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09: ENROLL-1, JOIN-2 and USB-1 at the top of Phase E. B needs VM-level isolation per task, abuse handling and its own design, and waits for real users |
 
 ## Risks
@@ -972,3 +979,4 @@ Q64 to Q67 in [design 0076](design/0076-protocol-compatibility-and-release-train
   `0.4.9` the tray app (design 0112). Their work is prepared as draft pull requests while `0.4.6` waits.
   The dates are estimates; a release still takes what is merged (design 0076, D1), and every tag needs
   the owner.
+- 2026-11-27: Q103 decided by the owner: a shorter exit check for `0.4.6` (three days and 30 green runs for pushes), the TEST-24 and TEST-25 records move to `0.4.7`, and `0.4.7` to `0.4.9` follow a few days apart. New estimates: `0.4.6` about 2026-11-28, `0.4.7` about 2026-11-30, `0.4.8` about 2026-12-03, `0.4.9` about 2026-12-10.
