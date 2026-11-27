@@ -1,7 +1,7 @@
 # 0109: Live output streaming, `logs`, and MCP tasks (`AX-3`)
 
 Status: Draft
-Created: 2026-11-24    Updated: 2026-11-26
+Created: 2026-11-24    Updated: 2026-11-27
 
 ## Summary
 
@@ -102,7 +102,7 @@ Add **opt-in** per-task live `stdout`/`stderr` streaming from executing workers 
      - `crates/core/src/protocol/client_msg_mirrors.rs` (`HumanClientMessage` / `BinaryClientMessage` + all four `From` impls + `protocol_version: u32` field and `from_client_message` / `protocol_version()` match arms)
      - `crates/core/src/protocol/client_resp_mirrors.rs` (`HumanClientResponse` / `BinaryClientResponse` + all four `From` impls + `protocol_version: u32` field and `from_client_response` / `protocol_version()` / `is_error()` match arms)
 5. **Capability bit (`crates/core/src/protocol.rs`):**
-   - Allocate the next unused flag bit after `TREE_V2` (`1 << 13`):
+   - Allocate the next unused flag bit after `TREE_V2` (`1 << 13`) — checked against the open protocol `11` draft branches (`#386`, `#487` `TEAM-6`, and `#412` `CACHE-1`), all of which stop at `TREE_V2 = 1 << 13`:
      ```rust
      /// Live task stdout/stderr chunk streaming (`WorkerMessage::TaskOutputChunk`, `AX-3`).
      pub const LIVE_OUTPUT: Self = Self(1 << 14);
@@ -141,21 +141,21 @@ Add **opt-in** per-task live `stdout`/`stderr` streaming from executing workers 
   - `SubscribeTaskOutput { task_id, after_seq, follow }` filters on `chunk.seq > after_seq.unwrap_or(0)` using `broker_seq`, so attempt `2` output is never dropped on failover/retry. When `attempt` increments, CLI `--follow` / `logs` may optionally emit a short boundary notice to `stderr`.
 - **Master session auth, connection lifecycle & RBAC:**
   - `WorkerSession` authorizes every `WorkerMessage::TaskOutputChunk` strictly from the TLS/OXS-AUTH-verified session `(worker_id, session_id)` owning `task_id`; mismatched or post-terminal chunks are dropped (`warn!` on claimed mismatch).
-  - Under OXS-AUTH v3, add `ClientMessage::SubscribeTaskOutput { .. }` to the `member.has_client_role()` match arm of `check_v3_client_message_role` (`crates/master/src/server/handshakes.rs`), matching `GetTaskStatus` and `GetTaskResult`.
+  - Under OXS-AUTH v3, add `ClientMessage::SubscribeTaskOutput { .. }` to the `member.has_client_role()` match arm of `check_v3_client_message_role` (`crates/master/src/server/handshakes.rs`), matching `GetTaskStatus` and `GetTaskResult` (cluster-scoped client authorization; OxideSwarm has no per-submitter task ACL today).
   - In `handle_client_connection` (`crates/master/src/server/client_and_members.rs`), `ClientMessage::SubscribeTaskOutput` transitions that dedicated client connection into a multi-frame streaming loop sending `ClientResponse::TaskOutputChunk*` -> `ClientResponse::TaskOutputEnd` and then closing cleanly (or terminating early on client disconnect, write timeout, `shutdown_rx`, or OXS-AUTH v3 `MemberConnections` revocation disconnect per `handshakes.rs`). `ClientMessage::SubmitTask { wait: true }` retains its existing single-response semantics on its own connection.
 
 ### D4: CLI (`submit --wait --follow` and `oxideswarm logs <task>`)
 
 - **Flags & `clap` validation (`crates/cli/src/cli_app.rs` & `crates/cli/src/cli_app/submit.rs`):**
-  - `SubmitArgs` adds `--follow: bool` (requires or implies `--wait`; note `SubmitArgs` has `--wait: bool` and no `--detach` flag, and invalid combinations fail with `clap` exit code `2`).
+  - `SubmitArgs` adds `--follow: bool`, which implies `--wait` (matching `--matrix` in [design 0101](0101-matrix-fanout.md) D1) and conflicts with `--matrix` and `--verify` (rejected by `clap` with exit code `2`). Note `SubmitArgs` has `--wait: bool` and no `--detach` flag.
 - **Race-free streaming submission flow:**
   - When `--follow` is active, CLI attaches `ExtensionInfo` `"live-output"` (`[0x01]`), issues `ClientMessage::SubmitTask { wait: false, .. }` **first** to obtain `ClientResponse::TaskSubmitted { task_id }`, then opens the dedicated companion `SubscribeTaskOutput { task_id, after_seq: None, follow: true }` stream while waiting for completion / `GetTaskResult` (and downloading `--output` files). This eliminates any client-side `task_id` admission race against `SubscribeTaskOutput`.
 - **Stream formatting & UTF-8 rules:**
   - In raw mode, write `OutputStream::Stdout` bytes verbatim to local `stdout` and `OutputStream::Stderr` bytes verbatim to local `stderr` (emitting at most one `stderr` notice if `dropped_bytes > 0` or `attempt > 1`). Avoid re-printing `TaskResult` raw `stdout`/`stderr` at exit if streaming completed cleanly without drops.
   - In `--json` mode and MCP JSON-RPC text payloads, decode non-UTF-8 sequences / split multi-byte sequences at `16 KiB` chunk boundaries using `String::from_utf8_lossy` (buffering trailing incomplete UTF-8 sequences `<= 3` bytes until the next chunk or stream end) rather than failing JSON serialization.
-  - Document `Ctrl+C` semantics cleanly: `Ctrl+C` during `oxideswarm submit --wait --follow` behaves consistently with `submit --wait` (sends `CancelTask` / prompts termination as designed for active submissions unless `--no-cancel-on-interrupt` applies), whereas `Ctrl+C` during `oxideswarm logs -f <task>` detaches from following cleanly (exit `130` or `0`? Wait — exit `0` / standard SIGINT detach without cancelling the remote task).
+  - Document `Ctrl+C` semantics cleanly: `Ctrl+C` during `oxideswarm submit --wait --follow` sends best-effort `CancelTask` (matching `oxideswarm shard` in `crates/cli/src/cli_app/shard.rs`) and exits `130`, whereas `Ctrl+C` during `oxideswarm logs -f <task>` detaches locally and exits `130` without cancelling the remote task.
 - **`oxideswarm logs <TASK_ID>` (`crates/cli/src/cli_app/tasks.rs`):**
-  - Flags: `<TASK_ID>`, `--follow` / `-f`, `--tail <BYTES_OR_LINES>`, `--json`.
+  - Flags: `<TASK_ID>`, `--follow` / `-f`, `--tail <LINES>` (last `N` buffered lines), `--tail-bytes <BYTES>` (last `N` buffered bytes; mutually exclusive with `--tail`, failing via `clap` with exit code `2`), and `--json`.
   - Streams via `SubscribeTaskOutput` and falls back transparently to `GetTaskResult` when a task ran on a `v10` worker, omitted `"live-output"`, or aged past live broker eviction.
 
 ### D5: MCP `2026-07-28` (`io.modelcontextprotocol/tasks`) and `2024-11-05` / `Q55` Fallback (`crates/cli/src/mcp.rs`)
@@ -188,7 +188,7 @@ Add **opt-in** per-task live `stdout`/`stderr` streaming from executing workers 
 ## Security
 
 - **Peer identity & spoofing:** `WorkerSession` authorizes `WorkerMessage::TaskOutputChunk` strictly from the TLS/OXS-AUTH-verified `(worker_id, session_id)` owning `task_id`; body `worker_id` values from another worker or stale session are ignored (`warn!`).
-- **OXS-AUTH v3 RBAC & revocation:** `SubscribeTaskOutput` requires `member.has_client_role()` in `check_v3_client_message_role` (`crates/master/src/server/handshakes.rs`), and active `SubscribeTaskOutput` streams terminate immediately on `MemberConnections` revocation.
+- **OXS-AUTH v3 RBAC & revocation:** `SubscribeTaskOutput` uses the same cluster-scoped `member.has_client_role()` check in `check_v3_client_message_role` (`crates/master/src/server/handshakes.rs`) as `GetTaskStatus` and `GetTaskResult` (no per-submitter task ACL exists today), and active `SubscribeTaskOutput` streams terminate immediately on `MemberConnections` revocation.
 - **Exhaustion defenses:** Post-decode / pre-buffer `MAX_LIVE_OUTPUT_CHUNK_BYTES = 16 KiB` (session closed on violation), `256 KiB` per-task ring cap, `32 MiB` global broker budget coupled to `TaskQueue` eviction, `16`/task + `256` global subscriber caps with `64`-depth zero-copy `try_send`, `LIVE_QUEUE_CAPACITY = 64`, and biased writer prioritization preserving `TaskResult`/`Checkpoint`/`BlobRequest`.
 - **MCP/JSON hygiene & Windows console rules:** `CREATE_NO_WINDOW` stays enforced on all Windows worker/E2E subprocesses ([design 0108](0108-windows-tasks-without-console-windows.md)), raw bytes stay strictly out of MCP stdout (`lossy UTF-8` JSON-RPC escaping), and `truncate_stream_for_llm` bounds tail excerpts.
 
@@ -230,3 +230,4 @@ The right column is a recommended default from [design 0064](0064-research-of-20
 
 - 2026-11-24: Draft design record `0109` written (`E-M4`, docs only — zero code merged in `0.4.x`); `Q55` remains open.
 - 2026-11-26: Updated against `origin/master` (`034f5725`) and `agent-win` reviews (`2026-11-25` & `2026-11-26`): targeted `0.5.0` / protocol `11` (`Q101`), specified opt-in [design 0082](0082-task-extension-slot.md) `"live-output"` task extension, `Session::data_tx` isolation with `biased` writer priority, `32 MiB` broker accounting coupled with `TaskQueue` eviction, master-monotonic `broker_seq` across retries, `SubscribeTaskOutput` OXS-AUTH v3 lifecycle, [design 0083](0083-one-version-window.md) mirror/previous-layout checklist, Windows pipe-buffering / UTF-8 / `Ctrl+C` semantics, and concrete `Q55` defaults.
+- 2026-11-27: Merged `origin/master` (`07caa5ae`), verified `ProtocolCapabilities::LIVE_OUTPUT` (`1 << 14`) against open protocol `11` drafts (`#386`, `#487`, `#412`), finalized cluster-scoped `member.has_client_role()` RBAC, `--follow` (`clap` implies `--wait`, conflicts with `--matrix` and `--verify`), `--tail <LINES>` / `--tail-bytes <BYTES>`, and `Ctrl+C` (`130`) semantics; ready for owner acceptance (`Status: Draft` and `Q55` open until owner decision).
