@@ -68,16 +68,28 @@ face.
    arguments and environment (today's `start-worker.vbs` contents), restarts it with backoff if it dies,
    and ends it on Quit. On Linux without a tray (some desktops), it falls back to today's systemd unit and a
    `--status` command line.
-2. It talks to the worker over a local control channel that only the same user can open: a named pipe
-   `\\.\pipe\oxideswarm-<user>-worker` on Windows, a Unix socket in the install's state folder (mode 600)
-   elsewhere. The worker serves it (part of NET-9's `pause`/`resume`) with `status`, `pause`, `resume`,
-   `limits get|set`. No network port is opened.
+2. It talks to the worker over the local control channel of design 0113 (#472)
+   D2.4 (`crates/worker/src/control.rs`), which only the same user can open: the named pipe
+   `\\.\pipe\oxideswarm-<user>-<name>` on Windows, the socket `[<name>.]control.sock` (mode 600) in
+   `$XDG_RUNTIME_DIR/oxideswarm/` or the OxideSwarm home elsewhere, where `<name>` is the worker's
+   `--name` (`default` when unset); the tray passes the same `--name` or `--control-socket` it gives the
+   worker. One tagged JSON line per request: `status`, `pause`, `resume`, `limits_get`, `limits_set`. No
+   network port is opened.
+   The status snapshot of NET-9a has the state (`running`, `held`, `paused`), its reason, the pause end
+   time, the number of active tasks and the limits. TRAY-1 adds to it, in `control.rs`, what D1.3 to D1.5
+   need and NET-9a does not: whether the worker is connected and over which link (`connected`,
+   `link_kind`), the last error, the master's address and dashboard URL, and a `tasks_started` counter
+   that only grows (a fast task can start and end between two polls). The fields are optional, so an
+   older worker still answers.
 3. Icon states: connected and idle, busy (number of running tasks), paused (with the reason: by hand, on
    battery, a game, hours, metered network), not connected (relay or direct shown on hover), error.
-4. Menu: state line; Pause for 1 h / until I resume; Resume; Limits (CPU %, hours, on battery, metered
-   network, while gaming, GPU on/off); Open dashboard; Open logs; Check for updates; Quit (stops the worker
-   until next logon).
-5. A notice (once) when the first task arrives after install, naming the cluster and how to pause.
+4. Menu: state line; Pause for 1 h / until I resume (`pause` with `until_epoch_ms` one hour ahead, or
+   none); Resume; Limits (CPU %, hours, daily task hours, on battery, metered network, GPU on/off: the
+   `[worker]` keys of design 0113 D1, set with `limits_set`; and while gaming, which is a setting of the
+   tray itself, D4.1); Open dashboard (the URL from `status`); Open logs; Check for updates; Quit (no
+   request: the tray ends the worker it started, which stops it until next logon).
+5. A notice (once) when the first task arrives after install, naming the cluster and how to pause
+   (`tasks_started` going above zero for the first time).
 
 ### D2 First run and join (TRAY-2)
 
@@ -105,9 +117,13 @@ face.
    full-screen window of another app on the active display; on Linux, the `_NET_WM_STATE_FULLSCREEN`
    window or the desktop's inhibit API. The tray reads it and sends `pause` with the reason `fullscreen`,
    and `resume` 60 s after it ends.
-2. "GPU on/off" in Limits: off makes the worker stop advertising its GPU for new tasks until it is turned
-   on again (a re-registration or a NET-9 control; the record of NET-9 decides which), so a gamer can lend
-   only the CPU.
+   The worker has one pause slot, so the tray must not overwrite the contributor's own pause or lift it:
+   it sends `pause` only when `status` shows `running`, and `resume` only when the state is still
+   `paused` with the reason `fullscreen`. A pause by hand while a game runs therefore replaces the
+   fullscreen one and stays after the game ends.
+2. "GPU on/off" in Limits is the `no_gpu_tasks` key of design 0113 (`limits_set`): the worker refuses GPU
+   tasks while it is set and the master holds back only GPU tasks for it, so a gamer can lend only the
+   CPU. No re-registration is needed.
 3. The worker already runs task processes below normal priority; GPU work inside the worker cannot be
    pre-empted mid-dispatch (an already submitted wgpu dispatch cannot be interrupted,
    `crates/worker/src/wgpu_engine.rs`), which is why the pause matters for G5.
@@ -123,6 +139,19 @@ Two ways to draw the app:
   `crates/master/src/dashboard.html`; larger, and it needs WebView2 on Windows (present on Windows 11).
 
 Recommendation: **A** first. The app's job is presence and control; rich views exist in the dashboard.
+
+Measured on Windows 11 by agent-win on 2026-11-26 (spike; both drove the NET-9a control channel of
+#478, both pass the licence check of `deny.toml`):
+
+| | A: `tray-icon` 0.21.3 + `muda` 0.17.2 | B: Tauri 2.12.7 |
+|---|---|---|
+| Release binary (size-optimised) | 272 KB | 4.85 MB |
+| Idle memory, tray only | 8.6 MB | 10.6 MB |
+| Idle memory with one window open | (native dialog) | 361 MB over 7 processes |
+| Cold build | 15 s | 192 s |
+| Crates pulled in | 24 | 244 |
+
+The choice is the owner's (Q102).
 
 ## Compatibility
 
@@ -173,3 +202,7 @@ Recommendation: **A** first. The app's job is presence and control; rich views e
   desktop app. The same day the owner's two USB sticks were rebuilt without `--no-autostart`, so a kit
   install starts the worker at logon again (the guide `HUONG-DAN-THU-NGHIEM` says how to stop it). Design
   number, TRAY-1 to TRAY-4 and Q102 claimed with `agent_bridge.py claim`.
+- 2026-11-27: Revised after agent-win-2's design-vs-code review (comment on #469 against #478 at
+  `c6542ee9`): D1.2 uses the endpoints and requests of design 0113 and lists the status fields TRAY-1
+  adds; D1.4 names the keys; D4.1 guards the single pause slot; D4.2 is decided (`no_gpu_tasks`). D5 has
+  the Q102 spike measurements.
