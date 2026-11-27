@@ -30,7 +30,7 @@ writing standard in [docs/README.md](README.md#writing-standard)).
 
 Use the two-step installer scripts (`scripts/install.sh` on macOS/Linux, `scripts/install.ps1` on
 Windows), download the archives by hand from the
-[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.5`), or
+[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.6`), or
 [build from source](#build-from-source).
 
 `scripts/install.sh` (bash 3.2 compatible) and `scripts/install.ps1` (Windows PowerShell) install
@@ -38,13 +38,13 @@ Windows), download the archives by hand from the
 service setup, no daemon start, and no edits to `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`):
 
 ```bash
-# macOS / Linux (defaults: --version 0.4.5, --dir "$HOME/.local/bin")
+# macOS / Linux (defaults: --version 0.4.6, --dir "$HOME/.local/bin")
 curl -fsSLO https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.sh
 bash install.sh [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
 ```
 
 ```powershell
-# Windows (defaults: --version 0.4.5, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
+# Windows (defaults: --version 0.4.6, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
 Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
 # PowerShell flag names (-Version, -Dir, -Gpu, -DryRun, -Help) are also accepted.
@@ -70,21 +70,21 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
-tar -xzf oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz
+gh attestation verify oxideswarm-0.4.6-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
+tar -xzf oxideswarm-0.4.6-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.4.5-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.4.5-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.6-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.6-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-gh attestation verify .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
-Expand-Archive .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
+Expand-Archive .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.5-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.6-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
@@ -401,7 +401,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.4.5` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.6` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|

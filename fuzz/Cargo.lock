@@ -2951,7 +2951,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_grid_cli"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "bincode",
  "blake3",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_master"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "axum",
  "bincode",
@@ -3050,7 +3050,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_grid_worker"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",

@@ -90,13 +90,15 @@ stages with an exit check each; its Stage 1 is Phase 19 of [BACKLOG.md](BACKLOG.
   0.2.0 and before the model items of design 0062. The plan is in
   [design 0065](design/0065-large-transfer-and-long-run-tests.md), with items TEST-24 to TEST-26.
   Q57 to Q59 were decided by the owner on 2026-11-19; TEST-24 step 1 (harness and loopback record) is in pull request 374.
-- Releases (2026-11-25): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
+- Releases (2026-11-28): `0.3.0` and `0.4.0` (an upgrade without stopping the whole cluster) are
   released, `0.4.1` fixes the two defects the Windows smoke test of `0.4.0` found, `0.4.2` adds
   `submit --verify` (VERIFY-1, VERIFY-2) with stability fixes, `0.4.3` closes every lane of a
   revoked member (ENROLL-1c), `0.4.4` fixes the Windows USB kit (BUG-29 to BUG-32) and hardens the
   Windows workspace root (SEC-17), and `0.4.5` fixes the USB kit update on Windows (BUG-38), the macOS
   RAM reading (BUG-37) and the macOS spawn stall (BUG-35), with the test campaign of TEST-57 to TEST-99
-  (TEST-70 to TEST-72, TEST-75 and TEST-76 did not land). Stability releases with no wire change
+  (TEST-70 to TEST-72, TEST-75 and TEST-76 did not land), and `0.4.6` is the stability release: the exit
+  check of Q80 as revised by Q103 holds, with BUG-40 and BUG-41 and the test items TEST-86 to TEST-102.
+  Stability releases with no wire change
   continue as `0.4.x` (Q80). `0.5.0` is the protocol 11 release for coding agents and machines working on one
   project: bet A of design 0056 with the shared plan, path leases, verify gate and grid mailbox of design 0111
   (Q101, which replaces the order of Q81). `0.6.0`, language model serving across machines, is Design only. The
@@ -179,7 +181,7 @@ number does not fix its content in advance.
 | `0.4.3` | Revocation closes every connection lane of a member (ENROLL-1c), fuzz targets for every untrusted parser (LV-1, LV-18), SAFETY comments for every `unsafe` site (LV-4), BUG-27, BUG-28, the launcher start race (TEST-35) and test fixes (TEST-50 to TEST-54) | Released on 2026-11-18, no wire change | Nothing |
 | `0.4.4` | The Windows USB kit: the folder menu, uninstall of older kits, the worker check, and `-Isolation fs` with `--workspaces` (BUG-29 to BUG-32); the Windows workspace root refuses junctions and symbolic links in every folder from home down and hard-linked marker or lock files (SEC-17); the run summary of `submit --wait` (ADOPT-2); build provenance for every archive (LV-5); `ox-mode dev cluster` on OS-picked ports (TEST-52) and test fixes (TEST-29, TEST-31, TEST-55, TEST-56) | Released on 2026-11-19, no wire change | Nothing |
 | `0.4.5` | The Windows USB kit update replaces a running worker's binary and the uninstall prompt names the folder (BUG-38); macOS available RAM read correctly with `sysinfo` 0.38 and `doctor` probes without a RAM floor (BUG-37); macOS task spawns serialised (BUG-35) and the worker supervisor fixes BUG-33 and BUG-34; the printed Windows `icacls` remedy (BUG-39); Windows tasks without console windows (TEST-88); install scripts (ADOPT-3); client-side `submit --matrix` and `shard` (AX-1, AX-2 Partial), process-task checkpoints (FEAT-5), Agent Mesh verified delivery (MESH-2, MESH-3), 3D routing (3D-2, 3D-3); endurance harness and records (TEST-24 to TEST-26) and test fixes (TEST-57 to TEST-99; TEST-70 to TEST-72, TEST-75 and TEST-76 did not land) | Released on 2026-11-25, no wire change | Nothing |
-| `0.4.6` | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md): the open test items (TEST-86, TEST-90, TEST-93, TEST-95, TEST-100, TEST-101), TEST-26 green, BUG-40 and BUG-41 | Planned for about 2026-11-28 (Q103: the exit check counts runs, not seven days; the TEST-24 and TEST-25 records move to `0.4.7`) | The exit check under "Stability" (Q80, as revised by Q103) |
+| `0.4.6` | Stability, the second goal of Phase 12 of [BACKLOG.md](BACKLOG.md): the open test items (TEST-86, TEST-90, TEST-93, TEST-95, TEST-100, TEST-101), TEST-26 green, BUG-40 and BUG-41 | Released on 2026-11-28 at protocol 10 (release pull request; no wire change, store format 4) | Nothing |
 | `0.4.7` | Machines set up from a USB kit take every task kind, and their owners control them: the developer toolset of [design 0110](design/0110-tools-on-kit-machines.md) (TOOL-1, TOOL-3, TOOL-4, TOOL-5) and the contributor controls of design 0113 (pull request 472) (NET-9a, NET-9b); the TEST-24 and TEST-25 records (Q103) | Planned for about 2026-11-30. Prepared as draft pull requests while `0.4.6` waits; merged after its tag | `0.4.6` |
 | `0.4.8` | Several coding agents on one project without a wire change: TEAM-1 to TEAM-5 of [design 0111](design/0111-team-plan-leases-and-verify-gate.md) (shared plan and snapshot, path leases, verify gate, circuit breaker, merge flow) and the rest of AX-2; this project runs one wave on the plan | Planned for about 2026-12-03. Prepared as draft pull requests while `0.4.6` waits | `0.4.7` |
 | `0.4.9` | The tray app of design 0112 (TRAY-1 to TRAY-3, and TRAY-4 when it needs no wire change): the worker in the background with its state in view, Pause, limits, first-run join and updates | Planned for about 2026-12-10; it may merge into `0.4.8` if both are ready | `0.4.8` and NET-9a |
