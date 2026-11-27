@@ -356,6 +356,7 @@ jobs:
       - run: python tests/test_campaign_driver.py
       - run: python tests/test_endurance_harness.py
       - run: python tests/test_study_timer.py
+      - run: python tests/test_host1_scripts.py
       - name: run agent mesh test suite
         run: python tests/run_mesh_simulation_tests.py
 

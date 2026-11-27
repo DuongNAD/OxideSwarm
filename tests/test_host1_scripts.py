@@ -51,6 +51,12 @@ class TestHost1Scripts(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"PowerShell parse error: {proc.stderr}")
 
     def test_dry_run_emits_no_pii_and_valid_json(self):
+        forbidden = [
+            socket.gethostname(),
+            os.environ.get("COMPUTERNAME", ""),
+            os.environ.get("USERNAME", ""),
+            os.environ.get("USER", ""),
+        ]
         if os.name == "nt":
             ps = shutil.which("powershell")
             self.assertIsNotNone(ps)
@@ -90,14 +96,81 @@ class TestHost1Scripts(unittest.TestCase):
                 facts = json.loads(raw_text)
                 for key in ("cpu_model", "physical_cores", "logical_processors", "ram_mib", "thread_sweep", "planned_commands"):
                     self.assertIn(key, facts)
-                forbidden = [
-                    socket.gethostname(),
-                    os.environ.get("COMPUTERNAME", ""),
-                    os.environ.get("USERNAME", ""),
-                    os.environ.get("USER", ""),
-                ]
-                combined = proc.stdout + "\n" + raw_text
-                self.assertEqual(SUMMARIZE.find_pii_leaks(combined, forbidden), [])
+                filtered_stdout = "\n".join(
+                    line for line in proc.stdout.splitlines() if not line.startswith("OUT_DIR=")
+                )
+                self.assertEqual(SUMMARIZE.find_pii_leaks(raw_text, forbidden), [])
+                self.assertEqual(SUMMARIZE.find_pii_leaks(filtered_stdout, forbidden), [])
+        else:
+            bash = shutil.which("bash")
+            self.assertIsNotNone(bash)
+            with tempfile.TemporaryDirectory() as tmp:
+                out2 = os.path.join(tmp, "out-state2")
+                out3 = os.path.join(tmp, "out-state3-cpuonly")
+                m06 = os.path.join(tmp, "Qwen3-0.6B-Q8_0.gguf")
+                m8 = os.path.join(tmp, "Qwen3-8B-Q4_K_M.gguf")
+                with open(m06, "wb") as f1, open(m8, "wb") as f2:
+                    f1.write(b"dummy06b")
+                    f2.write(b"dummy8b")
+
+                p2 = subprocess.run(
+                    [
+                        bash,
+                        SH_PATH,
+                        "--state",
+                        "state2",
+                        "--model-06b",
+                        m06,
+                        "--model-8b",
+                        m8,
+                        "--out-dir",
+                        out2,
+                        "--dry-run",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(p2.returncode, 0, f"sh state2 dry-run failed: {p2.stderr}\n{p2.stdout}")
+                with open(os.path.join(out2, "machine_facts.json"), "r", encoding="utf-8") as fh:
+                    raw2 = fh.read()
+                facts2 = json.loads(raw2)
+                for key in ("cpu_model", "physical_cores", "logical_processors", "ram_mib", "thread_sweep", "planned_commands"):
+                    self.assertIn(key, facts2)
+                self.assertFalse(facts2["cpu_only"])
+                filtered_stdout2 = "\n".join(
+                    line for line in p2.stdout.splitlines() if not line.startswith("OUT_DIR=")
+                )
+                self.assertEqual(SUMMARIZE.find_pii_leaks(raw2, forbidden), [])
+                self.assertEqual(SUMMARIZE.find_pii_leaks(filtered_stdout2, forbidden), [])
+
+                p3 = subprocess.run(
+                    [
+                        bash,
+                        SH_PATH,
+                        "--state",
+                        "state3",
+                        "--tuned",
+                        "--cpu-only",
+                        "--model-06b",
+                        m06,
+                        "--out-dir",
+                        out3,
+                        "--dry-run",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(p3.returncode, 0, f"sh state3 cpu-only dry-run failed: {p3.stderr}\n{p3.stdout}")
+                with open(os.path.join(out3, "machine_facts.json"), "r", encoding="utf-8") as fh:
+                    raw3 = fh.read()
+                facts3 = json.loads(raw3)
+                self.assertTrue(facts3["cpu_only"])
+                self.assertTrue(facts3["tuned"])
+                self.assertIsNotNone(facts3["planned_commands"]["cpu"])
+                self.assertIsNone(facts3["planned_commands"]["gpu_cuda"])
+                self.assertIsNone(facts3["planned_commands"]["gpu_vulkan"])
+                self.assertIsNone(facts3["models"]["qwen3_8b"])
+                self.assertEqual(SUMMARIZE.find_pii_leaks(raw3, forbidden), [])
 
     def test_cpu_only_dry_run_skips_gpu(self):
         if os.name != "nt":
