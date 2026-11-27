@@ -125,7 +125,7 @@ Checks a running master, with the same address and secret resolution as `submit`
 | C6 | Spread | `--spread-tasks <N>` unpinned 500 ms `sleep` tasks (default 4 per worker) complete; with two or more workers, at least two of them ran some (otherwise a warning) |
 
 | C7 | Links | no connected worker is reached through a relay; a relayed worker gives a warning (blob transfers are slower through a relay; a self-hosted relay option is planned, `LINK-1`) |
-| C8 | Blob throughput | an 8 MiB blob (random bytes, new on every run) is uploaded to the master and then fetched by every connected worker, which runs a pinned `cksum` (`certutil -hashfile` on Windows) on it; reports MB/s. A master without a blob store skips it |
+| C8 | Blob throughput | an 8 MiB blob (random bytes, new on every run) is uploaded to the master and then fetched by every direct/TCP worker (1 MiB for a relayed worker, `BUG-41`), which runs a pinned `cksum` (`certutil -hashfile` on Windows) on it; reports MB/s (Pass for direct/TCP, Warn with rate for relayed, Fail on error/timeout). A master without a blob store skips it |
 
 - The worker table has a `LINK` column from the master's `link:` tag: `direct <rtt>ms`, `relay <rtt>ms`,
   `tcp`, or `-` when the tag is missing or unreadable. `--json` carries `link_kind` and `link_rtt_ms`.
@@ -235,3 +235,4 @@ the network. Default behaviour is unchanged.
 - 2026-10-23: Milestone M5 completed. Closed W7 with verified loopback 2-worker cluster doctor checks. Advanced capabilities specified and implemented in design records 0002 (mobile coordination), 0003 (file staging), and 0004 (MCP and discovery).
 - 2026-11-09: `LINK-1` steps 1 and 2: the `LINK` column and C7 (warning for a relayed worker), and the C8
   blob throughput probe with `--skip-throughput` (MCP `doctor`: `skip_throughput`).
+- 2026-11-26: `BUG-41`: relayed workers use a 1 MiB C8 probe (`THROUGHPUT_PROBE_RELAY_BYTES`) and report `WARN` with their measured rate (`0.00 MB/s` precision below `1.0 MB/s`) instead of timing out at 60 s on an 8 MiB fetch; timeouts, refusals, and non-zero exits remain `FAIL`.
