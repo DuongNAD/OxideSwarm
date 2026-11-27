@@ -763,7 +763,7 @@ mod native_ui {
             #[cfg(target_os = "windows")]
             if !win_pump::pump_messages() {
                 let _ = cmd_tx.send(TrayCommand::Quit);
-                break;
+                return Ok(());
             }
 
             while let Ok(event) = menu_rx.try_recv() {
@@ -792,7 +792,5 @@ mod native_ui {
             #[cfg(not(target_os = "windows"))]
             std::thread::sleep(std::time::Duration::from_millis(80));
         }
-
-        Ok(())
     }
 }
