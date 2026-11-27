@@ -433,6 +433,14 @@ impl Drop for Session {
     }
 }
 
+#[cfg(feature = "p2p")]
+fn p2p_target_display(ticket: &str) -> String {
+    match rusty_grid_core::transport::parse_p2p_ticket(ticket) {
+        Ok(addr) => format!("iroh://{}", addr.id),
+        Err(_) => "p2p:<invalid-ticket>".to_string(),
+    }
+}
+
 impl WorkerClient {
     /// Evaluates active D1 contributor limits (optionally syncing updated `limits set` config)
     /// and updates [`ControlHandle::set_held_with_detail`].
@@ -527,7 +535,8 @@ impl WorkerClient {
     /// again, while its LAN address still does.
     pub(super) async fn establish_stream(&self) -> GridResult<(WorkerStreamMode, String)> {
         #[cfg(feature = "p2p")]
-        if self.config.p2p_ticket.is_some() {
+        if let Some(ticket) = self.config.p2p_ticket.as_deref() {
+            let p2p_target = p2p_target_display(ticket);
             return match self.establish_p2p().await {
                 Ok(established) => {
                     self.p2p_failures.store(0, Ordering::Relaxed);
@@ -539,16 +548,24 @@ impl WorkerClient {
                         error!(
                             worker_id = %self.worker_id,
                             failures,
+                            master = %p2p_target,
                             error = %e,
                             "The P2P ticket keeps failing; the Master probably restarted with a new identity (copy its current ticket)"
                         );
                     }
                     if !self.has_tcp_fallback() {
+                        warn!(
+                            worker_id = %self.worker_id,
+                            error = %e,
+                            master = %p2p_target,
+                            "P2P connect failed; no TCP fallback address configured"
+                        );
                         return Err(e);
                     }
                     warn!(
                         error = %e,
-                        master = %self.config.master_addr,
+                        master = %p2p_target,
+                        tcp_fallback = %self.config.master_addr,
                         "P2P connect failed; falling back to the Master's TCP address"
                     );
                     self.establish_tcp().await
@@ -573,7 +590,8 @@ impl WorkerClient {
     ) -> GridResult<(WorkerStreamMode, String)> {
         let node_addr = rusty_grid_core::transport::parse_p2p_ticket(ticket_str)
             .map_err(|e| GridError::Config(format!("Invalid P2P ticket: {e}")))?;
-        info!("Connecting to Master via P2P NAT Traversal (iroh QUIC)...");
+        let p2p_target = format!("iroh://{}", node_addr.id);
+        info!(master = %p2p_target, "Connecting to Master via P2P NAT Traversal (iroh QUIC)...");
 
         let mut ep_guard = self.p2p_endpoint.lock().await;
         let (endpoint, is_cached) = match ep_guard.as_ref() {

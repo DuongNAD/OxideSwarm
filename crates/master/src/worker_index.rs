@@ -190,7 +190,7 @@ pub(crate) struct WorkerAttrIndex {
 
 impl WorkerAttrIndex {
     /// Builds an attribute index over `workers`.
-    pub(crate) fn build(workers: &[WorkerInfo]) -> Self {
+    pub(crate) fn build(workers: &[WorkerInfo], respect_gpu_pause: bool) -> Self {
         let len = workers.len();
         let all = BitSet::filled(len);
         let mut connected = BitSet::new(len);
@@ -219,7 +219,7 @@ impl WorkerAttrIndex {
             if worker.status != WorkerStatus::Disconnected && !worker.paused {
                 connected.set(idx);
             }
-            if worker.capabilities.can_execute_gpu() && !worker.gpu_paused {
+            if worker.capabilities.can_execute_gpu() && (!respect_gpu_pause || !worker.gpu_paused) {
                 gpu.set(idx);
             }
             if worker.capabilities.has_blender {
@@ -567,7 +567,7 @@ impl WorkerIndex {
         mobile_flags: &[[bool; 4]],
     ) -> Self {
         let len = workers.len();
-        let attrs = WorkerAttrIndex::build(workers);
+        let attrs = WorkerAttrIndex::build(workers, true);
         let mut free_slots_mask = BitSet::new(len);
         let mut unblocked_mask = BitSet::new(len);
         let mut matching_base_mask = BitSet::new(len);
@@ -763,7 +763,7 @@ pub(crate) struct RegisteredIndex {
 impl RegisteredIndex {
     pub(crate) fn build(registered: &[WorkerInfo]) -> Self {
         Self {
-            attrs: WorkerAttrIndex::build(registered),
+            attrs: WorkerAttrIndex::build(registered, false),
         }
     }
 
@@ -1097,5 +1097,57 @@ mod tests {
         let req_any_gpu = TaskRequirements::gpu(60);
         assert!(statically_fits_caps(&req_any_gpu, &caps_8g));
         assert!(statically_fits_caps(&req_any_gpu, &caps_unknown));
+    }
+
+    #[test]
+    fn registered_index_keeps_gpu_paused_worker_while_schedulable_excludes_it() {
+        let mut gpu_worker = make_worker(
+            Uuid::new_v4(),
+            "gpu-paused-box",
+            8,
+            16384,
+            true,
+            false,
+            vec!["os:macos".into(), "arch:aarch64".into()],
+            ProtocolCapabilities::empty(),
+        );
+        gpu_worker.gpu_paused = true;
+        let workers = vec![gpu_worker];
+
+        let req_gpu = TaskRequirements::gpu(60);
+        let gpu_caps = CapRequirements {
+            requires_gpu: true,
+            requires_blender: false,
+            required_features: ProtocolCapabilities::empty(),
+        };
+        let cpu_caps = CapRequirements {
+            requires_gpu: false,
+            requires_blender: false,
+            required_features: ProtocolCapabilities::empty(),
+        };
+
+        let reg = RegisteredIndex::build(&workers);
+        assert!(
+            reg.any_fits_all(&workers, &req_gpu, 0, &Placement::default(), gpu_caps),
+            "registered_index must retain gpu_paused workers so fail_unfulfillable_tasks waits instead of failing queued GPU tasks"
+        );
+
+        let meta = vec![SeatStaticMeta {
+            host_busy: false,
+            is_gpu: false,
+            is_real_gpu: true,
+            initial_load: 0,
+        }];
+        let sched = WorkerIndex::build(&workers, meta, &[4], &[[true; 4]]);
+        assert!(
+            sched
+                .free_candidate_mask(&Placement::default(), gpu_caps, 1, false, &[])
+                .is_none(),
+            "schedulable index must still exclude gpu_paused workers from GPU dispatch"
+        );
+        let cpu_mask: Vec<usize> = sched
+            .free_candidate_mask(&Placement::default(), cpu_caps, 1, false, &[])
+            .map_or_else(Vec::new, |m| m.iter_ones().collect());
+        assert_eq!(cpu_mask, vec![0]);
     }
 }

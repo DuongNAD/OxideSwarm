@@ -283,13 +283,31 @@ pub fn sanitize_endpoint_segment(raw: &str) -> String {
     }
 }
 
-/// Default Unix control socket path (`$XDG_RUNTIME_DIR/oxideswarm/...` or `$HOME/.oxideswarm/...`).
+/// Default Unix control socket path (`$OXIDESWARM_HOME/...`, `$XDG_RUNTIME_DIR/oxideswarm/...`, or
+/// `$HOME/.oxideswarm/...`).
 #[cfg(unix)]
 pub fn default_unix_socket_path(worker_name: Option<&str>) -> Option<PathBuf> {
-    let dir = if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+    default_unix_socket_path_with(
+        worker_name,
+        std::env::var_os("OXIDESWARM_HOME").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn default_unix_socket_path_with(
+    worker_name: Option<&str>,
+    oxideswarm_home: Option<&std::ffi::OsStr>,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let dir = if let Some(ox_home) = oxideswarm_home.filter(|v| !v.is_empty()) {
+        PathBuf::from(ox_home)
+    } else if let Some(xdg) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
         PathBuf::from(xdg).join("oxideswarm")
     } else {
-        let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+        let home = home.filter(|v| !v.is_empty())?;
         PathBuf::from(home).join(".oxideswarm")
     };
     let file = match worker_name.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1612,5 +1630,40 @@ mod tests {
             ControlResponse::Limits { limits, .. } => assert!(!limits.hold_ends_tasks),
             other => panic!("expected LimitsGet after setting false, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_unix_socket_path_honours_oxideswarm_home_over_xdg_and_home() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            default_unix_socket_path_with(
+                Some("box1"),
+                Some(OsStr::new("/custom/ox")),
+                Some(OsStr::new("/run/user/1000")),
+                Some(OsStr::new("/home/alice")),
+            ),
+            Some(PathBuf::from("/custom/ox/box1.control.sock"))
+        );
+        assert_eq!(
+            default_unix_socket_path_with(
+                Some("box1"),
+                Some(OsStr::new("")),
+                Some(OsStr::new("/run/user/1000")),
+                Some(OsStr::new("/home/alice")),
+            ),
+            Some(PathBuf::from("/run/user/1000/oxideswarm/box1.control.sock"))
+        );
+        assert_eq!(
+            default_unix_socket_path_with(
+                None,
+                None,
+                Some(OsStr::new("")),
+                Some(OsStr::new("/home/alice")),
+            ),
+            Some(PathBuf::from("/home/alice/.oxideswarm/control.sock"))
+        );
+        assert_eq!(default_unix_socket_path_with(None, None, None, None), None);
     }
 }

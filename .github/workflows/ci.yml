@@ -522,6 +522,7 @@ jobs:
             --fault-scale 0.25 \
             --load-scale 1.0 \
             --sample-interval 60s \
+            --probe-interval 6s \
             --workers 3 \
             --slots 4 \
             --max-queue-size 64 \

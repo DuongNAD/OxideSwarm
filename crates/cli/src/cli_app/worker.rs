@@ -49,12 +49,26 @@ pub(super) fn resolve_worker_target_from(
     let cfg_master = clean(worker_cfg.and_then(|w| w.master.as_deref()));
     let cfg_ticket = clean(worker_cfg.and_then(|w| w.p2p_ticket.as_deref()));
 
+    let p2p_ticket = if cli_ticket.is_some() {
+        cli_ticket
+    } else if cli_master.is_some() {
+        None
+    } else if env_ticket.is_some() {
+        env_ticket
+    } else if env_master.is_some() {
+        None
+    } else {
+        cfg_ticket
+    };
+
     let (source, master_raw) = if let Some(ref m) = cli_master {
         ("--master", m.clone())
     } else if let Some((var, ref m)) = env_master {
         (var, m.clone())
     } else if let Some(ref m) = cfg_master {
         ("[worker].master", m.clone())
+    } else if p2p_ticket.is_some() {
+        ("p2p-ticket", String::new())
     } else {
         ("default", DEFAULT_MASTER_ADDR.to_string())
     };
@@ -75,19 +89,20 @@ pub(super) fn resolve_worker_target_from(
     }
     let master_addr = normalize_master_addr(&master_raw);
 
-    let p2p_ticket = if cli_ticket.is_some() {
-        cli_ticket
-    } else if cli_master.is_some() {
-        None
-    } else if env_ticket.is_some() {
-        env_ticket
-    } else if env_master.is_some() {
-        None
-    } else {
-        cfg_ticket
-    };
-
     Ok((master_addr, p2p_ticket))
+}
+
+fn peer_announce_target(master_addr: &str, p2p_ticket: Option<&str>) -> String {
+    if !master_addr.trim().is_empty() {
+        return master_addr.to_string();
+    }
+    match p2p_ticket {
+        Some(ticket) => match rusty_grid_core::transport::parse_p2p_ticket(ticket) {
+            Ok(addr) => format!("iroh://{}", addr.id),
+            Err(_) => "P2P ticket".to_string(),
+        },
+        None => String::new(),
+    }
 }
 
 /// Resolves `(master_addr, p2p_ticket)` for `oxideswarm worker` across CLI > Env > Config > Default,
@@ -196,7 +211,8 @@ pub(super) async fn run_worker(
             return ExitCode::from(AUTH_EXIT_CODE);
         }
     };
-    announce_peer_secret(peer_outcome, PeerRole::Worker, &master_addr);
+    let announce_target = peer_announce_target(&master_addr, p2p_ticket.as_deref());
+    announce_peer_secret(peer_outcome, PeerRole::Worker, &announce_target);
 
     let name = resolve_opt_string(
         args.name,
@@ -969,20 +985,25 @@ pub(crate) async fn run_worker_control_action(
 }
 
 pub(crate) fn resolve_config_write_path(config_file: Option<&ConfigFile>) -> Option<PathBuf> {
+    resolve_config_write_path_with(
+        config_file,
+        std::env::var_os("RUSTY_GRID_CONFIG").as_deref(),
+        crate::config::default_oxideswarm_dir(),
+    )
+}
+
+fn resolve_config_write_path_with(
+    config_file: Option<&ConfigFile>,
+    env_config: Option<&std::ffi::OsStr>,
+    oxideswarm_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
     if let Some(p) = config_file.and_then(|c| c.source_path.0.as_ref()) {
         return Some(p.clone());
     }
-    if let Some(env_path) = std::env::var_os("RUSTY_GRID_CONFIG").filter(|v| !v.is_empty()) {
+    if let Some(env_path) = env_config.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(env_path));
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|v| !v.is_empty())?;
-    Some(
-        PathBuf::from(home)
-            .join(".oxideswarm")
-            .join("rusty-grid.toml"),
-    )
+    oxideswarm_dir.map(|dir| dir.join("rusty-grid.toml"))
 }
 
 pub(crate) fn load_worker_limits_from_toml(
@@ -1196,9 +1217,85 @@ mod tests {
 
         let (master_addr, p2p_ticket) =
             resolve_worker_target_from(None, Some(&ticket), None, None, None)
-                .expect("--p2p-ticket with default master succeeds");
-        assert_eq!(master_addr, DEFAULT_MASTER_ADDR);
+                .expect("--p2p-ticket alone succeeds");
+        assert_eq!(master_addr, "");
         assert_eq!(p2p_ticket.as_deref(), Some(ticket.as_str()));
+    }
+
+    #[test]
+    fn bug40_ticket_only_has_no_tcp_fallback_while_explicit_master_keeps_it() {
+        let ticket = generated_p2p_ticket();
+
+        // 1. Ticket alone via CLI, env, or config: no default 127.0.0.1:8088 TCP fallback.
+        for (label, resolved) in [
+            (
+                "--p2p-ticket",
+                resolve_worker_target_from(None, Some(&ticket), None, None, None),
+            ),
+            (
+                "RUSTY_GRID_P2P_TICKET",
+                resolve_worker_target_from(None, None, None, Some(&ticket), None),
+            ),
+            (
+                "[worker].p2p_ticket",
+                resolve_worker_target_from(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&WorkerFileConfig {
+                        p2p_ticket: Some(ticket.clone()),
+                        ..Default::default()
+                    }),
+                ),
+            ),
+        ] {
+            let (master_addr, p2p_ticket) = resolved.unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                master_addr, "",
+                "{label}: ticket-only worker must not fall back to TCP {DEFAULT_MASTER_ADDR}"
+            );
+            assert_eq!(p2p_ticket.as_deref(), Some(ticket.as_str()));
+        }
+
+        // 2. Explicit master + ticket (Android / explicit fallback path): keeps normalized TCP address.
+        let (cli_addr, cli_tkt) =
+            resolve_worker_target_from(Some("192.168.1.10"), Some(&ticket), None, None, None)
+                .expect("explicit --master + --p2p-ticket");
+        assert_eq!(cli_addr, "192.168.1.10:8088");
+        assert_eq!(cli_tkt.as_deref(), Some(ticket.as_str()));
+
+        let (env_addr, env_tkt) = resolve_worker_target_from(
+            None,
+            None,
+            Some(("RUSTY_GRID_MASTER", "10.0.0.5:9088")),
+            Some(&ticket),
+            None,
+        )
+        .expect("explicit env master + env ticket");
+        assert_eq!(env_addr, "10.0.0.5:9088");
+        assert_eq!(env_tkt.as_deref(), Some(ticket.as_str()));
+
+        let (cfg_addr, cfg_tkt) = resolve_worker_target_from(
+            None,
+            None,
+            None,
+            None,
+            Some(&WorkerFileConfig {
+                master: Some("198.51.100.9:8088".into()),
+                p2p_ticket: Some(ticket.clone()),
+                ..Default::default()
+            }),
+        )
+        .expect("explicit [worker].master + [worker].p2p_ticket");
+        assert_eq!(cfg_addr, "198.51.100.9:8088");
+        assert_eq!(cfg_tkt.as_deref(), Some(ticket.as_str()));
+
+        // 3. Neither master nor ticket: keeps DEFAULT_MASTER_ADDR.
+        let (default_addr, no_tkt) =
+            resolve_worker_target_from(None, None, None, None, None).expect("default target");
+        assert_eq!(default_addr, DEFAULT_MASTER_ADDR);
+        assert_eq!(no_tkt, None);
     }
 
     #[tokio::test]
@@ -1305,5 +1402,38 @@ mod tests {
         .unwrap();
         assert!(resolved.hold_ends_tasks);
         assert!(resolved.no_gpu_tasks);
+    }
+
+    #[test]
+    fn resolve_config_write_path_honours_oxideswarm_home() {
+        use std::ffi::OsStr;
+
+        let mut cfg = ConfigFile::default();
+        cfg.source_path.0 = Some(PathBuf::from("/explicit/rusty-grid.toml"));
+
+        assert_eq!(
+            resolve_config_write_path_with(
+                Some(&cfg),
+                Some(OsStr::new("/env/rusty-grid.toml")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/explicit/rusty-grid.toml"))
+        );
+        assert_eq!(
+            resolve_config_write_path_with(
+                None,
+                Some(OsStr::new("/env/rusty-grid.toml")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/env/rusty-grid.toml"))
+        );
+        assert_eq!(
+            resolve_config_write_path_with(
+                None,
+                Some(OsStr::new("")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/custom/ox/rusty-grid.toml"))
+        );
     }
 }
