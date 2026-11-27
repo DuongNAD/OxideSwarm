@@ -2831,6 +2831,9 @@ version = "0.4.5"
 dependencies = [
  "clap",
  "muda",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rusty_grid_worker",
  "serde",
  "serde_json",

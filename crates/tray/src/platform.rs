@@ -741,11 +741,64 @@ mod native_ui {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    mod mac_pump {
+        #![allow(unsafe_code)]
+
+        use objc2::rc::Retained;
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+        use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+
+        pub struct MacApp {
+            app: Retained<NSApplication>,
+        }
+
+        impl MacApp {
+            pub fn init() -> Result<Self, String> {
+                let mtm = MainThreadMarker::new().ok_or_else(|| {
+                    "oxideswarm-tray must run on the macOS main thread".to_string()
+                })?;
+                let app = NSApplication::sharedApplication(mtm);
+                let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+                app.finishLaunching();
+                Ok(Self { app })
+            }
+
+            pub fn pump_events(&self, wait_secs: f64) {
+                // SAFETY: `NSDefaultRunLoopMode` is an immutable AppKit/Foundation static constant valid for process lifetime.
+                let mode = unsafe { NSDefaultRunLoopMode };
+                let until = NSDate::dateWithTimeIntervalSinceNow(wait_secs);
+                if let Some(ev) = self.app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&until),
+                    mode,
+                    true,
+                ) {
+                    self.app.sendEvent(&ev);
+                }
+                let past = NSDate::distantPast();
+                while let Some(ev) = self.app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&past),
+                    mode,
+                    true,
+                ) {
+                    self.app.sendEvent(&ev);
+                }
+                self.app.updateWindows();
+            }
+        }
+    }
+
     pub fn run(
         initial_view: MenuViewModel,
         cmd_tx: tokio_mpsc::UnboundedSender<TrayCommand>,
         view_rx: mpsc::Receiver<MenuViewModel>,
     ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let mac_app = mac_pump::MacApp::init()?;
+
         let icon = build_icon(initial_view.icon_state)?;
         let (menu, handles) = build_menu(&initial_view)?;
         let tray = TrayIconBuilder::new()
@@ -789,8 +842,8 @@ mod native_ui {
 
             #[cfg(target_os = "windows")]
             win_pump::wait_briefly(80);
-            #[cfg(not(target_os = "windows"))]
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            #[cfg(target_os = "macos")]
+            mac_app.pump_events(0.08);
         }
     }
 }
