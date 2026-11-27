@@ -768,11 +768,23 @@ impl WorkerClient {
             WorkerStreamMode::Single(stream) => {
                 if let Some(link_cfg) = self.config.simulated_link.clone() {
                     let wrapped = crate::sim::SimulatedLinkStream::wrap(stream, link_cfg);
-                    self.run_single_stream_session(wrapped, clock, backoff, shutdown_rx)
-                        .await
+                    self.run_single_stream_session(
+                        wrapped,
+                        &remote_desc,
+                        clock,
+                        backoff,
+                        shutdown_rx,
+                    )
+                    .await
                 } else {
-                    self.run_single_stream_session(stream, clock, backoff, shutdown_rx)
-                        .await
+                    self.run_single_stream_session(
+                        stream,
+                        &remote_desc,
+                        clock,
+                        backoff,
+                        shutdown_rx,
+                    )
+                    .await
                 }
             }
             #[cfg(feature = "p2p")]
@@ -825,6 +837,23 @@ impl WorkerClient {
                     }
                 };
                 backoff.reset();
+                let link_kind = {
+                    let conn_guard = self.p2p_conn.read().await;
+                    let path_info = conn_guard
+                        .as_ref()
+                        .and_then(rusty_grid_core::transport::inspect_connection_paths);
+                    if path_info.is_some_and(|p| p.is_relay && !p.is_ip) {
+                        crate::control::ControlLinkKind::Relay
+                    } else {
+                        crate::control::ControlLinkKind::Direct
+                    }
+                };
+                let dashboard_url = {
+                    let beacon = self.master_beacon.read().await;
+                    super::portal::derive_local_dashboard_url(beacon.as_ref(), &remote_desc)
+                };
+                self.control
+                    .set_connected(link_kind, Some(remote_desc), dashboard_url);
                 info!(worker_id = %self.worker_id, "Registration accepted over QUIC control stream; backoff counter reset");
 
                 // Control traffic (heartbeats, telemetry) and bulk data (results) each get their own
@@ -845,6 +874,7 @@ impl WorkerClient {
     >(
         &mut self,
         stream: S,
+        remote_desc: &str,
         clock: Arc<IoClock>,
         backoff: &mut ExponentialBackoff,
         shutdown_rx: &mut watch::Receiver<bool>,
@@ -890,6 +920,15 @@ impl WorkerClient {
             .and_then(|cfg| cfg.control.as_ref())
             .map(crate::sim::SimulatedNetworkControl::enter_session);
         backoff.reset();
+        let dashboard_url = {
+            let beacon = self.master_beacon.read().await;
+            super::portal::derive_local_dashboard_url(beacon.as_ref(), remote_desc)
+        };
+        self.control.set_connected(
+            crate::control::ControlLinkKind::Tcp,
+            Some(remote_desc.to_string()),
+            dashboard_url,
+        );
         info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
 
         // Split transport into independent reader and writer; one stream serves both queues.

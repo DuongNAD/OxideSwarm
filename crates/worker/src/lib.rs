@@ -44,8 +44,8 @@ pub use client::{
     compute_effective_resume_grace, WorkerClient, WorkerConfig, RESUME_SAFETY_MARGIN,
 };
 pub use control::{
-    ControlEndpoint, ControlHandle, ControlRequest, ControlResponse, ControlStatusSnapshot,
-    LimitPersistHook, WorkerControlState, WorkerLimitsConfig,
+    ControlEndpoint, ControlHandle, ControlLinkKind, ControlRequest, ControlResponse,
+    ControlStatusSnapshot, LimitPersistHook, WorkerControlState, WorkerLimitsConfig,
 };
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};

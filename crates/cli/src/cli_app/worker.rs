@@ -903,9 +903,22 @@ pub(crate) async fn run_worker_control_action(
                     .unwrap_or_default()
             );
             println!(
-                "  active_tasks={}, no_gpu_tasks={}",
-                snapshot.active_tasks, snapshot.no_gpu_tasks
+                "  active_tasks={}, tasks_started={}, no_gpu_tasks={}",
+                snapshot.active_tasks, snapshot.tasks_started, snapshot.no_gpu_tasks
             );
+            if let Some(connected) = snapshot.connected {
+                let link = snapshot.link_kind.map(|k| k.as_str()).unwrap_or("none");
+                println!("  connected={connected}, link_kind={link}");
+            }
+            if let Some(addr) = snapshot.master_addr.as_deref() {
+                println!("  master_addr={addr}");
+            }
+            if let Some(url) = snapshot.dashboard_url.as_deref() {
+                println!("  dashboard_url={url}");
+            }
+            if let Some(err) = snapshot.last_error.as_deref() {
+                println!("  last_error={err}");
+            }
             if let Some(ms) = snapshot.paused_until_epoch_ms {
                 println!("  paused_until_epoch_ms={ms}");
             }

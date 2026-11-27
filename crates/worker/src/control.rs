@@ -6,7 +6,7 @@
 //! verified to belong to the same OS user before any command runs.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -174,6 +174,25 @@ impl WorkerControlState {
     }
 }
 
+/// Transport link kind over which the worker is currently connected (`TRAY-1`, `design 0112` D1.2).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlLinkKind {
+    Direct,
+    Relay,
+    Tcp,
+}
+
+impl ControlLinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ControlLinkKind::Direct => "direct",
+            ControlLinkKind::Relay => "relay",
+            ControlLinkKind::Tcp => "tcp",
+        }
+    }
+}
+
 /// Snapshot returned by `status`, `pause`, `resume`, and `limits set`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ControlStatusSnapshot {
@@ -186,6 +205,18 @@ pub struct ControlStatusSnapshot {
     pub active_tasks: usize,
     pub limits: WorkerLimitsConfig,
     pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_kind: Option<ControlLinkKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_url: Option<String>,
+    #[serde(default)]
+    pub tasks_started: u64,
 }
 
 /// Control request sent over the worker's local socket or named pipe.
@@ -369,6 +400,20 @@ impl std::fmt::Debug for LimitPersistHook {
     }
 }
 
+fn sanitize_single_line_opt(raw: Option<String>, max_chars: usize) -> Option<String> {
+    let cleaned: String = raw?
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.chars().take(max_chars).collect())
+}
+
 #[derive(Debug)]
 struct ControlStateInner {
     paused: bool,
@@ -378,6 +423,11 @@ struct ControlStateInner {
     held: bool,
     hold_reason: Option<String>,
     limits: WorkerLimitsConfig,
+    connected: bool,
+    link_kind: Option<ControlLinkKind>,
+    last_error: Option<String>,
+    master_addr: Option<String>,
+    dashboard_url: Option<String>,
 }
 
 /// Thread-safe handle shared between the worker execution engine and the local control server.
@@ -385,6 +435,7 @@ pub struct ControlHandle {
     worker_id: Uuid,
     worker_name: String,
     active_tasks: Arc<AtomicUsize>,
+    tasks_started: AtomicU64,
     config_path: Mutex<Option<PathBuf>>,
     persist_hook: Option<LimitPersistHook>,
     inner: Mutex<ControlStateInner>,
@@ -416,6 +467,7 @@ impl ControlHandle {
             worker_id,
             worker_name: worker_name.into(),
             active_tasks,
+            tasks_started: AtomicU64::new(0),
             config_path: Mutex::new(config_path),
             persist_hook,
             inner: Mutex::new(ControlStateInner {
@@ -426,10 +478,43 @@ impl ControlHandle {
                 held: false,
                 hold_reason: None,
                 limits,
+                connected: false,
+                link_kind: None,
+                last_error: None,
+                master_addr: None,
+                dashboard_url: None,
             }),
             event_tx,
             session_sent_pause_rejection: AtomicBool::new(false),
         })
+    }
+
+    /// Records that a connected master session is active (`TRAY-1`, clears prior error).
+    pub fn set_connected(
+        &self,
+        link_kind: ControlLinkKind,
+        master_addr: Option<String>,
+        dashboard_url: Option<String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.connected = true;
+        inner.link_kind = Some(link_kind);
+        inner.last_error = None;
+        inner.master_addr = sanitize_single_line_opt(master_addr, 256);
+        inner.dashboard_url = sanitize_single_line_opt(dashboard_url, 512);
+    }
+
+    /// Records that the worker is disconnected, optionally recording a bounded single-line error.
+    pub fn set_disconnected(&self, last_error: Option<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.connected = false;
+        inner.link_kind = None;
+        inner.last_error = sanitize_single_line_opt(last_error, 256);
+    }
+
+    /// Increments the monotonic count of started task attempts on this worker.
+    pub fn record_task_started(&self) -> u64 {
+        self.tasks_started.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Subscribes to pause/resume transitions for the active session loop.
@@ -509,6 +594,12 @@ impl ControlHandle {
             active_tasks: self.active_tasks.load(Ordering::Acquire),
             limits: inner.limits.clone(),
             config_path,
+            connected: Some(inner.connected),
+            link_kind: inner.link_kind,
+            last_error: inner.last_error.clone(),
+            master_addr: inner.master_addr.clone(),
+            dashboard_url: inner.dashboard_url.clone(),
+            tasks_started: self.tasks_started.load(Ordering::Acquire),
         }
     }
 
@@ -1450,5 +1541,76 @@ mod tests {
             Some(PathBuf::from("/home/alice/.oxideswarm/control.sock"))
         );
         assert_eq!(default_unix_socket_path_with(None, None, None, None), None);
+    }
+
+    #[test]
+    fn control_status_snapshot_tray1_fields_and_legacy_compat() {
+        let wid = Uuid::new_v4();
+        // Legacy worker JSON without TRAY-1 optional fields must still deserialize cleanly.
+        let legacy_json = serde_json::json!({
+            "worker_id": wid,
+            "worker_name": "legacy-box",
+            "state": "running",
+            "reason": null,
+            "paused_until_epoch_ms": null,
+            "no_gpu_tasks": false,
+            "active_tasks": 0,
+            "limits": WorkerLimitsConfig::default(),
+            "config_path": null
+        });
+        let legacy: ControlStatusSnapshot =
+            serde_json::from_value(legacy_json).expect("legacy ControlStatusSnapshot");
+        assert_eq!(legacy.worker_name, "legacy-box");
+        assert_eq!(legacy.connected, None);
+        assert_eq!(legacy.link_kind, None);
+        assert_eq!(legacy.last_error, None);
+        assert_eq!(legacy.master_addr, None);
+        assert_eq!(legacy.dashboard_url, None);
+        assert_eq!(legacy.tasks_started, 0);
+
+        let handle = test_handle(WorkerLimitsConfig::default(), None);
+        let snap0 = handle.snapshot();
+        assert_eq!(snap0.connected, Some(false));
+        assert_eq!(snap0.link_kind, None);
+        assert_eq!(snap0.tasks_started, 0);
+
+        for (kind, expected_str) in [
+            (ControlLinkKind::Direct, "direct"),
+            (ControlLinkKind::Relay, "relay"),
+            (ControlLinkKind::Tcp, "tcp"),
+        ] {
+            handle.set_connected(
+                kind,
+                Some("127.0.0.1:8088".into()),
+                Some("http://127.0.0.1:8080".into()),
+            );
+            let val = serde_json::to_value(handle.handle_request(ControlRequest::Status))
+                .expect("serialize status");
+            assert_eq!(val["snapshot"]["connected"], true);
+            assert_eq!(val["snapshot"]["link_kind"], expected_str);
+            assert_eq!(val["snapshot"]["master_addr"], "127.0.0.1:8088");
+            assert_eq!(val["snapshot"]["dashboard_url"], "http://127.0.0.1:8080");
+            assert!(val["snapshot"].get("last_error").is_none());
+        }
+
+        assert_eq!(handle.record_task_started(), 1);
+        assert_eq!(handle.record_task_started(), 2);
+        handle.set_disconnected(Some("connection\nreset\tby\x07peer".into()));
+        let after_disc = handle.snapshot();
+        assert_eq!(after_disc.connected, Some(false));
+        assert_eq!(after_disc.link_kind, None);
+        assert_eq!(
+            after_disc.last_error.as_deref(),
+            Some("connection reset by peer")
+        );
+        assert_eq!(after_disc.tasks_started, 2);
+
+        // Next connect clears last_error.
+        handle.set_connected(ControlLinkKind::Direct, Some("iroh://peer".into()), None);
+        let reconnected = handle.snapshot();
+        assert_eq!(reconnected.connected, Some(true));
+        assert_eq!(reconnected.link_kind, Some(ControlLinkKind::Direct));
+        assert_eq!(reconnected.last_error, None);
+        assert_eq!(reconnected.tasks_started, 2);
     }
 }

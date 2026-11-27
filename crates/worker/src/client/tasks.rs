@@ -611,6 +611,7 @@ impl WorkerClient {
         let current_session_hold_secs = Arc::clone(&self.current_session_hold_secs);
         let resume_window_active = Arc::clone(&self.resume_window_active);
         let pending_resume_outbox = Arc::clone(&self.pending_resume_outbox);
+        let control = Arc::clone(&self.control);
         let grace_enabled = self.config.session_resume_grace_cap != Some(Duration::ZERO);
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
@@ -671,6 +672,7 @@ impl WorkerClient {
             };
 
             tracker.increment_active_tasks();
+            control.record_task_started();
 
             let progress = WorkerMessage::TaskProgress {
                 worker_id,

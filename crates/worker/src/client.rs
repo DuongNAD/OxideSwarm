@@ -1702,11 +1702,13 @@ impl WorkerClient {
 
             match outcome {
                 Ok(()) => {
+                    self.control.set_disconnected(None);
                     info!(worker_id = %self.worker_id, "Worker connection ended cleanly");
                     break;
                 }
                 Err(e) => {
                     if *shutdown_rx.borrow() {
+                        self.control.set_disconnected(None);
                         info!(worker_id = %self.worker_id, "Worker terminating on shutdown signal after connection notice");
                         self.resume_deadline = None;
                         self.expire_resume_window("FAST_SHUTDOWN").await;
@@ -1714,6 +1716,7 @@ impl WorkerClient {
                     }
 
                     if self.resume_reconnect_pending.swap(false, Ordering::AcqRel) {
+                        self.control.set_disconnected(None);
                         info!(
                             worker_id = %self.worker_id,
                             "Worker resumed; reconnecting immediately to clear hold-back"
@@ -1721,6 +1724,8 @@ impl WorkerClient {
                         backoff.reset();
                         continue;
                     }
+
+                    self.control.set_disconnected(Some(e.to_string()));
 
                     if let GridError::Config(_) = e {
                         error!(worker_id = %self.worker_id, error = %e, "Worker configuration error; not retrying");

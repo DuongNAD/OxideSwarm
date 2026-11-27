@@ -350,6 +350,23 @@ async fn t2_pause_hands_back_running_tasks_uncharged_holds_back_and_resumes() {
         .unwrap();
     assert_eq!(pinned_res.worker_id, worker_a);
     assert_eq!(pinned_res.exit_code, 0);
+
+    let after_snap = match send_control_request(&ep_a, &ControlRequest::Status)
+        .await
+        .expect("status RPC after task")
+    {
+        ControlResponse::Status { snapshot } => snapshot,
+        other => panic!("unexpected status response: {other:?}"),
+    };
+    assert_eq!(after_snap.connected, Some(true));
+    assert_eq!(
+        after_snap.link_kind,
+        Some(rusty_grid_worker::ControlLinkKind::Tcp)
+    );
+    assert!(after_snap.master_addr.is_some());
+    assert!(after_snap.dashboard_url.is_some());
+    assert!(after_snap.last_error.is_none());
+    assert!(after_snap.tasks_started >= 1);
 }
 
 #[tokio::test]
