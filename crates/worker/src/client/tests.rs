@@ -4519,3 +4519,162 @@ async fn test_worker_reports_a_previous_version_master_refusing_its_register() {
         "{err:?}"
     );
 }
+
+#[cfg(feature = "p2p")]
+fn capture_client_warn_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    #[derive(Default)]
+    struct FieldAndMsgVisitor(Vec<String>);
+    impl tracing::field::Visit for FieldAndMsgVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push(format!("{}={value}", field.name()));
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+    struct Collector {
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+        thread_id: std::thread::ThreadId,
+    }
+    impl tracing::Subscriber for Collector {
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if *metadata.level() <= tracing::Level::WARN {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::WARN)
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() <= tracing::Level::WARN
+                && std::thread::current().id() == self.thread_id
+            {
+                let mut v = FieldAndMsgVisitor::default();
+                event.record(&mut v);
+                self.events.lock().unwrap().push(v.0.join(" "));
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let thread_id = std::thread::current().id();
+    let dispatch = tracing::Dispatch::new(Collector {
+        events: Arc::clone(&events),
+        thread_id,
+    });
+    let _second = tracing::Dispatch::new(Collector {
+        events: Arc::clone(&events),
+        thread_id,
+    });
+    let result = tracing::dispatcher::with_default(&dispatch, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
+    let collected = events.lock().unwrap().clone();
+    (result, collected)
+}
+
+#[cfg(feature = "p2p")]
+#[test]
+fn test_bug40_ticket_only_has_no_tcp_fallback_and_logs_node_id() {
+    let secret_key = rusty_grid_core::transport::iroh::SecretKey::generate();
+    let addr = rusty_grid_core::transport::iroh::EndpointAddr::from(secret_key.public());
+    let expected_p2p = format!("iroh://{}", addr.id);
+    let ticket =
+        rusty_grid_core::transport::serialize_p2p_ticket(&addr).expect("serialize p2p ticket");
+
+    let client = WorkerClient::new(
+        WorkerConfig::new("")
+            .with_p2p_ticket(ticket.clone())
+            .with_p2p_minimal_preset(true)
+            .with_connect_timeout(Duration::from_millis(500))
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    assert!(!client.has_tcp_fallback());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let (res, logs) = capture_client_warn_logs(|| rt.block_on(client.establish_stream()));
+    assert!(res.is_err(), "ticket-only dial to closed node must fail");
+
+    let joined = logs.join("\n");
+    assert!(
+        joined.contains(&expected_p2p),
+        "failed P2P dial log must name {expected_p2p}, got:\n{joined}"
+    );
+    assert!(
+        !joined.contains("127.0.0.1:8088") && !joined.contains("falling back to the Master's TCP"),
+        "ticket-only failure must not mention 127.0.0.1:8088 or TCP fallback, got:\n{joined}"
+    );
+    assert!(
+        !joined.contains(&ticket),
+        "log must not echo raw ticket JSON, got:\n{joined}"
+    );
+}
+
+#[cfg(feature = "p2p")]
+#[test]
+fn test_bug40_ticket_plus_explicit_address_falls_back_to_tcp_and_logs_p2p_target() {
+    let secret_key = rusty_grid_core::transport::iroh::SecretKey::generate();
+    let addr = rusty_grid_core::transport::iroh::EndpointAddr::from(secret_key.public());
+    let expected_p2p = format!("iroh://{}", addr.id);
+    let ticket =
+        rusty_grid_core::transport::serialize_p2p_ticket(&addr).expect("serialize p2p ticket");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let (tcp_addr, accept_task) = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { listener.accept().await });
+        (addr, task)
+    });
+
+    let client = WorkerClient::new(
+        WorkerConfig::new(tcp_addr.to_string())
+            .with_p2p_ticket(ticket)
+            .with_p2p_minimal_preset(true)
+            .with_connect_timeout(Duration::from_millis(500))
+            .with_redirection_portal(false)
+            .with_no_battery(true),
+    );
+    assert!(client.has_tcp_fallback());
+
+    let (res, logs) = capture_client_warn_logs(|| rt.block_on(client.establish_stream()));
+    let (stream_mode, remote_desc) = res.expect("explicit TCP fallback must succeed");
+    assert!(matches!(stream_mode, WorkerStreamMode::Single(_)));
+    assert_eq!(remote_desc, tcp_addr.to_string());
+    let _ = rt
+        .block_on(accept_task)
+        .expect("accept task")
+        .expect("accepted");
+
+    let joined = logs.join("\n");
+    assert!(
+        joined.contains(&format!("master={expected_p2p}"))
+            && joined.contains(&format!("tcp_fallback={tcp_addr}")),
+        "fallback warning must name master={expected_p2p} and tcp_fallback={tcp_addr}, got:\n{joined}"
+    );
+}
