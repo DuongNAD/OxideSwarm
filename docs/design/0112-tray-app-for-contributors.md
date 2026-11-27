@@ -138,7 +138,7 @@ Two ways to draw the app:
 - **B. Tauri**: a web view that can host richer screens (task list, charts) by reusing
   `crates/master/src/dashboard.html`; larger, and it needs WebView2 on Windows (present on Windows 11).
 
-Recommendation: **A** first. The app's job is presence and control; rich views exist in the dashboard.
+Decision (Q102, the owner, 2026-11-27): **A**, the native tray menu. The app's job is presence and control; rich views exist in the dashboard. Tauri stays possible later for a richer window without changing the control channel.
 
 Measured on Windows 11 by agent-win on 2026-11-26 (spike; both drove the NET-9a control channel of
 #478, both pass the licence check of `deny.toml`):
@@ -151,7 +151,7 @@ Measured on Windows 11 by agent-win on 2026-11-26 (spike; both drove the NET-9a 
 | Cold build | 15 s | 192 s |
 | Crates pulled in | 24 | 244 |
 
-The choice is the owner's (Q102).
+These numbers are the basis of the decision above.
 
 ## Compatibility
 
@@ -193,7 +193,7 @@ The choice is the owner's (Q102).
 | TRAY-2 | First run join from token, invite or USB kit; verified updates | `crates/tray`, `crates/cli/src/join.rs` | T2 (join part) passes | Planned |
 | TRAY-3 | Tray in the USB kit and installers, start at logon by default, `--no-tray` | `packaging/usb/*`, installers under `scripts/`, `windows/`, `packaging/` | T3 passes | Planned |
 | TRAY-4 | Pause while a full-screen program runs; GPU on/off | `crates/tray`, `crates/worker` | T1 (detector) and T4 pass | Planned |
-| Q102 | Owner decision: native tray menu (A) or Tauri (B) | this record | The owner answers or accepts A | Open |
+| Q102 | Owner decision: native tray menu (A) or Tauri (B) | this record | The owner answers or accepts A | Done (A, 2026-11-27) |
 
 ## Status log
 
@@ -206,3 +206,4 @@ The choice is the owner's (Q102).
   `c6542ee9`): D1.2 uses the endpoints and requests of design 0113 and lists the status fields TRAY-1
   adds; D1.4 names the keys; D4.1 guards the single pause slot; D4.2 is decided (`no_gpu_tasks`). D5 has
   the Q102 spike measurements.
+- 2026-11-27: Q102 decided by the owner: the native tray menu (D5 option A, `tray-icon` and `muda`).

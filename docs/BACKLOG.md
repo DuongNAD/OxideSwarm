@@ -129,7 +129,7 @@ The defaults let work continue. The owner can overrule any of them before the it
 | D10 | Should the quick start lead with `oxideswarm invite` (a revocable key per machine) instead of the join token (the raw cluster secret, with no expiry)? | Yes, once ENROLL-1c cuts every lane of a revoked member | ENROLL-1, DOC-9 |
 | Q13 | Which ecosystem comes first: (A) each person or team runs a cluster that trusted people add machines to, or (B) a public grid where strangers run each other's code? | A, decided by the owner on 2026-11-09. B waits for real users and its own design | ENROLL-1, JOIN-2, USB-1 |
 | Q99 | How does Rust reach machines set up from the USB kit? | Decided by the owner on 2026-11-26: the full toolset, Python, Rust (GNU) and Git in the Windows kit plus tool packs ([design 0110](design/0110-tools-on-kit-machines.md)) | TOOL-1 to TOOL-5 |
-| Q102 | Tray app toolkit: a native tray menu with the dashboard in the browser, or a Tauri window? | Native tray menu (`tray-icon`, `muda`) first ([design 0112](design/0112-tray-app-for-contributors.md) D5) | TRAY-1 |
+| Q102 | Tray app toolkit: a native tray menu with the dashboard in the browser, or a Tauri window? | Decided by the owner on 2026-11-27: the native tray menu (`tray-icon`, `muda`), with the dashboard in the browser ([design 0112](design/0112-tray-app-for-contributors.md) D5; Tauri was measured at 18 times the binary size and 10 times the crates) | TRAY-1 |
 
 ## Index
 
