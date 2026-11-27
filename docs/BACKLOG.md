@@ -230,7 +230,7 @@ Recounted on 2026-11-24 from the rows with pull request 474: 307 items, 208 Impl
 Recounted on 2026-11-24 from the rows with pull request 489: 308 items, 210 Implemented, 19 Partial and 79 Planned; 17 open items are In and 81 are Out.
 Recounted on 2026-11-24 from the rows with pull request 492: 308 items, 210 Implemented, 19 Partial and 79 Planned; 15 open items are In and 83 are Out.
 Recounted on 2026-11-27 from the rows with pull request 495 (HOST-1 to HOST-5, design 0114): 313 items, 210 Implemented, 19 Partial and 84 Planned; 15 open items are In and 88 are Out.
-Recounted on 2026-11-27 from the rows after TEST-26 and TEST-86 Implemented and TEST-103 added: 314 items, 212 Implemented, 17 Partial and 85 Planned; 14 open items are In and 88 are Out.
+Recounted on 2026-11-27 from the rows after TEST-26 and TEST-86 Implemented and TEST-103 and TEST-104 added: 315 items, 212 Implemented, 17 Partial and 86 Planned; 15 open items are In and 88 are Out.
 "Pull requests" lists them by number, "(open)" marks one
 that is not merged yet, and "(design)" marks a design record that builds nothing.
 "Line" places an open item against the stop line of
@@ -357,6 +357,7 @@ APP-4, APP-5 and BENCH-3 to BENCH-7, decided on 2026-11-18). An Implemented item
 | TEST-100 | CI `endurance (loopback)`: `endurance.py soak` fails in `run_soak` with `AttributeError: 'SoakCluster' object has no attribute 'leftover_pids'` | P1 | S | TEST-26 |  | Implemented |  |  |
 | TEST-102 | CI `endurance (loopback)`: `4_probe_p99` fails on shared-runner single-sample jitter (`67.4 -> 330.9 ms` across `14`/`16` probes) | P1 | S | TEST-26 |  | Implemented |  |  |
 | TEST-103 | CI `endurance (loopback)`: `4_probe_p99` still fails after TEST-102 on two isolated `~400 ms` probes among `160` late probes | P2 | S | TEST-102 |  | Planned | In |  |
+| TEST-104 | Windows CI: `test_a_task_cannot_signal_or_inspect_foreign_processes` gets no output from its PowerShell task within the capped `35 s` | P2 | S | TEST-69 |  | Planned | In |  |
 | DOC-1 | Correct false status claims | P1 | M | INT-4 |  | Implemented |  | 60 |
 | DOC-2 | Remove unbacked performance numbers | P1 | S | INT-4 |  | Implemented |  | 61 |
 | DOC-3 | Align design records with the code | P1 | M | INT-4 |  | Implemented |  | 68 |
@@ -1124,6 +1125,29 @@ The standard in `docs/README.md` requires "only what the code does". These items
 - **Done when:** The replay of `45975322901` and the TEST-102 replay of `45821686282` pass, the uniform
   slowdown tests of TEST-102 still fail as they should, `python3 tests/test_endurance_harness.py` passes,
   and the job is green on two later runs on `master`.
+
+
+### TEST-104: Windows CI: `test_a_task_cannot_signal_or_inspect_foreign_processes` gets no output from its PowerShell task within the capped `35 s`
+
+- **Evidence:** `master` CI `workflow_dispatch` run `46014247326` (`2026-11-27T14:15:17Z`, `a255c3c7`), job
+  `workspace tests (windows-latest)`: `crates/worker/tests/test_feat3_os_isolation.rs:4675`
+  (`windows::test_a_task_cannot_signal_or_inspect_foreign_processes`) failed with
+  `fs: task did not start: [] (stderr: Task timed out after 35s)`; the other `30` tests of the binary passed.
+  The task printed nothing, not even `TASK_STARTED`, and stderr was empty. This is the first failure of the
+  job in `52` `ci.yml` runs on `master` since `2026-11-24T00:00:00Z`.
+- **Problem:** The test asks `win_task` for `60 s`, and `win_task` silently caps a request of exactly `60`
+  to `35 s`. A PowerShell start inside a fresh AppContainer profile with a private desktop on a starved
+  runner can take that long, so the test decides on a wall-clock window (the lesson of TEST-36 to TEST-38).
+  One run cannot tell a slow start from a hang in the AppContainer or desktop set-up.
+- **Do:**
+  1. Reproduce on Windows 11: run the test 50 times alone and 50 times under 4 to 6 CPU busy loops, and
+     record the time to `TASK_STARTED` per run.
+  2. If the start is only slow, remove the special `60 -> 35` cap in `win_task` and `win_cmd_task` for
+     this test (or use `WIN_WAIT_TIMEOUT`), and print the elapsed time instead of asserting a window.
+  3. If a run hangs past `90 s`, it is a BUG in the Windows isolation start-up: capture the process tree and
+     file it.
+- **Done when:** The cause is written here, the test passes `50/50` under busy loops on Windows 11, and the
+  next `20` `workspace tests (windows-latest)` jobs on `master` pass.
 
 ### AND-1: Make the Android app build
 
@@ -3635,3 +3659,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-26: TEST-102 Implemented and TEST-90 Implemented (`mac/test-102-soak-probe-p99`, claim `claims/item/TEST-102__mac-ag__20261126T181703649531Z__14209a41.json`): CI run `45821686282` (`034f5725`, `ubuntu-latest` `endurance (loopback)`) passed `transfer` (`6/6`), `1_accounting` (`2,185/2,185`), `2_resource_plateau`, `3_disk_and_journal` (Linux `--workspaces` `0700` confirmed, closing `TEST-90`), `5_clean_stop`, and `6_fault_injection` (`16/16`), failing only `4_probe_p99` (`67.402 -> 330.897 ms`, `ratio 4.9093` on `14`/`16` probes despite lower late median `31.28 vs 32.38 ms`) due to 60 s probe cadence, missing latency floor, and 15 s fault pad; added `--probe-interval 6s` (`min(6s, --sample-interval)`), `30` clean probes/window minimum, `100 ms` floor (`max(1.5x baseline, 100 ms)`, catching `30 -> 200 ms` uniform regressions), `30 s` post-fault exclusion pad (`soak_fault_pad_seconds`), failing-first tests in `tests/test_endurance_harness.py`, and design `0065` status-log update.
 - 2026-11-27: HOST-1 to HOST-5 added (Planned, Out) from [design 0114](design/0114-llm-worker-host.md), pull request 495; the owner decided Q104 to Q107 at the recommended defaults (no OxideSwarm OS, no own engine, measure first, normal priority only in the headless image).
 - 2026-11-27: TEST-86 Implemented under the Q103 rule (`51/51` green `workspace tests (macos-latest)` jobs on `master` since 2026-11-24). TEST-26 Implemented under the Q103 rule (green on `master` runs `45889278688` and `45946160149`). TEST-103 added (Planned, In): the started run `45975322901` failed only `4_probe_p99` on two isolated `~400 ms` probes while the median stayed at `27-28 ms`; the owner decided in chat that 0.4.6 is tagged with this recorded as a false failure of the check.
+- 2026-11-27: TEST-104 added (Planned, In): the started run `46014247326` failed only `workspace tests (windows-latest)`, one Windows isolation test whose PowerShell task printed nothing within the capped `35 s`; first failure of that job in `52` `master` runs since 2026-11-24.
