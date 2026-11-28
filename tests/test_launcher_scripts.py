@@ -789,6 +789,25 @@ KIT_GPU_TARGETS = tuple(t.replace(".tar.gz", "-gpu.tar.gz").replace(".zip", "-gp
 KIT_TOKEN = "oxs1-join:" + "QUJD" * 10 + "." + "0" * 32
 
 
+def _make_zip_bytes_raw(files_bytes):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in files_bytes.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _make_tar_xz_root_bytes(folder_name, files_bytes):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:xz") as tf:
+        for name, data in files_bytes.items():
+            info = tarfile.TarInfo(name="%s/%s" % (folder_name, name))
+            info.size = len(data)
+            info.mode = 0o755
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
 @unittest.skipIf(IS_WINDOWS, "the bash kit scripts are tested on Linux and macOS; the .cmd path runs on Windows")
 class UsbKitTests(unittest.TestCase):
     """packaging/usb: make_kit.sh writes a kit, install.sh installs from it, uninstall.sh removes it."""
@@ -1679,6 +1698,124 @@ class UsbKitTests(unittest.TestCase):
         self.assertEqual(un.returncode, 0, un.stdout)
         self.assertFalse(os.path.exists(root_cli))
 
+    def test_make_kit_toolset_verifies_hashes_writes_notice_and_refuses_mismatch(self):
+        # Design 0110 T2: --toolset full|--toolset python,git with verified local --tools-dir,
+        # refusal on SHA-256 mismatch or empty NOTICE.txt, kit.json toolset metadata, and
+        # unchanged kit when --toolset is omitted.
+        tools_cache = os.path.join(self.tmp, "tools_src")
+        os.makedirs(tools_cache, exist_ok=True)
+        fake_files = [
+            ("python", "python", "3.15.2", "python-fake-embed-amd64.zip", _make_zip_bytes_raw({"python.exe": b"MZpy", "LICENSE.txt": b"PSF License"})),
+            ("rust", "rustc", "1.96.0", "rustc-fake-gnu.tar.xz", _make_tar_xz_root_bytes("rustc-1.96.0-x86_64-pc-windows-gnu", {"components": b"rustc\n", "rustc/manifest.in": b"file:bin/rustc.exe\n", "rustc/bin/rustc.exe": b"MZrustc"})),
+            ("rust", "rust-std", "1.96.0", "rust-std-fake-gnu.tar.xz", _make_tar_xz_root_bytes("rust-std-1.96.0-x86_64-pc-windows-gnu", {"components": b"rust-std\n", "rust-std/manifest.in": b"dir:lib/rustlib\n", "rust-std/lib/rustlib/std.rlib": b"RLIB"})),
+            ("rust", "cargo", "1.96.0", "cargo-fake-gnu.tar.xz", _make_tar_xz_root_bytes("cargo-1.96.0-x86_64-pc-windows-gnu", {"components": b"cargo\n", "cargo/manifest.in": b"file:bin/cargo.exe\n", "cargo/bin/cargo.exe": b"MZcargo"})),
+            ("rust", "rust-mingw", "1.96.0", "rust-mingw-fake-gnu.tar.xz", _make_tar_xz_root_bytes("rust-mingw-1.96.0-x86_64-pc-windows-gnu", {"components": b"rust-mingw\n", "rust-mingw/manifest.in": b"dir:lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained\n", "rust-mingw/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/x86_64-w64-mingw32-gcc.exe": b"MZld"})),
+            ("mingw", "w64devkit", "2.11.0", "w64devkit-fake.zip", _make_zip_bytes_raw({"w64devkit/bin/gcc.exe": b"MZgcc", "w64devkit/bin/ar.exe": b"MZar"})),
+            ("git", "mingit", "2.56.1", "MinGit-fake.zip", _make_zip_bytes_raw({"cmd/git.exe": b"MZgit"})),
+        ]
+        lock_lines = []
+        expected_sums = []
+        for tool, comp, ver, fname, payload in fake_files:
+            fpath = os.path.join(tools_cache, fname)
+            with open(fpath, "wb") as f:
+                f.write(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            expected_sums.append((fname, digest))
+            lock_lines.append(f"{tool}\t{comp}\t{ver}\t{fname}\t{digest}\thttps://example.invalid/{fname}")
+        lock_file = os.path.join(self.tmp, "fake_tools.lock")
+        with open(lock_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lock_lines) + "\n")
+
+        env = dict(self.env(), OXIDESWARM_TOOLS_LOCK=lock_file)
+
+        # Without --toolset: no tools/ and no kit.json.
+        res_plain = subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick, "--version", "9.9.9",
+             "--archives", self.archives, "--replace"],
+            input=KIT_TOKEN + "\n", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+        self.assertEqual(res_plain.returncode, 0, res_plain.stdout)
+        kit = os.path.join(self.stick, "OxideSwarm")
+        self.assertFalse(os.path.exists(os.path.join(kit, "tools")))
+        self.assertFalse(os.path.exists(os.path.join(kit, "kit.json")))
+
+        # --toolset full --tools-dir: populates tools/, SHA256SUMS, NOTICE.txt, kit.json, check files.
+        res_full = subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick, "--version", "9.9.9",
+             "--archives", self.archives, "--toolset", "full", "--tools-dir", tools_cache, "--replace"],
+            input=KIT_TOKEN + "\n", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+        self.assertEqual(res_full.returncode, 0, res_full.stdout)
+        sums_text = read(os.path.join(kit, "archives", "SHA256SUMS"))
+        for fname, digest in expected_sums:
+            self.assertTrue(os.path.isfile(os.path.join(kit, "tools", fname)), fname)
+            self.assertIn(f"{digest}  tools/{fname}", sums_text)
+        notice_path = os.path.join(kit, "tools", "NOTICE.txt")
+        self.assertTrue(os.path.isfile(notice_path))
+        notice_text = read(notice_path)
+        for token in ("PSF", "Apache-2.0", "GPL v3", "w64devkit", "MinGit", "GPL v2", "source"):
+            self.assertIn(token, notice_text)
+        self.assertTrue(os.path.isfile(os.path.join(kit, "tools", "check", "hello.rs")))
+        self.assertTrue(os.path.isfile(os.path.join(kit, "tools", "check", "cc-check", "Cargo.toml")))
+        meta = json.loads(read(os.path.join(kit, "kit.json")))
+        self.assertEqual(meta["kit_format"], 0)
+        self.assertEqual(meta["toolset"], ["python", "rust", "mingw", "git"])
+
+        # install.sh on Unix still works from a --toolset kit (kit_format 0).
+        unix_root = os.path.join(self.tmp, "unix-from-toolset")
+        res_inst = subprocess.run(
+            ["bash", os.path.join(kit, "install.sh"), "--install-root", unix_root, "--no-autostart", "--name", "u-ts"],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+        )
+        self.assertEqual(res_inst.returncode, 0, res_inst.stdout)
+        subprocess.run(
+            ["bash", os.path.join(kit, "uninstall.sh"), "--install-root", unix_root, "--yes"],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+        )
+
+        # Subset --toolset python,git.
+        res_sub = subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick, "--version", "9.9.9",
+             "--archives", self.archives, "--toolset", "python,git", "--tools-dir", tools_cache, "--replace"],
+            input=KIT_TOKEN + "\n", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+        self.assertEqual(res_sub.returncode, 0, res_sub.stdout)
+        self.assertEqual(json.loads(read(os.path.join(kit, "kit.json")))["toolset"], ["python", "git"])
+        self.assertFalse(os.path.exists(os.path.join(kit, "tools", "rustc-fake-gnu.tar.xz")))
+
+        # Empty NOTICE.txt must be refused.
+        empty_notice = os.path.join(self.tmp, "empty_notice.txt")
+        open(empty_notice, "w", encoding="utf-8").close()
+        env_empty_n = dict(env, OXIDESWARM_TOOLS_NOTICE_FILE=empty_notice)
+        res_no_notice = subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick, "--version", "9.9.9",
+             "--archives", self.archives, "--toolset", "python", "--tools-dir", tools_cache, "--replace"],
+            input=KIT_TOKEN + "\n", env=env_empty_n, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+        self.assertNotEqual(res_no_notice.returncode, 0)
+        self.assertIn("NOTICE.txt", res_no_notice.stdout)
+
+        # Unknown toolset item refused.
+        res_bad_t = subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick, "--version", "9.9.9",
+             "--archives", self.archives, "--toolset", "bogustool", "--tools-dir", tools_cache, "--replace"],
+            input=KIT_TOKEN + "\n", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+        self.assertNotEqual(res_bad_t.returncode, 0)
+        self.assertIn("unknown tool", res_bad_t.stdout)
+
+        # Corrupted tool file fails checksum check.
+        bad_file = os.path.join(tools_cache, "python-fake-embed-amd64.zip")
+        with open(bad_file, "ab") as f:
+            f.write(b"X")
+        res_bad_sha = subprocess.run(
+            ["bash", os.path.join(ROOT, "packaging", "usb", "make_kit.sh"), self.stick, "--version", "9.9.9",
+             "--archives", self.archives, "--toolset", "full", "--tools-dir", tools_cache, "--replace"],
+            input=KIT_TOKEN + "\n", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+        )
+        self.assertNotEqual(res_bad_sha.returncode, 0)
+        self.assertIn("checksum mismatch", res_bad_sha.stdout)
+
 
 class StaticRepositoryChecks(unittest.TestCase):
     def test_windows_usb_scripts_enforce_cmdletbinding_isolation_and_manifest_revocation(self):
@@ -2194,6 +2331,7 @@ public class Program {
         self.assertTrue(os.path.isfile(path), ".gitattributes is missing")
         rules = read(path)
         self.assertRegex(rules, r"(?m)^\*\.sh\s+text\s+eol=lf")
+        self.assertRegex(rules, r"(?m)^packaging/usb/tools\.lock\s+text\s+eol=lf")
         for ext in ("cmd", "ps1", "vbs"):
             self.assertRegex(rules, r"(?m)^\*\.%s\s+text\s+eol=crlf" % ext)
 
@@ -4147,6 +4285,367 @@ public class Program {
                 body_head,
                 f"Windows isolation test {m.group(1)} must start with skip_if_duplicate_ci_pass!();",
             )
+
+    def test_usb_toolset_lock_and_scripts_match_design_0110(self):
+        lock_path = os.path.join(ROOT, "packaging", "usb", "tools.lock")
+        self.assertTrue(os.path.isfile(lock_path))
+        lock_bytes = read_bytes(lock_path)
+        self.assertNotIn(b"\r", lock_bytes, "tools.lock must use LF line endings")
+        rows = []
+        for raw in lock_bytes.decode("utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            self.assertEqual(len(cols), 6, f"Expected 6 tab-separated columns in {line!r}")
+            tool, comp, ver, fname, sha, url = cols
+            self.assertRegex(sha, r"^[0-9a-f]{64}$")
+            self.assertTrue(url.startswith("https://"), url)
+            rows.append((tool, comp, ver, fname))
+        self.assertEqual([r[:2] for r in rows], [
+            ("python", "python"),
+            ("rust", "rustc"),
+            ("rust", "rust-std"),
+            ("rust", "cargo"),
+            ("rust", "rust-mingw"),
+            ("mingw", "w64devkit"),
+            ("git", "mingit"),
+        ])
+        for comp_row in rows:
+            if comp_row[0] == "rust":
+                self.assertEqual(comp_row[2], "1.96.0", "Rust toolset pin must match CI toolchain 1.96.0")
+
+        for rel in (
+            "packaging/usb/tools/check/hello.rs",
+            "packaging/usb/tools/check/cc-check/Cargo.toml",
+            "packaging/usb/tools/check/cc-check/build.rs",
+            "packaging/usb/tools/check/cc-check/c/add.c",
+            "packaging/usb/tools/check/cc-check/src/main.rs",
+        ):
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, rel)), rel)
+
+        inst_ps1 = read(os.path.join(ROOT, "packaging", "usb", "install.ps1"))
+        for needle in (
+            "[switch]$Tools",
+            "[switch]$NoTools",
+            "Install the developer tools for tasks",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER",
+            "x86_64-w64-mingw32-gcc.exe",
+            'Remove("RUSTUP_HOME")',
+            'Remove("CARGO_TARGET_DIR")',
+            "--isolation-read-dir",
+            "GrantToolchainRx",
+            "cargo build --release --offline",
+            "--target-dir cc-check\\target",
+            "--crate-type bin",
+            "NOTICE.txt",
+        ):
+            self.assertIn(needle, inst_ps1)
+
+        if IS_WINDOWS and shutil.which("powershell"):
+            self._run_windows_toolset_e2e()
+
+    def _run_windows_toolset_e2e(self):
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix="ox_win_toolset_t2_"))
+        tmp_home = os.path.join(tmp, "home")
+        tmp_localappdata = os.path.join(tmp_home, "AppData", "Local")
+        tmp_appdata = os.path.join(tmp_home, "AppData", "Roaming")
+        tmp_temp = os.path.join(tmp_localappdata, "Temp")
+        for d in (tmp_home, tmp_localappdata, tmp_appdata, tmp_temp):
+            os.makedirs(d, exist_ok=True)
+        test_run_val = f"OxideSwarmUsbToolsetTest_{os.getpid()}"
+        test_pointer_key = rf"HKCU:\Software\OxideSwarm\UsbKitToolsetTest_{os.getpid()}"
+        pids_log = os.path.join(tmp, "spawned.pids")
+        args_log = os.path.join(tmp, "oxide_args.log")
+
+        # Build a clean PATH containing Windows essentials and PowerShell, but NO host cargo.exe.
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        stripped_path = os.pathsep.join([
+            os.path.join(sys_root, "System32"),
+            sys_root,
+            os.path.join(sys_root, "System32", "Wbem"),
+            os.path.join(sys_root, "System32", "WindowsPowerShell", "v1.0"),
+        ])
+        self.assertIsNone(shutil.which("cargo", path=stripped_path))
+
+        ps_env = {
+            k: v for k, v in os.environ.items()
+            if k.upper() not in ("PSMODULEPATH", "OXIDESWARM_HOME", "CARGO_HOME", "RUSTUP_HOME", "PATH")
+        }
+        ps_env.update(
+            PATH=stripped_path,
+            USERPROFILE=tmp_home,
+            HOME=tmp_home,
+            LOCALAPPDATA=tmp_localappdata,
+            APPDATA=tmp_appdata,
+            TEMP=tmp_temp,
+            TMP=tmp_temp,
+            OXIDESWARM_USB_RUN_VALUE=test_run_val,
+            OXIDESWARM_USB_POINTER_KEY=test_pointer_key,
+            OXIDESWARM_USB_ONLINE_SUMS_URL="off",
+            OXIDESWARM_REVOKE_WORKER_SCOPE_ROOT=tmp,
+            FAKE_OXIDE_PIDS_LOG=pids_log,
+            FAKE_ARGS_LOG=args_log,
+        )
+
+        try:
+            hello_bin = os.path.join(tmp, "fake_hello.exe")
+            hello_cs = os.path.join(tmp, "FakeHello.cs")
+            with open(hello_cs, "w", encoding="utf-8") as f:
+                f.write('using System;\npublic class Program { public static int Main() { Console.WriteLine("oxideswarm-tool-check-ok"); return 0; } }\n')
+            ps_env["FAKE_HELLO_EXE"] = hello_bin
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                 f"Add-Type -Path '{hello_cs}' -OutputAssembly '{hello_bin}' -OutputType ConsoleApplication"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30, check=True,
+            )
+
+            fake_exe = os.path.join(tmp, "oxideswarm.exe")
+            cs_file = os.path.join(tmp, "FakeOxideToolset.cs")
+            cs_code = r"""
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class Program {
+    public static int Main(string[] args) {
+        string argsLog = Environment.GetEnvironmentVariable("FAKE_ARGS_LOG");
+        if (!string.IsNullOrEmpty(argsLog)) {
+            try { File.AppendAllText(argsLog, string.Join(" ", args) + Environment.NewLine); } catch {}
+        }
+        if (args.Length > 0 && args[0] == "--version") {
+            Console.WriteLine("oxideswarm 9.9.9");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "join") {
+            Console.In.ReadToEnd();
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "worker") {
+            string pidsLog = Environment.GetEnvironmentVariable("FAKE_OXIDE_PIDS_LOG");
+            if (!string.IsNullOrEmpty(pidsLog)) {
+                try { File.AppendAllText(pidsLog, Process.GetCurrentProcess().Id.ToString() + Environment.NewLine); } catch {}
+            }
+            Thread.Sleep(60000);
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "workers") {
+            Console.WriteLine("[{\"name\":\"t2-win-tools\",\"tags\":[\"state:connected\",\"tool:python\",\"tool:rustc\",\"tool:cargo\",\"tool:git\"]}]");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "doctor") {
+            Console.WriteLine("doctor ok");
+            return 0;
+        }
+        if (args.Length > 0 && args[0] == "submit") {
+            string outAsset = null;
+            for (int i = 1; i < args.Length - 1; i++) {
+                if (args[i] == "--output-asset") { outAsset = args[i + 1]; break; }
+            }
+            if (!string.IsNullOrEmpty(outAsset)) {
+                string helloSrc = Environment.GetEnvironmentVariable("FAKE_HELLO_EXE");
+                Directory.CreateDirectory(Path.GetDirectoryName(outAsset));
+                File.Copy(helloSrc, outAsset, true);
+            }
+            string joined = string.Join(" ", args);
+            if (joined.Contains("cc-check")) {
+                Console.WriteLine("add_c(40, 2) = 42");
+            } else {
+                Console.WriteLine("ok");
+            }
+            return 0;
+        }
+        return 0;
+    }
+}
+"""
+            with open(cs_file, "w", encoding="utf-8") as f:
+                f.write(cs_code)
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                 f"Add-Type -Path '{cs_file}' -OutputAssembly '{fake_exe}' -OutputType ConsoleApplication"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30, check=True,
+            )
+
+            kit_dir = os.path.join(tmp, "kit")
+            os.makedirs(os.path.join(kit_dir, "archives"), exist_ok=True)
+            os.makedirs(os.path.join(kit_dir, "tools", "check", "cc-check", "c"), exist_ok=True)
+            os.makedirs(os.path.join(kit_dir, "tools", "check", "cc-check", "src"), exist_ok=True)
+            for name in ("install.ps1", "uninstall.ps1"):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", name), os.path.join(kit_dir, name))
+            shutil.copyfile(os.path.join(ROOT, "windows", "revoke-isolation-acls.ps1"), os.path.join(kit_dir, "revoke-isolation-acls.ps1"))
+            for check_rel in (
+                os.path.join("tools", "check", "hello.rs"),
+                os.path.join("tools", "check", "cc-check", "Cargo.toml"),
+                os.path.join("tools", "check", "cc-check", "build.rs"),
+                os.path.join("tools", "check", "cc-check", "c", "add.c"),
+                os.path.join("tools", "check", "cc-check", "src", "main.rs"),
+            ):
+                shutil.copyfile(os.path.join(ROOT, "packaging", "usb", check_rel), os.path.join(kit_dir, check_rel))
+            with open(os.path.join(kit_dir, "join.token"), "w", encoding="utf-8") as f:
+                f.write(KIT_TOKEN + "\n")
+            with open(os.path.join(kit_dir, "no-autostart"), "w", encoding="utf-8") as f:
+                f.write("trial\n")
+            with open(os.path.join(kit_dir, "tools", "NOTICE.txt"), "w", encoding="utf-8") as f:
+                f.write("Python PSF; Rust MIT/Apache-2.0; w64devkit GPL v3 source; MinGit GPL v2 source\n")
+
+            zip_name = "oxideswarm-9.9.9-x86_64-pc-windows-msvc.zip"
+            zip_path = os.path.join(kit_dir, "archives", zip_name)
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.write(fake_exe, "oxideswarm.exe")
+            sum_lines = [f"{hashlib.sha256(read_bytes(zip_path)).hexdigest()}  {zip_name}"]
+
+            def write_tool_set(py_ver, rust_ver, mingw_ver, git_ver):
+                t_defs = [
+                    ("python", "python", py_ver, f"python-{py_ver}-embed-amd64.zip", _make_zip_bytes_raw({"python.exe": b"MZpy", "LICENSE.txt": b"PSF"})),
+                    ("rust", "rustc", rust_ver, f"rustc-{rust_ver}-x86_64-pc-windows-gnu.tar.xz", _make_tar_xz_root_bytes(f"rustc-{rust_ver}-x86_64-pc-windows-gnu", {"components": b"rustc\n", "rustc/manifest.in": b"file:bin/rustc.exe\n", "rustc/bin/rustc.exe": b"MZrustc"})),
+                    ("rust", "rust-std", rust_ver, f"rust-std-{rust_ver}-x86_64-pc-windows-gnu.tar.xz", _make_tar_xz_root_bytes(f"rust-std-{rust_ver}-x86_64-pc-windows-gnu", {"components": b"rust-std\n", "rust-std/manifest.in": b"dir:lib/rustlib/x86_64-pc-windows-gnu/lib\n", "rust-std/lib/rustlib/x86_64-pc-windows-gnu/lib/libstd.rlib": b"RLIB"})),
+                    ("rust", "cargo", rust_ver, f"cargo-{rust_ver}-x86_64-pc-windows-gnu.tar.xz", _make_tar_xz_root_bytes(f"cargo-{rust_ver}-x86_64-pc-windows-gnu", {"components": b"cargo\n", "cargo/manifest.in": b"file:bin/cargo.exe\n", "cargo/bin/cargo.exe": b"MZcargo"})),
+                    ("rust", "rust-mingw", rust_ver, f"rust-mingw-{rust_ver}-x86_64-pc-windows-gnu.tar.xz", _make_tar_xz_root_bytes(f"rust-mingw-{rust_ver}-x86_64-pc-windows-gnu", {"components": b"rust-mingw\n", "rust-mingw/manifest.in": b"dir:lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained\n", "rust-mingw/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/x86_64-w64-mingw32-gcc.exe": b"MZld"})),
+                    ("mingw", "w64devkit", mingw_ver, f"w64devkit-x64-{mingw_ver}.zip", _make_zip_bytes_raw({"w64devkit/bin/gcc.exe": b"MZgcc", "w64devkit/bin/ar.exe": b"MZar"})),
+                    ("git", "mingit", git_ver, f"MinGit-{git_ver}-64-bit.zip", _make_zip_bytes_raw({"cmd/git.exe": b"MZgit"})),
+                ]
+                t_lock_lines = []
+                t_sums = list(sum_lines)
+                for tool, comp, ver, fname, data in t_defs:
+                    fp = os.path.join(kit_dir, "tools", fname)
+                    with open(fp, "wb") as f:
+                        f.write(data)
+                    h = hashlib.sha256(data).hexdigest()
+                    t_lock_lines.append(f"{tool}\t{comp}\t{ver}\t{fname}\t{h}\thttps://example.invalid/{fname}")
+                    t_sums.append(f"{h}  tools/{fname}")
+                with open(os.path.join(kit_dir, "tools", "tools.lock"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(t_lock_lines) + "\n")
+                with open(os.path.join(kit_dir, "archives", "SHA256SUMS"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(t_sums) + "\n")
+                with open(os.path.join(kit_dir, "kit.json"), "w", encoding="utf-8") as f:
+                    json.dump({"kit_format": 0, "version": "9.9.9", "roles": ["worker", "client"], "workspaces": True, "gpu": False, "toolset": ["python", "rust", "mingw", "git"]}, f)
+
+            write_tool_set("3.15.2", "1.96.0", "2.11.0", "2.56.1")
+
+            # 1. -NoTools: installs no tools/ or cargo-home/, VBS omits GNU linker.
+            root_no = os.path.join(tmp_localappdata, "inst-no-tools")
+            res_no = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(kit_dir, "install.ps1"),
+                 "-InstallRoot", root_no, "-Name", "t2-win-tools", "-NoTools"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+            )
+            self.assertEqual(res_no.returncode, 0, res_no.stdout)
+            self.assertFalse(os.path.exists(os.path.join(root_no, "tools")))
+            self.assertFalse(os.path.exists(os.path.join(root_no, "cargo-home")))
+            vbs_no = read(os.path.join(root_no, "start-worker.vbs"))
+            self.assertNotIn("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER", vbs_no)
+            self.assertNotIn("--workspaces", vbs_no)
+            self.assertIn("tools=0", read(os.path.join(root_no, "kit-install.txt")))
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                 "-InstallRoot", root_no, "-Yes"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, check=True,
+            )
+
+            # 2. -Tools with -Isolation fs: extracts all 4 tools, sets VBS env, enables --workspaces,
+            # grants ACL on tools/, runs D5 checks, updates cleanly, and uninstall removes tools/ + cargo-home/.
+            open(args_log, "w", encoding="utf-8").close()
+            root_yes = os.path.join(tmp_localappdata, "OxideSwarm-USB")
+            res_yes = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(kit_dir, "install.ps1"),
+                 "-InstallRoot", root_yes, "-Name", "t2-win-tools", "-Tools", "-Isolation", "fs"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            self.assertEqual(res_yes.returncode, 0, res_yes.stdout)
+            for rel in (
+                os.path.join("tools", "NOTICE.txt"),
+                os.path.join("tools", "python-3.15.2", "python.exe"),
+                os.path.join("tools", "rust-1.96.0", "bin", "rustc.exe"),
+                os.path.join("tools", "rust-1.96.0", "bin", "cargo.exe"),
+                os.path.join("tools", "rust-1.96.0", "lib", "rustlib", "x86_64-pc-windows-gnu", "lib", "libstd.rlib"),
+                os.path.join("tools", "rust-1.96.0", "lib", "rustlib", "x86_64-pc-windows-gnu", "bin", "self-contained", "x86_64-w64-mingw32-gcc.exe"),
+                os.path.join("tools", "mingw-2.11.0", "bin", "gcc.exe"),
+                os.path.join("tools", "git-2.56.1", "cmd", "git.exe"),
+            ):
+                self.assertTrue(os.path.isfile(os.path.join(root_yes, rel)), rel)
+            self.assertTrue(os.path.isdir(os.path.join(root_yes, "cargo-home")))
+            cargo_cfg = read(os.path.join(root_yes, "cargo-home", "config.toml"))
+            self.assertIn("[target.x86_64-pc-windows-gnu]", cargo_cfg)
+            self.assertIn("x86_64-w64-mingw32-gcc.exe", cargo_cfg)
+            vbs_yes = read(os.path.join(root_yes, "start-worker.vbs"))
+            for expected_vbs in (
+                os.path.join(root_yes, "cargo-home"),
+                'Remove("RUSTUP_HOME")',
+                'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER',
+                'x86_64-w64-mingw32-gcc.exe',
+                os.path.join(root_yes, "tools", "python-3.15.2"),
+                os.path.join(root_yes, "tools", "rust-1.96.0", "bin"),
+                os.path.join(root_yes, "tools", "mingw-2.11.0", "bin"),
+                os.path.join(root_yes, "tools", "git-2.56.1", "cmd"),
+                "--workspaces --workspace-root",
+                "--isolation-read-dir",
+            ):
+                self.assertIn(expected_vbs, vbs_yes)
+            grant_log_text = read(os.path.join(root_yes, "home", "windows_acl_grants.txt"))
+            self.assertIn(os.path.join(root_yes, "tools"), grant_log_text)
+            self.assertIn("check python:  OK", res_yes.stdout)
+            self.assertIn("check compile: OK (oxideswarm-tool-check-ok)", res_yes.stdout)
+            self.assertIn("check mingw:   OK", res_yes.stdout)
+            self.assertIn("check git:     OK", res_yes.stdout)
+            args_text = read(args_log)
+            self.assertIn("--require-tool python", args_text)
+            self.assertIn("--require-tool rustc", args_text)
+            self.assertIn("--require-tool cargo", args_text)
+            self.assertIn("--require-tool git", args_text)
+            self.assertIn("tools=1", read(os.path.join(root_yes, "kit-install.txt")))
+
+            # 3. -Update to newer python version removes old folder after switching VBS & restarting.
+            write_tool_set("3.15.3", "1.96.0", "2.11.0", "2.56.1")
+            res_upd = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(kit_dir, "install.ps1"),
+                 "-InstallRoot", root_yes, "-Update"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90,
+            )
+            self.assertEqual(res_upd.returncode, 0, res_upd.stdout)
+            self.assertTrue(os.path.isfile(os.path.join(root_yes, "tools", "python-3.15.3", "python.exe")))
+            self.assertFalse(os.path.exists(os.path.join(root_yes, "tools", "python-3.15.2")))
+            self.assertIn("python-3.15.3", read(os.path.join(root_yes, "start-worker.vbs")))
+
+            # 4. Uninstall leaves no tools/ or cargo-home/.
+            res_un = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(kit_dir, "uninstall.ps1"),
+                 "-InstallRoot", root_yes, "-Yes"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+            )
+            self.assertEqual(res_un.returncode, 0, res_un.stdout)
+            self.assertFalse(os.path.exists(root_yes))
+            self.assertFalse(os.path.exists(os.path.join(root_yes, "tools")))
+            self.assertFalse(os.path.exists(os.path.join(root_yes, "cargo-home")))
+
+            # 5. Tampered tool archive fails checksum verification before creating install root.
+            bad_py_path = os.path.join(kit_dir, "tools", "python-3.15.3-embed-amd64.zip")
+            with open(bad_py_path, "ab") as f:
+                f.write(b"TAMPERED")
+            root_bad = os.path.join(tmp_localappdata, "inst-tampered-tool")
+            res_bad = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(kit_dir, "install.ps1"),
+                 "-InstallRoot", root_bad, "-Name", "t2-bad-tool", "-Tools"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60,
+            )
+            self.assertNotEqual(res_bad.returncode, 0)
+            self.assertIn("checksum mismatch", res_bad.stdout.lower())
+            self.assertFalse(os.path.exists(root_bad))
+        finally:
+            if os.path.isfile(pids_log):
+                for line in read(pids_log).splitlines():
+                    ps = line.strip()
+                    if ps.isdigit():
+                        subprocess.run(
+                            ["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {ps} -Force -ErrorAction SilentlyContinue"],
+                            env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                        )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name '{test_run_val}' -ErrorAction SilentlyContinue; Remove-Item -Path '{test_pointer_key}' -Recurse -Force -ErrorAction SilentlyContinue"],
+                env=ps_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class WindowsOxctlStopTests(unittest.TestCase):
