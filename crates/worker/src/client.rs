@@ -165,17 +165,42 @@ pub const MOBILE_TELEMETRY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// re-reads it.
 pub const MOBILE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Aborts the wrapped task when dropped.
-struct AbortOnDrop(JoinHandle<()>);
+/// Aborts the wrapped task when dropped unless gracefully awaited via [`AbortOnDrop::shutdown_gracefully`].
+pub(super) struct AbortOnDrop(Option<JoinHandle<()>>);
+
+impl AbortOnDrop {
+    pub(super) fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.0.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    async fn shutdown_gracefully(
+        mut self,
+        stop_tx: &tokio::sync::watch::Sender<bool>,
+        timeout: Duration,
+    ) {
+        let _ = stop_tx.send(true);
+        if let Some(handle) = self.0.as_mut() {
+            if tokio::time::timeout(timeout, handle).await.is_ok() {
+                self.0 = None;
+            }
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
     }
 }
 
 /// Configuration options for initializing and connecting a Worker client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     /// Address of the Master node to connect to (e.g. "127.0.0.1:8088"; the dashboard is on :8080).
     pub master_addr: String,
@@ -326,6 +351,43 @@ pub struct WorkerConfig {
     pub fake_runner: Option<crate::sim::FakeRunnerConfig>,
     /// Optional simulated link shaping and byte/disconnect instrumentation (`SCALE-1`).
     pub simulated_link: Option<crate::sim::SimulatedLinkConfig>,
+    /// Optional local same-user control IPC endpoint (`design 0113` D2).
+    pub control_endpoint: Option<crate::control::ControlEndpoint>,
+    /// Initial contributor-configured worker limits (`design 0113` D1/D2).
+    pub initial_limits: crate::control::WorkerLimitsConfig,
+    /// Path to the active config file displayed by `oxideswarm worker status`.
+    pub control_config_path: Option<PathBuf>,
+    /// Persistence callback invoked by `oxideswarm worker limits set` to update `[worker]` TOML keys.
+    pub limit_persist_hook: Option<crate::control::LimitPersistHook>,
+    /// Also hand back already-running tasks when an automatic contributor limit holds (`NET-9b`).
+    pub hold_ends_tasks: bool,
+    /// Interval for re-evaluating automatic contributor limits (default: [`crate::limits::LIMITS_EVAL_INTERVAL`]).
+    pub limit_eval_interval: Duration,
+    /// Optional battery probe override (for tests; defaults to [`crate::limits::SystemBatteryProbe`] unless `no_battery`).
+    pub battery_probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
+    /// Optional metered-network probe override (for tests; defaults to [`crate::limits::SystemMeteredNetworkProbe`]).
+    pub metered_probe: Option<Arc<dyn crate::limits::MeteredNetworkProbe>>,
+    /// Optional host CPU probe override (for tests; defaults to [`crate::limits::SystemHostCpuProbe`]).
+    pub cpu_probe: Option<Arc<dyn crate::limits::HostCpuProbe>>,
+    /// Optional local wall-clock override (for tests; defaults to [`crate::limits::SystemLocalClock`]).
+    pub local_clock: Option<Arc<dyn crate::limits::LocalClock>>,
+    /// Optional private state file path to persist daily task-hours usage across restarts.
+    pub daily_budget_path: Option<PathBuf>,
+    /// Optional directory where per-worker-id daily budget files (`daily-budget.<worker_id>.json`)
+    /// are stored when `daily_budget_path` is not explicitly specified.
+    pub daily_budget_dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("master_addr", &self.master_addr)
+            .field("name", &self.name)
+            .field("no_battery", &self.no_battery)
+            .field("hold_ends_tasks", &self.hold_ends_tasks)
+            .field("limit_eval_interval", &self.limit_eval_interval)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkerConfig {
@@ -384,6 +446,18 @@ impl WorkerConfig {
             rendezvous_url: None,
             fake_runner: None,
             simulated_link: None,
+            control_endpoint: None,
+            initial_limits: crate::control::WorkerLimitsConfig::default(),
+            control_config_path: None,
+            limit_persist_hook: None,
+            hold_ends_tasks: false,
+            limit_eval_interval: crate::limits::LIMITS_EVAL_INTERVAL,
+            battery_probe: None,
+            metered_probe: None,
+            cpu_probe: None,
+            local_clock: None,
+            daily_budget_path: None,
+            daily_budget_dir: None,
         }
     }
 
@@ -682,6 +756,93 @@ impl WorkerConfig {
         self
     }
 
+    /// Configures the local same-user control endpoint served while the worker runs.
+    pub fn with_control_endpoint(
+        mut self,
+        endpoint: Option<crate::control::ControlEndpoint>,
+    ) -> Self {
+        self.control_endpoint = endpoint;
+        self
+    }
+
+    /// Configures the initial contributor limits state (`design 0113` D1/D2).
+    pub fn with_initial_limits(mut self, limits: crate::control::WorkerLimitsConfig) -> Self {
+        self.hold_ends_tasks = limits.hold_ends_tasks;
+        self.initial_limits = limits;
+        self
+    }
+
+    /// Records the configuration file path reported by `worker status` / `limits`.
+    pub fn with_control_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.control_config_path = path;
+        self
+    }
+
+    /// Registers a persistence callback invoked when `limits set` mutates `[worker]` settings.
+    pub fn with_limit_persist_hook(
+        mut self,
+        hook: Option<crate::control::LimitPersistHook>,
+    ) -> Self {
+        self.limit_persist_hook = hook;
+        self
+    }
+
+    /// Configures `--hold-ends-tasks`: hand back running tasks on automatic limit holds (`NET-9b`).
+    pub fn with_hold_ends_tasks(mut self, enabled: bool) -> Self {
+        self.hold_ends_tasks = enabled;
+        self.initial_limits.hold_ends_tasks = enabled;
+        self
+    }
+
+    /// Overrides the periodic evaluation cadence for automatic contributor limits.
+    pub fn with_limit_eval_interval(mut self, interval: Duration) -> Self {
+        self.limit_eval_interval = interval;
+        self
+    }
+
+    /// Injects a custom [`BatteryProbe`] (used by `net9b` integration tests).
+    pub fn with_battery_probe(
+        mut self,
+        probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
+    ) -> Self {
+        self.battery_probe = probe;
+        self
+    }
+
+    /// Injects a custom [`MeteredNetworkProbe`] (used by `net9b` integration tests).
+    pub fn with_metered_probe(
+        mut self,
+        probe: Option<Arc<dyn crate::limits::MeteredNetworkProbe>>,
+    ) -> Self {
+        self.metered_probe = probe;
+        self
+    }
+
+    /// Injects a custom [`HostCpuProbe`] (used by `net9b` integration tests).
+    pub fn with_cpu_probe(mut self, probe: Option<Arc<dyn crate::limits::HostCpuProbe>>) -> Self {
+        self.cpu_probe = probe;
+        self
+    }
+
+    /// Injects a custom [`LocalClock`] (used by `net9b` integration tests).
+    pub fn with_local_clock(mut self, clock: Option<Arc<dyn crate::limits::LocalClock>>) -> Self {
+        self.local_clock = clock;
+        self
+    }
+
+    /// Sets the private state file path for persisting daily contributor task-hours across restarts.
+    pub fn with_daily_budget_path(mut self, path: Option<PathBuf>) -> Self {
+        self.daily_budget_path = path;
+        self
+    }
+
+    /// Sets the directory in which per-worker-id daily budget files (`daily-budget.<worker_id>.json`)
+    /// are stored when [`Self::with_daily_budget_path`] is not set.
+    pub fn with_daily_budget_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.daily_budget_dir = dir;
+        self
+    }
+
     /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
     pub fn simulated(
         master_addr: impl Into<String>,
@@ -747,6 +908,23 @@ fn resolve_worker_id(config: &WorkerConfig) -> Uuid {
     Uuid::new_v4()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CachedLimitProbes {
+    pub(super) battery: crate::limits::BatteryStatus,
+    pub(super) metered: crate::limits::MeteredStatus,
+    pub(super) host_cpu_pct: Option<f32>,
+}
+
+impl Default for CachedLimitProbes {
+    fn default() -> Self {
+        Self {
+            battery: crate::limits::BatteryStatus::Unknown,
+            metered: crate::limits::MeteredStatus::Unknown,
+            host_cpu_pct: None,
+        }
+    }
+}
+
 /// Autonomous Worker client managing connection, registration, task execution, and communication with Master.
 pub struct WorkerClient {
     config: WorkerConfig,
@@ -804,6 +982,26 @@ pub struct WorkerClient {
     /// Outbox for checkpoints and completed task results produced while disconnected within the
     /// session-resume grace window.
     pending_resume_outbox: Arc<std::sync::Mutex<tasks::PendingResumeOutbox>>,
+    /// Local pause/resume & contributor-limits control state (`design 0113` D2).
+    control: Arc<crate::control::ControlHandle>,
+    /// Set by `run_session` when a pause-resume asks for an immediate reconnect without backoff.
+    resume_reconnect_pending: AtomicBool,
+    /// Stateful D1 limits evaluator (30 s CPU averager + daily task-hours budget + weekly hours).
+    limits_evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
+    /// Wakes `run_session` after completed tasks record daily runtime or background probes refresh.
+    limits_reeval_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the background OS probe poller when limits change.
+    probe_refresh_notify: Arc<tokio::sync::Notify>,
+    /// Monotonic start instant of the most recently launched task (for CPU tree start grace).
+    last_task_start: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Resolved daily task-hours persistence file path (`None` when persistence is disabled).
+    #[cfg(test)]
+    daily_budget_path: Option<PathBuf>,
+    cached_limit_probes: Arc<std::sync::Mutex<CachedLimitProbes>>,
+    battery_probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
+    metered_probe: Arc<dyn crate::limits::MeteredNetworkProbe>,
+    cpu_probe: Option<Arc<dyn crate::limits::HostCpuProbe>>,
+    local_clock: Arc<dyn crate::limits::LocalClock>,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
     #[cfg(feature = "p2p")]
@@ -1110,6 +1308,69 @@ impl WorkerClient {
             initial_features.insert(ProtocolCapabilities::WORKSPACES);
         }
 
+        let local_clock: Arc<dyn crate::limits::LocalClock> = config
+            .local_clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::limits::SystemLocalClock));
+        let battery_probe = config.battery_probe.clone().or_else(|| {
+            (!config.no_battery).then(|| {
+                Arc::new(crate::limits::SystemBatteryProbe) as Arc<dyn crate::limits::BatteryProbe>
+            })
+        });
+        let metered_probe: Arc<dyn crate::limits::MeteredNetworkProbe> = config
+            .metered_probe
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::limits::SystemMeteredNetworkProbe));
+        let cpu_probe = config.cpu_probe.clone();
+        let mut initial_limits = config.initial_limits.clone();
+        initial_limits.hold_ends_tasks |= config.hold_ends_tasks;
+        let init_limits = crate::limits::WorkerLimits::from_control_config(&initial_limits);
+        let daily_budget_path = config.daily_budget_path.clone().or_else(|| {
+            config
+                .daily_budget_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("daily-budget.{worker_id}.json")))
+        });
+        let init_day = local_clock.local_now().date();
+        let (limits_evaluator, effective_control_limits) =
+            match crate::limits::LimitsEvaluator::with_budget_path(
+                init_limits,
+                init_day,
+                daily_budget_path.clone(),
+            ) {
+                Ok(eval) => (eval, initial_limits),
+                Err(e) => {
+                    warn!(error = %e, "Invalid initial contributor limits ignored; using defaults");
+                    (
+                        crate::limits::LimitsEvaluator::with_budget_path(
+                            crate::limits::WorkerLimits::default(),
+                            init_day,
+                            daily_budget_path.clone(),
+                        )
+                        .expect("default limits are valid"),
+                        crate::control::WorkerLimitsConfig::default(),
+                    )
+                }
+            };
+        if config.no_battery
+            && config.battery_probe.is_none()
+            && effective_control_limits.no_tasks_on_battery == Some(true)
+        {
+            warn!(
+                worker_id = %worker_id,
+                "Both no_battery and --no-tasks-on-battery are set; battery probing is disabled so --no-tasks-on-battery will never hold tasks"
+            );
+        }
+
+        let control = crate::control::ControlHandle::new(
+            worker_id,
+            capabilities.name.clone(),
+            Arc::clone(&active_tasks),
+            effective_control_limits,
+            config.control_config_path.clone(),
+            config.limit_persist_hook.clone(),
+        );
+
         Self {
             config,
             worker_id,
@@ -1142,6 +1403,19 @@ impl WorkerClient {
             pending_resume_outbox: Arc::new(std::sync::Mutex::new(
                 tasks::PendingResumeOutbox::with_capacity(2 * concurrency_permits.max(1)),
             )),
+            control,
+            resume_reconnect_pending: AtomicBool::new(false),
+            limits_evaluator: Arc::new(std::sync::Mutex::new(limits_evaluator)),
+            limits_reeval_notify: Arc::new(tokio::sync::Notify::new()),
+            probe_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            last_task_start: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            daily_budget_path,
+            cached_limit_probes: Arc::new(std::sync::Mutex::new(CachedLimitProbes::default())),
+            battery_probe,
+            metered_probe,
+            cpu_probe,
+            local_clock,
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "p2p")]
@@ -1149,6 +1423,11 @@ impl WorkerClient {
             #[cfg(feature = "p2p")]
             p2p_failures: AtomicU32::new(0),
         }
+    }
+
+    /// Returns a shared handle to the worker's local pause/resume and limits state.
+    pub fn control_handle(&self) -> Arc<crate::control::ControlHandle> {
+        Arc::clone(&self.control)
     }
 
     /// Returns the active P2P path information, if connected via P2P.
@@ -1388,6 +1667,11 @@ impl WorkerClient {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn resolved_daily_budget_path(&self) -> Option<&std::path::Path> {
+        self.daily_budget_path.as_deref()
+    }
+
     /// Returns the active backoff configuration.
     pub fn backoff_config(&self) -> &BackoffConfig {
         &self.backoff_config
@@ -1547,7 +1831,7 @@ impl WorkerClient {
             let portal_shutdown_rx = shutdown_rx.clone();
             let beacon_ref = Arc::clone(&self.master_beacon);
             let secret = self.config.cluster_secret.clone();
-            AbortOnDrop(tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 spawn_worker_redirection_portal_with_secret(
                     portal_port,
                     beacon_ref,
@@ -1565,13 +1849,64 @@ impl WorkerClient {
             && !self.config.no_battery
             && self.mobile.snapshot().is_some())
         .then(|| {
-            AbortOnDrop(spawn_mobile_poller(
+            AbortOnDrop::new(spawn_mobile_poller(
                 self.mobile.clone(),
                 MOBILE_POLL_INTERVAL,
                 detect_live_mobile_status,
             ))
         });
 
+        let (control_shutdown_tx, control_shutdown_rx) = watch::channel(false);
+        let control_server_handle = self.config.control_endpoint.clone().map(|endpoint| {
+            let handle = Arc::clone(&self.control);
+            let mut merged_shutdown_rx = shutdown_rx.clone();
+            let mut local_rx = control_shutdown_rx;
+            let (srv_stop_tx, srv_stop_rx) = watch::channel(false);
+            tokio::spawn(async move {
+                let srv_handle = Arc::clone(&handle);
+                let mut srv_fut = Box::pin(crate::control::serve_control_endpoint(
+                    endpoint.clone(),
+                    srv_handle,
+                    srv_stop_rx,
+                ));
+                tokio::select! {
+                    res = &mut srv_fut => {
+                        if let Err(err) = res {
+                            handle.set_control_server_error(Some(err.clone()));
+                            tracing::error!(endpoint = %endpoint.display_target(), error = %err, "Local worker control server failed");
+                            eprintln!(
+                                "warning: local worker control server failed ({}): {err}",
+                                endpoint.display_target()
+                            );
+                        }
+                    }
+                    _ = merged_shutdown_rx.changed() => {
+                        let _ = srv_stop_tx.send(true);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), srv_fut).await;
+                    }
+                    _ = local_rx.changed() => {
+                        let _ = srv_stop_tx.send(true);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), srv_fut).await;
+                    }
+                }
+            })
+        });
+
+        let (initial_ready_tx, initial_ready_rx) = tokio::sync::oneshot::channel();
+        let (poller_shutdown_tx, poller_shutdown_rx) = watch::channel(false);
+        let limits_probe_poller = AbortOnDrop::new(
+            self.spawn_limits_probe_poller(Some(initial_ready_tx), poller_shutdown_rx),
+        );
+        {
+            let probe_wait = tokio::time::timeout(Duration::from_secs(1), initial_ready_rx);
+            tokio::select! {
+                _ = probe_wait => {}
+                _ = shutdown_rx.changed() => {}
+            }
+        }
+        self.sync_and_evaluate_limits(false).await;
+
+        let mut run_result = Ok(());
         loop {
             if *shutdown_rx.borrow() {
                 info!(worker_id = %self.worker_id, "Worker shutdown requested; exiting supervisor");
@@ -1581,6 +1916,8 @@ impl WorkerClient {
             }
 
             self.master_shutdown_announced = false;
+            self.resume_reconnect_pending
+                .store(false, Ordering::Release);
             let outcome = self.connect_and_run(&mut shutdown_rx, &mut backoff).await;
 
             let is_shutdown = *shutdown_rx.borrow();
@@ -1596,6 +1933,7 @@ impl WorkerClient {
             let keep_for_resume = outcome.is_err()
                 && !is_shutdown
                 && evac_reason.is_none()
+                && !self.resume_reconnect_pending.load(Ordering::Acquire)
                 && self
                     .resume_deadline
                     .is_some_and(|d| tokio::time::Instant::now() < d);
@@ -1617,11 +1955,21 @@ impl WorkerClient {
                         break;
                     }
 
+                    if self.resume_reconnect_pending.swap(false, Ordering::AcqRel) {
+                        info!(
+                            worker_id = %self.worker_id,
+                            "Worker resumed; reconnecting immediately to clear hold-back"
+                        );
+                        backoff.reset();
+                        continue;
+                    }
+
                     if let GridError::Config(_) = e {
                         error!(worker_id = %self.worker_id, error = %e, "Worker configuration error; not retrying");
                         self.resume_deadline = None;
                         self.expire_resume_window(&cancel_reason).await;
-                        return Err(e);
+                        run_result = Err(e);
+                        break;
                     }
 
                     let auth_failure =
@@ -1702,7 +2050,44 @@ impl WorkerClient {
             }
         }
 
-        Ok(())
+        let _ = control_shutdown_tx.send(true);
+        if let Some(mut handle) = control_server_handle {
+            if tokio::time::timeout(Duration::from_secs(1), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+            }
+        }
+
+        limits_probe_poller
+            .shutdown_gracefully(&poller_shutdown_tx, Duration::from_secs(2))
+            .await;
+
+        let final_persist = self
+            .limits_evaluator
+            .lock()
+            .ok()
+            .and_then(|eval| eval.pending_budget_persist(true));
+        if let Some(work) = final_persist {
+            let day = work.day;
+            let used_ms = work.used_ms;
+            let persisted = tokio::task::spawn_blocking(move || match work.write_to_disk() {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(error = %err, "Failed to persist daily task budget on shutdown");
+                    false
+                }
+            })
+            .await
+            .unwrap_or(false);
+            if persisted {
+                if let Ok(mut eval) = self.limits_evaluator.lock() {
+                    eval.mark_budget_persisted(day, used_ms);
+                }
+            }
+        }
+        run_result
     }
 }
 

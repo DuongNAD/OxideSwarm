@@ -232,3 +232,11 @@ path = "../../tests/cli_usb_kit_e2e.rs"
 [[test]]
 name = "verify_e2e"
 path = "../../tests/verify_e2e.rs"
+
+[[test]]
+name = "net9a_contributor_controls"
+path = "../../tests/net9a_contributor_controls.rs"
+
+[[test]]
+name = "net9b_contributor_limits"
+path = "../../tests/net9b_contributor_limits.rs"

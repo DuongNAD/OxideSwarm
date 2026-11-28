@@ -406,6 +406,18 @@ impl Session {
         }
     }
 
+    /// Waits briefly for queued data frames (such as pause hand-back results) to leave `data_tx`
+    /// before closing a session to re-register.
+    pub(super) async fn flush_data_queue_briefly(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.data_tx.capacity() < self.data_tx.max_capacity()
+            && !self.data_tx.is_closed()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Ends the session: queues `farewell`, lets the writers flush the control queue (bounded),
     /// then stops every lane task, which closes the sockets.
     pub(super) async fn close(mut self, farewell: Option<WorkerMessage>) {
@@ -442,6 +454,327 @@ fn p2p_target_display(ticket: &str) -> String {
 }
 
 impl WorkerClient {
+    pub(super) fn spawn_limits_probe_poller(
+        &self,
+        mut initial_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let control = Arc::clone(&self.control);
+        let active_task_table = Arc::clone(&self.active_task_table);
+        let cached_probes = Arc::clone(&self.cached_limit_probes);
+        let limits_evaluator = Arc::clone(&self.limits_evaluator);
+        let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
+        let probe_refresh_notify = Arc::clone(&self.probe_refresh_notify);
+        let last_task_start = Arc::clone(&self.last_task_start);
+        let battery_probe = self.battery_probe.clone();
+        let metered_probe = Arc::clone(&self.metered_probe);
+        let cpu_probe = self.cpu_probe.clone();
+        let interval = self
+            .config
+            .limit_eval_interval
+            .max(Duration::from_millis(50));
+        let step_interval = interval
+            .min(Duration::from_secs(1))
+            .max(Duration::from_millis(50));
+
+        tokio::spawn(async move {
+            struct InitialProbeGate {
+                pending: std::sync::atomic::AtomicUsize,
+                tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            }
+            impl InitialProbeGate {
+                fn done_one(&self) {
+                    if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        if let Some(tx) = self.tx.lock().ok().and_then(|mut s| s.take()) {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            }
+
+            let tree_sampler = Arc::new(std::sync::Mutex::new(
+                crate::limits::WorkerTreeCpuSampler::new(),
+            ));
+            let mut battery_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut metered_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut cpu_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut persist_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut last_battery_poll: Option<tokio::time::Instant> = None;
+            let mut last_metered_poll: Option<tokio::time::Instant> = None;
+            let mut last_cpu_poll: Option<tokio::time::Instant> = None;
+            let mut tick = tokio::time::interval(step_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                let lim = control.limits();
+                let need_battery = lim.no_tasks_on_battery.unwrap_or(false);
+                let need_metered = lim.no_tasks_on_metered.unwrap_or(false);
+                let need_cpu = lim.local_max_cpu_pct.is_some();
+                let now_tokio = tokio::time::Instant::now();
+
+                let initial_gate = if let Some(tx) = initial_ready_tx.take() {
+                    let count = usize::from(need_battery && battery_probe.is_some())
+                        + usize::from(need_metered);
+                    if count == 0 {
+                        let _ = tx.send(());
+                        None
+                    } else {
+                        Some(Arc::new(InitialProbeGate {
+                            pending: std::sync::atomic::AtomicUsize::new(count),
+                            tx: std::sync::Mutex::new(Some(tx)),
+                        }))
+                    }
+                } else {
+                    None
+                };
+
+                if need_battery
+                    && battery_inflight
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                    && last_battery_poll.is_none_or(|t| now_tokio.duration_since(t) >= interval)
+                {
+                    if let Some(probe) = battery_probe.as_ref().map(Arc::clone) {
+                        last_battery_poll = Some(now_tokio);
+                        let cache = Arc::clone(&cached_probes);
+                        let notify = Arc::clone(&limits_reeval_notify);
+                        let gate = initial_gate.as_ref().map(Arc::clone);
+                        battery_inflight = Some(tokio::spawn(async move {
+                            let val = tokio::task::spawn_blocking(move || probe.probe_battery())
+                                .await
+                                .unwrap_or(crate::limits::BatteryStatus::Unknown);
+                            if let Ok(mut guard) = cache.lock() {
+                                guard.battery = val;
+                            }
+                            if let Some(g) = gate {
+                                g.done_one();
+                            }
+                            notify.notify_one();
+                        }));
+                    }
+                }
+
+                if need_metered
+                    && metered_inflight
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                    && last_metered_poll.is_none_or(|t| now_tokio.duration_since(t) >= interval)
+                {
+                    last_metered_poll = Some(now_tokio);
+                    let probe = Arc::clone(&metered_probe);
+                    let cache = Arc::clone(&cached_probes);
+                    let notify = Arc::clone(&limits_reeval_notify);
+                    let gate = initial_gate.as_ref().map(Arc::clone);
+                    metered_inflight = Some(tokio::spawn(async move {
+                        let val = tokio::task::spawn_blocking(move || probe.probe_metered())
+                            .await
+                            .unwrap_or(crate::limits::MeteredStatus::Unknown);
+                        if let Ok(mut guard) = cache.lock() {
+                            guard.metered = val;
+                        }
+                        if let Some(g) = gate {
+                            g.done_one();
+                        }
+                        notify.notify_one();
+                    }));
+                }
+
+                if need_cpu
+                    && cpu_inflight
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    let (has_active, root_pids): (bool, Vec<u32>) = {
+                        let table = active_task_table.read().await;
+                        let pids = table
+                            .values()
+                            .map(|h| h.child_pid.load(Ordering::Acquire))
+                            .filter(|&p| p != 0)
+                            .collect();
+                        (!table.is_empty(), pids)
+                    };
+                    let cpu_cadence = if has_active { step_interval } else { interval };
+                    if last_cpu_poll.is_none_or(|t| now_tokio.duration_since(t) >= cpu_cadence) {
+                        last_cpu_poll = Some(now_tokio);
+                        let cache = Arc::clone(&cached_probes);
+                        let notify = Arc::clone(&limits_reeval_notify);
+                        if let Some(probe) = cpu_probe.as_ref().map(Arc::clone) {
+                            cpu_inflight = Some(tokio::spawn(async move {
+                                let val =
+                                    tokio::task::spawn_blocking(move || probe.probe_cpu_pct())
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                if let Ok(mut guard) = cache.lock() {
+                                    guard.host_cpu_pct = val;
+                                }
+                                notify.notify_one();
+                            }));
+                        } else {
+                            let task_start = last_task_start.lock().ok().and_then(|g| *g);
+                            let sampler = Arc::clone(&tree_sampler);
+                            cpu_inflight = Some(tokio::spawn(async move {
+                                let val = tokio::task::spawn_blocking(move || {
+                                    sampler.lock().ok().and_then(|mut s| {
+                                        s.sample_external_cpu_pct(
+                                            std::time::Instant::now(),
+                                            task_start,
+                                            &root_pids,
+                                        )
+                                    })
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Ok(mut guard) = cache.lock() {
+                                    guard.host_cpu_pct = val;
+                                }
+                                notify.notify_one();
+                            }));
+                        }
+                    }
+                }
+
+                if persist_inflight
+                    .as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    let work = limits_evaluator
+                        .lock()
+                        .ok()
+                        .and_then(|eval| eval.pending_budget_persist(false));
+                    if let Some(work) = work {
+                        let eval_ref = Arc::clone(&limits_evaluator);
+                        persist_inflight = Some(tokio::spawn(async move {
+                            let day = work.day;
+                            let used_ms = work.used_ms;
+                            let wrote =
+                                tokio::task::spawn_blocking(move || match work.write_to_disk() {
+                                    Ok(()) => true,
+                                    Err(err) => {
+                                        warn!(
+                                            error = %err,
+                                            "Failed to persist daily task budget"
+                                        );
+                                        false
+                                    }
+                                })
+                                .await
+                                .unwrap_or(false);
+                            if wrote {
+                                if let Ok(mut eval) = eval_ref.lock() {
+                                    eval.mark_budget_persisted(day, used_ms);
+                                }
+                            }
+                        }));
+                    }
+                }
+
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tick.tick() => {}
+                    _ = probe_refresh_notify.notified() => {
+                        // Force immediate refresh when limit needs change.
+                        last_battery_poll = None;
+                        last_metered_poll = None;
+                        last_cpu_poll = None;
+                    }
+                }
+            }
+
+            if let Some(h) = battery_inflight.take() {
+                h.abort();
+            }
+            if let Some(h) = metered_inflight.take() {
+                h.abort();
+            }
+            if let Some(h) = cpu_inflight.take() {
+                h.abort();
+            }
+            if let Some(handle) = persist_inflight.take() {
+                let _ = handle.await;
+            }
+        })
+    }
+
+    fn limits_probe_needs(&self) -> (bool, bool, bool) {
+        let Ok(eval) = self.limits_evaluator.lock() else {
+            return (false, false, false);
+        };
+        let lim = eval.limits();
+        (
+            lim.no_tasks_on_battery,
+            lim.no_tasks_on_metered,
+            lim.local_max_cpu_pct.is_some(),
+        )
+    }
+
+    /// Evaluates active D1 contributor limits from cached OS probes (optionally syncing updated
+    /// `limits set` config) and updates [`ControlHandle::set_held_with_detail`].
+    pub(super) async fn sync_and_evaluate_limits(&self, sync_from_control: bool) {
+        let prev_needs = self.limits_probe_needs();
+        if sync_from_control {
+            let latest = crate::limits::WorkerLimits::from_control_config(&self.control.limits());
+            if let Ok(mut eval) = self.limits_evaluator.lock() {
+                if let Err(err) = eval.update_limits(latest) {
+                    warn!(error = %err, "Failed to apply updated contributor limits");
+                }
+            }
+        }
+
+        let (need_battery, need_metered, need_cpu) = self.limits_probe_needs();
+        if (need_battery, need_metered, need_cpu) != prev_needs {
+            self.probe_refresh_notify.notify_one();
+        }
+
+        let cached = *self
+            .cached_limit_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sample = crate::limits::LimitSample {
+            now: std::time::Instant::now(),
+            local_now: self.local_clock.local_now(),
+            host_cpu_pct: if need_cpu { cached.host_cpu_pct } else { None },
+            battery: if need_battery {
+                cached.battery
+            } else {
+                crate::limits::BatteryStatus::Unknown
+            },
+            metered: if need_metered {
+                cached.metered
+            } else {
+                crate::limits::MeteredStatus::Unknown
+            },
+        };
+        let eval_res = {
+            let Ok(mut eval) = self.limits_evaluator.lock() else {
+                return;
+            };
+            eval.evaluate(sample)
+        };
+        self.control.set_held_with_detail(
+            eval_res.held,
+            eval_res.reason,
+            eval_res.local_detail,
+            eval_res.hand_back_running,
+        );
+    }
+
+    async fn should_reconnect_after_hold_clears(&self, session: &Session) -> bool {
+        !self.control.is_paused_or_held()
+            && self.active_task_table.read().await.is_empty()
+            && session.data_tx.capacity() == session.data_tx.max_capacity()
+            && self.control.take_session_reconnect_needed()
+    }
+
     /// True when a plain TCP address (or `auto` discovery) is configured next to a P2P ticket.
     #[cfg(feature = "p2p")]
     pub(super) fn has_tcp_fallback(&self) -> bool {
@@ -996,6 +1329,38 @@ impl WorkerClient {
                 }
             }
         }
+        self.control.clear_session_pause_rejection();
+        self.sync_and_evaluate_limits(true).await;
+        // Subscribe BEFORE spawning the session task loop and immediately check whether a
+        // pause happened during reconnect or the resume grace window so surviving resumed tasks
+        // are handed back cleanly on session start instead of running to completion while paused.
+        let mut control_rx = self.control.subscribe();
+        let handback_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handback_notify = Arc::new(tokio::sync::Notify::new());
+        let mut _handback_guards: Vec<AbortOnDrop> = Vec::new();
+        if let Some(reason) = self.control.active_pause_handback_reason() {
+            if let Some(h) = self
+                .spawn_hand_back_running_tasks_on_pause(
+                    &reason,
+                    session.data_tx.clone(),
+                    Arc::clone(&handback_in_flight),
+                    Arc::clone(&handback_notify),
+                )
+                .await
+            {
+                _handback_guards.push(AbortOnDrop::new(h));
+            }
+        }
+        let mut pending_resume_reconnect = false;
+        let mut pause_expiry_tick = tokio::time::interval(Duration::from_secs(1));
+        pause_expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut limit_eval_tick = tokio::time::interval(
+            self.config
+                .limit_eval_interval
+                .max(Duration::from_millis(50)),
+        );
+        limit_eval_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut farewell: Option<WorkerMessage> = None;
         let _outbox_flush_guard = (!buffered_checkpoints.is_empty()
             || !buffered_results.is_empty())
@@ -1004,7 +1369,7 @@ impl WorkerClient {
             let flush_blob_client = blob_client.clone();
             let flush_runner = Arc::clone(&self.runner);
             let flush_outbox = Arc::clone(&self.pending_resume_outbox);
-            AbortOnDrop(tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 for (tid, cp_msg) in buffered_checkpoints {
                     let cancelled = flush_outbox
                         .lock()
@@ -1178,6 +1543,109 @@ impl WorkerClient {
                     }
                 }
 
+                // Local pause / resume control transitions (`design 0113` D2/D3).
+                ev = control_rx.recv() => {
+                    match ev {
+                        Ok(crate::control::ControlEvent::PauseHandBack { reason }) => {
+                            if let Some(h) = self
+                                .spawn_hand_back_running_tasks_on_pause(
+                                    &reason,
+                                    session.data_tx.clone(),
+                                    Arc::clone(&handback_in_flight),
+                                    Arc::clone(&handback_notify),
+                                )
+                                .await
+                            {
+                                _handback_guards.retain(|g| !g.is_finished());
+                                _handback_guards.push(AbortOnDrop::new(h));
+                            }
+                        }
+                        Ok(crate::control::ControlEvent::LimitsUpdated) => {
+                            self.probe_refresh_notify.notify_one();
+                            self.sync_and_evaluate_limits(true).await;
+                            if self.should_reconnect_after_hold_clears(&session).await {
+                                info!(
+                                    worker_id = %worker_id,
+                                    "Worker limits updated and hold cleared; closing session to re-register immediately"
+                                );
+                                self.resume_reconnect_pending.store(true, Ordering::Release);
+                                break Err(GridError::ConnectionClosed);
+                            }
+                        }
+                        Ok(crate::control::ControlEvent::ResumeReconnect) => {
+                            if handback_in_flight.load(Ordering::Acquire) > 0 {
+                                pending_resume_reconnect = true;
+                            } else if self.should_reconnect_after_hold_clears(&session).await {
+                                info!(
+                                    worker_id = %worker_id,
+                                    "Worker resumed while held back; closing session to re-register immediately"
+                                );
+                                self.resume_reconnect_pending.store(true, Ordering::Release);
+                                break Err(GridError::ConnectionClosed);
+                            }
+                        }
+                        Err(
+                            tokio::sync::broadcast::error::RecvError::Lagged(_)
+                            | tokio::sync::broadcast::error::RecvError::Closed,
+                        ) => {}
+                    }
+                }
+
+                _ = limit_eval_tick.tick() => {
+                    self.sync_and_evaluate_limits(true).await;
+                    if self.should_reconnect_after_hold_clears(&session).await {
+                        info!(
+                            worker_id = %worker_id,
+                            "Contributor limit hold cleared; closing session to re-register immediately"
+                        );
+                        self.resume_reconnect_pending.store(true, Ordering::Release);
+                        break Err(GridError::ConnectionClosed);
+                    }
+                }
+
+                _ = self.limits_reeval_notify.notified() => {
+                    self.sync_and_evaluate_limits(true).await;
+                    if self.should_reconnect_after_hold_clears(&session).await {
+                        info!(
+                            worker_id = %worker_id,
+                            "Completed task idle check cleared hold; closing session to re-register immediately"
+                        );
+                        self.resume_reconnect_pending.store(true, Ordering::Release);
+                        break Err(GridError::ConnectionClosed);
+                    }
+                }
+
+                _ = handback_notify.notified(), if pending_resume_reconnect => {
+                    if handback_in_flight.load(Ordering::Acquire) == 0 {
+                        pending_resume_reconnect = false;
+                        session.flush_data_queue_briefly(Duration::from_millis(500)).await;
+                        if self.should_reconnect_after_hold_clears(&session).await {
+                            info!(
+                                worker_id = %worker_id,
+                                "Worker resumed after pause hand-back finished; closing session to re-register immediately"
+                            );
+                            self.resume_reconnect_pending.store(true, Ordering::Release);
+                            break Err(GridError::ConnectionClosed);
+                        }
+                    }
+                }
+
+                _ = pause_expiry_tick.tick() => {
+                    let _ = self.control.check_pause_expiry();
+                    if pending_resume_reconnect && handback_in_flight.load(Ordering::Acquire) == 0 {
+                        pending_resume_reconnect = false;
+                        session.flush_data_queue_briefly(Duration::from_millis(500)).await;
+                    }
+                    if self.should_reconnect_after_hold_clears(&session).await {
+                        info!(
+                            worker_id = %worker_id,
+                            "Worker pause expired or hand-back finished while held back; closing session to re-register immediately"
+                        );
+                        self.resume_reconnect_pending.store(true, Ordering::Release);
+                        break Err(GridError::ConnectionClosed);
+                    }
+                }
+
                 // External shutdown signal
                 res = shutdown_rx.changed() => {
                     if res.is_ok() && *shutdown_rx.borrow() {
@@ -1216,6 +1684,7 @@ impl WorkerClient {
         if outcome.is_err()
             && !*shutdown_rx.borrow()
             && current_evacuation_reason().is_none()
+            && !self.resume_reconnect_pending.load(Ordering::Acquire)
             && grace > Duration::ZERO
         {
             self.resume_deadline = Some(tokio::time::Instant::now() + grace);

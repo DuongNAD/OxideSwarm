@@ -403,6 +403,44 @@ impl WorkerClient {
             return;
         }
 
+        // Local pause / held / --no-gpu-tasks admission check (`design 0113` D2).
+        let requires_gpu = task.spec.requires_gpu() || task.requirements.gpu_required;
+        match self.control.check_assignment(requires_gpu) {
+            crate::control::AssignmentDecision::Allow => {}
+            crate::control::AssignmentDecision::RejectPaused(reason) => {
+                let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
+                warn!(task_id = %task_id, reason = %reason, "Refusing task: worker paused");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    1,
+                    "",
+                    msg.as_str(),
+                    0,
+                    Some(msg.clone()),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                self.control.mark_session_pause_rejection();
+                return;
+            }
+            crate::control::AssignmentDecision::RejectNoGpuTasks => {
+                let msg = crate::control::NO_GPU_TASKS_REJECTION_MESSAGE.to_string();
+                warn!(task_id = %task_id, "Refusing GPU task: --no-gpu-tasks enabled");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    1,
+                    "",
+                    msg.as_str(),
+                    0,
+                    Some(msg.clone()),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                self.control.mark_session_gpu_pause_rejection();
+                return;
+            }
+        }
+
         // Defence in depth (design 0082 D2.3): the Master never places a task with an extension this
         // worker lacks, but a task with an unknown critical extension, or a malformed extension
         // list, is never run without the restriction it carries.
@@ -574,6 +612,12 @@ impl WorkerClient {
         let resume_window_active = Arc::clone(&self.resume_window_active);
         let pending_resume_outbox = Arc::clone(&self.pending_resume_outbox);
         let grace_enabled = self.config.session_resume_grace_cap != Some(Duration::ZERO);
+        let limits_evaluator = Arc::clone(&self.limits_evaluator);
+        let limits_clock = Arc::clone(&self.local_clock);
+        let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
+        let probe_refresh_notify = Arc::clone(&self.probe_refresh_notify);
+        let last_task_start = Arc::clone(&self.last_task_start);
+        let control = Arc::clone(&self.control);
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
         // own cleanup (which needs the lock) can never overtake the insertion and leave a stale
@@ -747,6 +791,80 @@ impl WorkerClient {
             let (exec_cancel_tx, exec_cancel_rx) = oneshot::channel::<String>();
             let mut exec_cancel_tx = Some(exec_cancel_tx);
             let mut cancelled_reason: Option<String> = None;
+            let exec_started = std::time::Instant::now();
+            struct ActiveBudgetGuard {
+                run_id: u64,
+                exec_started: std::time::Instant,
+                evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
+                clock: Arc<dyn crate::limits::LocalClock>,
+                notify: Arc<tokio::sync::Notify>,
+                probe_notify: Arc<tokio::sync::Notify>,
+                finished: bool,
+            }
+            impl ActiveBudgetGuard {
+                fn new(
+                    run_id: u64,
+                    exec_started: std::time::Instant,
+                    evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
+                    clock: Arc<dyn crate::limits::LocalClock>,
+                    notify: Arc<tokio::sync::Notify>,
+                    probe_notify: Arc<tokio::sync::Notify>,
+                    last_task_start: &std::sync::Mutex<Option<std::time::Instant>>,
+                ) -> Self {
+                    let started_local = clock.local_now();
+                    if let Ok(mut slot) = last_task_start.lock() {
+                        *slot = Some(exec_started);
+                    }
+                    if let Ok(mut eval) = evaluator.lock() {
+                        eval.begin_active_task(run_id, started_local, exec_started);
+                    }
+                    probe_notify.notify_one();
+                    Self {
+                        run_id,
+                        exec_started,
+                        evaluator,
+                        clock,
+                        notify,
+                        probe_notify,
+                        finished: false,
+                    }
+                }
+
+                fn finish(mut self, elapsed: Duration) {
+                    self.finished = true;
+                    let ended_local = self.clock.local_now();
+                    if let Ok(mut eval) = self.evaluator.lock() {
+                        eval.finish_active_task(self.run_id, ended_local, elapsed);
+                    }
+                    self.notify.notify_one();
+                    self.probe_notify.notify_one();
+                }
+            }
+            impl Drop for ActiveBudgetGuard {
+                fn drop(&mut self) {
+                    if !self.finished {
+                        let ended_local = self.clock.local_now();
+                        if let Ok(mut eval) = self.evaluator.lock() {
+                            eval.finish_active_task(
+                                self.run_id,
+                                ended_local,
+                                self.exec_started.elapsed(),
+                            );
+                        }
+                        self.notify.notify_one();
+                        self.probe_notify.notify_one();
+                    }
+                }
+            }
+            let budget_guard = ActiveBudgetGuard::new(
+                attempt,
+                exec_started,
+                Arc::clone(&limits_evaluator),
+                Arc::clone(&limits_clock),
+                Arc::clone(&limits_reeval_notify),
+                Arc::clone(&probe_refresh_notify),
+                &last_task_start,
+            );
             let mut result = {
                 let exec_fut = runner.execute_task_with_checkpoint(
                     &task,
@@ -775,6 +893,9 @@ impl WorkerClient {
                     }
                 }
             };
+            let budget_elapsed =
+                Duration::from_millis(result.execution_time_ms).max(exec_started.elapsed());
+            budget_guard.finish(budget_elapsed);
             while let Ok(cp_msg) = cp_rx.try_recv() {
                 forward_checkpoint(cp_msg, true).await;
             }
@@ -897,6 +1018,7 @@ impl WorkerClient {
                 }
             }
 
+            let completed_cleanly = cancelled_reason.is_none() && !suppress.load(Ordering::Acquire);
             if let Some(reason) = cancelled_reason {
                 if result.exit_code != EXIT_CODE_CANCELLED {
                     result.exit_code = EXIT_CODE_CANCELLED;
@@ -909,7 +1031,13 @@ impl WorkerClient {
 
             if !suppress.load(Ordering::Acquire) {
                 if let Some(tx) = current_tx(&session_data_tx, &outbound_tx) {
-                    let _ = tx.send(WorkerMessage::from(result)).await;
+                    let rej_snap = control.pause_rejection_snapshot();
+                    if tx.send(WorkerMessage::from(result)).await.is_ok() && completed_cleanly {
+                        control.clear_session_pause_rejection_on_completed_result(
+                            rej_snap,
+                            requires_gpu,
+                        );
+                    }
                 }
             }
             drop(cancel_slot);
@@ -1116,6 +1244,82 @@ impl WorkerClient {
                 join.abort();
             }
         }
+        count
+    }
+
+    /// Drains running tasks and starts stopping their process trees synchronously so the session
+    /// `select!` loop never blocks for the up-to-4 s join deadline; the spawned task finishes
+    /// waiting for the kills, sends refusal results, and notifies `notify` on completion.
+    pub(super) async fn spawn_hand_back_running_tasks_on_pause(
+        &self,
+        reason: &str,
+        outbound_tx: mpsc::Sender<WorkerMessage>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let mut joins = self.begin_pause_handback_drain(reason).await;
+        if joins.is_empty() {
+            return None;
+        }
+        struct InFlightGuard(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<tokio::sync::Notify>,
+        );
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+                self.1.notify_one();
+            }
+        }
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let worker_id = self.worker_id;
+        let control = Arc::clone(&self.control);
+        let why = reason.to_string();
+        Some(tokio::spawn(async move {
+            let _guard = InFlightGuard(in_flight, notify);
+            let _ = Self::finish_pause_handback(worker_id, control, why, &mut joins, &outbound_tx)
+                .await;
+        }))
+    }
+
+    async fn begin_pause_handback_drain(
+        &self,
+        reason: &str,
+    ) -> Vec<(TaskId, Option<tokio::task::JoinHandle<()>>)> {
+        let drained: Vec<(TaskId, TaskExecutionHandle)> = {
+            let mut lock = self.active_task_table.write().await;
+            lock.drain().collect()
+        };
+        drained
+            .into_iter()
+            .map(|(tid, handle)| (tid, Self::begin_stop(handle, reason)))
+            .collect()
+    }
+
+    async fn finish_pause_handback(
+        worker_id: uuid::Uuid,
+        control: Arc<crate::control::ControlHandle>,
+        reason: String,
+        joins: &mut [(TaskId, Option<tokio::task::JoinHandle<()>>)],
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> usize {
+        let count = joins.len();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        for (_, join_opt) in joins.iter_mut() {
+            if let Some(ref mut join) = join_opt {
+                if tokio::time::timeout_at(deadline, &mut *join).await.is_err() {
+                    warn!("Paused task did not stop within hand-back deadline; aborting handle");
+                    join.abort();
+                }
+            }
+        }
+        let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
+        for (tid, _) in joins.iter() {
+            let result =
+                TaskResult::failure(worker_id, *tid, 1, "", msg.as_str(), 0, Some(msg.clone()));
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+        }
+        control.mark_session_pause_rejection();
         count
     }
 

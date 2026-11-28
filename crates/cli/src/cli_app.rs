@@ -425,8 +425,10 @@ pub struct MasterArgs {
     pub rendezvous: Option<String>,
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 pub struct WorkerArgs {
+    #[command(subcommand)]
+    pub action: Option<WorkerControlSubcommand>,
     #[arg(
         long,
         help = "Address of the Master's grid port (default 127.0.0.1:8088, the dashboard is on :8080); a bare host gets :8088; 'auto' discovers it on the LAN; for a P2P ticket use --p2p-ticket"
@@ -612,6 +614,143 @@ pub struct WorkerArgs {
         help = "URL of rendezvous registry for cross-subnet discovery (or set OXIDESWARM_RENDEZVOUS)"
     )]
     pub rendezvous: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Local Unix socket or Windows named pipe for worker pause/resume/status/limits control (env RUSTY_GRID_CONTROL_SOCKET)"
+    )]
+    pub control_socket: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Refuse GPU tasks while continuing to accept CPU tasks (env RUSTY_GRID_NO_GPU_TASKS)"
+    )]
+    pub no_gpu_tasks: bool,
+
+    #[arg(
+        long,
+        help = "Also hand back running tasks when an automatic contributor limit holds the worker (env RUSTY_GRID_HOLD_ENDS_TASKS)"
+    )]
+    pub hold_ends_tasks: bool,
+
+    #[arg(
+        long,
+        value_name = "PCT",
+        help = "Hold new tasks while 30 s average host CPU % exceeds PCT (1..=100; env RUSTY_GRID_LOCAL_MAX_CPU_PCT)"
+    )]
+    pub local_max_cpu_pct: Option<u8>,
+
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help = "Allowed weekly local execution hours (e.g. \"mon-fri 18:00-08:00; sat-sun 00:00-24:00\"; env RUSTY_GRID_HOURS)"
+    )]
+    pub hours: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "HOURS",
+        help = "Maximum summed task execution hours per local calendar day in (0, 24] (env RUSTY_GRID_MAX_TASK_HOURS_PER_DAY)"
+    )]
+    pub max_task_hours_per_day: Option<f64>,
+
+    #[arg(
+        long,
+        help = "Hold new tasks while operating on battery power (env RUSTY_GRID_NO_TASKS_ON_BATTERY)"
+    )]
+    pub no_tasks_on_battery: bool,
+
+    #[arg(
+        long,
+        help = "Hold new tasks while on a metered network connection (env RUSTY_GRID_NO_TASKS_ON_METERED)"
+    )]
+    pub no_tasks_on_metered: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkerControlSubcommand {
+    /// Pause this worker immediately and hand back running tasks uncharged
+    Pause(WorkerPauseArgs),
+    /// Resume a paused worker
+    Resume(WorkerControlTargetArgs),
+    /// Query local worker pause state and active contributor limits
+    Status(WorkerControlTargetArgs),
+    /// Get or set contributor limits on a running worker
+    Limits(WorkerLimitsArgs),
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub struct WorkerPauseArgs {
+    #[arg(
+        long,
+        value_name = "WHEN",
+        help = "Automatically resume after duration (e.g. 2h, 30m) or time (HH:MM, RFC3339)"
+    )]
+    pub until: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "Reason recorded locally for the pause"
+    )]
+    pub reason: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to worker control socket or named pipe"
+    )]
+    pub control_socket: Option<PathBuf>,
+
+    #[arg(long, help = "Named worker to target (matches worker --name)")]
+    pub name: Option<String>,
+
+    #[arg(long, help = "Output machine-readable JSON")]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug, Clone, Default)]
+pub struct WorkerControlTargetArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to worker control socket or named pipe"
+    )]
+    pub control_socket: Option<PathBuf>,
+
+    #[arg(long, help = "Named worker to target (matches worker --name)")]
+    pub name: Option<String>,
+
+    #[arg(long, help = "Output machine-readable JSON")]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct WorkerLimitsArgs {
+    #[command(subcommand)]
+    pub op: WorkerLimitsSubcommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum WorkerLimitsSubcommand {
+    /// Print the running worker's contributor limits
+    Get(WorkerControlTargetArgs),
+    /// Set a contributor limit key and persist it into [worker] in config
+    Set {
+        key: String,
+        value: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Path to worker control socket or named pipe"
+        )]
+        control_socket: Option<PathBuf>,
+        #[arg(long, help = "Named worker to target (matches worker --name)")]
+        name: Option<String>,
+        #[arg(long, help = "Output machine-readable JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Parser, Debug, Clone, Default)]

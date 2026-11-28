@@ -531,6 +531,20 @@ pub use win::{
     PrivateDirOutcome,
 };
 
+/// Builds a process- and call-unique sibling temp path for atomic replacement in the same
+/// directory so concurrent writers in the same process never collide on NTFS.
+#[cfg(any(windows, test))]
+fn private_replace_temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "private".to_string());
+    let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()))
+}
+
 /// Refuses `path` when its volume keeps no file permissions (BUG-24). Unix: not checked (design
 /// 0085 lists it as not covered); always `Ok`.
 #[cfg(not(windows))]
@@ -881,11 +895,7 @@ mod win {
     /// the same directory (so the result always carries the protected DACL).
     pub fn write_private_replace(path: &Path, data: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "private".to_string());
-        let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+        let tmp = super::private_replace_temp_path(path);
         let _ = std::fs::remove_file(&tmp);
         let result = create_private_new(&tmp).and_then(|mut f| {
             f.write_all(data)?;
@@ -1663,6 +1673,18 @@ mod tests {
 
         assert!(is_trusted_ancestor_owner_sid(SID_TRUSTED_INSTALLER, ME));
         assert!(!is_trusted_ancestor_owner_sid(OTHER_LOCAL_USER, ME));
+    }
+
+    #[test]
+    fn private_replace_temp_path_is_unique_across_calls() {
+        let target = Path::new("/tmp/state/worker.daily-budget.json");
+        let p1 = super::private_replace_temp_path(target);
+        let p2 = super::private_replace_temp_path(target);
+        assert_ne!(p1, p2);
+        assert_eq!(p1.parent(), target.parent());
+        assert_eq!(p2.parent(), target.parent());
+        assert!(p1.to_string_lossy().ends_with(".tmp"));
+        assert!(p2.to_string_lossy().ends_with(".tmp"));
     }
 
     #[test]

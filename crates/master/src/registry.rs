@@ -27,6 +27,11 @@ pub const RX_LIVENESS_CEILING_FACTOR: u32 = 60;
 pub const REJECTION_COOLDOWN_BASE: Duration = Duration::from_secs(5);
 /// Upper bound of the rejection cooldown.
 pub const REJECTION_COOLDOWN_MAX: Duration = Duration::from_secs(60);
+/// First hold-back applied to a worker that reports `paused` or `no gpu tasks` (`design 0113` D3);
+/// doubles per consecutive pause refusal up to [`PAUSE_HOLDBACK_MAX`].
+pub const PAUSE_HOLDBACK_BASE: Duration = Duration::from_secs(60);
+/// Upper bound of the contributor-pause hold-back (`design 0113` D3).
+pub const PAUSE_HOLDBACK_MAX: Duration = Duration::from_secs(600);
 /// Maximum time a newly registered or re-registered mobile worker connection is held back from
 /// scheduling while waiting for its first post-`RegisterAck` `WorkerMessage::MobileTelemetry` frame
 /// (`2 × MOBILE_TELEMETRY_CHECK_INTERVAL`).
@@ -103,6 +108,14 @@ pub struct WorkerEntry {
     pub consecutive_rejections: u32,
     /// Scheduling exclusion deadline after rejections; the worker stays registered meanwhile.
     pub excluded_until: Option<Instant>,
+    /// Consecutive pause refusals (`Task rejected by worker: paused: ...`) in this hold-back streak.
+    pub consecutive_pause_rejections: u32,
+    /// Scheduling hold-back deadline while contributor-paused; surfaced as `state:paused`.
+    pub paused_until: Option<Instant>,
+    /// Consecutive GPU-only pause refusals (`Task rejected by worker: no gpu tasks`).
+    pub consecutive_gpu_pause_rejections: u32,
+    /// GPU scheduling hold-back deadline while `--no-gpu-tasks` is active; CPU tasks still schedule.
+    pub gpu_paused_until: Option<Instant>,
     /// Configured or dynamically negotiated heartbeat interval.
     pub heartbeat_interval: Option<Duration>,
     /// Negotiated protocol capabilities (Requirement R2).
@@ -145,6 +158,12 @@ pub struct WorkerInfo {
     /// Latest live mobile telemetry snapshot reported by the worker (or seeded from `capabilities.mobile`).
     #[serde(default)]
     pub mobile_status: Option<MobileLiveStatus>,
+    /// True while the worker is held back after a contributor-pause rejection (`state:paused`).
+    #[serde(default)]
+    pub paused: bool,
+    /// True while GPU tasks are held back after a `no gpu tasks` rejection (`design 0113` D3).
+    #[serde(default)]
+    pub gpu_paused: bool,
 }
 
 impl WorkerInfo {
@@ -174,6 +193,8 @@ impl WorkerInfo {
             ram_available_mb: ram,
             features: ProtocolCapabilities::empty(),
             mobile_status,
+            paused: false,
+            gpu_paused: false,
         }
     }
 }
@@ -229,6 +250,7 @@ impl WorkerEntry {
             rusty_grid_core::placement::PROTO_TAG_PREFIX,
             self.peer_version
         ));
+        let now = Instant::now();
         WorkerInfo {
             worker_id: self.worker_id,
             session_id: self.session_id,
@@ -242,6 +264,8 @@ impl WorkerEntry {
             ram_available_mb: self.ram_available_mb,
             features: self.features,
             mobile_status,
+            paused: matches!(self.paused_until, Some(until) if until > now),
+            gpu_paused: matches!(self.gpu_paused_until, Some(until) if until > now),
         }
     }
 }
@@ -538,8 +562,12 @@ impl WorkerRegistry {
             existing.active_tasks = 0;
             existing.reported_active_tasks = 0;
             existing.rx_clock = None;
-            // A fresh Register carries a fresh capability snapshot, so a past rejection streak no longer applies.
+            // A fresh Register carries a fresh capability snapshot, so past rejection/pause streaks no longer apply.
             existing.consecutive_rejections = 0;
+            existing.consecutive_pause_rejections = 0;
+            existing.paused_until = None;
+            existing.consecutive_gpu_pause_rejections = 0;
+            existing.gpu_paused_until = None;
             // Hold a re-registering mobile worker until its first post-RegisterAck
             // `MobileTelemetry` frame arrives (capped at `MOBILE_INITIAL_TELEMETRY_HOLD`) so a
             // phone that was Normal in session 1 and heated up while disconnected is not scheduled
@@ -628,6 +656,10 @@ impl WorkerRegistry {
                 rx_clock: None,
                 consecutive_rejections: 0,
                 excluded_until,
+                consecutive_pause_rejections: 0,
+                paused_until: None,
+                consecutive_gpu_pause_rejections: 0,
+                gpu_paused_until: None,
                 heartbeat_interval: hb_interval,
                 mobile_status,
                 peer_version: rusty_grid_core::protocol::PROTOCOL_VERSION_CURRENT,
@@ -1275,6 +1307,133 @@ impl WorkerRegistry {
         until.checked_duration_since(Instant::now())
     }
 
+    fn advance_pause_holdback(
+        now: Instant,
+        consecutive: &mut u32,
+        until: &mut Option<Instant>,
+    ) -> (Duration, bool) {
+        if let Some(remaining) = until.and_then(|u| u.checked_duration_since(now)) {
+            if !remaining.is_zero() {
+                return (remaining, false);
+            }
+        }
+        *consecutive = consecutive.saturating_add(1);
+        let doublings = (*consecutive - 1).min(16);
+        let hold = PAUSE_HOLDBACK_BASE
+            .saturating_mul(1u32 << doublings)
+            .min(PAUSE_HOLDBACK_MAX);
+        *until = Some(now + hold);
+        (hold, true)
+    }
+
+    /// Holds a paused worker back from all scheduling for an exponentially backing-off window
+    /// (`60 s` doubling to `10 min`, `design 0113` D3) and surfaces `state:paused`.
+    ///
+    /// Simultaneous hand-backs within an already active hold-back window do not double again;
+    /// each lapsed pause window increments once.
+    pub async fn record_pause_holdback(
+        &self,
+        worker_id: &Uuid,
+        expected_session: Option<u64>,
+    ) -> Option<Duration> {
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        let entry = inner.workers.get_mut(worker_id)?;
+        if let Some(expected) = expected_session {
+            if entry.session_id != expected {
+                return None;
+            }
+        }
+        let (hold, advanced) = Self::advance_pause_holdback(
+            now,
+            &mut entry.consecutive_pause_rejections,
+            &mut entry.paused_until,
+        );
+        if advanced {
+            tracing::info!(
+                worker_id = %worker_id,
+                consecutive = entry.consecutive_pause_rejections,
+                hold_secs = hold.as_secs(),
+                "Worker reported paused; holding back from scheduling (state:paused)"
+            );
+        }
+        Some(hold)
+    }
+
+    /// Holds a worker back from GPU task scheduling (`60 s` doubling to `10 min`) while
+    /// keeping CPU tasks eligible (`design 0113` D3).
+    pub async fn record_gpu_pause_holdback(
+        &self,
+        worker_id: &Uuid,
+        expected_session: Option<u64>,
+    ) -> Option<Duration> {
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        let entry = inner.workers.get_mut(worker_id)?;
+        if let Some(expected) = expected_session {
+            if entry.session_id != expected {
+                return None;
+            }
+        }
+        let (hold, advanced) = Self::advance_pause_holdback(
+            now,
+            &mut entry.consecutive_gpu_pause_rejections,
+            &mut entry.gpu_paused_until,
+        );
+        if advanced {
+            tracing::info!(
+                worker_id = %worker_id,
+                consecutive = entry.consecutive_gpu_pause_rejections,
+                hold_secs = hold.as_secs(),
+                "Worker reported no gpu tasks; holding back GPU assignments while keeping CPU work"
+            );
+        }
+        Some(hold)
+    }
+
+    /// Clears contributor-pause hold-backs when the worker completes or executes a task cleanly.
+    /// Completing a CPU task clears `paused_until`; `gpu_paused_until` is cleared only when a GPU
+    /// task completes (or on session re-registration).
+    pub async fn clear_pause_holdback(&self, worker_id: &Uuid, is_gpu_task: bool) {
+        let has_holdback = {
+            let inner = self.inner.read().await;
+            inner.workers.get(worker_id).is_some_and(|e| {
+                e.consecutive_pause_rejections > 0
+                    || e.paused_until.is_some()
+                    || (is_gpu_task
+                        && (e.consecutive_gpu_pause_rejections > 0 || e.gpu_paused_until.is_some()))
+            })
+        };
+        if !has_holdback {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        if let Some(entry) = inner.workers.get_mut(worker_id) {
+            entry.consecutive_pause_rejections = 0;
+            entry.paused_until = None;
+            if is_gpu_task {
+                entry.consecutive_gpu_pause_rejections = 0;
+                entry.gpu_paused_until = None;
+            }
+        }
+    }
+
+    /// Remaining full-worker pause hold-back duration, if any.
+    pub async fn pause_holdback_remaining(&self, worker_id: &Uuid) -> Option<Duration> {
+        let inner = self.inner.read().await;
+        let entry = inner.workers.get(worker_id)?;
+        let until = entry.paused_until?;
+        until.checked_duration_since(Instant::now())
+    }
+
+    /// Remaining GPU-only pause hold-back duration, if any.
+    pub async fn gpu_pause_holdback_remaining(&self, worker_id: &Uuid) -> Option<Duration> {
+        let inner = self.inner.read().await;
+        let entry = inner.workers.get(worker_id)?;
+        let until = entry.gpu_paused_until?;
+        until.checked_duration_since(Instant::now())
+    }
+
     /// Atomically increments the active task count for a worker and updates status to Busy.
     pub async fn increment_active_tasks(&self, worker_id: &Uuid) -> GridResult<usize> {
         let mut inner = self.inner.write().await;
@@ -1421,6 +1580,7 @@ impl WorkerRegistry {
             .values()
             .filter(|e| e.status != WorkerStatus::Disconnected)
             .filter(|e| !matches!(e.excluded_until, Some(until) if until > now))
+            .filter(|e| !matches!(e.paused_until, Some(until) if until > now))
             .map(|e| e.to_info())
             .collect()
     }
@@ -1437,6 +1597,7 @@ impl WorkerRegistry {
             let info = e.to_info();
             if e.status != WorkerStatus::Disconnected
                 && !matches!(e.excluded_until, Some(until) if until > now)
+                && !matches!(e.paused_until, Some(until) if until > now)
             {
                 schedulable.push(info.clone());
             }
@@ -3496,5 +3657,106 @@ mod tests {
         let after_live_release = registry.get_worker(id).await.unwrap();
         assert_eq!(after_live_release.active_tasks, 0);
         assert_eq!(after_live_release.status, WorkerStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn test_net9a_pause_and_gpu_pause_holdbacks() {
+        let registry = WorkerRegistry::new();
+        let w_id = Uuid::new_v4();
+        let caps = WorkerCapabilities::new("gpu-box", 8, 16_384, true, true, None);
+        let addr: SocketAddr = "127.0.0.1:4100".parse().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let reg = registry
+            .register_session(
+                w_id,
+                caps.clone(),
+                ProtocolCapabilities::empty(),
+                addr,
+                tx.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let hold = registry
+            .record_gpu_pause_holdback(&w_id, Some(reg.session_id))
+            .await
+            .unwrap();
+        assert_eq!(hold, PAUSE_HOLDBACK_BASE);
+        // Simultaneous hand-backs during an active hold-back do not re-double.
+        let hold_same = registry
+            .record_gpu_pause_holdback(&w_id, Some(reg.session_id))
+            .await
+            .unwrap();
+        assert!(hold_same <= PAUSE_HOLDBACK_BASE);
+        let expired = match Instant::now().checked_sub(Duration::from_secs(1)) {
+            Some(t) => t,
+            None => {
+                let past = Instant::now();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                past
+            }
+        };
+        {
+            let mut inner = registry.inner.write().await;
+            inner.workers.get_mut(&w_id).unwrap().gpu_paused_until = Some(expired);
+        }
+        let hold2 = registry
+            .record_gpu_pause_holdback(&w_id, Some(reg.session_id))
+            .await
+            .unwrap();
+        assert_eq!(hold2, PAUSE_HOLDBACK_BASE * 2);
+
+        // GPU hold-back leaves worker schedulable for CPU work, with gpu_paused=true.
+        let (sched, reg_list, _) = registry.scheduler_snapshot().await;
+        assert_eq!(sched.len(), 1);
+        assert!(sched[0].gpu_paused);
+        assert!(!sched[0].paused);
+        assert_eq!(reg_list.len(), 1);
+
+        // Completing a CPU task does NOT clear gpu_paused.
+        registry.clear_pause_holdback(&w_id, false).await;
+        assert!(registry.gpu_pause_holdback_remaining(&w_id).await.is_some());
+
+        // Completing a GPU task clears gpu_paused.
+        registry.clear_pause_holdback(&w_id, true).await;
+        assert!(registry.gpu_pause_holdback_remaining(&w_id).await.is_none());
+
+        // Full pause excludes worker from schedulable list while keeping it in registered list,
+        // and 5 simultaneous hand-back refusals count as 1 doubling (`60 s`).
+        for _ in 0..5 {
+            let p_hold = registry
+                .record_pause_holdback(&w_id, Some(reg.session_id))
+                .await
+                .unwrap();
+            assert!(p_hold <= PAUSE_HOLDBACK_BASE);
+        }
+        assert_eq!(
+            registry
+                .inner
+                .read()
+                .await
+                .workers
+                .get(&w_id)
+                .unwrap()
+                .consecutive_pause_rejections,
+            1
+        );
+        let (sched, reg_list, _) = registry.scheduler_snapshot().await;
+        assert!(sched.is_empty());
+        assert_eq!(reg_list.len(), 1);
+        assert!(reg_list[0].paused);
+        assert!(registry.list_schedulable_workers().await.is_empty());
+
+        // Re-registration clears both hold-backs immediately.
+        let (tx2, _rx2) = mpsc::channel(4);
+        let _reg2 = registry
+            .register_session(w_id, caps, ProtocolCapabilities::empty(), addr, tx2, None)
+            .await
+            .unwrap();
+        let (sched, _, _) = registry.scheduler_snapshot().await;
+        assert_eq!(sched.len(), 1);
+        assert!(!sched[0].paused);
+        assert!(!sched[0].gpu_paused);
     }
 }

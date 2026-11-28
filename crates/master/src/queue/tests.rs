@@ -1840,6 +1840,8 @@ async fn test_three_d_tasks_require_three_d_protocol_capability_for_placement() 
         cpu_usage_pct: 0.0,
         ram_available_mb: 8192,
         mobile_status: None,
+        paused: false,
+        gpu_paused: false,
     };
 
     let tasks = vec![gen3d_task.clone(), autorig_task.clone()];
@@ -2226,4 +2228,188 @@ async fn large_checkpoints_are_rate_limited_and_leave_headroom_for_submissions()
         .record_checkpoint_from(worker, Some(1), id, small)
         .await
         .unwrap());
+}
+
+#[tokio::test]
+async fn paused_refusals_do_not_exhaust_rejection_cap_or_charge_retries() {
+    let queue = TaskQueue::new();
+    let worker = Uuid::new_v4();
+    let task = Task::new(
+        TaskSpec::command("echo", vec!["ok".into()]),
+        TaskRequirements::generic(1, 64).with_max_retries(0),
+    );
+    let id = queue.submit(task).await.unwrap();
+
+    for round in 1..=10u64 {
+        let scheduled = queue
+            .schedule_tasks_batch_in_sessions(&[(id, worker, round)])
+            .await;
+        assert_eq!(
+            scheduled.len(),
+            1,
+            "round {round} must schedule queued task"
+        );
+        let rejection = worker_rejection(
+            worker,
+            id,
+            "Task rejected by worker: paused: gaming",
+            "Task rejected by worker: paused: gaming",
+        );
+        let outcome = queue
+            .record_result_from(worker, Some(round), rejection)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.disposition,
+            ResultDisposition::Requeued,
+            "round {round} paused refusal must requeue uncharged"
+        );
+        assert_eq!(outcome.state, TaskState::Queued);
+        let info = queue.get_task(&id).await.unwrap();
+        assert_eq!(info.state, TaskState::Queued);
+        assert_eq!(
+            info.retry_count, 0,
+            "round {round} must keep retry_count == 0"
+        );
+        assert_eq!(
+            info.failover_count, 0,
+            "round {round} must keep failover_count == 0"
+        );
+        let rej_count = queue.inner.read().await.tasks[&id].rejection_count;
+        assert_eq!(rej_count, 0, "round {round} must keep rejection_count == 0");
+        assert!(
+            queue.get_retry_history(&id).await.unwrap().is_empty(),
+            "round {round} paused refusal must not grow retry_history"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_gpu_tasks_refusals_do_not_exhaust_rejection_cap_or_charge_retries() {
+    let queue = TaskQueue::new();
+    let worker = Uuid::new_v4();
+    let task = Task::new(
+        TaskSpec::command("gpu-job", vec![]),
+        TaskRequirements::new(1, 512, true, 60).with_max_retries(0),
+    );
+    let id = queue.submit(task).await.unwrap();
+
+    for round in 1..=10u64 {
+        let scheduled = queue
+            .schedule_tasks_batch_in_sessions(&[(id, worker, round)])
+            .await;
+        assert_eq!(
+            scheduled.len(),
+            1,
+            "round {round} must schedule queued GPU task"
+        );
+        let rejection = worker_rejection(
+            worker,
+            id,
+            "Task rejected by worker: no gpu tasks",
+            "Task rejected by worker: no gpu tasks",
+        );
+        let outcome = queue
+            .record_result_from(worker, Some(round), rejection)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.disposition,
+            ResultDisposition::Requeued,
+            "round {round} no-gpu refusal must requeue uncharged"
+        );
+        assert_eq!(outcome.state, TaskState::Queued);
+        let info = queue.get_task(&id).await.unwrap();
+        assert_eq!(info.state, TaskState::Queued);
+        assert_eq!(
+            info.retry_count, 0,
+            "round {round} must keep retry_count == 0"
+        );
+        assert_eq!(
+            info.failover_count, 0,
+            "round {round} must keep failover_count == 0"
+        );
+        let rej_count = queue.inner.read().await.tasks[&id].rejection_count;
+        assert_eq!(rej_count, 0, "round {round} must keep rejection_count == 0");
+        assert!(
+            queue.get_retry_history(&id).await.unwrap().is_empty(),
+            "round {round} no-gpu refusal must not grow retry_history"
+        );
+    }
+}
+
+#[tokio::test]
+async fn paused_refusals_work_without_retry_on_worker_disconnect_and_do_not_grow_retry_history() {
+    let policy = RetryPolicy {
+        retry_on_worker_disconnect: false,
+        retry_on_execution_failure: false,
+        max_retries: 0,
+        ..Default::default()
+    };
+    let queue = TaskQueue::with_config(policy, None);
+    let worker = Uuid::new_v4();
+    let task = Task::new(
+        TaskSpec::command("echo", vec!["ok".into()]),
+        TaskRequirements::generic(1, 64).with_max_retries(0),
+    );
+    let id = queue.submit(task).await.unwrap();
+
+    for round in 1..=10u64 {
+        let scheduled = queue
+            .schedule_tasks_batch_in_sessions(&[(id, worker, round)])
+            .await;
+        assert_eq!(
+            scheduled.len(),
+            1,
+            "round {round} must schedule queued task"
+        );
+        let rejection = worker_rejection(
+            worker,
+            id,
+            "Task rejected by worker: paused: away",
+            "Task rejected by worker: paused: away",
+        );
+        let outcome = queue
+            .record_result_from(worker, Some(round), rejection)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.disposition,
+            ResultDisposition::Requeued,
+            "round {round} paused refusal must requeue even with retry_on_worker_disconnect = false"
+        );
+        assert_eq!(outcome.state, TaskState::Queued);
+        let info = queue.get_task(&id).await.unwrap();
+        assert_eq!(info.retry_count, 0);
+        assert_eq!(info.failover_count, 0);
+        assert!(
+            queue.get_retry_history(&id).await.unwrap().is_empty(),
+            "round {round} paused refusal must not push RetryAttempt onto retry_history"
+        );
+    }
+
+    let gpu_task = Task::new(
+        TaskSpec::command("gpu-job", vec![]),
+        TaskRequirements::new(1, 512, true, 60).with_max_retries(0),
+    );
+    let gpu_id = queue.submit(gpu_task).await.unwrap();
+    for round in 11..=20u64 {
+        let scheduled = queue
+            .schedule_tasks_batch_in_sessions(&[(gpu_id, worker, round)])
+            .await;
+        assert_eq!(scheduled.len(), 1);
+        let rejection = worker_rejection(
+            worker,
+            gpu_id,
+            "Task rejected by worker: no gpu tasks",
+            "Task rejected by worker: no gpu tasks",
+        );
+        let outcome = queue
+            .record_result_from(worker, Some(round), rejection)
+            .await
+            .unwrap();
+        assert_eq!(outcome.disposition, ResultDisposition::Requeued);
+        assert_eq!(outcome.state, TaskState::Queued);
+        assert!(queue.get_retry_history(&gpu_id).await.unwrap().is_empty());
+    }
 }

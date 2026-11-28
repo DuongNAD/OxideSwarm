@@ -197,7 +197,7 @@ fn ensure_telemetry_sampler_started() {
     });
 }
 
-fn get_system_telemetry() -> (f32, u64) {
+pub(crate) fn get_system_telemetry() -> (f32, u64) {
     ensure_telemetry_sampler_started();
     if let Ok(cache) = TELEMETRY_CACHE.lock() {
         *cache

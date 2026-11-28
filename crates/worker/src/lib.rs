@@ -13,6 +13,7 @@ pub mod backoff;
 pub mod blob_cache;
 pub mod blob_client;
 pub mod client;
+pub mod control;
 pub mod cpu_simd;
 #[cfg(feature = "3d")]
 pub mod gen3d;
@@ -22,6 +23,9 @@ pub mod identity;
 // LV-4: OS sandbox primitives (Windows AppContainer/ACLs/Desktop/CreateProcessW, Linux namespaces/seccomp, macOS sandbox_init).
 #[allow(unsafe_code)]
 pub mod isolation;
+// LV-4: cfg(windows) INetworkCostManager COM and GetSystemPowerStatus queries for contributor limits (design 0113 D1).
+#[allow(unsafe_code)]
+pub mod limits;
 // LV-4: cfg(windows) Job Objects / snapshots and cfg(unix) setsid/killpg/proc_pidinfo process-tree supervision.
 #[allow(unsafe_code)]
 pub mod process_tree;
@@ -42,11 +46,23 @@ pub use blob_cache::{BlobCache, CachePin, DEFAULT_BLOB_CACHE_MAX_BYTES};
 pub use client::{
     compute_effective_resume_grace, WorkerClient, WorkerConfig, RESUME_SAFETY_MARGIN,
 };
+pub use control::{
+    ControlEndpoint, ControlHandle, ControlRequest, ControlResponse, ControlStatusSnapshot,
+    LimitPersistHook, WorkerControlState, WorkerLimitsConfig,
+};
 pub use gpu::{GpuError, GpuNotice, NoticeLevel, WGPU_COMPILED};
 pub use heartbeat::{HeartbeatHandle, HeartbeatTracker, MobileTelemetryHandle};
 pub use isolation::{
     validate_extra_read_only_dirs, verify_isolation_support, verify_isolation_support_with_config,
     HostDirs, IsolationLevel, ISOLATION_READ_DIRS_ENV,
+};
+pub use limits::{
+    classify_windows_nlm_cost, format_limit_rejection, parse_linux_nm_metered_output,
+    parse_macos_path_flags, BatteryProbe, BatteryStatus, CpuAverager, DailyTaskBudget,
+    HoldEvaluation, HostCpuProbe, HoursSchedule, LimitSample, LimitsEvaluator, LocalClock,
+    MeteredNetworkProbe, MeteredStatus, SystemBatteryProbe, SystemHostCpuProbe, SystemLocalClock,
+    SystemMeteredNetworkProbe, WorkerLimits, CPU_AVERAGE_WINDOW, LIMITS_EVAL_INTERVAL,
+    NO_GPU_TASKS_REJECTION_MESSAGE, PAUSE_REJECTION_PREFIX,
 };
 pub use process_tree::{terminate_all_task_process_trees, ProcessPriority};
 pub use runner::{
