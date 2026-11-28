@@ -645,10 +645,25 @@ async fn apply_task_result_inner(
             }
         }
     }
-    if outcome.rejected {
-        let _ = registry.record_rejection(&worker_id, session_id).await;
-    } else if outcome.disposition != ResultDisposition::Late {
-        registry.clear_rejections(&worker_id).await;
+    match outcome.rejection_kind {
+        Some(crate::queue::WorkerRejectionKind::Paused) => {
+            let _ = registry.record_pause_holdback(&worker_id, session_id).await;
+        }
+        Some(crate::queue::WorkerRejectionKind::NoGpuTasks) => {
+            let _ = registry
+                .record_gpu_pause_holdback(&worker_id, session_id)
+                .await;
+        }
+        Some(crate::queue::WorkerRejectionKind::Generic) => {
+            let _ = registry.record_rejection(&worker_id, session_id).await;
+        }
+        None if outcome.disposition != ResultDisposition::Late => {
+            registry.clear_rejections(&worker_id).await;
+            registry
+                .clear_pause_holdback(&worker_id, outcome.task_requires_gpu)
+                .await;
+        }
+        None => {}
     }
     // The acknowledgement token hashes the whole result, `asset_bytes` included, and is sent
     // only when this master holds sessions for resume, so it is computed only then (BUG-27).

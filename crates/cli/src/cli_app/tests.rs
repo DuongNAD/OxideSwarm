@@ -692,12 +692,16 @@ fn test_worker_state_counts_only_connected_workers() {
         .with_tags(vec!["state:connected".to_string()]);
     let gone = WorkerCapabilities::new("b", 4, 4096, false, false, None)
         .with_tags(vec!["state:disconnected".to_string()]);
+    let paused = WorkerCapabilities::new("p", 4, 4096, false, false, None)
+        .with_tags(vec!["state:paused".to_string()]);
     let untagged = WorkerCapabilities::new("c", 4, 4096, false, false, None);
     assert_eq!(worker_state(&connected), Some("connected"));
     assert_eq!(worker_state(&gone), Some("disconnected"));
+    assert_eq!(worker_state(&paused), Some("paused"));
     assert_eq!(worker_state(&untagged), None);
     assert!(worker_is_connected(&connected));
     assert!(!worker_is_connected(&gone));
+    assert!(worker_is_connected(&paused));
     assert!(worker_is_connected(&untagged));
 }
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::store::{DurableAck, JournalRecord};
 
 use super::{
-    is_worker_rejection, owned_by, owned_by_speculative, retained_bytes, CancelOutcome,
+    classify_worker_rejection, owned_by, owned_by_speculative, retained_bytes, CancelOutcome,
     DelayedRetryKey, QueueOrderKey, ResultDisposition, ResultOutcome, RetryAttempt, TaskEntry,
     TaskQueue, TaskQueueInner, TaskState, MAX_WORKER_REJECTIONS_PER_TASK,
 };
@@ -316,6 +316,7 @@ impl TaskQueue {
             sequence,
             task_key,
             timeout_secs,
+            task_requires_gpu,
             resumed_from_checkpoint,
             reporting_session_id,
             reporting_session_live,
@@ -352,6 +353,7 @@ impl TaskQueue {
                 entry.sequence,
                 entry.task_key,
                 entry.task.requirements.timeout_secs,
+                entry.task.requirements.gpu_required,
                 if spec_owner {
                     false
                 } else {
@@ -375,6 +377,8 @@ impl TaskQueue {
                     disposition: ResultDisposition::Stale,
                     state,
                     rejected: false,
+                    rejection_kind: None,
+                    task_requires_gpu,
                     adopted_from_hold: false,
                     task_key,
                     timeout_secs,
@@ -431,6 +435,8 @@ impl TaskQueue {
                     disposition: ResultDisposition::Late,
                     state,
                     rejected: false,
+                    rejection_kind: None,
+                    task_requires_gpu,
                     adopted_from_hold: false,
                     task_key,
                     timeout_secs,
@@ -444,7 +450,8 @@ impl TaskQueue {
             ));
         }
 
-        let rejected = is_worker_rejection(&result);
+        let rejection_kind = classify_worker_rejection(&result);
+        let rejected = rejection_kind.is_some();
 
         // If a speculative sibling is running alongside this failed attempt, keep the task alive
         // on the remaining attempt without charging retries or waking waiters (`0060` D3).
@@ -520,6 +527,8 @@ impl TaskQueue {
                         disposition: ResultDisposition::SiblingFailed,
                         state: next_state,
                         rejected,
+                        rejection_kind,
+                        task_requires_gpu,
                         adopted_from_hold: false,
                         task_key,
                         timeout_secs,
@@ -613,13 +622,30 @@ impl TaskQueue {
             } else if rejected
                 && policy.retry_on_worker_disconnect
                 && entry.rejection_count < MAX_WORKER_REJECTIONS_PER_TASK
-                && policy.failover_budget(entry).0
+                && (matches!(
+                    rejection_kind,
+                    Some(
+                        crate::queue::WorkerRejectionKind::Paused
+                            | crate::queue::WorkerRejectionKind::NoGpuTasks
+                    )
+                ) || policy.failover_budget(entry).0)
             {
                 // The worker refused to run it: that is the worker's problem, not the task's. Hand
-                // the task to somebody else without charging its execution retry budget.
+                // the task to somebody else without charging its execution retry budget; contributor
+                // pauses (`Paused` / `NoGpuTasks`) leave `retry_count` and `failover_count`
+                // untouched so tasks with `max_retries = 0` also hand back uncharged.
                 entry.rejection_count += 1;
-                entry.failover_count += 1;
-                entry.retry_count += 1;
+                let charge_failover = !matches!(
+                    rejection_kind,
+                    Some(
+                        crate::queue::WorkerRejectionKind::Paused
+                            | crate::queue::WorkerRejectionKind::NoGpuTasks
+                    )
+                );
+                if charge_failover {
+                    entry.failover_count += 1;
+                    entry.retry_count += 1;
+                }
                 if !entry.avoid_workers.contains(&worker_id) {
                     entry.avoid_workers.push(worker_id);
                 }
@@ -785,6 +811,8 @@ impl TaskQueue {
                 disposition,
                 state: res_state,
                 rejected,
+                rejection_kind,
+                task_requires_gpu,
                 adopted_from_hold: adoptable_by_sender,
                 task_key,
                 timeout_secs,

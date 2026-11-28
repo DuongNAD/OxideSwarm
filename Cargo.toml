@@ -5,6 +5,7 @@ members = [
     "crates/master",
     "crates/worker",
     "crates/cli",
+    "crates/tray",
     "crates/android_bridge",
     "crates/agent_mesh",
 ]

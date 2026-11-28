@@ -195,6 +195,10 @@ impl WorkerSummary {
     fn connected(&self) -> bool {
         self.state.as_deref() != Some("disconnected")
     }
+
+    fn paused(&self) -> bool {
+        self.state.as_deref() == Some("paused")
+    }
 }
 
 /// How the master reaches a worker.
@@ -736,10 +740,13 @@ async fn run_checks(
         )
     };
     report.push("C2", "Workers", None, outcome, detail);
+    paused_worker_check(report);
+    let active_connected: Vec<WorkerSummary> =
+        connected.iter().filter(|w| !w.paused()).cloned().collect();
 
-    // C3 to C5: probes pinned to each connected worker.
+    // C3 to C5: probes pinned to each active connected worker (skipping paused ones).
     let mut probes: Vec<Probe> = Vec::new();
-    for w in &connected {
+    for w in &active_connected {
         let Some(worker_id) = w.id else {
             report.push(
                 "C3",
@@ -810,17 +817,22 @@ async fn run_checks(
     }
     if options.skip_gpu {
         report.push("C5", "GPU probe", None, Outcome::Skip, "--skip-gpu");
-    } else if !connected.is_empty() && !listed.iter().any(|c| c.can_execute_gpu()) {
+    } else if !active_connected.is_empty()
+        && !listed
+            .iter()
+            .filter(|c| !c.tags.iter().any(|t| t == "state:paused"))
+            .any(|c| c.can_execute_gpu())
+    {
         report.push(
             "C5",
             "GPU probe",
             None,
             Outcome::Skip,
-            "no worker advertises a GPU",
+            "no active worker advertises a GPU",
         );
     }
 
-    spread_check(&mut transport, options, &connected, report).await?;
+    spread_check(&mut transport, options, &active_connected, report).await?;
     link_check(report);
     if !options.skip_throughput {
         throughput_check(
@@ -828,7 +840,7 @@ async fn run_checks(
             secret,
             &mut transport,
             options,
-            &connected,
+            &active_connected,
             report,
         )
         .await?;
@@ -843,6 +855,26 @@ async fn run_checks(
     }
     transport.close().await;
     Ok(())
+}
+
+/// Emits a `WARN` for each connected worker that is held back due to contributor pause
+/// (`state:paused`), without failing `doctor`.
+fn paused_worker_check(report: &mut DoctorReport) {
+    let paused_names: Vec<String> = report
+        .workers
+        .iter()
+        .filter(|w| w.paused())
+        .map(|w| w.name.clone())
+        .collect();
+    for name in paused_names {
+        report.push(
+            "C2",
+            "Workers",
+            Some(name.as_str()),
+            Outcome::Warn,
+            "worker is paused (state:paused); skipping active probes",
+        );
+    }
 }
 
 /// C7: warns for every connected worker whose link goes through a relay.
@@ -1632,6 +1664,32 @@ mod tests {
         }
         let throughput = throughput_task(id, "macos", &[], timeout);
         assert_eq!(throughput.requirements.ram_mb, 0);
+    }
+
+    #[test]
+    fn test_net9a_doctor_warns_on_paused_worker_without_failing() {
+        let mut report = DoctorReport {
+            master: "m".into(),
+            workers: vec![
+                WorkerSummary::of(&caps("paused-box", &["state:paused"])),
+                WorkerSummary::of(&caps("ready-box", &["state:connected"])),
+            ],
+            checks: Vec::new(),
+            auth_failed: false,
+        };
+        assert!(report.workers[0].connected());
+        assert!(report.workers[0].paused());
+        assert!(!report.workers[1].paused());
+        paused_worker_check(&mut report);
+        let warns: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|c| c.outcome == Outcome::Warn)
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(warns[0].worker.as_deref(), Some("paused-box"));
+        assert!(warns[0].detail.contains("state:paused"));
+        assert!(!report.failed());
     }
 
     #[tokio::test]

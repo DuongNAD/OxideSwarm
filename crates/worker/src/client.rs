@@ -326,6 +326,14 @@ pub struct WorkerConfig {
     pub fake_runner: Option<crate::sim::FakeRunnerConfig>,
     /// Optional simulated link shaping and byte/disconnect instrumentation (`SCALE-1`).
     pub simulated_link: Option<crate::sim::SimulatedLinkConfig>,
+    /// Optional local same-user control IPC endpoint (`design 0113` D2).
+    pub control_endpoint: Option<crate::control::ControlEndpoint>,
+    /// Initial contributor-configured worker limits (`design 0113` D1/D2).
+    pub initial_limits: crate::control::WorkerLimitsConfig,
+    /// Path to the active config file displayed by `oxideswarm worker status`.
+    pub control_config_path: Option<PathBuf>,
+    /// Persistence callback invoked by `oxideswarm worker limits set` to update `[worker]` TOML keys.
+    pub limit_persist_hook: Option<crate::control::LimitPersistHook>,
 }
 
 impl WorkerConfig {
@@ -384,6 +392,10 @@ impl WorkerConfig {
             rendezvous_url: None,
             fake_runner: None,
             simulated_link: None,
+            control_endpoint: None,
+            initial_limits: crate::control::WorkerLimitsConfig::default(),
+            control_config_path: None,
+            limit_persist_hook: None,
         }
     }
 
@@ -682,6 +694,36 @@ impl WorkerConfig {
         self
     }
 
+    /// Configures the local same-user control endpoint served while the worker runs.
+    pub fn with_control_endpoint(
+        mut self,
+        endpoint: Option<crate::control::ControlEndpoint>,
+    ) -> Self {
+        self.control_endpoint = endpoint;
+        self
+    }
+
+    /// Configures the initial contributor limits state (`design 0113` D1/D2).
+    pub fn with_initial_limits(mut self, limits: crate::control::WorkerLimitsConfig) -> Self {
+        self.initial_limits = limits;
+        self
+    }
+
+    /// Records the configuration file path reported by `worker status` / `limits`.
+    pub fn with_control_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.control_config_path = path;
+        self
+    }
+
+    /// Registers a persistence callback invoked when `limits set` mutates `[worker]` settings.
+    pub fn with_limit_persist_hook(
+        mut self,
+        hook: Option<crate::control::LimitPersistHook>,
+    ) -> Self {
+        self.limit_persist_hook = hook;
+        self
+    }
+
     /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
     pub fn simulated(
         master_addr: impl Into<String>,
@@ -804,6 +846,10 @@ pub struct WorkerClient {
     /// Outbox for checkpoints and completed task results produced while disconnected within the
     /// session-resume grace window.
     pending_resume_outbox: Arc<std::sync::Mutex<tasks::PendingResumeOutbox>>,
+    /// Local pause/resume & contributor-limits control state (`design 0113` D2).
+    control: Arc<crate::control::ControlHandle>,
+    /// Set by `run_session` when a pause-resume asks for an immediate reconnect without backoff.
+    resume_reconnect_pending: AtomicBool,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
     #[cfg(feature = "p2p")]
@@ -1110,6 +1156,15 @@ impl WorkerClient {
             initial_features.insert(ProtocolCapabilities::WORKSPACES);
         }
 
+        let control = crate::control::ControlHandle::new(
+            worker_id,
+            capabilities.name.clone(),
+            Arc::clone(&active_tasks),
+            config.initial_limits.clone(),
+            config.control_config_path.clone(),
+            config.limit_persist_hook.clone(),
+        );
+
         Self {
             config,
             worker_id,
@@ -1142,6 +1197,8 @@ impl WorkerClient {
             pending_resume_outbox: Arc::new(std::sync::Mutex::new(
                 tasks::PendingResumeOutbox::with_capacity(2 * concurrency_permits.max(1)),
             )),
+            control,
+            resume_reconnect_pending: AtomicBool::new(false),
             #[cfg(feature = "p2p")]
             p2p_endpoint: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "p2p")]
@@ -1149,6 +1206,11 @@ impl WorkerClient {
             #[cfg(feature = "p2p")]
             p2p_failures: AtomicU32::new(0),
         }
+    }
+
+    /// Returns a shared handle to the worker's local pause/resume and limits state.
+    pub fn control_handle(&self) -> Arc<crate::control::ControlHandle> {
+        Arc::clone(&self.control)
     }
 
     /// Returns the active P2P path information, if connected via P2P.
@@ -1572,6 +1634,37 @@ impl WorkerClient {
             ))
         });
 
+        let (control_shutdown_tx, control_shutdown_rx) = watch::channel(false);
+        let control_server_handle = self.config.control_endpoint.clone().map(|endpoint| {
+            let handle = Arc::clone(&self.control);
+            let mut merged_shutdown_rx = shutdown_rx.clone();
+            let mut local_rx = control_shutdown_rx;
+            let (srv_stop_tx, srv_stop_rx) = watch::channel(false);
+            tokio::spawn(async move {
+                let mut srv_fut = Box::pin(crate::control::serve_control_endpoint(
+                    endpoint.clone(),
+                    handle,
+                    srv_stop_rx,
+                ));
+                tokio::select! {
+                    res = &mut srv_fut => {
+                        if let Err(err) = res {
+                            warn!(endpoint = %endpoint.display_target(), error = %err, "Local worker control server failed");
+                        }
+                    }
+                    _ = merged_shutdown_rx.changed() => {
+                        let _ = srv_stop_tx.send(true);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), srv_fut).await;
+                    }
+                    _ = local_rx.changed() => {
+                        let _ = srv_stop_tx.send(true);
+                        let _ = tokio::time::timeout(Duration::from_secs(1), srv_fut).await;
+                    }
+                }
+            })
+        });
+
+        let mut run_result = Ok(());
         loop {
             if *shutdown_rx.borrow() {
                 info!(worker_id = %self.worker_id, "Worker shutdown requested; exiting supervisor");
@@ -1581,6 +1674,8 @@ impl WorkerClient {
             }
 
             self.master_shutdown_announced = false;
+            self.resume_reconnect_pending
+                .store(false, Ordering::Release);
             let outcome = self.connect_and_run(&mut shutdown_rx, &mut backoff).await;
 
             let is_shutdown = *shutdown_rx.borrow();
@@ -1596,6 +1691,7 @@ impl WorkerClient {
             let keep_for_resume = outcome.is_err()
                 && !is_shutdown
                 && evac_reason.is_none()
+                && !self.resume_reconnect_pending.load(Ordering::Acquire)
                 && self
                     .resume_deadline
                     .is_some_and(|d| tokio::time::Instant::now() < d);
@@ -1606,22 +1702,37 @@ impl WorkerClient {
 
             match outcome {
                 Ok(()) => {
+                    self.control.set_disconnected(None);
                     info!(worker_id = %self.worker_id, "Worker connection ended cleanly");
                     break;
                 }
                 Err(e) => {
                     if *shutdown_rx.borrow() {
+                        self.control.set_disconnected(None);
                         info!(worker_id = %self.worker_id, "Worker terminating on shutdown signal after connection notice");
                         self.resume_deadline = None;
                         self.expire_resume_window("FAST_SHUTDOWN").await;
                         break;
                     }
 
+                    if self.resume_reconnect_pending.swap(false, Ordering::AcqRel) {
+                        self.control.set_disconnected(None);
+                        info!(
+                            worker_id = %self.worker_id,
+                            "Worker resumed; reconnecting immediately to clear hold-back"
+                        );
+                        backoff.reset();
+                        continue;
+                    }
+
+                    self.control.set_disconnected(Some(e.to_string()));
+
                     if let GridError::Config(_) = e {
                         error!(worker_id = %self.worker_id, error = %e, "Worker configuration error; not retrying");
                         self.resume_deadline = None;
                         self.expire_resume_window(&cancel_reason).await;
-                        return Err(e);
+                        run_result = Err(e);
+                        break;
                     }
 
                     let auth_failure =
@@ -1702,7 +1813,17 @@ impl WorkerClient {
             }
         }
 
-        Ok(())
+        let _ = control_shutdown_tx.send(true);
+        if let Some(mut handle) = control_server_handle {
+            if tokio::time::timeout(Duration::from_secs(1), &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+            }
+        }
+
+        run_result
     }
 }
 

@@ -218,6 +218,28 @@ async fn resolve_portal_master(
     }
 }
 
+/// Derives the local user's master dashboard URL for tray status snapshots (`TRAY-1`, `0112` D1.2).
+pub(super) fn derive_local_dashboard_url(
+    beacon: Option<&rusty_grid_core::discovery::MasterBeacon>,
+    remote_desc: &str,
+) -> Option<String> {
+    if let Some(b) = beacon {
+        return portal_master_from_beacon(b, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .and_then(|(ui, _cluster)| (!ui.trim().is_empty()).then_some(ui));
+    }
+    let trimmed = remote_desc.trim();
+    if trimmed.is_empty() || trimmed.starts_with("iroh://") || trimmed.eq_ignore_ascii_case("auto")
+    {
+        return None;
+    }
+    let host = portal_host_of(trimmed)?;
+    sanitize_http_origin(&format!(
+        "http://{}:{}",
+        url_host(&host),
+        PORTAL_DASHBOARD_PORT
+    ))
+}
+
 fn worker_portal_standby_html() -> String {
     r#"<!DOCTYPE html>
 <html lang="en" data-theme="dark">

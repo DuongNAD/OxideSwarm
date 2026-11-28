@@ -768,11 +768,23 @@ impl WorkerClient {
             WorkerStreamMode::Single(stream) => {
                 if let Some(link_cfg) = self.config.simulated_link.clone() {
                     let wrapped = crate::sim::SimulatedLinkStream::wrap(stream, link_cfg);
-                    self.run_single_stream_session(wrapped, clock, backoff, shutdown_rx)
-                        .await
+                    self.run_single_stream_session(
+                        wrapped,
+                        &remote_desc,
+                        clock,
+                        backoff,
+                        shutdown_rx,
+                    )
+                    .await
                 } else {
-                    self.run_single_stream_session(stream, clock, backoff, shutdown_rx)
-                        .await
+                    self.run_single_stream_session(
+                        stream,
+                        &remote_desc,
+                        clock,
+                        backoff,
+                        shutdown_rx,
+                    )
+                    .await
                 }
             }
             #[cfg(feature = "p2p")]
@@ -825,6 +837,23 @@ impl WorkerClient {
                     }
                 };
                 backoff.reset();
+                let link_kind = {
+                    let conn_guard = self.p2p_conn.read().await;
+                    let path_info = conn_guard
+                        .as_ref()
+                        .and_then(rusty_grid_core::transport::inspect_connection_paths);
+                    if path_info.is_some_and(|p| p.is_relay && !p.is_ip) {
+                        crate::control::ControlLinkKind::Relay
+                    } else {
+                        crate::control::ControlLinkKind::Direct
+                    }
+                };
+                let dashboard_url = {
+                    let beacon = self.master_beacon.read().await;
+                    super::portal::derive_local_dashboard_url(beacon.as_ref(), &remote_desc)
+                };
+                self.control
+                    .set_connected(link_kind, Some(remote_desc), dashboard_url);
                 info!(worker_id = %self.worker_id, "Registration accepted over QUIC control stream; backoff counter reset");
 
                 // Control traffic (heartbeats, telemetry) and bulk data (results) each get their own
@@ -845,6 +874,7 @@ impl WorkerClient {
     >(
         &mut self,
         stream: S,
+        remote_desc: &str,
         clock: Arc<IoClock>,
         backoff: &mut ExponentialBackoff,
         shutdown_rx: &mut watch::Receiver<bool>,
@@ -890,6 +920,15 @@ impl WorkerClient {
             .and_then(|cfg| cfg.control.as_ref())
             .map(crate::sim::SimulatedNetworkControl::enter_session);
         backoff.reset();
+        let dashboard_url = {
+            let beacon = self.master_beacon.read().await;
+            super::portal::derive_local_dashboard_url(beacon.as_ref(), remote_desc)
+        };
+        self.control.set_connected(
+            crate::control::ControlLinkKind::Tcp,
+            Some(remote_desc.to_string()),
+            dashboard_url,
+        );
         info!(worker_id = %self.worker_id, "Registration accepted; backoff counter reset");
 
         // Split transport into independent reader and writer; one stream serves both queues.
@@ -996,6 +1035,11 @@ impl WorkerClient {
                 }
             }
         }
+        self.control.clear_session_pause_rejection();
+        let mut control_rx = self.control.subscribe();
+        let mut pause_expiry_tick = tokio::time::interval(Duration::from_secs(1));
+        pause_expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut farewell: Option<WorkerMessage> = None;
         let _outbox_flush_guard = (!buffered_checkpoints.is_empty()
             || !buffered_results.is_empty())
@@ -1178,6 +1222,36 @@ impl WorkerClient {
                     }
                 }
 
+                // Local pause / resume control transitions (`design 0113` D2/D3).
+                ev = control_rx.recv() => {
+                    match ev {
+                        Ok(crate::control::ControlEvent::PauseHandBack { reason }) => {
+                            self.hand_back_running_tasks_on_pause(&reason, &session.data_tx)
+                                .await;
+                        }
+                        Ok(crate::control::ControlEvent::ResumeReconnect) => {
+                            if self.control.take_session_pause_rejection()
+                                && self.active_task_table.read().await.is_empty()
+                            {
+                                info!(
+                                    worker_id = %worker_id,
+                                    "Worker resumed while held back; closing session to re-register immediately"
+                                );
+                                self.resume_reconnect_pending.store(true, Ordering::Release);
+                                break Err(GridError::ConnectionClosed);
+                            }
+                        }
+                        Err(
+                            tokio::sync::broadcast::error::RecvError::Lagged(_)
+                            | tokio::sync::broadcast::error::RecvError::Closed,
+                        ) => {}
+                    }
+                }
+
+                _ = pause_expiry_tick.tick() => {
+                    let _ = self.control.check_pause_expiry();
+                }
+
                 // External shutdown signal
                 res = shutdown_rx.changed() => {
                     if res.is_ok() && *shutdown_rx.borrow() {
@@ -1216,6 +1290,7 @@ impl WorkerClient {
         if outcome.is_err()
             && !*shutdown_rx.borrow()
             && current_evacuation_reason().is_none()
+            && !self.resume_reconnect_pending.load(Ordering::Acquire)
             && grace > Duration::ZERO
         {
             self.resume_deadline = Some(tokio::time::Instant::now() + grace);
