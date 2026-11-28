@@ -60,6 +60,23 @@ installs the GPU build on yes. Without a terminal to ask, it installs the plain 
 `--no-gpu` (`-Gpu` and `-NoGpu` on Windows) answer the question in advance. The GPU build skips
 software adapters, so on a machine without a GPU it behaves like the plain build.
 
+`--toolset full` (or a comma-separated subset of `python,rust,mingw,git`) bundles SHA-256-pinned
+Windows developer tools from `packaging/usb/tools.lock` into `<DIR>/OxideSwarm/tools/` alongside
+`tools/NOTICE.txt` (design 0110): Python embeddable (`python.org`), Rust `x86_64-pc-windows-gnu` at
+the CI version (`1.96.0`), `w64devkit` MinGW-w64 GCC (`--tools-dir <DIR>` supplies local cached tool
+archives instead of downloading them), and MinGit (`NOTICE.txt` links the exact GPL source
+releases). On a toolset kit, `install.ps1` asks once whether to install the developer tools (default
+Yes; `-Tools` and `-NoTools` skip the prompt), extracts them privately under `<folder>\tools\`, sets
+`<folder>\cargo-home\` as `CARGO_HOME`, leaves `RUSTUP_HOME` unset, sets
+`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER` to Rust's self-contained linker inside
+`start-worker.vbs` (so `PATH` and the Windows user environment never change), enables `--workspaces`
+from the private `cargo`, grants `oxideswarm.toolchain` read/execute on `tools\` under `-Isolation
+fs` (recorded in `home\windows_acl_grants.txt` for `uninstall.ps1`), and runs pinned end-to-end
+checks (`python`, `rustc`, `RustCompilation`, `cargo build --release --offline` on `cc-check`, and
+`git`). GNU builds of large OxideSwarm binaries use `--release` because debug DLLs hit Windows' GNU
+export ordinal limit. `uninstall.ps1` removes `tools\` and `cargo-home\` along with the rest of
+`<folder>`.
+
 ## Networks where machines cannot see each other
 
 On school, office or café Wi-Fi, the machines often cannot reach each other directly (client

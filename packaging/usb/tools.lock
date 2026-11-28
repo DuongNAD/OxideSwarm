@@ -1,0 +1,16 @@
+# OxideSwarm Windows USB kit developer toolset lock (design 0110).
+# Columns (tab-separated; no spaces inside values):
+#   tool	component	version	filename	sha256	url
+#
+# Official hash sources (verified 2026-11-26):
+# - python 3.15.2: https://www.python.org/downloads/release/python-3152/
+# - rust 1.96.0 (CI toolchain): https://static.rust-lang.org/dist/channel-rust-1.96.0.toml
+# - mingw (w64devkit 2.11.0 x64): https://github.com/skeeto/w64devkit/releases/tag/v2.11.0
+# - git (MinGit 2.56.1 64-bit): https://github.com/git-for-windows/git/releases/tag/v2.56.1.windows.1
+python	python	3.15.2	python-3.15.2-embed-amd64.zip	d012f3aa29cf07436dae8aea1fec0fd195c2612a0b059b1f915ae0afb9ad1f62	https://www.python.org/ftp/python/3.15.2/python-3.15.2-embed-amd64.zip
+rust	rustc	1.96.0	rustc-1.96.0-x86_64-pc-windows-gnu.tar.xz	6472d5d19eebeaed5d611a073192bd8e2c378aa0fc4cd3fe514510b0aadeaff2	https://static.rust-lang.org/dist/2026-05-28/rustc-1.96.0-x86_64-pc-windows-gnu.tar.xz
+rust	rust-std	1.96.0	rust-std-1.96.0-x86_64-pc-windows-gnu.tar.xz	4502f0fdac8151b874723acb771cc5dca9a33df9f12a40081947909058bb46dc	https://static.rust-lang.org/dist/2026-05-28/rust-std-1.96.0-x86_64-pc-windows-gnu.tar.xz
+rust	cargo	1.96.0	cargo-1.96.0-x86_64-pc-windows-gnu.tar.xz	06b3a0e42f80b420668a9b4e9e10cee1ad8d7fb75d1db8b85f7fb8358b465a4b	https://static.rust-lang.org/dist/2026-05-28/cargo-1.96.0-x86_64-pc-windows-gnu.tar.xz
+rust	rust-mingw	1.96.0	rust-mingw-1.96.0-x86_64-pc-windows-gnu.tar.xz	092d13da42e200ce37b5caa2443fc43e991eac64fb5e2e178fb220cff799a995	https://static.rust-lang.org/dist/2026-05-28/rust-mingw-1.96.0-x86_64-pc-windows-gnu.tar.xz
+mingw	w64devkit	2.11.0	w64devkit-x64-2.11.0.7z.exe	54c2bb9962e8a30c8270e34c5efc3d5fee579f53087fa7d435b95fbba2af7b2b	https://github.com/skeeto/w64devkit/releases/download/v2.11.0/w64devkit-x64-2.11.0.7z.exe
+git	mingit	2.56.1	MinGit-2.56.1-64-bit.zip	4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd	https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip

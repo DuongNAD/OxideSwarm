@@ -1,8 +1,9 @@
-# OxideSwarm USB uninstaller for Windows (kit format v0 / v1, design 0053 / 0055).
+# OxideSwarm USB uninstaller for Windows (kit format v0 / v1, design 0053 / 0055 / 0110).
 # Stops the worker this kit installed, revokes any oxideswarm.toolchain ACL grants recorded in its
-# manifest (<install folder>\home\windows_acl_grants.txt), removes its HKCU Run entry, its folder
-# (binaries, credentials, logs, task folders and file cache), and %TEMP%\oxideswarm-usb (the task
-# folders of an install with -Isolation fs in %LOCALAPPDATA%, and of installs before 2026-11-18).
+# manifest (<install folder>\home\windows_acl_grants.txt, including private tools\), removes its
+# HKCU Run entry, its folder (binaries, private tools\, cargo-home\, credentials, logs, task
+# folders and file cache), and %TEMP%\oxideswarm-usb (the task folders of an install with
+# -Isolation fs in %LOCALAPPDATA%, and of installs before 2026-11-18).
 # Nothing else is touched. Without -InstallRoot it removes the install the installer recorded in HKCU (another
 # drive included), else %LOCALAPPDATA%\OxideSwarm-USB (or %LOCALAPPDATA%\OxideSwarm for an older
 # install). Pass -KeepKey to retain <install folder>\home\node.key for rejoining with the same identity.
