@@ -1254,7 +1254,7 @@ impl WorkerClient {
         impl Drop for InFlightGuard {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::AcqRel);
-                self.1.notify_waiters();
+                self.1.notify_one();
             }
         }
         in_flight.fetch_add(1, Ordering::AcqRel);
