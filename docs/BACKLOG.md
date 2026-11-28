@@ -735,6 +735,43 @@ The full suite must pass on a clean machine before CI can require it.
   - Check 5 (Clean stop): `passed` (`0` leftover processes on Mac or Windows workers; Mac workdir preserved
     outside `/tmp` locally).
   Stays `Partial | In` pending a full uninterrupted `24 h` 3-machine run.
+- **Update (2026-11-28, 24 h monotonic / 19.5 h active-worker 3-machine LAN TCP soak record, branch `mac/test-25-24h-record-2026-11-27`):**
+  Ran `endurance.py soak --master-only --link lan-tcp --duration 24h --fault-scale 1.0 --load-scale 1.0 --workers 2 --slots 2 --workspaces --max-queue-size 64 --blob-store-mb 4096 --blob-cache-mb 2048 --sample-interval 60s --probe-interval 6s`
+  on `rusty-grid 0.4.5` release (`07caa5ae`, Mac Apple M5 master + Windows `win-case` + Windows `win-dell`), started
+  `2026-11-27T06:11:46Z` and completed monotonic `24 h` (`86,658.8 s` actual duration) at `~2026-11-28T11:08Z`.
+  Committed raw sanitized output `benchmarks/endurance/results/2026-11-27-soak-24h-lan-tcp-macos-arm64-to-windows-amd64.json`
+  (`all_passed: false` due to external host events, none caused by OxideSwarm: `win-dell` dropped at `2026-11-27T14:58:01Z`
+  [`~8 h 46 m`] on Windows Antigravity host restart; `win-case` stopped cleanly per owner decision at
+  `2026-11-28T01:45:30Z` [`~19 h 33 m`]; Mac slept `~03:35Z..08:25Z` [`~4 h 50 m`, pausing `time.monotonic()`] and woke with
+  DHCP IP `192.168.1.5 -> 192.168.1.13`, causing `master_restart` gen 11 at `09:03:48Z` / `t = 79,200.39 s` to fail bind
+  with `Can't assign requested address (os error 49)`):
+  - Check 1 (Accounting, `passed: false`): `63,420` submitted and `63,420` completed (`0` lost, `0` duplicates, `0` untracked;
+    `62,142` `ok`, `1,171` `cancelled`, `68` `failed`, `39` `timeout`; `107` unexpected outcomes: `66` `probe:failed`, `2`
+    `noop:failed`, `30` `noop:timeout`, `4` `reused_input:timeout`, `3` `new_input:timeout`, `2` `workspace_sync:timeout`; `1`
+    `hash_mismatch` on `reused_input` task `01f7e5e7-cb28-4c31-9803-a932f537dc30` reporting `actual: null` despite
+    `outcome: ok`, flagged for follow-up; `160` expected `queue_burst` `QueueFull` refusals; `13,712` submit failures
+    dominated by post-departure/post-DHCP `8,970` `os error 65`, `2,607` `os error 51`, and `2,131` `QueueFull`). Master
+    audit across `12` generations (`master-0..10` live, `master-11` bind failure): `63,350` unique master-logged results
+    (`0` duplicates, `0` queue record errors, `70` missing from master results after gen 11 bind failure, `74` failover
+    sweeps [`2` reaper, `0` superseded], `52` orphan requeues / `54` requeues logged, `49` retries/failovers across `47`
+    tasks from `11` `/api/tasks` snapshots).
+  - Check 2 (Resource plateau, `passed: false`, `no_common_process_roles`): Mac master across `11` live generations (`1,317`
+    samples of `1,440` total) bounded at `10,092,544–170,098,688 B` (`10.1–170.1 MiB`), peak handles `<= 57`, peak threads
+    `<= 17`.
+  - Check 3 (Disk & journal, `passed: false`, missing remote idle snapshots): Mac `blob_store_ok: true` (`peak
+    4,293,921,565 B <= 4 GiB`, `idle 4,262,464,284 B`), `tmp_leftovers: {}`, `journal_compaction_ok: true` (`11` scheduled
+    compactions: `gen 0..9` shrank `346,992–1,899,942 B -> 24 B`, `gen 10` `24 -> 24 B`).
+  - Check 4 (Probe p99, `passed: false`, `late_count = 0` in hour 24): `12,136` probes (`10,306` ok across
+    `t = 0.04..70,289.6 s`, `519` baseline H2 clean probes); active-worker medians stayed flat (`H2` 2-worker `p50 103.24 ms` /
+    `p95 221.21 ms` / `p99 631.99 ms`; `H18` 1-worker `p50 100.96 ms` / `p95 226.61 ms`; `H19` 1-worker `p50 104.22 ms` /
+    `p95 205.49 ms`; `H19.5` 1-worker `p50 104.46 ms` / `p95 275.19 ms`).
+  - Check 5 (Clean stop, `passed: false`, `missing_remote_shutdowns` for departed `win-case`/`win-dell`): Mac
+    `leftover_pids: []`, `leftover_task_trees: []`.
+  - Check 6 (Fault injection, `passed: false`, `100/152` ok, `52` errors): `0` fault errors before `win-dell` dropped
+    (`t < 31,600 s`) and `0` Mac/`win-case` fault errors before `win-case` left (`t < 70,400 s`); all `52` errors (`29`
+    `worker_kill`, `19` `link_cut`, `2` `master_restart`, `2` `queue_burst`) followed those departures and post-wake DHCP.
+  Stays `Partial | Out` pending an uninterrupted `24 h` 3-machine run and follow-up on `reused_input` `actual: null`
+  (`01f7e5e7-cb28-4c31-9803-a932f537dc30`).
 
 ### TEST-26: Run short versions of TEST-24 and TEST-25 on a schedule in CI
 
@@ -3668,3 +3705,4 @@ Add one dated line per finished item, newest last.
 - 2026-11-27: HOST-1 to HOST-5 added (Planned, Out) from [design 0114](design/0114-llm-worker-host.md), pull request 495; the owner decided Q104 to Q107 at the recommended defaults (no OxideSwarm OS, no own engine, measure first, normal priority only in the headless image).
 - 2026-11-27: TEST-86 Implemented under the Q103 rule (`51/51` green `workspace tests (macos-latest)` jobs on `master` since 2026-11-24). TEST-26 Implemented under the Q103 rule (green on `master` runs `45889278688` and `45946160149`). TEST-103 added (Planned, In): the started run `45975322901` failed only `4_probe_p99` on two isolated `~400 ms` probes while the median stayed at `27-28 ms`; the owner decided in chat that 0.4.6 is tagged with this recorded as a false failure of the check.
 - 2026-11-27: TEST-104 added (Planned, In): the started run `46014247326` failed only `workspace tests (windows-latest)`, one Windows isolation test whose PowerShell task printed nothing within the capped `35 s`; first failure of that job in `52` `master` runs since 2026-11-24. The owner decided in chat to tag 0.4.6 with TEST-104 recorded as well.
+- 2026-11-28: TEST-25 Partial (`mac/test-25-24h-record-2026-11-27`): committed raw `24 h` monotonic / `19.5 h` active-worker 3-machine LAN TCP soak record `benchmarks/endurance/results/2026-11-27-soak-24h-lan-tcp-macos-arm64-to-windows-amd64.json` (`07caa5ae` `0.4.5` release, `86,658.8 s`, `all_passed: false` from external host departures/sleep: `win-dell` `14:58:01Z` Antigravity restart, `win-case` `01:45:30Z` owner leave, Mac sleep + DHCP `.5 -> .13` `master-11` `os error 49`; `63,420/63,420` submitted/completed, `0` lost, `0` duplicates, `0` queue errors, `1` `reused_input` `actual: null` hash mismatch `01f7e5e7-cb28-4c31-9803-a932f537dc30`; `0` fault errors pre-`win-dell` & `0` Mac/`win-case` fault errors pre-`win-case`; Mac master RSS `10.1–170.1 MiB`, `blob_store_ok: true` `<= 4 GiB`, `11` compactions `-> 24 B`, active-worker probe median `100.96–104.46 ms`, `leftover_pids: []`). Stays `Partial | Out` pending an uninterrupted `24 h` 3-machine run and investigation of `01f7e5e7-cb28-4c31-9803-a932f537dc30`.
