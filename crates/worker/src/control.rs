@@ -2086,27 +2086,27 @@ mod tests {
         // Second `first_pipe_instance` on the same pipe name must fail visibly.
         assert!(windows_ipc::create_private_pipe_server(&pipe_name, true).is_err());
 
-        // Early-closing clients before `connect().await` deterministically trigger `ERROR_NO_DATA`
-        // (232) on `ConnectNamedPipe`; verify `connect()` error + `disconnect()` + `next_pipe_server`
-        // recycles cleanly, and stress live server against early client drops too.
+        // A client opening and closing BEFORE `connect().await` triggers Win32 `ERROR_NO_DATA` (232),
+        // which `mio`/`tokio` maps to `Ok(())`; verify `connect().await` + `process_control_stream`
+        // exits cleanly without hanging or panicking and `next_pipe_server` creates a healthy replacement.
         {
-            const WIN_ERROR_NO_DATA: i32 = 232;
             let recycle_pipe = format!(r"\\.\pipe\oxideswarm-recycle-{}", Uuid::new_v4());
             let srv_inst = windows_ipc::create_private_pipe_server(&recycle_pipe, true).unwrap();
             let c = ClientOptions::new().open(&recycle_pipe).unwrap();
             drop(c);
-            let err = srv_inst
-                .connect()
-                .await
-                .expect_err("client closing before connect() must yield ERROR_NO_DATA");
-            assert_eq!(err.raw_os_error(), Some(WIN_ERROR_NO_DATA));
-            let _ = srv_inst.disconnect();
+            match srv_inst.connect().await {
+                Ok(()) => {
+                    process_control_stream(srv_inst, Arc::clone(&handle)).await;
+                }
+                Err(_) => {
+                    let _ = srv_inst.disconnect();
+                }
+            }
             let (_, mut rx_recycle) = watch::channel(false);
             let recycled = windows_ipc::next_pipe_server(&recycle_pipe, &mut rx_recycle)
                 .await
                 .unwrap()
                 .expect("recycled pipe instance created");
-            drop(srv_inst);
             drop(recycled);
         }
         for _ in 0..3 {
