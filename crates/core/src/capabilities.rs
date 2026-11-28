@@ -1299,9 +1299,9 @@ fn detect_os_version(is_android: bool) -> String {
 }
 
 /// Maximum wall-clock time a single host capability probe subprocess (`blender --version`,
-/// `cargo --version`, `rustc --version`, `git --version`, `pmset`, `sysctl`, `sw_vers`,
-/// `nvidia-smi`, `nvcc`, `dumpsys`, `getprop`) may take before it is killed and treated as
-/// unavailable.
+/// `cargo --version`, `rustc --version`, `git --version`, `python --version`, `pmset`, `sysctl`,
+/// `sw_vers`, `nvidia-smi`, `nvcc`, `dumpsys`, `getprop`) may take before it is killed and treated
+/// as unavailable.
 pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Debug)]
@@ -1628,7 +1628,7 @@ fn run_host_probe(cmd: &mut std::process::Command, label: &str) -> Option<std::p
 }
 
 /// Host tools probed at worker start-up (`<tool> --version`, bounded by [`HOST_PROBE_TIMEOUT`]).
-pub const HOST_PROBED_TOOLS: [&str; 3] = ["cargo", "rustc", "git"];
+pub const HOST_PROBED_TOOLS: [&str; 4] = ["cargo", "rustc", "git", "python"];
 
 /// Prepends standard Git for Windows / MSYS2 binary directories (`C:\Program Files\Git\usr\bin`,
 /// `C:\Program Files\Git\bin`, `C:\Program Files (x86)\Git\usr\bin`,
@@ -2186,7 +2186,7 @@ std::thread_local! {
 
 /// Overrides the host tool tags returned by [`detect_host_tools`] on the current thread for the
 /// duration of `f`. Used by unit tests to simulate a worker with or without specific tools
-/// (`cargo`, `rustc`, `git`).
+/// (`cargo`, `rustc`, `git`, `python`).
 #[cfg(test)]
 pub fn with_test_tool_probe<R>(tools: Vec<String>, f: impl FnOnce() -> R) -> R {
     struct Reset(Option<Vec<String>>);
@@ -2210,55 +2210,415 @@ pub fn with_test_tool_probe<R>(tools: Vec<String>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Runs `<program> --version` bounded by `timeout` (with cluster secrets stripped via
-/// [`crate::cluster_auth::probe_command`]) and returns `true` when the subprocess exits 0.
-pub fn probe_tool_with_timeout<P: AsRef<std::ffi::OsStr>>(
-    program: P,
-    timeout: std::time::Duration,
-) -> bool {
-    let program_ref = program.as_ref();
-    #[cfg(windows)]
-    let (resolved_program, effective_path) = {
-        let base_path = std::env::var("PATH").unwrap_or_default();
-        let effective_path = augment_windows_path(&base_path);
-        let resolved = resolve_windows_executable(&program_ref.to_string_lossy(), &effective_path);
-        (resolved, effective_path)
-    };
-    #[cfg(windows)]
-    let mut cmd = {
-        let mut c = crate::cluster_auth::probe_command(&resolved_program);
-        c.env("PATH", &effective_path);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut cmd = crate::cluster_auth::probe_command(program_ref);
-    cmd.arg("--version");
-    match run_command_bounded(&mut cmd, timeout) {
-        ProbeExecOutcome::Output(output) => output.status.success(),
-        ProbeExecOutcome::TimedOut => {
-            tracing::warn!(
-                tool = %program_ref.to_string_lossy(),
-                timeout_secs = timeout.as_secs_f32(),
-                "Host tool version probe timed out; treating tool as unavailable"
-            );
-            false
-        }
-        ProbeExecOutcome::SpawnFailed => false,
+const MACOS_CLT_STUB_PATHS: [&str; 2] = ["/usr/bin/python3", "/usr/bin/git"];
+
+fn default_macos_clt_stubs() -> Vec<&'static std::path::Path> {
+    if cfg!(target_os = "macos") {
+        MACOS_CLT_STUB_PATHS
+            .iter()
+            .map(std::path::Path::new)
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 
-/// Probes [`HOST_PROBED_TOOLS`] (`cargo`, `rustc`, `git`) with [`HOST_PROBE_TIMEOUT`] without
-/// consulting the process-wide cache, returning `tool:<name>` tags in [`HOST_PROBED_TOOLS`] order.
-pub fn detect_host_tools_uncached() -> Vec<String> {
+/// Returns `true` when `stdout` prints a Python 3 version banner (`Python 3.<...>`).
+fn is_python3_version_output(stdout: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.starts_with("Python 3."))
+}
+
+fn normalized_path_components(path: &std::path::Path, case_insensitive: bool) -> Vec<String> {
+    let raw = path.to_string_lossy();
+    let stripped = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix("//?/UNC/"))
+        .or_else(|| raw.strip_prefix(r"\\?\"))
+        .or_else(|| raw.strip_prefix("//?/"))
+        .unwrap_or(&raw);
+    stripped
+        .split(['/', '\\'])
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .map(|seg| {
+            if case_insensitive {
+                seg.to_ascii_lowercase()
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Returns `true` when `path` is `<local_app_data>/Microsoft/WindowsApps` or inside it.
+fn is_windows_apps_path(path: &std::path::Path, local_app_data: Option<&std::path::Path>) -> bool {
+    let Some(base) = local_app_data.filter(|p| !p.as_os_str().is_empty()) else {
+        return false;
+    };
+    let apps_dir = base.join("Microsoft").join("WindowsApps");
+    let apps_parts = normalized_path_components(&apps_dir, true);
+    if apps_parts.is_empty() {
+        return false;
+    }
+    let cand_parts = normalized_path_components(path, true);
+    cand_parts.starts_with(&apps_parts)
+}
+
+fn path_matches_any_stub(path: &std::path::Path, stub_paths: &[&std::path::Path]) -> bool {
+    if stub_paths.is_empty() {
+        return false;
+    }
+    let ci = cfg!(windows);
+    let cand_parts = normalized_path_components(path, ci);
+    stub_paths
+        .iter()
+        .any(|stub| cand_parts == normalized_path_components(stub, ci))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_macos_clt_stub_path(path: &std::path::Path) -> bool {
+    let stubs = [
+        std::path::Path::new(MACOS_CLT_STUB_PATHS[0]),
+        std::path::Path::new(MACOS_CLT_STUB_PATHS[1]),
+    ];
+    path_matches_any_stub(path, &stubs)
+}
+
+fn is_blocked_probe_path(
+    path: &std::path::Path,
+    local_app_data: Option<&std::path::Path>,
+    stub_paths: &[&std::path::Path],
+    clt_installed: &mut dyn FnMut() -> bool,
+) -> bool {
+    if is_windows_apps_path(path, local_app_data) {
+        return true;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            if is_windows_apps_path(&canon, local_app_data) {
+                return true;
+            }
+        }
+    }
+    if path_matches_any_stub(path, stub_paths) && !clt_installed() {
+        return true;
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_clt_installed(timeout: std::time::Duration) -> bool {
+    let mut cmd = crate::cluster_auth::probe_command("/usr/bin/xcode-select");
+    cmd.arg("-p");
+    matches!(
+        run_command_bounded(&mut cmd, timeout),
+        ProbeExecOutcome::Output(output) if output.status.success()
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_macos_clt_installed(_timeout: std::time::Duration) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn filter_windows_probe_path(
+    effective_path: &str,
+    local_app_data: Option<&std::path::Path>,
+) -> String {
+    let kept: Vec<std::path::PathBuf> = std::env::split_paths(effective_path)
+        .filter(|dir| !dir.as_os_str().is_empty() && !is_windows_apps_path(dir, local_app_data))
+        .collect();
+    std::env::join_paths(kept)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| effective_path.to_string())
+}
+
+#[cfg(windows)]
+fn resolve_probe_candidate(
+    program: &str,
+    filtered_path: &str,
+    local_app_data: Option<&std::path::Path>,
+    stub_paths: &[&std::path::Path],
+    clt_installed: &mut dyn FnMut() -> bool,
+    use_git_fast_path: bool,
+) -> Option<std::path::PathBuf> {
+    if program.is_empty() || program.contains('\0') {
+        return None;
+    }
+    if let Some(explicit) = resolve_explicit_windows_program(program, None, None)
+        .ok()
+        .flatten()
+    {
+        let p = std::path::PathBuf::from(&explicit);
+        if !is_valid_windows_executable(&p) {
+            return None;
+        }
+        if is_blocked_probe_path(&p, local_app_data, stub_paths, clt_installed) {
+            return None;
+        }
+        return Some(p);
+    }
+
+    if use_git_fast_path {
+        for base in &[r"C:\Program Files\Git\usr\bin", r"C:\Program Files\Git\bin"] {
+            if let Some(found) = probe_candidate_in_dir(std::path::Path::new(base), program) {
+                let p = std::path::PathBuf::from(&found);
+                if !is_blocked_probe_path(&p, local_app_data, stub_paths, clt_installed) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    for dir in std::env::split_paths(filtered_path) {
+        if dir.as_os_str().is_empty() || is_windows_apps_path(&dir, local_app_data) {
+            continue;
+        }
+        if let Some(found) = probe_candidate_in_dir(&dir, program) {
+            let p = std::path::PathBuf::from(&found);
+            if !is_blocked_probe_path(&p, local_app_data, stub_paths, clt_installed) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn resolve_probe_candidate(
+    program: &str,
+    path_env: &str,
+    local_app_data: Option<&std::path::Path>,
+    stub_paths: &[&std::path::Path],
+    clt_installed: &mut dyn FnMut() -> bool,
+    _use_git_fast_path: bool,
+) -> Option<std::path::PathBuf> {
+    if program.is_empty() || program.contains('\0') {
+        return None;
+    }
+    if program.contains('/') {
+        let p = std::path::PathBuf::from(program);
+        if is_blocked_probe_path(&p, local_app_data, stub_paths, clt_installed) {
+            return None;
+        }
+        return Some(p);
+    }
+    for dir in std::env::split_paths(path_env) {
+        if dir.as_os_str().is_empty() || is_windows_apps_path(&dir, local_app_data) {
+            continue;
+        }
+        let cand = dir.join(program);
+        if !is_executable_file(&cand) {
+            continue;
+        }
+        if is_blocked_probe_path(&cand, local_app_data, stub_paths, clt_installed) {
+            continue;
+        }
+        return Some(cand);
+    }
+    None
+}
+
+fn run_resolved_tool_version_probe(
+    resolved: &std::path::Path,
+    label: &str,
+    filtered_path: Option<&str>,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut cmd = crate::cluster_auth::probe_command(resolved);
+    if let Some(path_val) = filtered_path {
+        cmd.env("PATH", path_val);
+    }
+    cmd.arg("--version");
+    match run_command_bounded(&mut cmd, timeout) {
+        ProbeExecOutcome::Output(output) => Some(output),
+        ProbeExecOutcome::TimedOut => {
+            tracing::warn!(
+                tool = %label,
+                timeout_secs = timeout.as_secs_f32(),
+                "Host tool version probe timed out; treating tool as unavailable"
+            );
+            None
+        }
+        ProbeExecOutcome::SpawnFailed => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_single_tool_with_env(
+    program: &str,
+    timeout: std::time::Duration,
+    filtered_path: &str,
+    local_app_data: Option<&std::path::Path>,
+    stub_paths: &[&std::path::Path],
+    clt_installed: &mut dyn FnMut() -> bool,
+    use_git_fast_path: bool,
+) -> bool {
+    let Some(resolved) = resolve_probe_candidate(
+        program,
+        filtered_path,
+        local_app_data,
+        stub_paths,
+        clt_installed,
+        use_git_fast_path,
+    ) else {
+        return false;
+    };
+    run_resolved_tool_version_probe(&resolved, program, Some(filtered_path), timeout)
+        .is_some_and(|output| output.status.success())
+}
+
+fn probe_python_with_env(
+    timeout: std::time::Duration,
+    filtered_path: &str,
+    local_app_data: Option<&std::path::Path>,
+    stub_paths: &[&std::path::Path],
+    clt_installed: &mut dyn FnMut() -> bool,
+    use_git_fast_path: bool,
+) -> bool {
+    for candidate in ["python", "python3"] {
+        let Some(resolved) = resolve_probe_candidate(
+            candidate,
+            filtered_path,
+            local_app_data,
+            stub_paths,
+            clt_installed,
+            use_git_fast_path,
+        ) else {
+            continue;
+        };
+        if let Some(output) =
+            run_resolved_tool_version_probe(&resolved, candidate, Some(filtered_path), timeout)
+        {
+            if output.status.success() && is_python3_version_output(&output.stdout) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn detect_host_tools_with_env(
+    timeout: std::time::Duration,
+    path_env: &str,
+    local_app_data: Option<&std::path::Path>,
+    stub_paths: &[&std::path::Path],
+    probe_clt: &mut dyn FnMut() -> bool,
+    use_git_fast_path: bool,
+) -> Vec<String> {
+    #[cfg(windows)]
+    let effective_path = if use_git_fast_path {
+        augment_windows_path(path_env)
+    } else {
+        path_env.to_string()
+    };
+    #[cfg(windows)]
+    let filtered_path = filter_windows_probe_path(&effective_path, local_app_data);
+    #[cfg(not(windows))]
+    let filtered_path = path_env.to_string();
+
+    let mut clt_cached: Option<bool> = None;
+    let mut clt_installed = || -> bool {
+        if let Some(cached) = clt_cached {
+            cached
+        } else {
+            let val = probe_clt();
+            clt_cached = Some(val);
+            val
+        }
+    };
+
     HOST_PROBED_TOOLS
         .iter()
-        .filter(|&&tool| probe_tool_with_timeout(tool, HOST_PROBE_TIMEOUT))
+        .filter(|&&tool| {
+            if tool == "python" {
+                probe_python_with_env(
+                    timeout,
+                    &filtered_path,
+                    local_app_data,
+                    stub_paths,
+                    &mut clt_installed,
+                    use_git_fast_path,
+                )
+            } else {
+                probe_single_tool_with_env(
+                    tool,
+                    timeout,
+                    &filtered_path,
+                    local_app_data,
+                    stub_paths,
+                    &mut clt_installed,
+                    use_git_fast_path,
+                )
+            }
+        })
         .map(|tool| format!("{}{tool}", crate::placement::TOOL_TAG_PREFIX))
         .collect()
 }
 
-/// Probes `cargo --version`, `rustc --version` and `git --version` on `PATH` (each bounded by
-/// [`HOST_PROBE_TIMEOUT`]) and returns `tool:<name>` tags for those that succeed.
+/// Runs `<program> --version` bounded by `timeout` (with cluster secrets stripped via
+/// [`crate::cluster_auth::probe_command`]) and returns `true` when the subprocess exits 0
+/// (skipping Windows Store `WindowsApps` aliases and unconfigured macOS Command Line Tools stubs).
+pub fn probe_tool_with_timeout<P: AsRef<std::ffi::OsStr>>(
+    program: P,
+    timeout: std::time::Duration,
+) -> bool {
+    let program_str = program.as_ref().to_string_lossy();
+    let base_path = std::env::var("PATH").unwrap_or_default();
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let stubs = default_macos_clt_stubs();
+    #[cfg(windows)]
+    let filtered_path =
+        filter_windows_probe_path(&augment_windows_path(&base_path), local_app_data.as_deref());
+    #[cfg(not(windows))]
+    let filtered_path = base_path;
+    let mut clt_installed = || probe_macos_clt_installed(timeout);
+    probe_single_tool_with_env(
+        &program_str,
+        timeout,
+        &filtered_path,
+        local_app_data.as_deref(),
+        &stubs,
+        &mut clt_installed,
+        true,
+    )
+}
+
+/// Probes [`HOST_PROBED_TOOLS`] (`cargo`, `rustc`, `git`, `python`) with [`HOST_PROBE_TIMEOUT`]
+/// without consulting the process-wide cache, returning `tool:<name>` tags in
+/// [`HOST_PROBED_TOOLS`] order.
+pub fn detect_host_tools_uncached() -> Vec<String> {
+    let base_path = std::env::var("PATH").unwrap_or_default();
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let stubs = default_macos_clt_stubs();
+    let mut probe_clt = || probe_macos_clt_installed(HOST_PROBE_TIMEOUT);
+    detect_host_tools_with_env(
+        HOST_PROBE_TIMEOUT,
+        &base_path,
+        local_app_data.as_deref(),
+        &stubs,
+        &mut probe_clt,
+        true,
+    )
+}
+
+/// Probes `cargo --version`, `rustc --version`, `git --version` and `python`/`python3 --version`
+/// (`Python 3.`) on `PATH` (each bounded by [`HOST_PROBE_TIMEOUT`], skipping `WindowsApps` and
+/// macOS Command Line Tools stubs) and returns `tool:<name>` tags for those that succeed.
 pub fn detect_host_tools() -> Vec<String> {
     #[cfg(test)]
     if let Some(override_tags) = TEST_TOOL_PROBE.with(|c| c.borrow().clone()) {
@@ -3647,6 +4007,31 @@ Now drawing from 'AC Power'
         }
     }
 
+    fn write_bare_test_script(
+        dir: &std::path::Path,
+        name: &str,
+        unix_body: &str,
+        win_body: &str,
+    ) -> std::path::PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = win_body;
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{unix_body}\n")).expect("write script");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+            path
+        }
+        #[cfg(windows)]
+        {
+            let _ = unix_body;
+            let path = dir.join(format!("{name}.cmd"));
+            std::fs::write(&path, format!("@echo off\r\n{win_body}\r\n")).expect("write script");
+            path
+        }
+    }
+
     fn assert_pid_file_process_dead(pid_file: &std::path::Path) {
         let raw = std::fs::read_to_string(pid_file).unwrap_or_else(|e| {
             panic!(
@@ -3944,7 +4329,10 @@ Now drawing from 'AC Power'
         let uncached = detect_host_tools_uncached();
         for tag in &uncached {
             assert!(
-                matches!(tag.as_str(), "tool:cargo" | "tool:rustc" | "tool:git"),
+                matches!(
+                    tag.as_str(),
+                    "tool:cargo" | "tool:rustc" | "tool:git" | "tool:python"
+                ),
                 "unexpected tool tag {tag}"
             );
         }
@@ -3959,6 +4347,304 @@ Now drawing from 'AC Power'
             });
             assert_eq!(caps.tags, vec!["tool:git".to_string()]);
         });
+    }
+
+    #[test]
+    fn test_tool1_python_version_and_stub_path_predicates() {
+        assert!(is_python3_version_output(b"Python 3.12.0\n"));
+        assert!(is_python3_version_output(b"\r\n  Python 3.15.2 \r\n"));
+        assert!(!is_python3_version_output(b"Python 2.7.18\n"));
+        assert!(!is_python3_version_output(b""));
+        assert!(!is_python3_version_output(
+            b"Python was not found; run without arguments to install from the Microsoft Store\n"
+        ));
+
+        let local_app_data = std::path::Path::new(r"C:\Users\dev\AppData\Local");
+        assert!(is_windows_apps_path(
+            std::path::Path::new(r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps"),
+            Some(local_app_data)
+        ));
+        assert!(is_windows_apps_path(
+            std::path::Path::new(
+                r"\\?\c:\users\dev\appdata\local\microsoft\windowsapps\python.exe"
+            ),
+            Some(local_app_data)
+        ));
+        assert!(is_windows_apps_path(
+            std::path::Path::new(r"C:/Users/dev/AppData/Local/Microsoft/WindowsApps/python3.exe"),
+            Some(local_app_data)
+        ));
+        assert!(!is_windows_apps_path(
+            std::path::Path::new(r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps2\python.exe"),
+            Some(local_app_data)
+        ));
+        assert!(!is_windows_apps_path(
+            std::path::Path::new(r"C:\Python312\python.exe"),
+            Some(local_app_data)
+        ));
+        assert!(!is_windows_apps_path(
+            std::path::Path::new(r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\python.exe"),
+            None
+        ));
+
+        assert!(is_macos_clt_stub_path(std::path::Path::new(
+            "/usr/bin/python3"
+        )));
+        assert!(is_macos_clt_stub_path(std::path::Path::new("/usr/bin/git")));
+        assert!(!is_macos_clt_stub_path(std::path::Path::new(
+            "/opt/homebrew/bin/python3"
+        )));
+        assert!(!is_macos_clt_stub_path(std::path::Path::new(
+            "/usr/local/bin/git"
+        )));
+        assert!(!is_macos_clt_stub_path(std::path::Path::new(
+            "/usr/bin/python"
+        )));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri: spawns a process")]
+    fn test_tool1_python_probe_and_stub_skipping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe_timeout = if cfg!(windows) {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(3)
+        };
+        let join_path = |dirs: &[&std::path::Path]| -> String {
+            std::env::join_paths(dirs)
+                .expect("join_paths")
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut always_clt = || true;
+
+        // 1. `python` prints `Python 3.12.0` -> `tool:python`.
+        let py3_dir = dir.path().join("py3");
+        std::fs::create_dir_all(&py3_dir).unwrap();
+        write_bare_test_script(
+            &py3_dir,
+            "python",
+            "echo 'Python 3.12.0'",
+            "echo Python 3.12.0",
+        );
+        assert_eq!(
+            detect_host_tools_with_env(
+                probe_timeout,
+                &join_path(&[&py3_dir]),
+                None,
+                &[],
+                &mut always_clt,
+                false,
+            ),
+            vec!["tool:python".to_string()]
+        );
+
+        // 2. `python` prints `Python 2.7.18` (and no `python3`) -> no `tool:python`.
+        let py2_dir = dir.path().join("py2");
+        std::fs::create_dir_all(&py2_dir).unwrap();
+        write_bare_test_script(
+            &py2_dir,
+            "python",
+            "echo 'Python 2.7.18'",
+            "echo Python 2.7.18",
+        );
+        assert!(detect_host_tools_with_env(
+            probe_timeout,
+            &join_path(&[&py2_dir]),
+            None,
+            &[],
+            &mut always_clt,
+            false,
+        )
+        .is_empty());
+
+        // 3. `python` exits 9009 (and no `python3`) -> no `tool:python`.
+        let py_err_dir = dir.path().join("py_err");
+        std::fs::create_dir_all(&py_err_dir).unwrap();
+        write_bare_test_script(&py_err_dir, "python", "exit 9009", "exit /b 9009");
+        assert!(detect_host_tools_with_env(
+            probe_timeout,
+            &join_path(&[&py_err_dir]),
+            None,
+            &[],
+            &mut always_clt,
+            false,
+        )
+        .is_empty());
+
+        // 4. `python` exits 9009 (or prints Python 2) and `python3` prints `Python 3.12.0` -> `tool:python`.
+        let py3_fallback_dir = dir.path().join("py3_fallback");
+        std::fs::create_dir_all(&py3_fallback_dir).unwrap();
+        write_bare_test_script(&py3_fallback_dir, "python", "exit 9009", "exit /b 9009");
+        write_bare_test_script(
+            &py3_fallback_dir,
+            "python3",
+            "echo 'Python 3.12.0'",
+            "echo Python 3.12.0",
+        );
+        assert_eq!(
+            detect_host_tools_with_env(
+                probe_timeout,
+                &join_path(&[&py3_fallback_dir]),
+                None,
+                &[],
+                &mut always_clt,
+                false,
+            ),
+            vec!["tool:python".to_string()]
+        );
+
+        // 5. WindowsApps candidates are skipped without executing them; real Python later in PATH wins.
+        let fake_local = dir.path().join("local_app_data");
+        let win_apps = fake_local.join("Microsoft").join("WindowsApps");
+        std::fs::create_dir_all(&win_apps).unwrap();
+        let winapps_sentinel = dir.path().join("winapps_ran.txt");
+        let winapps_py = write_bare_test_script(
+            &win_apps,
+            "python",
+            &format!(
+                "echo ran > '{}'\necho 'Python 3.12.0'",
+                winapps_sentinel.display()
+            ),
+            &format!(
+                "echo ran>\"{}\"\r\necho Python 3.12.0",
+                winapps_sentinel.display()
+            ),
+        );
+        assert!(detect_host_tools_with_env(
+            probe_timeout,
+            &join_path(&[&win_apps]),
+            Some(&fake_local),
+            &[],
+            &mut always_clt,
+            false,
+        )
+        .is_empty());
+        assert!(
+            !winapps_sentinel.exists(),
+            "WindowsApps python candidate must not be executed"
+        );
+        assert!(
+            !probe_single_tool_with_env(
+                &winapps_py.to_string_lossy(),
+                probe_timeout,
+                &join_path(&[&win_apps]),
+                Some(&fake_local),
+                &[],
+                &mut always_clt,
+                false,
+            ),
+            "explicit WindowsApps path must be skipped"
+        );
+        assert!(!winapps_sentinel.exists());
+        assert_eq!(
+            detect_host_tools_with_env(
+                probe_timeout,
+                &join_path(&[&win_apps, &py3_dir]),
+                Some(&fake_local),
+                &[],
+                &mut always_clt,
+                false,
+            ),
+            vec!["tool:python".to_string()]
+        );
+        assert!(!winapps_sentinel.exists());
+
+        // 6. macOS CLT stubs (/usr/bin/python3, /usr/bin/git model) are skipped without running when
+        //    xcode-select -p fails, while earlier non-stub entries run and CLT=true allows them.
+        let fake_usr_bin = dir.path().join("fake_usr_bin");
+        std::fs::create_dir_all(&fake_usr_bin).unwrap();
+        let py_stub_sentinel = dir.path().join("clt_py_ran.txt");
+        let git_stub_sentinel = dir.path().join("clt_git_ran.txt");
+        let py_stub = write_bare_test_script(
+            &fake_usr_bin,
+            "python3",
+            &format!(
+                "echo ran > '{}'\necho 'Python 3.12.0'",
+                py_stub_sentinel.display()
+            ),
+            &format!(
+                "echo ran>\"{}\"\r\necho Python 3.12.0",
+                py_stub_sentinel.display()
+            ),
+        );
+        let git_stub = write_bare_test_script(
+            &fake_usr_bin,
+            "git",
+            &format!(
+                "echo ran > '{}'\necho 'git version 2.45.0'",
+                git_stub_sentinel.display()
+            ),
+            &format!(
+                "echo ran>\"{}\"\r\necho git version 2.45.0",
+                git_stub_sentinel.display()
+            ),
+        );
+        let stub_refs = [py_stub.as_path(), git_stub.as_path()];
+        let mut clt_calls = 0usize;
+        let mut clt_missing = || {
+            clt_calls += 1;
+            false
+        };
+        assert!(detect_host_tools_with_env(
+            probe_timeout,
+            &join_path(&[&fake_usr_bin]),
+            None,
+            &stub_refs,
+            &mut clt_missing,
+            false,
+        )
+        .is_empty());
+        assert!(
+            !py_stub_sentinel.exists() && !git_stub_sentinel.exists(),
+            "macOS CLT stub candidates must not execute when xcode-select -p fails"
+        );
+        assert_eq!(
+            clt_calls, 1,
+            "xcode-select -p result should be cached per pass"
+        );
+
+        let real_first = dir.path().join("homebrew_bin");
+        std::fs::create_dir_all(&real_first).unwrap();
+        write_bare_test_script(
+            &real_first,
+            "python3",
+            "echo 'Python 3.13.1'",
+            "echo Python 3.13.1",
+        );
+        let mut clt_calls_with_brew = 0usize;
+        let mut clt_missing_brew = || {
+            clt_calls_with_brew += 1;
+            false
+        };
+        assert_eq!(
+            detect_host_tools_with_env(
+                probe_timeout,
+                &join_path(&[&real_first, &fake_usr_bin]),
+                None,
+                &stub_refs,
+                &mut clt_missing_brew,
+                false,
+            ),
+            vec!["tool:python".to_string()]
+        );
+        assert!(!py_stub_sentinel.exists() && !git_stub_sentinel.exists());
+        assert_eq!(clt_calls_with_brew, 1);
+
+        let mut clt_present = || true;
+        assert_eq!(
+            detect_host_tools_with_env(
+                probe_timeout,
+                &join_path(&[&fake_usr_bin]),
+                None,
+                &stub_refs,
+                &mut clt_present,
+                false,
+            ),
+            vec!["tool:git".to_string(), "tool:python".to_string()]
+        );
+        assert!(py_stub_sentinel.exists() && git_stub_sentinel.exists());
     }
 
     #[cfg(windows)]
