@@ -1373,7 +1373,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolve_control_endpoint_for_cli_falls_back_to_config_worker_name() {
         let ep = resolve_control_endpoint_for_cli(None, None, None, None, Some("rig-alpha"))

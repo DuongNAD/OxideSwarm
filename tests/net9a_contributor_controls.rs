@@ -11,29 +11,37 @@
 //!   limit updates to `rusty-grid.toml` without disturbing unrelated `[worker]` keys.
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+#[cfg(unix)]
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::{watch, Notify};
+use tokio::sync::watch;
+#[cfg(unix)]
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 #[cfg(unix)]
 use rusty_grid_cli::doctor::{run_doctor, DoctorOptions, Outcome};
+#[cfg(unix)]
 use rusty_grid_core::capabilities::WorkerCapabilities;
+#[cfg(unix)]
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_master::reaper::ReaperConfig;
+#[cfg(unix)]
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
 use rusty_grid_worker::control::{
-    send_control_request, ControlEndpoint, ControlRequest, ControlResponse, WorkerControlState,
-    WorkerLimitsConfig,
+    send_control_request, ControlEndpoint, ControlRequest, WorkerLimitsConfig,
 };
+#[cfg(unix)]
+use rusty_grid_worker::control::{ControlResponse, WorkerControlState};
 
 struct Net9Cluster {
     master: MasterHandle,

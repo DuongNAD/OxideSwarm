@@ -1187,12 +1187,14 @@ mod windows_ipc {
     };
     use windows_sys::Win32::Security::{
         EqualSid, GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+
+    const WIN_ERROR_PIPE_BUSY: i32 = 231;
 
     struct LocalSdGuard(PSECURITY_DESCRIPTOR);
     impl Drop for LocalSdGuard {
@@ -1454,14 +1456,6 @@ mod windows_ipc {
                         Err(e) => {
                             warn!(error = %e, "Named-pipe control accept error; recycling pipe instance");
                             let _ = server.disconnect();
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                                res = shutdown_rx.changed() => {
-                                    if res.is_err() || *shutdown_rx.borrow() {
-                                        break;
-                                    }
-                                }
-                            }
                             let Some(next) = next_pipe_server(&pipe_name, &mut shutdown_rx).await? else {
                                 break;
                             };
@@ -1483,9 +1477,21 @@ mod windows_ipc {
         pipe_name: &str,
         req: &ControlRequest,
     ) -> Result<ControlResponse, String> {
-        let client = ClientOptions::new()
-            .open(pipe_name)
-            .map_err(|e| format!("failed to open control pipe {pipe_name}: {e}"))?;
+        let busy_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let client = loop {
+            match ClientOptions::new().open(pipe_name) {
+                Ok(c) => break c,
+                Err(e)
+                    if e.raw_os_error() == Some(WIN_ERROR_PIPE_BUSY)
+                        && tokio::time::Instant::now() < busy_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    return Err(format!("failed to open control pipe {pipe_name}: {e}"));
+                }
+            }
+        };
         verify_pipe_server_same_user(&client, pipe_name)?;
         let mut payload = serde_json::to_string(req)
             .map_err(|e| format!("failed to serialize control request: {e}"))?;
@@ -1866,7 +1872,19 @@ mod tests {
 
         // Early-closing clients must not trap `run_windows_server` in a busy loop or break next RPCs.
         for _ in 0..3 {
-            let early = ClientOptions::new().open(&pipe_name).expect("open early");
+            let open_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let early = loop {
+                match ClientOptions::new().open(&pipe_name) {
+                    Ok(c) => break c,
+                    Err(e)
+                        if e.raw_os_error() == Some(windows_ipc::WIN_ERROR_PIPE_BUSY)
+                            && tokio::time::Instant::now() < open_deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("open early: {e}"),
+                }
+            };
             drop(early);
         }
         let resp = send_control_request(
