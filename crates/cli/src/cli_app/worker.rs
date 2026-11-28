@@ -7,6 +7,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use rusty_grid_core::placement::{validate_user_tag, IsolationLevel};
+use rusty_grid_worker::control::{
+    parse_pause_until, send_control_request, ControlEndpoint, ControlRequest, ControlResponse,
+    LimitPersistHook, WorkerLimitsConfig,
+};
 use rusty_grid_worker::{NoticeLevel, ProcessPriority, WorkerClient, WorkerConfig};
 
 use crate::config::{
@@ -20,7 +24,8 @@ use crate::secret_cmd::{
 
 use super::{
     resolve_no_battery, resolve_p2p_minimal, resolve_relay_url, resolve_wire_codec,
-    wait_for_worker_shutdown_signal, WorkerArgs, MIB,
+    wait_for_worker_shutdown_signal, WorkerArgs, WorkerControlSubcommand, WorkerLimitsSubcommand,
+    MIB,
 };
 
 /// Resolves `(master_addr, p2p_ticket)` from explicit CLI, env and config values without reading
@@ -133,6 +138,16 @@ pub(super) async fn run_worker(
     secret_opts: SecretOpts,
 ) -> ExitCode {
     rusty_grid_core::capabilities::suppress_windows_error_dialogs();
+    let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
+    if let Some(action) = args.action.clone() {
+        return run_worker_control_action(
+            action,
+            args.control_socket.as_deref(),
+            args.name.as_deref(),
+            worker_cfg.as_ref().and_then(|w| w.name.as_deref()),
+        )
+        .await;
+    }
     let rendezvous_url =
         match crate::connect::resolve_and_validate_rendezvous_url(args.rendezvous.as_deref()) {
             Ok(url) => url,
@@ -141,7 +156,6 @@ pub(super) async fn run_worker(
                 return ExitCode::FAILURE;
             }
         };
-    let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
     let p2p_minimal = resolve_p2p_minimal();
@@ -619,6 +633,40 @@ pub(super) async fn run_worker(
     };
     config = config.with_wire_codec(wire_codec);
 
+    let config_write_path = resolve_config_write_path(config_file.as_ref());
+    let mut initial_limits = config_write_path
+        .as_deref()
+        .and_then(|p| load_worker_limits_from_toml(p).ok())
+        .unwrap_or_default();
+    let no_gpu_tasks_override = resolve_bool(
+        args.no_gpu_tasks.then_some(true),
+        &["RUSTY_GRID_NO_GPU_TASKS"],
+        None,
+        initial_limits.no_gpu_tasks,
+    );
+    initial_limits.no_gpu_tasks = no_gpu_tasks_override;
+    // `#478` (`NET-9a`) defines the `--hold-ends-tasks` CLI flag; `#481` (`NET-9b`) consumes it for limit holds.
+    let _hold_ends_tasks = args.hold_ends_tasks;
+
+    let control_socket_override = resolve_opt_string(
+        args.control_socket.map(|p| p.display().to_string()),
+        &["RUSTY_GRID_CONTROL_SOCKET", "OXIDESWARM_CONTROL_SOCKET"],
+        None,
+    )
+    .map(PathBuf::from);
+    let control_endpoint =
+        ControlEndpoint::resolve(control_socket_override.as_deref(), config.name.as_deref());
+    let persist_hook = config_write_path.clone().map(|path| {
+        LimitPersistHook(std::sync::Arc::new(move |limits: &WorkerLimitsConfig| {
+            persist_worker_limits_to_toml(&path, limits).map(|()| Some(path.clone()))
+        }))
+    });
+    config = config
+        .with_control_endpoint(control_endpoint)
+        .with_initial_limits(initial_limits)
+        .with_control_config_path(config_write_path)
+        .with_limit_persist_hook(persist_hook);
+
     let mut client = WorkerClient::new(config);
     if let Err(e) = client.validate_isolation_config() {
         eprintln!("error: {e}");
@@ -731,6 +779,346 @@ pub(super) fn resolve_isolation_read_dirs(
         }
     }
     out
+}
+
+fn resolve_control_endpoint_for_cli(
+    flag_socket: Option<&std::path::Path>,
+    parent_socket: Option<&std::path::Path>,
+    flag_name: Option<&str>,
+    parent_name: Option<&str>,
+    config_worker_name: Option<&str>,
+) -> Result<ControlEndpoint, String> {
+    let env_socket = resolve_opt_string(
+        None,
+        &["RUSTY_GRID_CONTROL_SOCKET", "OXIDESWARM_CONTROL_SOCKET"],
+        None,
+    )
+    .map(PathBuf::from);
+    let socket = flag_socket.or(parent_socket).or(env_socket.as_deref());
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let name = clean(flag_name)
+        .or_else(|| clean(parent_name))
+        .or_else(|| resolve_opt_string(None, &["RUSTY_GRID_WORKER_NAME", "RUSTY_GRID_NAME"], None))
+        .or_else(|| clean(config_worker_name));
+    ControlEndpoint::resolve(socket, name.as_deref()).ok_or_else(|| {
+        "cannot determine default worker control socket (set --control-socket or HOME)".to_string()
+    })
+}
+
+pub(crate) async fn run_worker_control_action(
+    action: WorkerControlSubcommand,
+    parent_socket: Option<&std::path::Path>,
+    parent_name: Option<&str>,
+    config_worker_name: Option<&str>,
+) -> ExitCode {
+    let (socket_flag, name_flag, json, req) = match action {
+        WorkerControlSubcommand::Pause(p) => {
+            let until_epoch_ms = match p.until.as_deref() {
+                Some(spec) => match parse_pause_until(spec, chrono::Utc::now()) {
+                    Ok(ms) => Some(ms),
+                    Err(e) => {
+                        eprintln!("worker pause: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            };
+            (
+                p.control_socket,
+                p.name,
+                p.json,
+                ControlRequest::Pause {
+                    until_epoch_ms,
+                    reason: p.reason,
+                },
+            )
+        }
+        WorkerControlSubcommand::Resume(t) => {
+            (t.control_socket, t.name, t.json, ControlRequest::Resume)
+        }
+        WorkerControlSubcommand::Status(t) => {
+            (t.control_socket, t.name, t.json, ControlRequest::Status)
+        }
+        WorkerControlSubcommand::Limits(l) => match l.op {
+            WorkerLimitsSubcommand::Get(t) => {
+                (t.control_socket, t.name, t.json, ControlRequest::LimitsGet)
+            }
+            WorkerLimitsSubcommand::Set {
+                key,
+                value,
+                control_socket,
+                name,
+                json,
+            } => (
+                control_socket,
+                name,
+                json,
+                ControlRequest::LimitsSet { key, value },
+            ),
+        },
+    };
+
+    let endpoint = match resolve_control_endpoint_for_cli(
+        socket_flag.as_deref(),
+        parent_socket,
+        name_flag.as_deref(),
+        parent_name,
+        config_worker_name,
+    ) {
+        Ok(ep) => ep,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let resp = match send_control_request(&endpoint, &req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("worker control ({}): {e}", endpoint.display_target());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&resp) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("failed to encode response: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return if matches!(resp, ControlResponse::Error { .. }) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
+
+    match resp {
+        ControlResponse::Status { snapshot } => {
+            println!(
+                "Worker {} ({}): state={}{}",
+                snapshot.worker_name,
+                snapshot.worker_id,
+                snapshot.state.as_str(),
+                snapshot
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            );
+            println!(
+                "  active_tasks={}, no_gpu_tasks={}",
+                snapshot.active_tasks, snapshot.no_gpu_tasks
+            );
+            if let Some(ms) = snapshot.paused_until_epoch_ms {
+                println!("  paused_until_epoch_ms={ms}");
+            }
+            if let Some(err) = snapshot.control_server_error {
+                println!("  control_server_error={err}");
+            }
+            ExitCode::SUCCESS
+        }
+        ControlResponse::Ok { message, snapshot } => {
+            println!(
+                "{message} (state={}, active_tasks={})",
+                snapshot.state.as_str(),
+                snapshot.active_tasks
+            );
+            ExitCode::SUCCESS
+        }
+        ControlResponse::Limits {
+            limits,
+            config_path,
+        } => {
+            println!("Worker contributor limits:");
+            println!("  local_max_cpu_pct = {:?}", limits.local_max_cpu_pct);
+            println!("  hours = {:?}", limits.hours);
+            println!(
+                "  max_task_hours_per_day = {:?}",
+                limits.max_task_hours_per_day
+            );
+            println!("  no_tasks_on_battery = {:?}", limits.no_tasks_on_battery);
+            println!("  no_tasks_on_metered = {:?}", limits.no_tasks_on_metered);
+            println!("  no_gpu_tasks = {}", limits.no_gpu_tasks);
+            if let Some(p) = config_path {
+                println!("  config = {p}");
+            }
+            ExitCode::SUCCESS
+        }
+        ControlResponse::Error { message } => {
+            eprintln!("error: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub(crate) fn resolve_config_write_path(config_file: Option<&ConfigFile>) -> Option<PathBuf> {
+    resolve_config_write_path_with(
+        config_file,
+        std::env::var_os("RUSTY_GRID_CONFIG").as_deref(),
+        crate::config::default_oxideswarm_dir(),
+    )
+}
+
+fn resolve_config_write_path_with(
+    config_file: Option<&ConfigFile>,
+    env_config: Option<&std::ffi::OsStr>,
+    oxideswarm_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = config_file.and_then(|c| c.source_path.0.as_ref()) {
+        return Some(p.clone());
+    }
+    if let Some(env_path) = env_config.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(env_path));
+    }
+    oxideswarm_dir.map(|dir| dir.join("rusty-grid.toml"))
+}
+
+pub(crate) fn load_worker_limits_from_toml(
+    path: &std::path::Path,
+) -> Result<WorkerLimitsConfig, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkerLimitsConfig::default());
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let Some(worker_tbl) = doc.get("worker").and_then(|item| item.as_table_like()) else {
+        return Ok(WorkerLimitsConfig::default());
+    };
+    Ok(WorkerLimitsConfig {
+        local_max_cpu_pct: worker_tbl
+            .get("local_max_cpu_pct")
+            .and_then(|v| v.as_integer())
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|n| (1..=100).contains(n)),
+        hours: worker_tbl
+            .get("hours")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        max_task_hours_per_day: worker_tbl
+            .get("max_task_hours_per_day")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+            .filter(|f| f.is_finite() && *f > 0.0),
+        no_tasks_on_battery: worker_tbl
+            .get("no_tasks_on_battery")
+            .and_then(|v| v.as_bool()),
+        no_tasks_on_metered: worker_tbl
+            .get("no_tasks_on_metered")
+            .and_then(|v| v.as_bool()),
+        no_gpu_tasks: worker_tbl
+            .get("no_gpu_tasks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+pub(crate) fn persist_worker_limits_to_toml(
+    path: &std::path::Path,
+    limits: &WorkerLimitsConfig,
+) -> Result<(), String> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = if existing.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        existing
+            .parse()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?
+    };
+
+    if !doc.as_table().contains_key("worker") {
+        doc["worker"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let worker_tbl = doc["worker"]
+        .as_table_mut()
+        .ok_or_else(|| format!("{} has non-table [worker] entry", path.display()))?;
+
+    match limits.local_max_cpu_pct {
+        Some(pct) => {
+            worker_tbl["local_max_cpu_pct"] = toml_edit::value(i64::from(pct));
+        }
+        None => {
+            worker_tbl.remove("local_max_cpu_pct");
+        }
+    }
+    match &limits.hours {
+        Some(h) => {
+            worker_tbl["hours"] = toml_edit::value(h.as_str());
+        }
+        None => {
+            worker_tbl.remove("hours");
+        }
+    }
+    match limits.max_task_hours_per_day {
+        Some(hrs) => {
+            worker_tbl["max_task_hours_per_day"] = toml_edit::value(hrs);
+        }
+        None => {
+            worker_tbl.remove("max_task_hours_per_day");
+        }
+    }
+    match limits.no_tasks_on_battery {
+        Some(b) => {
+            worker_tbl["no_tasks_on_battery"] = toml_edit::value(b);
+        }
+        None => {
+            worker_tbl.remove("no_tasks_on_battery");
+        }
+    }
+    match limits.no_tasks_on_metered {
+        Some(b) => {
+            worker_tbl["no_tasks_on_metered"] = toml_edit::value(b);
+        }
+        None => {
+            worker_tbl.remove("no_tasks_on_metered");
+        }
+    }
+    if limits.no_gpu_tasks {
+        worker_tbl["no_gpu_tasks"] = toml_edit::value(true);
+    } else {
+        worker_tbl.remove("no_gpu_tasks");
+    }
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension(format!("toml.tmp.{}", uuid::Uuid::new_v4()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("create temp config {}: {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        f.write_all(doc.to_string().as_bytes())
+            .map_err(|e| format!("write temp config {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("sync temp config {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("replace config {}: {e}", path.display())
+    })
 }
 
 #[cfg(test)]
@@ -898,5 +1286,108 @@ mod tests {
         .await
         .expect("worker --master <ticket> must fail fast without attempting TCP");
         assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn worker_control_subcommands_parse_and_toml_persistence_preserves_comments() {
+        for argv in [
+            vec![
+                "oxideswarm",
+                "worker",
+                "pause",
+                "--until",
+                "2h",
+                "--reason",
+                "call",
+            ],
+            vec!["oxideswarm", "worker", "resume", "--name", "box1"],
+            vec!["oxideswarm", "worker", "status", "--json"],
+            vec!["oxideswarm", "worker", "limits", "get"],
+            vec![
+                "oxideswarm",
+                "worker",
+                "limits",
+                "set",
+                "no_gpu_tasks",
+                "true",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("parse worker control CLI");
+            assert!(matches!(cli.command, Commands::Worker(_)));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("rusty-grid.toml");
+        std::fs::write(
+            &cfg_path,
+            "# contributor config\n[worker]\nname = \"mac-box\"\n",
+        )
+        .unwrap();
+
+        let limits = WorkerLimitsConfig {
+            local_max_cpu_pct: Some(40),
+            hours: Some("18:00-08:00".into()),
+            max_task_hours_per_day: Some(4.5),
+            no_tasks_on_battery: Some(true),
+            no_tasks_on_metered: Some(true),
+            no_gpu_tasks: true,
+        };
+        persist_worker_limits_to_toml(&cfg_path, &limits).unwrap();
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(raw.contains("# contributor config"));
+        assert!(raw.contains("name = \"mac-box\""));
+        let loaded = load_worker_limits_from_toml(&cfg_path).unwrap();
+        assert_eq!(loaded, limits);
+    }
+
+    #[test]
+    fn resolve_config_write_path_honours_oxideswarm_home() {
+        use std::ffi::OsStr;
+
+        let mut cfg = ConfigFile::default();
+        cfg.source_path.0 = Some(PathBuf::from("/explicit/rusty-grid.toml"));
+
+        assert_eq!(
+            resolve_config_write_path_with(
+                Some(&cfg),
+                Some(OsStr::new("/env/rusty-grid.toml")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/explicit/rusty-grid.toml"))
+        );
+        assert_eq!(
+            resolve_config_write_path_with(
+                None,
+                Some(OsStr::new("/env/rusty-grid.toml")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/env/rusty-grid.toml"))
+        );
+        assert_eq!(
+            resolve_config_write_path_with(
+                None,
+                Some(OsStr::new("")),
+                Some(PathBuf::from("/custom/ox")),
+            ),
+            Some(PathBuf::from("/custom/ox/rusty-grid.toml"))
+        );
+    }
+
+    #[test]
+    fn resolve_control_endpoint_for_cli_falls_back_to_config_worker_name() {
+        let ep = resolve_control_endpoint_for_cli(None, None, None, None, Some("rig-alpha"))
+            .expect("resolve endpoint");
+        assert_eq!(
+            ep,
+            ControlEndpoint::resolve(None, Some("rig-alpha")).expect("worker endpoint")
+        );
+        // Explicit `--name` overrides `[worker].name`.
+        let ep_override =
+            resolve_control_endpoint_for_cli(None, None, Some("rig-beta"), None, Some("rig-alpha"))
+                .expect("resolve override");
+        assert_eq!(
+            ep_override,
+            ControlEndpoint::resolve(None, Some("rig-beta")).expect("worker override")
+        );
     }
 }

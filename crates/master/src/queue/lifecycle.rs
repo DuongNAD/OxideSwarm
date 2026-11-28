@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::store::{DurableAck, JournalRecord};
 
 use super::{
-    is_worker_rejection, owned_by, owned_by_speculative, retained_bytes, CancelOutcome,
+    classify_worker_rejection, owned_by, owned_by_speculative, retained_bytes, CancelOutcome,
     DelayedRetryKey, QueueOrderKey, ResultDisposition, ResultOutcome, RetryAttempt, TaskEntry,
     TaskQueue, TaskQueueInner, TaskState, MAX_WORKER_REJECTIONS_PER_TASK,
 };
@@ -316,6 +316,7 @@ impl TaskQueue {
             sequence,
             task_key,
             timeout_secs,
+            task_requires_gpu,
             resumed_from_checkpoint,
             reporting_session_id,
             reporting_session_live,
@@ -352,6 +353,7 @@ impl TaskQueue {
                 entry.sequence,
                 entry.task_key,
                 entry.task.requirements.timeout_secs,
+                entry.task.requirements.gpu_required || entry.task.spec.requires_gpu(),
                 if spec_owner {
                     false
                 } else {
@@ -375,6 +377,8 @@ impl TaskQueue {
                     disposition: ResultDisposition::Stale,
                     state,
                     rejected: false,
+                    rejection_kind: None,
+                    task_requires_gpu,
                     adopted_from_hold: false,
                     task_key,
                     timeout_secs,
@@ -431,6 +435,8 @@ impl TaskQueue {
                     disposition: ResultDisposition::Late,
                     state,
                     rejected: false,
+                    rejection_kind: None,
+                    task_requires_gpu,
                     adopted_from_hold: false,
                     task_key,
                     timeout_secs,
@@ -444,7 +450,8 @@ impl TaskQueue {
             ));
         }
 
-        let rejected = is_worker_rejection(&result);
+        let rejection_kind = classify_worker_rejection(&result);
+        let rejected = rejection_kind.is_some();
 
         // If a speculative sibling is running alongside this failed attempt, keep the task alive
         // on the remaining attempt without charging retries or waking waiters (`0060` D3).
@@ -520,6 +527,8 @@ impl TaskQueue {
                         disposition: ResultDisposition::SiblingFailed,
                         state: next_state,
                         rejected,
+                        rejection_kind,
+                        task_requires_gpu,
                         adopted_from_hold: false,
                         task_key,
                         timeout_secs,
@@ -610,110 +619,192 @@ impl TaskQueue {
                     timestamp_utc: now_epoch,
                 };
                 (TaskState::Cancelled, ResultDisposition::Terminal, record)
-            } else if rejected
-                && policy.retry_on_worker_disconnect
-                && entry.rejection_count < MAX_WORKER_REJECTIONS_PER_TASK
-                && policy.failover_budget(entry).0
-            {
-                // The worker refused to run it: that is the worker's problem, not the task's. Hand
-                // the task to somebody else without charging its execution retry budget.
-                entry.rejection_count += 1;
-                entry.failover_count += 1;
-                entry.retry_count += 1;
-                if !entry.avoid_workers.contains(&worker_id) {
-                    entry.avoid_workers.push(worker_id);
-                }
-                let attempt = RetryAttempt {
-                    attempt: entry.retry_count,
-                    timestamp_utc: now_epoch,
-                    failed_worker_id: Some(worker_id),
-                    reason: "Worker rejected the task without running it".into(),
-                    exit_code: Some(result.exit_code),
-                    error: result.error.clone(),
-                };
-                entry.retry_history.push(attempt.clone());
-                entry.state = TaskState::Queued;
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                entry.assigned_session_live = None;
-                entry.scheduled_instant = None;
-                entry.started_instant = None;
-                ready_key_to_insert = Some(QueueOrderKey {
-                    priority_rev: Reverse(entry.priority),
-                    sequence: entry.sequence,
-                    task_id,
-                });
-                let record = JournalRecord::TaskRequeued {
-                    task_id,
-                    state: TaskState::Queued,
-                    retry_count: entry.retry_count,
-                    failover_count: entry.failover_count,
-                    evacuation_count: entry.evacuation_count,
-                    rejection_count: entry.rejection_count,
-                    avoid_workers: entry.avoid_workers.clone(),
-                    retry_attempt: Some(attempt),
-                    retry_delay_ms: Some(0),
-                };
-                (TaskState::Queued, ResultDisposition::Requeued, record)
-            } else if policy.retry_on_execution_failure
-                && entry.retry_count.saturating_sub(entry.failover_count) < policy.max_retries
-            {
-                entry.retry_count += 1;
-                let delay_ms = policy.calculate_backoff(entry.retry_count);
-                let retry_after = now_instant + Duration::from_millis(delay_ms);
-
-                entry.state = TaskState::Retrying;
-                entry.assigned_worker_id = None;
-                entry.assigned_session = None;
-                entry.assigned_session_live = None;
-                entry.retry_after_instant = Some(retry_after);
-                let attempt = RetryAttempt {
-                    attempt: entry.retry_count,
-                    timestamp_utc: now_epoch,
-                    failed_worker_id: Some(worker_id),
-                    reason: "Non-zero exit code execution failure".into(),
-                    exit_code: Some(result.exit_code),
-                    error: result.error.clone(),
-                };
-                entry.retry_history.push(attempt.clone());
-
-                delay_key_to_insert = Some(DelayedRetryKey {
-                    retry_after,
-                    task_id,
-                });
-
-                let record = JournalRecord::TaskRequeued {
-                    task_id,
-                    state: TaskState::Retrying,
-                    retry_count: entry.retry_count,
-                    failover_count: entry.failover_count,
-                    evacuation_count: entry.evacuation_count,
-                    rejection_count: entry.rejection_count,
-                    avoid_workers: entry.avoid_workers.clone(),
-                    retry_attempt: Some(attempt),
-                    retry_delay_ms: Some(delay_ms),
-                };
-                (TaskState::Retrying, ResultDisposition::Requeued, record)
             } else {
-                // Unrecoverable or exhausted failure
-                entry.state = TaskState::Failed;
-                entry.error_message = result.error.clone();
-                entry.result = Some(result.clone());
-                entry.cold_result = None;
-                let record = JournalRecord::TaskTerminal {
-                    task_id,
-                    state: TaskState::Failed,
-                    assigned_worker_id: entry.assigned_worker_id,
-                    retry_count: entry.retry_count,
-                    failover_count: entry.failover_count,
-                    evacuation_count: entry.evacuation_count,
-                    rejection_count: entry.rejection_count,
-                    retry_attempt: None,
-                    result: Some(result),
-                    error_message: entry.error_message.clone(),
-                    timestamp_utc: now_epoch,
-                };
-                (TaskState::Failed, ResultDisposition::Terminal, record)
+                let is_contributor_pause = rejected
+                    && matches!(
+                        rejection_kind,
+                        Some(
+                            crate::queue::WorkerRejectionKind::Paused
+                                | crate::queue::WorkerRejectionKind::NoGpuTasks
+                        )
+                    );
+                if is_contributor_pause || (rejected && policy.retry_on_worker_disconnect) {
+                    if is_contributor_pause
+                        || (entry.rejection_count < MAX_WORKER_REJECTIONS_PER_TASK
+                            && policy.failover_budget(entry).0)
+                    {
+                        // The worker refused to run it: that is the worker's problem, not the task's.
+                        // Hand the task to somebody else without charging its execution retry
+                        // budget; contributor pauses (`Paused` / `NoGpuTasks`) apply even when
+                        // `retry_on_worker_disconnect` is false, never touch counters or
+                        // `retry_history`, and emit no `RetryAttempt` journal payload.
+                        let retry_attempt = if is_contributor_pause {
+                            None
+                        } else {
+                            entry.rejection_count += 1;
+                            entry.failover_count += 1;
+                            entry.retry_count += 1;
+                            let attempt = RetryAttempt {
+                                attempt: entry.retry_count,
+                                timestamp_utc: now_epoch,
+                                failed_worker_id: Some(worker_id),
+                                reason: "Worker rejected the task without running it".into(),
+                                exit_code: Some(result.exit_code),
+                                error: result.error.clone(),
+                            };
+                            entry.retry_history.push(attempt.clone());
+                            Some(attempt)
+                        };
+                        if !entry.avoid_workers.contains(&worker_id) {
+                            entry.avoid_workers.push(worker_id);
+                        }
+                        entry.state = TaskState::Queued;
+                        entry.assigned_worker_id = None;
+                        entry.assigned_session = None;
+                        entry.assigned_session_live = None;
+                        entry.scheduled_instant = None;
+                        entry.started_instant = None;
+                        ready_key_to_insert = Some(QueueOrderKey {
+                            priority_rev: Reverse(entry.priority),
+                            sequence: entry.sequence,
+                            task_id,
+                        });
+                        let record = JournalRecord::TaskRequeued {
+                            task_id,
+                            state: TaskState::Queued,
+                            retry_count: entry.retry_count,
+                            failover_count: entry.failover_count,
+                            evacuation_count: entry.evacuation_count,
+                            rejection_count: entry.rejection_count,
+                            avoid_workers: entry.avoid_workers.clone(),
+                            retry_attempt,
+                            retry_delay_ms: Some(0),
+                        };
+                        (TaskState::Queued, ResultDisposition::Requeued, record)
+                    } else if policy.retry_on_execution_failure
+                        && entry.retry_count.saturating_sub(entry.failover_count)
+                            < policy.max_retries
+                    {
+                        entry.retry_count += 1;
+                        let delay_ms = policy.calculate_backoff(entry.retry_count);
+                        let retry_after = now_instant + Duration::from_millis(delay_ms);
+
+                        entry.state = TaskState::Retrying;
+                        entry.assigned_worker_id = None;
+                        entry.assigned_session = None;
+                        entry.assigned_session_live = None;
+                        entry.retry_after_instant = Some(retry_after);
+                        let attempt = RetryAttempt {
+                            attempt: entry.retry_count,
+                            timestamp_utc: now_epoch,
+                            failed_worker_id: Some(worker_id),
+                            reason: "Non-zero exit code execution failure".into(),
+                            exit_code: Some(result.exit_code),
+                            error: result.error.clone(),
+                        };
+                        entry.retry_history.push(attempt.clone());
+
+                        delay_key_to_insert = Some(DelayedRetryKey {
+                            retry_after,
+                            task_id,
+                        });
+
+                        let record = JournalRecord::TaskRequeued {
+                            task_id,
+                            state: TaskState::Retrying,
+                            retry_count: entry.retry_count,
+                            failover_count: entry.failover_count,
+                            evacuation_count: entry.evacuation_count,
+                            rejection_count: entry.rejection_count,
+                            avoid_workers: entry.avoid_workers.clone(),
+                            retry_attempt: Some(attempt),
+                            retry_delay_ms: Some(delay_ms),
+                        };
+                        (TaskState::Retrying, ResultDisposition::Requeued, record)
+                    } else {
+                        entry.state = TaskState::Failed;
+                        let msg = result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("Exited with code {}", result.exit_code));
+                        entry.error_message = Some(msg);
+                        entry.result = Some(result.clone());
+                        entry.cold_result = None;
+                        let record = JournalRecord::TaskTerminal {
+                            task_id,
+                            state: TaskState::Failed,
+                            assigned_worker_id: entry.assigned_worker_id,
+                            retry_count: entry.retry_count,
+                            failover_count: entry.failover_count,
+                            evacuation_count: entry.evacuation_count,
+                            rejection_count: entry.rejection_count,
+                            retry_attempt: None,
+                            result: Some(result),
+                            error_message: entry.error_message.clone(),
+                            timestamp_utc: now_epoch,
+                        };
+                        (TaskState::Failed, ResultDisposition::Terminal, record)
+                    }
+                } else if policy.retry_on_execution_failure
+                    && entry.retry_count.saturating_sub(entry.failover_count) < policy.max_retries
+                {
+                    entry.retry_count += 1;
+                    let delay_ms = policy.calculate_backoff(entry.retry_count);
+                    let retry_after = now_instant + Duration::from_millis(delay_ms);
+
+                    entry.state = TaskState::Retrying;
+                    entry.assigned_worker_id = None;
+                    entry.assigned_session = None;
+                    entry.assigned_session_live = None;
+                    entry.retry_after_instant = Some(retry_after);
+                    let attempt = RetryAttempt {
+                        attempt: entry.retry_count,
+                        timestamp_utc: now_epoch,
+                        failed_worker_id: Some(worker_id),
+                        reason: "Non-zero exit code execution failure".into(),
+                        exit_code: Some(result.exit_code),
+                        error: result.error.clone(),
+                    };
+                    entry.retry_history.push(attempt.clone());
+
+                    delay_key_to_insert = Some(DelayedRetryKey {
+                        retry_after,
+                        task_id,
+                    });
+
+                    let record = JournalRecord::TaskRequeued {
+                        task_id,
+                        state: TaskState::Retrying,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        avoid_workers: entry.avoid_workers.clone(),
+                        retry_attempt: Some(attempt),
+                        retry_delay_ms: Some(delay_ms),
+                    };
+                    (TaskState::Retrying, ResultDisposition::Requeued, record)
+                } else {
+                    // Unrecoverable or exhausted failure
+                    entry.state = TaskState::Failed;
+                    entry.error_message = result.error.clone();
+                    entry.result = Some(result.clone());
+                    entry.cold_result = None;
+                    let record = JournalRecord::TaskTerminal {
+                        task_id,
+                        state: TaskState::Failed,
+                        assigned_worker_id: entry.assigned_worker_id,
+                        retry_count: entry.retry_count,
+                        failover_count: entry.failover_count,
+                        evacuation_count: entry.evacuation_count,
+                        rejection_count: entry.rejection_count,
+                        retry_attempt: None,
+                        result: Some(result),
+                        error_message: entry.error_message.clone(),
+                        timestamp_utc: now_epoch,
+                    };
+                    (TaskState::Failed, ResultDisposition::Terminal, record)
+                }
             }
         };
 
@@ -785,6 +876,8 @@ impl TaskQueue {
                 disposition,
                 state: res_state,
                 rejected,
+                rejection_kind,
+                task_requires_gpu,
                 adopted_from_hold: adoptable_by_sender,
                 task_key,
                 timeout_secs,

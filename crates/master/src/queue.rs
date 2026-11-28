@@ -739,6 +739,17 @@ pub enum ResultDisposition {
     SiblingFailed,
 }
 
+/// Sub-kind of a worker-side task refusal (`design 0113` D2 & D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerRejectionKind {
+    /// Generic worker refusal (low battery, insufficient capabilities, sandbox base unusable).
+    Generic,
+    /// Worker is locally paused by its contributor (`Task rejected by worker: paused: <reason>`).
+    Paused,
+    /// Worker is running with `--no-gpu-tasks` (`Task rejected by worker: no gpu tasks`).
+    NoGpuTasks,
+}
+
 /// Outcome of `TaskQueue::record_result_from`.
 #[derive(Debug, Clone)]
 pub struct ResultOutcome {
@@ -748,6 +759,10 @@ pub struct ResultOutcome {
     /// The result was a worker-side refusal to run the task at all (see [`is_worker_rejection`]);
     /// the caller should penalise the worker.
     pub rejected: bool,
+    /// Structured kind of worker-side refusal, if [`Self::rejected`] is `true`.
+    pub rejection_kind: Option<WorkerRejectionKind>,
+    /// True when the task required a GPU (so completing it clears any `no gpu tasks` hold-back).
+    pub task_requires_gpu: bool,
     /// True when the task was held in `TaskState::Queued` under an active `adoptable_by` window for
     /// this worker and was adopted + completed in one step (e.g. a QUIC data-lane `TaskResult`
     /// arriving before `ResumeSession` on the control lane).
@@ -798,25 +813,37 @@ const WORKER_REJECTION_MARKERS: &[&str] = &[
     "rejected by worker: sandbox base unusable",
 ];
 
-/// True when `result` is a worker refusing to run a task at all (critically low battery,
-/// capabilities insufficient, no GPU for a GPU task) rather than the task failing.
+/// Classifies a worker-side task refusal (`None` when the task actually ran or was cancelled).
 ///
-/// Such a result is produced instantly, before anything executes, so it says nothing about the
-/// task: another worker may run it fine. It also makes the refusing worker look permanently idle,
-/// which is how one stale-snapshot phone ends up absorbing a large share of a cluster's work.
-pub fn is_worker_rejection(result: &TaskResult) -> bool {
+/// Such a result is produced without running the task, so another worker may run it fine and
+/// the refusing worker should be cooled down or held back (`design 0113` D2/D3).
+pub fn classify_worker_rejection(result: &TaskResult) -> Option<WorkerRejectionKind> {
     if result.exit_code == 0
         || result.exit_code == 130
         || result.execution_time_ms != 0
         || !result.stdout.0.is_empty()
     {
-        return false;
+        return None;
     }
     let mut text = result.error.clone().unwrap_or_default();
     text.push(' ');
     text.push_str(&result.stderr_str());
     let text = text.to_ascii_lowercase();
-    WORKER_REJECTION_MARKERS.iter().any(|m| text.contains(m))
+    if text.contains("rejected by worker: paused") {
+        Some(WorkerRejectionKind::Paused)
+    } else if text.contains("rejected by worker: no gpu tasks") {
+        Some(WorkerRejectionKind::NoGpuTasks)
+    } else if WORKER_REJECTION_MARKERS.iter().any(|m| text.contains(m)) {
+        Some(WorkerRejectionKind::Generic)
+    } else {
+        None
+    }
+}
+
+/// True when `result` is a worker refusing to run a task at all (critically low battery,
+/// capabilities insufficient, no GPU for a GPU task, or contributor pause) rather than the task failing.
+pub fn is_worker_rejection(result: &TaskResult) -> bool {
+    classify_worker_rejection(result).is_some()
 }
 
 /// True when `entry` is currently assigned to `worker_id` (and, if both sides know it, `session_id`).

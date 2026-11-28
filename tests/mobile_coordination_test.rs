@@ -456,6 +456,10 @@ async fn test_adaptive_rrc_keepalive_controller_and_dynamic_master_timeout() {
         rx_clock: None,
         consecutive_rejections: 0,
         excluded_until: None,
+        consecutive_pause_rejections: 0,
+        paused_until: None,
+        consecutive_gpu_pause_rejections: 0,
+        gpu_paused_until: None,
         heartbeat_interval: Some(Duration::from_secs(25)), // 4 * 25s = 100s window
         features: Default::default(),
         mobile_status: None,

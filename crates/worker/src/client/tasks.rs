@@ -403,6 +403,44 @@ impl WorkerClient {
             return;
         }
 
+        // Local pause / held / --no-gpu-tasks admission check (`design 0113` D2).
+        let requires_gpu = task.spec.requires_gpu() || task.requirements.gpu_required;
+        match self.control.check_assignment(requires_gpu) {
+            crate::control::AssignmentDecision::Allow => {}
+            crate::control::AssignmentDecision::RejectPaused(reason) => {
+                self.control.mark_session_pause_rejection();
+                let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
+                warn!(task_id = %task_id, reason = %reason, "Refusing task: worker paused");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    1,
+                    "",
+                    msg.as_str(),
+                    0,
+                    Some(msg.clone()),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                return;
+            }
+            crate::control::AssignmentDecision::RejectNoGpuTasks => {
+                self.control.mark_session_pause_rejection();
+                let msg = crate::control::NO_GPU_TASKS_REJECTION_MESSAGE.to_string();
+                warn!(task_id = %task_id, "Refusing GPU task: --no-gpu-tasks enabled");
+                let result = TaskResult::failure(
+                    worker_id,
+                    task_id,
+                    1,
+                    "",
+                    msg.as_str(),
+                    0,
+                    Some(msg.clone()),
+                );
+                let _ = outbound_tx.send(WorkerMessage::from(result)).await;
+                return;
+            }
+        }
+
         // Defence in depth (design 0082 D2.3): the Master never places a task with an extension this
         // worker lacks, but a task with an unknown critical extension, or a malformed extension
         // list, is never run without the restriction it carries.
@@ -1115,6 +1153,82 @@ impl WorkerClient {
                 warn!("Active task did not finish checkpoint drain within timeout; aborting it");
                 join.abort();
             }
+        }
+        count
+    }
+
+    /// Drains running tasks and starts stopping their process trees synchronously so the session
+    /// `select!` loop never blocks for the up-to-4 s join deadline; the spawned task finishes
+    /// waiting for the kills, sends refusal results, and notifies `notify` on completion.
+    pub(super) async fn spawn_hand_back_running_tasks_on_pause(
+        &self,
+        reason: &str,
+        outbound_tx: mpsc::Sender<WorkerMessage>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let mut joins = self.begin_pause_handback_drain(reason).await;
+        if joins.is_empty() {
+            return None;
+        }
+        struct InFlightGuard(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<tokio::sync::Notify>,
+        );
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+                self.1.notify_one();
+            }
+        }
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let worker_id = self.worker_id;
+        let control = Arc::clone(&self.control);
+        let why = reason.to_string();
+        Some(tokio::spawn(async move {
+            let _guard = InFlightGuard(in_flight, notify);
+            let _ = Self::finish_pause_handback(worker_id, control, why, &mut joins, &outbound_tx)
+                .await;
+        }))
+    }
+
+    async fn begin_pause_handback_drain(
+        &self,
+        reason: &str,
+    ) -> Vec<(TaskId, Option<tokio::task::JoinHandle<()>>)> {
+        let drained: Vec<(TaskId, TaskExecutionHandle)> = {
+            let mut lock = self.active_task_table.write().await;
+            lock.drain().collect()
+        };
+        drained
+            .into_iter()
+            .map(|(tid, handle)| (tid, Self::begin_stop(handle, reason)))
+            .collect()
+    }
+
+    async fn finish_pause_handback(
+        worker_id: uuid::Uuid,
+        control: Arc<crate::control::ControlHandle>,
+        reason: String,
+        joins: &mut [(TaskId, Option<tokio::task::JoinHandle<()>>)],
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> usize {
+        let count = joins.len();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        for (_, join_opt) in joins.iter_mut() {
+            if let Some(ref mut join) = join_opt {
+                if tokio::time::timeout_at(deadline, &mut *join).await.is_err() {
+                    warn!("Paused task did not stop within hand-back deadline; aborting handle");
+                    join.abort();
+                }
+            }
+        }
+        control.mark_session_pause_rejection();
+        let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
+        for (tid, _) in joins.iter() {
+            let result =
+                TaskResult::failure(worker_id, *tid, 1, "", msg.as_str(), 0, Some(msg.clone()));
+            let _ = outbound_tx.send(WorkerMessage::from(result)).await;
         }
         count
     }
