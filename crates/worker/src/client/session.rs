@@ -454,12 +454,17 @@ fn p2p_target_display(ticket: &str) -> String {
 }
 
 impl WorkerClient {
-    pub(super) fn spawn_limits_probe_poller(&self) -> tokio::task::JoinHandle<()> {
+    pub(super) fn spawn_limits_probe_poller(
+        &self,
+        mut initial_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> tokio::task::JoinHandle<()> {
         let control = Arc::clone(&self.control);
         let active_task_table = Arc::clone(&self.active_task_table);
         let cached_probes = Arc::clone(&self.cached_limit_probes);
+        let limits_evaluator = Arc::clone(&self.limits_evaluator);
         let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
         let probe_refresh_notify = Arc::clone(&self.probe_refresh_notify);
+        let last_task_start = Arc::clone(&self.last_task_start);
         let battery_probe = self.battery_probe.clone();
         let metered_probe = Arc::clone(&self.metered_probe);
         let cpu_probe = self.cpu_probe.clone();
@@ -467,15 +472,36 @@ impl WorkerClient {
             .config
             .limit_eval_interval
             .max(Duration::from_millis(50));
+        let step_interval = interval
+            .min(Duration::from_secs(1))
+            .max(Duration::from_millis(50));
 
         tokio::spawn(async move {
+            struct InitialProbeGate {
+                pending: std::sync::atomic::AtomicUsize,
+                tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            }
+            impl InitialProbeGate {
+                fn done_one(&self) {
+                    if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        if let Some(tx) = self.tx.lock().ok().and_then(|mut s| s.take()) {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            }
+
             let tree_sampler = Arc::new(std::sync::Mutex::new(
                 crate::limits::WorkerTreeCpuSampler::new(),
             ));
             let mut battery_inflight: Option<tokio::task::JoinHandle<()>> = None;
             let mut metered_inflight: Option<tokio::task::JoinHandle<()>> = None;
             let mut cpu_inflight: Option<tokio::task::JoinHandle<()>> = None;
-            let mut tick = tokio::time::interval(interval);
+            let mut persist_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut last_battery_poll: Option<tokio::time::Instant> = None;
+            let mut last_metered_poll: Option<tokio::time::Instant> = None;
+            let mut last_cpu_poll: Option<tokio::time::Instant> = None;
+            let mut tick = tokio::time::interval(step_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -483,21 +509,44 @@ impl WorkerClient {
                 let need_battery = lim.no_tasks_on_battery.unwrap_or(false);
                 let need_metered = lim.no_tasks_on_metered.unwrap_or(false);
                 let need_cpu = lim.local_max_cpu_pct.is_some();
+                let now_tokio = tokio::time::Instant::now();
+
+                let initial_gate = if let Some(tx) = initial_ready_tx.take() {
+                    let count = usize::from(need_battery && battery_probe.is_some())
+                        + usize::from(need_metered);
+                    if count == 0 {
+                        let _ = tx.send(());
+                        None
+                    } else {
+                        Some(Arc::new(InitialProbeGate {
+                            pending: std::sync::atomic::AtomicUsize::new(count),
+                            tx: std::sync::Mutex::new(Some(tx)),
+                        }))
+                    }
+                } else {
+                    None
+                };
 
                 if need_battery
                     && battery_inflight
                         .as_ref()
                         .is_none_or(tokio::task::JoinHandle::is_finished)
+                    && last_battery_poll.is_none_or(|t| now_tokio.duration_since(t) >= interval)
                 {
                     if let Some(probe) = battery_probe.as_ref().map(Arc::clone) {
+                        last_battery_poll = Some(now_tokio);
                         let cache = Arc::clone(&cached_probes);
                         let notify = Arc::clone(&limits_reeval_notify);
+                        let gate = initial_gate.as_ref().map(Arc::clone);
                         battery_inflight = Some(tokio::spawn(async move {
                             let val = tokio::task::spawn_blocking(move || probe.probe_battery())
                                 .await
                                 .unwrap_or(crate::limits::BatteryStatus::Unknown);
                             if let Ok(mut guard) = cache.lock() {
                                 guard.battery = val;
+                            }
+                            if let Some(g) = gate {
+                                g.done_one();
                             }
                             notify.notify_one();
                         }));
@@ -508,16 +557,22 @@ impl WorkerClient {
                     && metered_inflight
                         .as_ref()
                         .is_none_or(tokio::task::JoinHandle::is_finished)
+                    && last_metered_poll.is_none_or(|t| now_tokio.duration_since(t) >= interval)
                 {
+                    last_metered_poll = Some(now_tokio);
                     let probe = Arc::clone(&metered_probe);
                     let cache = Arc::clone(&cached_probes);
                     let notify = Arc::clone(&limits_reeval_notify);
+                    let gate = initial_gate.as_ref().map(Arc::clone);
                     metered_inflight = Some(tokio::spawn(async move {
                         let val = tokio::task::spawn_blocking(move || probe.probe_metered())
                             .await
                             .unwrap_or(crate::limits::MeteredStatus::Unknown);
                         if let Ok(mut guard) = cache.lock() {
                             guard.metered = val;
+                        }
+                        if let Some(g) = gate {
+                            g.done_one();
                         }
                         notify.notify_one();
                     }));
@@ -528,50 +583,100 @@ impl WorkerClient {
                         .as_ref()
                         .is_none_or(tokio::task::JoinHandle::is_finished)
                 {
-                    let cache = Arc::clone(&cached_probes);
-                    let notify = Arc::clone(&limits_reeval_notify);
-                    if let Some(probe) = cpu_probe.as_ref().map(Arc::clone) {
-                        cpu_inflight = Some(tokio::spawn(async move {
-                            let val = tokio::task::spawn_blocking(move || probe.probe_cpu_pct())
+                    let (has_active, root_pids): (bool, Vec<u32>) = {
+                        let table = active_task_table.read().await;
+                        let pids = table
+                            .values()
+                            .map(|h| h.child_pid.load(Ordering::Acquire))
+                            .filter(|&p| p != 0)
+                            .collect();
+                        (!table.is_empty(), pids)
+                    };
+                    let cpu_cadence = if has_active { step_interval } else { interval };
+                    if last_cpu_poll.is_none_or(|t| now_tokio.duration_since(t) >= cpu_cadence) {
+                        last_cpu_poll = Some(now_tokio);
+                        let cache = Arc::clone(&cached_probes);
+                        let notify = Arc::clone(&limits_reeval_notify);
+                        if let Some(probe) = cpu_probe.as_ref().map(Arc::clone) {
+                            cpu_inflight = Some(tokio::spawn(async move {
+                                let val =
+                                    tokio::task::spawn_blocking(move || probe.probe_cpu_pct())
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                if let Ok(mut guard) = cache.lock() {
+                                    guard.host_cpu_pct = val;
+                                }
+                                notify.notify_one();
+                            }));
+                        } else {
+                            let task_start = last_task_start.lock().ok().and_then(|g| *g);
+                            let sampler = Arc::clone(&tree_sampler);
+                            cpu_inflight = Some(tokio::spawn(async move {
+                                let val = tokio::task::spawn_blocking(move || {
+                                    sampler.lock().ok().and_then(|mut s| {
+                                        s.sample_external_cpu_pct(
+                                            std::time::Instant::now(),
+                                            task_start,
+                                            &root_pids,
+                                        )
+                                    })
+                                })
                                 .await
                                 .ok()
                                 .flatten();
-                            if let Ok(mut guard) = cache.lock() {
-                                guard.host_cpu_pct = val;
+                                if let Ok(mut guard) = cache.lock() {
+                                    guard.host_cpu_pct = val;
+                                }
+                                notify.notify_one();
+                            }));
+                        }
+                    }
+                }
+
+                if persist_inflight
+                    .as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    let work = limits_evaluator
+                        .lock()
+                        .ok()
+                        .and_then(|eval| eval.pending_budget_persist(false));
+                    if let Some(work) = work {
+                        let eval_ref = Arc::clone(&limits_evaluator);
+                        persist_inflight = Some(tokio::spawn(async move {
+                            let day = work.day;
+                            let used_ms = work.used_ms;
+                            let wrote =
+                                tokio::task::spawn_blocking(move || match work.write_to_disk() {
+                                    Ok(()) => true,
+                                    Err(err) => {
+                                        warn!(
+                                            error = %err,
+                                            "Failed to persist daily task budget"
+                                        );
+                                        false
+                                    }
+                                })
+                                .await
+                                .unwrap_or(false);
+                            if wrote {
+                                if let Ok(mut eval) = eval_ref.lock() {
+                                    eval.mark_budget_persisted(day, used_ms);
+                                }
                             }
-                            notify.notify_one();
-                        }));
-                    } else {
-                        let root_pids: Vec<u32> = {
-                            let table = active_task_table.read().await;
-                            table
-                                .values()
-                                .map(|h| h.child_pid.load(Ordering::Acquire))
-                                .filter(|&p| p != 0)
-                                .collect()
-                        };
-                        let sampler = Arc::clone(&tree_sampler);
-                        cpu_inflight = Some(tokio::spawn(async move {
-                            let val = tokio::task::spawn_blocking(move || {
-                                sampler
-                                    .lock()
-                                    .ok()
-                                    .map(|mut s| s.sample_external_cpu_pct(&root_pids))
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                            if let Ok(mut guard) = cache.lock() {
-                                guard.host_cpu_pct = val;
-                            }
-                            notify.notify_one();
                         }));
                     }
                 }
 
                 tokio::select! {
                     _ = tick.tick() => {}
-                    _ = probe_refresh_notify.notified() => {}
+                    _ = probe_refresh_notify.notified() => {
+                        // Force immediate refresh when limit needs change.
+                        last_battery_poll = None;
+                        last_metered_poll = None;
+                        last_cpu_poll = None;
+                    }
                 }
             }
         })

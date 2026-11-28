@@ -700,28 +700,13 @@ pub(super) async fn run_worker(
         .filter(|p| !p.as_os_str().is_empty())
         .map(PathBuf::from)
         .or_else(crate::config::default_oxideswarm_dir);
-    let daily_budget_path = budget_dir.map(|dir| {
-        let file_name = match config
-            .name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(name) => format!(
-                "{}.daily-budget.json",
-                rusty_grid_worker::control::sanitize_endpoint_segment(name)
-            ),
-            None => "daily-budget.json".to_string(),
-        };
-        dir.join(file_name)
-    });
     config = config
         .with_control_endpoint(control_endpoint)
         .with_initial_limits(initial_limits)
         .with_hold_ends_tasks(resolved_limits.hold_ends_tasks)
         .with_control_config_path(config_write_path)
         .with_limit_persist_hook(persist_hook)
-        .with_daily_budget_path(daily_budget_path);
+        .with_daily_budget_dir(budget_dir);
 
     let mut client = WorkerClient::new(config);
     if let Err(e) = client.validate_isolation_config() {

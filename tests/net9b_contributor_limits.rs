@@ -894,3 +894,132 @@ async fn net9b_daily_budget_persists_across_worker_restart() {
     .await;
     assert_eq!(snap.reason.as_deref(), Some("daily task-hours cap reached"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn net9b_cpu_bound_worker_task_never_triggers_cpu_hold() {
+    let mut cluster = Net9bCluster::new().await;
+    let dir = ipc_tempdir();
+    let ep = unique_endpoint(dir.path(), "cputree");
+
+    // Uses the REAL `WorkerTreeCpuSampler` (no fake cpu_probe) with an aggressive 40% limit.
+    cluster.spawn_worker(
+        "cpu-tree-box",
+        2,
+        Some(ep.clone()),
+        WorkerLimitsConfig {
+            local_max_cpu_pct: Some(40),
+            ..Default::default()
+        },
+        ProbeHandles::default(),
+    );
+    cluster.wait_for_workers(1).await;
+    let _ = poll_control_status(&ep, |s| s.state == WorkerControlState::Running).await;
+
+    // Launch a CPU-bound multi-worker task (including short subshell forks) for ~2.5 s.
+    let script = concat!(
+        "for i in 1 2 3 4; do ",
+        "(end=$(( $(date +%s) + 2 )); while [ $(date +%s) -le $end ]; do :; done) & ",
+        "done; wait"
+    );
+    let tid = cluster
+        .master
+        .submit_task(Task::new(
+            TaskSpec::command("sh", vec!["-c".into(), script.into()]),
+            TaskRequirements::generic(1, 64).with_max_retries(0),
+        ))
+        .await
+        .unwrap();
+
+    let wait_handle = tokio::spawn({
+        let master = cluster.master.clone();
+        async move { master.wait_task(tid, Some(WAIT_BOUND)).await }
+    });
+
+    while !wait_handle.is_finished() {
+        let snap = match send_control_request(&ep, &ControlRequest::Status).await {
+            Ok(ControlResponse::Status { snapshot }) => snapshot,
+            _ => continue,
+        };
+        assert_ne!(
+            snap.state,
+            WorkerControlState::Held,
+            "worker's own CPU-bound task must never trigger Held: {snap:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    let res = wait_handle.await.unwrap().unwrap();
+    assert_eq!(res.exit_code, 0, "{:?}", res.error);
+}
+
+#[tokio::test]
+async fn net9b_initial_battery_probe_holds_before_first_task() {
+    let mut cluster = Net9bCluster::new().await;
+    let dir = ipc_tempdir();
+    let ep = unique_endpoint(dir.path(), "initbatt");
+    let batt = Arc::new(AtomicU8::new(1)); // OnBattery from startup
+    let marker_dir = tempfile::tempdir().unwrap();
+    let ran_marker = marker_dir.path().join("should_not_run.marker");
+
+    let w_id = cluster.spawn_worker(
+        "init-batt-box",
+        1,
+        Some(ep.clone()),
+        WorkerLimitsConfig {
+            no_tasks_on_battery: Some(true),
+            ..Default::default()
+        },
+        ProbeHandles {
+            battery: Some(batt),
+            ..Default::default()
+        },
+    );
+    cluster.wait_for_workers(1).await;
+
+    // Right after first registration, the initial battery probe has already populated Held("on battery").
+    let snap = match send_control_request(&ep, &ControlRequest::Status)
+        .await
+        .unwrap()
+    {
+        ControlResponse::Status { snapshot } => snapshot,
+        other => panic!("unexpected status response: {other:?}"),
+    };
+    assert_eq!(
+        snap.state,
+        WorkerControlState::Held,
+        "initial pre-registration battery probe must hold worker before first task"
+    );
+    assert_eq!(snap.reason.as_deref(), Some("on battery"));
+
+    // Any task submitted immediately must be refused without executing `ran_marker`.
+    #[cfg(unix)]
+    let spec = TaskSpec::command(
+        "sh",
+        vec![
+            "-c".into(),
+            format!("touch '{}' && echo wrong", ran_marker.display()),
+        ],
+    );
+    #[cfg(windows)]
+    let spec = TaskSpec::command(
+        "cmd",
+        vec![
+            "/C".into(),
+            format!("echo wrong > \"{}\"", ran_marker.display()),
+        ],
+    );
+    let _tid = cluster
+        .master
+        .submit_task(Task::new(
+            spec,
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        ))
+        .await
+        .unwrap();
+    cluster.wait_until_paused(w_id, true).await;
+    assert!(
+        !ran_marker.exists(),
+        "held-on-battery worker must never accept or run a task during startup window"
+    );
+}

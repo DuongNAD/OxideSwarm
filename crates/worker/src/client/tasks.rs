@@ -615,6 +615,8 @@ impl WorkerClient {
         let limits_evaluator = Arc::clone(&self.limits_evaluator);
         let limits_clock = Arc::clone(&self.local_clock);
         let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
+        let probe_refresh_notify = Arc::clone(&self.probe_refresh_notify);
+        let last_task_start = Arc::clone(&self.last_task_start);
         let control = Arc::clone(&self.control);
 
         // The table lock is held from before the spawn until the handle is inserted, so the run's
@@ -796,6 +798,7 @@ impl WorkerClient {
                 evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
                 clock: Arc<dyn crate::limits::LocalClock>,
                 notify: Arc<tokio::sync::Notify>,
+                probe_notify: Arc<tokio::sync::Notify>,
                 finished: bool,
             }
             impl ActiveBudgetGuard {
@@ -805,17 +808,24 @@ impl WorkerClient {
                     evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
                     clock: Arc<dyn crate::limits::LocalClock>,
                     notify: Arc<tokio::sync::Notify>,
+                    probe_notify: Arc<tokio::sync::Notify>,
+                    last_task_start: &std::sync::Mutex<Option<std::time::Instant>>,
                 ) -> Self {
                     let started_local = clock.local_now();
+                    if let Ok(mut slot) = last_task_start.lock() {
+                        *slot = Some(exec_started);
+                    }
                     if let Ok(mut eval) = evaluator.lock() {
                         eval.begin_active_task(run_id, started_local, exec_started);
                     }
+                    probe_notify.notify_one();
                     Self {
                         run_id,
                         exec_started,
                         evaluator,
                         clock,
                         notify,
+                        probe_notify,
                         finished: false,
                     }
                 }
@@ -827,6 +837,7 @@ impl WorkerClient {
                         eval.finish_active_task(self.run_id, ended_local, elapsed);
                     }
                     self.notify.notify_one();
+                    self.probe_notify.notify_one();
                 }
             }
             impl Drop for ActiveBudgetGuard {
@@ -841,6 +852,7 @@ impl WorkerClient {
                             );
                         }
                         self.notify.notify_one();
+                        self.probe_notify.notify_one();
                     }
                 }
             }
@@ -850,6 +862,8 @@ impl WorkerClient {
                 Arc::clone(&limits_evaluator),
                 Arc::clone(&limits_clock),
                 Arc::clone(&limits_reeval_notify),
+                Arc::clone(&probe_refresh_notify),
+                &last_task_start,
             );
             let mut result = {
                 let exec_fut = runner.execute_task_with_checkpoint(

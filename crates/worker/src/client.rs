@@ -348,6 +348,9 @@ pub struct WorkerConfig {
     pub local_clock: Option<Arc<dyn crate::limits::LocalClock>>,
     /// Optional private state file path to persist daily task-hours usage across restarts.
     pub daily_budget_path: Option<PathBuf>,
+    /// Optional directory where per-worker-id daily budget files (`daily-budget.<worker_id>.json`)
+    /// are stored when `daily_budget_path` is not explicitly specified.
+    pub daily_budget_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -429,6 +432,7 @@ impl WorkerConfig {
             cpu_probe: None,
             local_clock: None,
             daily_budget_path: None,
+            daily_budget_dir: None,
         }
     }
 
@@ -807,6 +811,13 @@ impl WorkerConfig {
         self
     }
 
+    /// Sets the directory in which per-worker-id daily budget files (`daily-budget.<worker_id>.json`)
+    /// are stored when [`Self::with_daily_budget_path`] is not set.
+    pub fn with_daily_budget_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.daily_budget_dir = dir;
+        self
+    }
+
     /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
     pub fn simulated(
         master_addr: impl Into<String>,
@@ -956,6 +967,11 @@ pub struct WorkerClient {
     limits_reeval_notify: Arc<tokio::sync::Notify>,
     /// Wakes the background OS probe poller when limits change.
     probe_refresh_notify: Arc<tokio::sync::Notify>,
+    /// Monotonic start instant of the most recently launched task (for CPU tree start grace).
+    last_task_start: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Resolved daily task-hours persistence file path (`None` when persistence is disabled).
+    #[cfg(test)]
+    daily_budget_path: Option<PathBuf>,
     cached_limit_probes: Arc<std::sync::Mutex<CachedLimitProbes>>,
     battery_probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
     metered_probe: Arc<dyn crate::limits::MeteredNetworkProbe>,
@@ -1284,12 +1300,18 @@ impl WorkerClient {
         let mut initial_limits = config.initial_limits.clone();
         initial_limits.hold_ends_tasks |= config.hold_ends_tasks;
         let init_limits = crate::limits::WorkerLimits::from_control_config(&initial_limits);
+        let daily_budget_path = config.daily_budget_path.clone().or_else(|| {
+            config
+                .daily_budget_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("daily-budget.{worker_id}.json")))
+        });
         let init_day = local_clock.local_now().date();
         let (limits_evaluator, effective_control_limits) =
             match crate::limits::LimitsEvaluator::with_budget_path(
                 init_limits,
                 init_day,
-                config.daily_budget_path.clone(),
+                daily_budget_path.clone(),
             ) {
                 Ok(eval) => (eval, initial_limits),
                 Err(e) => {
@@ -1298,7 +1320,7 @@ impl WorkerClient {
                         crate::limits::LimitsEvaluator::with_budget_path(
                             crate::limits::WorkerLimits::default(),
                             init_day,
-                            config.daily_budget_path.clone(),
+                            daily_budget_path.clone(),
                         )
                         .expect("default limits are valid"),
                         crate::control::WorkerLimitsConfig::default(),
@@ -1361,6 +1383,9 @@ impl WorkerClient {
             limits_evaluator: Arc::new(std::sync::Mutex::new(limits_evaluator)),
             limits_reeval_notify: Arc::new(tokio::sync::Notify::new()),
             probe_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            last_task_start: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            daily_budget_path,
             cached_limit_probes: Arc::new(std::sync::Mutex::new(CachedLimitProbes::default())),
             battery_probe,
             metered_probe,
@@ -1617,6 +1642,11 @@ impl WorkerClient {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn resolved_daily_budget_path(&self) -> Option<&std::path::Path> {
+        self.daily_budget_path.as_deref()
+    }
+
     /// Returns the active backoff configuration.
     pub fn backoff_config(&self) -> &BackoffConfig {
         &self.backoff_config
@@ -1837,7 +1867,16 @@ impl WorkerClient {
             })
         });
 
-        let _limits_probe_poller = AbortOnDrop(self.spawn_limits_probe_poller());
+        let (initial_ready_tx, initial_ready_rx) = tokio::sync::oneshot::channel();
+        let _limits_probe_poller =
+            AbortOnDrop(self.spawn_limits_probe_poller(Some(initial_ready_tx)));
+        {
+            let probe_wait = tokio::time::timeout(Duration::from_secs(1), initial_ready_rx);
+            tokio::select! {
+                _ = probe_wait => {}
+                _ = shutdown_rx.changed() => {}
+            }
+        }
         self.sync_and_evaluate_limits(false).await;
 
         let mut run_result = Ok(());
@@ -1994,8 +2033,28 @@ impl WorkerClient {
             }
         }
 
-        if let Ok(mut eval) = self.limits_evaluator.lock() {
-            eval.flush_budget();
+        let final_persist = self
+            .limits_evaluator
+            .lock()
+            .ok()
+            .and_then(|eval| eval.pending_budget_persist(true));
+        if let Some(work) = final_persist {
+            let day = work.day;
+            let used_ms = work.used_ms;
+            let persisted = tokio::task::spawn_blocking(move || match work.write_to_disk() {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(error = %err, "Failed to persist daily task budget on shutdown");
+                    false
+                }
+            })
+            .await
+            .unwrap_or(false);
+            if persisted {
+                if let Ok(mut eval) = self.limits_evaluator.lock() {
+                    eval.mark_budget_persisted(day, used_ms);
+                }
+            }
         }
         run_result
     }

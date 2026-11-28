@@ -703,6 +703,7 @@ impl ControlHandle {
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let was_held = inner.held;
+            let was_hand_back = inner.hold_hand_back_running;
             inner.held = held;
             inner.hold_hand_back_running = held && hand_back_running;
             inner.hold_reason = if held {
@@ -726,7 +727,7 @@ impl ControlHandle {
             } else {
                 None
             };
-            if held && !was_held && !inner.paused && hand_back_running {
+            if held && !inner.paused && inner.hold_hand_back_running && !was_hand_back {
                 trigger_handback = inner.hold_reason.clone();
             } else if !held && was_held && !inner.paused {
                 trigger_resume = true;
@@ -2141,5 +2142,59 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         srv.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn set_held_hands_back_when_hold_hand_back_running_flips_false_to_true() {
+        let handle = test_handle(WorkerLimitsConfig::default(), None);
+        let mut rx = handle.subscribe();
+
+        // 1. CPU hold starts (`hand_back_running = false`) -> no PauseHandBack event.
+        handle.set_held_with_detail(
+            true,
+            Some("host cpu above limit".into()),
+            Some("cpu high".into()),
+            false,
+        );
+        assert!(rx.try_recv().is_err());
+
+        // 2. While still held, reason transitions to battery with `--hold-ends-tasks` (`true`) ->
+        //    MUST emit `ControlEvent::PauseHandBack`.
+        handle.set_held_with_detail(
+            true,
+            Some("on battery".into()),
+            Some("running on battery".into()),
+            true,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ControlEvent::PauseHandBack {
+                reason: "on battery".into()
+            }
+        );
+
+        // 3. Repeated tick with `hand_back_running = true` must NOT re-emit PauseHandBack.
+        handle.set_held_with_detail(
+            true,
+            Some("on battery".into()),
+            Some("running on battery".into()),
+            true,
+        );
+        assert!(rx.try_recv().is_err());
+
+        // 4. Clearing hold emits ResumeReconnect, then holding with `hand_back_running = false`
+        //    and flipping `limits set hold_ends_tasks true` (`hand_back_running = true`) emits PauseHandBack.
+        handle.set_held_with_detail(false, None, None, false);
+        assert_eq!(rx.try_recv().unwrap(), ControlEvent::ResumeReconnect);
+
+        handle.set_held_with_detail(true, Some("on battery".into()), None, false);
+        assert!(rx.try_recv().is_err());
+        handle.set_held_with_detail(true, Some("on battery".into()), None, true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ControlEvent::PauseHandBack {
+                reason: "on battery".into()
+            }
+        );
     }
 }

@@ -462,7 +462,7 @@ mod imp {
     pub(super) struct RawId {
         pub(super) pgid: libc::pid_t,
         worker_pid: libc::pid_t,
-        needle: TaskEnvNeedle,
+        pub(super) needle: TaskEnvNeedle,
         #[cfg(target_os = "macos")]
         spawn_tvsec: u64,
         #[cfg(target_os = "linux")]
@@ -1485,12 +1485,29 @@ mod imp {
         attach_suspended_process_to_kill_on_close_job, close_job_object, terminate_job_object,
     };
 
-    /// A Job Object handle, as an integer so it can sit in a `static`.
-    pub(super) type RawId = isize;
+    /// A Job Object handle and root/token metadata stored in `LIVE`.
+    #[derive(Clone, Copy)]
+    pub(super) struct RawId {
+        pub(super) job: isize,
+        pub(super) root_pid: u32,
+        pub(super) run_token: uuid::Uuid,
+    }
 
-    pub(super) fn attach(child: &super::SpawnedChild) -> Option<RawId> {
+    impl PartialEq for RawId {
+        fn eq(&self, other: &Self) -> bool {
+            self.job == other.job
+        }
+    }
+
+    impl Eq for RawId {}
+
+    pub(super) fn attach(child: &super::SpawnedChild, run_token: uuid::Uuid) -> Option<RawId> {
         let process = child.raw_handle()?;
-        attach_suspended_process_to_kill_on_close_job(process)
+        attach_suspended_process_to_kill_on_close_job(process).map(|job| RawId {
+            job,
+            root_pid: child.id().unwrap_or(0),
+            run_token,
+        })
     }
 
     /// Windows has no polite group signal; the caller goes straight to `kill`.
@@ -1499,11 +1516,11 @@ mod imp {
     }
 
     pub(super) fn kill(id: RawId) {
-        terminate_job_object(id);
+        terminate_job_object(id.job);
     }
 
     pub(super) fn release(id: RawId) {
-        close_job_object(id);
+        close_job_object(id.job);
     }
 }
 
@@ -1531,6 +1548,60 @@ static LIVE: Mutex<Vec<imp::RawId>> = Mutex::new(Vec::new());
 
 fn live() -> MutexGuard<'static, Vec<imp::RawId>> {
     LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Attribution metadata for a live task process tree (`RUSTY_GRID_RUN_TOKEN` and OS group/root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveTaskTreeMeta {
+    pub(crate) pgid: Option<u32>,
+    pub(crate) root_pid: Option<u32>,
+    pub(crate) run_token_env: Option<String>,
+}
+
+/// Returns the Unix process-group id of `pid` if positive.
+#[cfg(unix)]
+pub(crate) fn pid_pgid(pid: u32) -> Option<u32> {
+    let raw = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getpgid` has no memory preconditions and only queries kernel process metadata.
+    let pgid = unsafe { libc::getpgid(raw) };
+    (pgid > 0).then_some(pgid as u32)
+}
+
+/// Snapshots active task trees so host CPU sampling can attribute worker tasks accurately.
+pub(crate) fn live_task_tree_metas() -> Vec<LiveTaskTreeMeta> {
+    let live = live();
+    live.iter()
+        .map(|id| {
+            #[cfg(unix)]
+            {
+                let run_token_env = (id.needle[0] != 0).then(|| {
+                    String::from_utf8_lossy(&id.needle[..TASK_ENV_NEEDLE_LEN - 1]).into_owned()
+                });
+                LiveTaskTreeMeta {
+                    pgid: (id.pgid > 1).then_some(id.pgid as u32),
+                    root_pid: (id.pgid > 1).then_some(id.pgid as u32),
+                    run_token_env,
+                }
+            }
+            #[cfg(windows)]
+            {
+                LiveTaskTreeMeta {
+                    pgid: None,
+                    root_pid: (id.root_pid > 0).then_some(id.root_pid),
+                    run_token_env: Some(format!("RUSTY_GRID_RUN_TOKEN={}", id.run_token)),
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = id;
+                LiveTaskTreeMeta {
+                    pgid: None,
+                    root_pid: None,
+                    run_token_env: None,
+                }
+            }
+        })
+        .collect()
 }
 
 /// Kills every task process tree that is still alive and returns how many there were.
@@ -1644,7 +1715,9 @@ impl ProcessTree {
 
         #[cfg(unix)]
         let id = imp::attach(child, &unix);
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let id = imp::attach(child, configured.run_token);
+        #[cfg(not(any(unix, windows)))]
         let id = imp::attach(child);
 
         let inner = id.map(|id| {
