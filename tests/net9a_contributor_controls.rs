@@ -27,12 +27,9 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use rusty_grid_cli::doctor::{run_doctor, DoctorOptions, Outcome};
-#[cfg(unix)]
 use rusty_grid_core::capabilities::WorkerCapabilities;
-#[cfg(unix)]
 use rusty_grid_core::task::{Task, TaskRequirements, TaskSpec, TaskStatus};
 use rusty_grid_master::reaper::ReaperConfig;
-#[cfg(unix)]
 use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};

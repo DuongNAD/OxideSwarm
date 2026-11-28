@@ -1194,7 +1194,7 @@ mod windows_ipc {
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
-    const WIN_ERROR_PIPE_BUSY: i32 = 231;
+    pub(super) const WIN_ERROR_PIPE_BUSY: i32 = 231;
 
     struct LocalSdGuard(PSECURITY_DESCRIPTOR);
     impl Drop for LocalSdGuard {
