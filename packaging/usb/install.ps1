@@ -18,7 +18,7 @@
 # not join again, and only replaces the binaries and restarts the worker.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Name NAME] [-InstallRoot DIR] [-NoAutostart] [-Workspaces | -NoWorkspaces] [-Isolation off|fs]
-#                                                 [-Gpu | -NoGpu] [-Slots N] [-Update]
+#                                                 [-Gpu | -NoGpu] [-Tools | -NoTools] [-Slots N] [-Update]
 #
 # -Slots N sets how many tasks the worker runs at once. Without it the installer uses the logical
 # processors of the performance cores, at most half of all processors (USB-4).
@@ -31,6 +31,8 @@ param(
     [switch]$NoWorkspaces,
     [switch]$Gpu,
     [switch]$NoGpu,
+    [switch]$Tools,
+    [switch]$NoTools,
     [switch]$Update,
     [int]$Slots = 0,
     [ValidateSet('off', 'fs')]
@@ -120,7 +122,7 @@ function Rollback-FreshInstall {
                     $p = Join-Path $InstallRoot $f
                     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
                 }
-                foreach ($d in @('bin', 'home', 'run', 'logs', 'workspaces', 'work')) {
+                foreach ($d in @('bin', 'home', 'run', 'logs', 'workspaces', 'work', 'tools', 'cargo-home')) {
                     if ($d -eq 'logs' -and $keepLogs) { continue }
                     $dp = Join-Path $InstallRoot $d
                     if (Test-Path -LiteralPath $dp) { Remove-TreeNoFollow $dp }
@@ -137,6 +139,7 @@ function Fail($msg) {
     exit 1
 }
 if ($Workspaces -and $NoWorkspaces) { Fail "cannot specify both -Workspaces and -NoWorkspaces" }
+if ($Tools -and $NoTools) { Fail "cannot specify both -Tools and -NoTools" }
 if ($PSBoundParameters.ContainsKey('Slots') -and ($Slots -lt 1 -or $Slots -gt 256)) { Fail "-Slots needs a number from 1 to 256 (got: $Slots)" }
 $slotsSet = if ($PSBoundParameters.ContainsKey('Slots')) { $Slots } else { 0 }
 # Full form of %LOCALAPPDATA%: GetFullPath on Windows PowerShell 5.1 expands 8.3 short names (a CI
@@ -165,11 +168,16 @@ $kitVersion = $null
 $KitHasWorker = $true
 $KitHasClient = $true
 $useWorkspaces = $true
+$kitToolset = @()
 if ($IsV1Kit -and -not (Test-Path -LiteralPath $KitJson)) { Fail "kit.json is missing from this v1 kit" }
 if (Test-Path -LiteralPath $KitJson) {
     try { $kitMeta = Get-Content -Raw -LiteralPath $KitJson | ConvertFrom-Json }
     catch { Fail "invalid kit.json: $_" }
-    if ($kitMeta.kit_format -ne 1) { Fail "unsupported kit_format '$($kitMeta.kit_format)' in kit.json (expected 1)" }
+    if ($IsV1Kit) {
+        if ($kitMeta.kit_format -ne 1) { Fail "unsupported kit_format '$($kitMeta.kit_format)' in kit.json (expected 1)" }
+    } elseif ($kitMeta.kit_format -notin @(0, 1)) {
+        Fail "unsupported kit_format '$($kitMeta.kit_format)' in kit.json (expected 0 or 1)"
+    }
     $kitVersion = "$($kitMeta.version)"
     if (-not $kitVersion -or $kitVersion.Contains('..') -or $kitVersion -notmatch '^[A-Za-z0-9.+_-]+$') {
         Fail "invalid version '$kitVersion' in kit.json"
@@ -178,9 +186,59 @@ if (Test-Path -LiteralPath $KitJson) {
     $KitHasWorker = $kitRoles -contains 'worker'
     $KitHasClient = $kitRoles -contains 'client'
     if (-not $KitHasWorker -and -not $KitHasClient) { Fail "kit.json roles lists neither 'worker' nor 'client'" }
-    if (-not $Update) { $useWorkspaces = [bool]$kitMeta.workspaces }
+    if (-not $Update -and $kitMeta.PSObject.Properties.Name -contains 'workspaces') { $useWorkspaces = [bool]$kitMeta.workspaces }
+    if ($kitMeta.PSObject.Properties.Name -contains 'toolset' -and $kitMeta.toolset) {
+        $seenTools = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($rt in @($kitMeta.toolset)) {
+            $tn = "$rt".Trim().ToLowerInvariant()
+            if ($tn -notin @('python', 'rust', 'mingw', 'git')) { Fail "unsupported tool '$rt' in kit.json toolset" }
+            if (-not $seenTools.Contains($tn)) { $seenTools.Add($tn) }
+        }
+        $kitToolset = @($seenTools)
+    }
 }
-if (-not $KitHasWorker) { $NoGpu = $true }
+$KitToolsLock = Join-Path $Kit 'tools\tools.lock'
+$KitNoticeFile = Join-Path $Kit 'tools\NOTICE.txt'
+$kitToolEntries = @()
+if ($kitToolset.Count -gt 0) {
+    if (-not (Test-Path -LiteralPath $KitToolsLock)) { Fail "tools\tools.lock is missing from this toolset kit" }
+    if (-not (Test-Path -LiteralPath $KitNoticeFile)) { Fail "tools\NOTICE.txt is missing from this toolset kit" }
+    foreach ($lockLine in (Get-Content -LiteralPath $KitToolsLock)) {
+        $trimmedLine = $lockLine.Trim()
+        if (-not $trimmedLine -or $trimmedLine.StartsWith('#')) { continue }
+        $cols = $trimmedLine -split "`t"
+        if ($cols.Count -ne 6) { Fail "malformed line in tools\tools.lock: $trimmedLine" }
+        $tName = $cols[0].Trim().ToLowerInvariant()
+        if ($tName -notin $kitToolset) { continue }
+        $tFile = $cols[3].Trim()
+        $tSha = $cols[4].Trim().ToLowerInvariant()
+        if (-not $tFile -or $tFile.Contains('/') -or $tFile.Contains('\') -or $tFile.Contains('..')) {
+            Fail "unsafe file name '$tFile' in tools\tools.lock"
+        }
+        if ($tSha -notmatch '^[0-9a-f]{64}$') { Fail "invalid sha256 '$tSha' in tools\tools.lock for $tFile" }
+        $kitToolEntries += [pscustomobject]@{
+            Tool      = $tName
+            Component = $cols[1].Trim().ToLowerInvariant()
+            Version   = $cols[2].Trim()
+            FileName  = $tFile
+            Sha256    = $tSha
+            Url       = $cols[5].Trim()
+        }
+    }
+    foreach ($reqTool in $kitToolset) {
+        if (@($kitToolEntries | Where-Object { $_.Tool -eq $reqTool }).Count -eq 0) {
+            Fail "tools\tools.lock has no entries for '$reqTool'"
+        }
+    }
+}
+if (-not $KitHasWorker) {
+    $NoGpu = $true
+    if ($Tools) { Fail "-Tools requires a kit with the worker role" }
+    $NoTools = $true
+}
+if (-not $Update -and $Tools -and $kitToolset.Count -eq 0) {
+    Fail "this kit has no developer toolset (make it with make_kit.sh --toolset full)"
+}
 # A kit made with make_kit.sh --no-autostart is meant for a trial on someone else's machine.
 if (Test-Path (Join-Path $Kit 'no-autostart')) { $NoAutostart = $true }
 $IsolationFile = Join-Path $Kit 'isolation'
@@ -246,10 +304,12 @@ if ($Update) {
         if ($Name -notmatch '^[A-Za-z0-9_.-]+$') { $Name = "" }
     }
     if (-not $Gpu -and -not $NoGpu -and $settings.ContainsKey('gpu')) { if ($settings['gpu'] -eq '1') { $Gpu = $true } else { $NoGpu = $true } }
+    if (-not $Tools -and -not $NoTools -and $settings.ContainsKey('tools')) { if ($settings['tools'] -eq '1') { $Tools = $true } else { $NoTools = $true } }
     if ($settings['workspaces'] -eq '0') { $useWorkspaces = $false }
     elseif ($settings['workspaces'] -eq '1') { $useWorkspaces = $true }
     if (-not $IsV1Kit -and $settings.ContainsKey('worker')) { $KitHasWorker = ($settings['worker'] -eq '1') }
     if (-not $IsV1Kit -and $settings.ContainsKey('client')) { $KitHasClient = ($settings['client'] -eq '1') }
+    if (-not $KitHasWorker) { $NoTools = $true }
     # Slots chosen with -Slots at install time are kept; an automatic choice is made again.
     if ($slotsSet -eq 0 -and $settings['slots'] -match '^\d+$' -and [int]$settings['slots'] -ge 1 -and [int]$settings['slots'] -le 256) { $slotsSet = [int]$settings['slots'] }
     # The isolation it runs with is kept: kit-install.txt, else the --isolation in its launcher (an
@@ -686,7 +746,7 @@ if ($NoWorkspaces) { $useWorkspaces = $false }
 elseif ($Workspaces) { $useWorkspaces = $true }
 $UserProfileFull = if ($env:USERPROFILE) { [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\') } else { '' }
 $archivePredatesIsolatedWs = ($kitVersion -and $kitVersion -match '\b0\.1\.[01](\b|-)') -or ($Archive.Name -match '^oxideswarm-0\.1\.[01](-|\.)')
-if ($KitHasWorker -and $Isolation -eq 'fs' -and $useWorkspaces -and (-not $archivePredatesIsolatedWs) -and ($Workspaces -or [bool](Get-Command cargo -ErrorAction SilentlyContinue)) -and $UserProfileFull) {
+if ($KitHasWorker -and $Isolation -eq 'fs' -and $useWorkspaces -and (-not $archivePredatesIsolatedWs) -and ($Workspaces -or ($Tools -and ($kitToolset -contains 'rust')) -or [bool](Get-Command cargo -ErrorAction SilentlyContinue)) -and $UserProfileFull) {
     $plannedWsRoot = if ([string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)) { Join-Path $InstallRoot 'usb-kit\workspaces' } else { Join-Path $InstallRoot 'workspaces' }
     $inUserProfile = [string]::Equals($plannedWsRoot, $UserProfileFull, [StringComparison]::OrdinalIgnoreCase) -or $plannedWsRoot.StartsWith($UserProfileFull + '\', [StringComparison]::OrdinalIgnoreCase)
     $allowedProfileWs1 = Join-Path $UserProfileFull 'AppData\Local\OxideSwarm-USB\workspaces'
@@ -732,6 +792,55 @@ if ($GpuArchive) {
         Write-Host "  gpu:     yes (GPU build; the worker offers the GPU it finds)"
     } else {
         Write-Host "  gpu:     no (CPU build; run install.ps1 -Gpu to change that)"
+    }
+}
+
+# One question for the pinned private developer toolset (design 0110 D3): default Yes on a
+# toolset kit; -Tools / -NoTools answer it without prompting; -Update keeps the earlier answer.
+$useTools = $false
+$selectedToolEntries = @()
+if ($KitHasWorker -and $kitToolset.Count -gt 0) {
+    $toolLabelParts = @()
+    $displayNames = @{ python = 'Python'; rust = 'Rust'; mingw = 'MinGW'; git = 'Git' }
+    foreach ($tn in $kitToolset) {
+        $firstEntry = $kitToolEntries | Where-Object { $_.Tool -eq $tn } | Select-Object -First 1
+        $shortVer = if ($firstEntry.Version -match '^(\d+\.\d+)') { $Matches[1] } else { $firstEntry.Version }
+        $toolLabelParts += "$($displayNames[$tn]) $shortVer"
+    }
+    [int64]$totalToolBytes = 0
+    foreach ($te in $kitToolEntries) {
+        $tf = Join-Path $Kit ("tools\" + $te.FileName)
+        if (-not (Test-Path -LiteralPath $tf)) { Fail "tool archive missing on stick: tools\$($te.FileName)" }
+        $totalToolBytes += (Get-Item -LiteralPath $tf).Length
+    }
+    $toolSizeMb = [Math]::Max(1, [int][Math]::Ceiling($totalToolBytes / 1MB))
+    $toolSummary = $toolLabelParts -join ', '
+    if ($NoTools) {
+        $useTools = $false
+    } elseif ($Tools) {
+        $useTools = $true
+    } elseif (-not $Update -and -not [Console]::IsInputRedirected) {
+        $toolAnswer = Read-Host "Install the developer tools for tasks ($toolSummary, $toolSizeMb MB on stick, only inside $InstallRoot)? [Y/n]"
+        $useTools = -not ($toolAnswer -match '^\s*[Nn]')
+    } else {
+        $useTools = $true
+    }
+    if ($useTools) {
+        $selectedToolEntries = @($kitToolEntries)
+        Write-Host "  tools:   yes ($toolSummary, inside $InstallRoot\tools)"
+    } else {
+        Write-Host "  tools:   no (run install.ps1 -Tools to add them later)"
+    }
+}
+
+if ($KitHasWorker -and $Isolation -eq 'fs' -and $useWorkspaces -and (-not $archivePredatesIsolatedWs) -and ($Workspaces -or ($useTools -and ($kitToolset -contains 'rust')) -or [bool](Get-Command cargo -ErrorAction SilentlyContinue)) -and $UserProfileFull) {
+    $plannedWsRoot = if ([string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)) { Join-Path $InstallRoot 'usb-kit\workspaces' } else { Join-Path $InstallRoot 'workspaces' }
+    $inUserProfile = [string]::Equals($plannedWsRoot, $UserProfileFull, [StringComparison]::OrdinalIgnoreCase) -or $plannedWsRoot.StartsWith($UserProfileFull + '\', [StringComparison]::OrdinalIgnoreCase)
+    $allowedProfileWs1 = Join-Path $UserProfileFull 'AppData\Local\OxideSwarm-USB\workspaces'
+    $allowedProfileWs2 = Join-Path $UserProfileFull 'AppData\Local\OxideSwarm\usb-kit\workspaces'
+    $allowedInProfile = [string]::Equals($plannedWsRoot, $allowedProfileWs1, [StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($plannedWsRoot, $allowedProfileWs2, [StringComparison]::OrdinalIgnoreCase)
+    if ($inUserProfile -and -not $allowedInProfile) {
+        Fail "cannot use ${InstallRoot} with -Isolation fs and workspaces: under -Isolation fs the worker accepts a workspace folder inside the user profile only in $DefaultRoot (or an updated legacy install in $LegacyDefaultRoot); omit -InstallRoot to use $DefaultRoot, or choose a folder outside $UserProfileFull"
     }
 }
 
@@ -825,12 +934,34 @@ function Verify-OnlineSums([string]$fileName, [string]$localExpected) {
     Say "  online:  $fileName matches online SHA256SUMS"
 }
 
-$expected = Lookup-SumEntry (Get-Content $Sums) $Archive.Name
+$sumLines = Get-Content $Sums
+$expected = Lookup-SumEntry $sumLines $Archive.Name
 if (-not $expected) { Fail "$($Archive.Name) is not listed in SHA256SUMS" }
 $actual = (Get-FileHash $Archive.FullName -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { Fail "checksum mismatch for $($Archive.Name): the copy on the stick is damaged" }
 Say "  archive: $($Archive.Name) (checksum OK)"
 Verify-OnlineSums $Archive.Name $expected
+
+if ($selectedToolEntries.Count -gt 0) {
+    foreach ($te in $selectedToolEntries) {
+        $toolPath = Join-Path $Kit ("tools\" + $te.FileName)
+        if (-not (Test-Path -LiteralPath $toolPath)) { Fail "tool archive missing on stick: tools\$($te.FileName)" }
+        if ((Get-Item -LiteralPath $toolPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Fail "refusing link at tools\$($te.FileName)"
+        }
+        $sumExp = Lookup-SumEntry $sumLines ("tools/" + $te.FileName)
+        if (-not $sumExp) { $sumExp = Lookup-SumEntry $sumLines $te.FileName }
+        if (-not $sumExp) { Fail "tools/$($te.FileName) is not listed in SHA256SUMS" }
+        if ($sumExp -ne $te.Sha256) {
+            Fail "SHA256SUMS disagrees with tools.lock for $($te.FileName) ($sumExp vs $($te.Sha256))"
+        }
+        $toolAct = (Get-FileHash -LiteralPath $toolPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($toolAct -ne $te.Sha256) {
+            Fail "checksum mismatch for tools\$($te.FileName): the copy on the stick is damaged"
+        }
+    }
+    Say "  tools:   all $($selectedToolEntries.Count) tool archive checksums OK"
+}
 
 # Task folders and the file cache (the worker's sandbox base): <install folder>\work, in %LOCALAPPDATA%
 # too since 2026-11-18 (design 0053 status log). Only an install in %LOCALAPPDATA% with -Isolation fs
@@ -1051,10 +1182,358 @@ $version = & $Exe --version
 if ($LASTEXITCODE -ne 0) { Fail "the unpacked binary does not run on this machine" }
 Write-Host "  binary:  $version"
 
-# Every command below keeps its state in $State and runs from $InstallRoot.
+$EnvCargoHome = $null
+$ToolsDir = Join-Path $InstallRoot 'tools'
+$PrivateCargoHome = Join-Path $InstallRoot 'cargo-home'
+$installedToolDirs = @{}
+$installedToolNames = @()
+$oldToolDirsToClean = @()
+
+function Expand-ToolArchive([string]$archivePath, [string]$destDir) {
+    if (-not (Test-Path -LiteralPath $destDir)) {
+        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    }
+    if ($archivePath -match '\.zip$') {
+        Expand-Archive -LiteralPath $archivePath -DestinationPath $destDir -Force
+    } elseif ($archivePath -match '\.(tar\.xz|tar\.gz|tgz|txz|tar)$') {
+        $global:LASTEXITCODE = 0
+        & tar.exe -xf $archivePath -C $destDir
+        if ($LASTEXITCODE -ne 0) { Fail "tar.exe failed to extract $archivePath (exit $LASTEXITCODE)" }
+    } elseif ($archivePath -match '\.7z(\.exe)?$') {
+        $global:LASTEXITCODE = 0
+        & tar.exe -xf $archivePath -C $destDir 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            if ($archivePath -match '\.7z\.exe$') {
+                $p7 = Start-Process -FilePath $archivePath -ArgumentList @('-y', "-o$destDir") -Wait -WindowStyle Hidden -PassThru
+                if ($p7.ExitCode -ne 0) { Fail "self-extracting archive $archivePath failed (exit $($p7.ExitCode))" }
+            } else {
+                Fail "tar.exe could not extract $archivePath (exit $LASTEXITCODE)"
+            }
+        }
+    } else {
+        Fail "unsupported tool archive format: $archivePath"
+    }
+}
+
+function Copy-RelPathChecked([string]$srcBase, [string]$dstBase, [string]$relPath, [bool]$isDir) {
+    $norm = $relPath.Trim().TrimStart('.', '/', '\').Replace('/', '\')
+    if (-not $norm -or $norm.Contains('..') -or [IO.Path]::IsPathRooted($norm)) {
+        Fail "unsafe relative path '$relPath' inside Rust component manifest"
+    }
+    $s = Join-Path $srcBase $norm
+    $d = Join-Path $dstBase $norm
+    if (-not (Test-Path -LiteralPath $s)) { Fail "manifest entry missing in extracted component: $norm" }
+    if ($isDir) {
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        foreach ($item in @(Get-ChildItem -LiteralPath $s -Recurse -Force)) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $subRel = $item.FullName.Substring($s.Length).TrimStart('\')
+            $target = Join-Path $d $subRel
+            if ($item.PSIsContainer) {
+                if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Force -Path $target | Out-Null }
+            } else {
+                $tp = Split-Path -Parent $target
+                if (-not (Test-Path -LiteralPath $tp)) { New-Item -ItemType Directory -Force -Path $tp | Out-Null }
+                [IO.File]::Copy($item.FullName, $target, $true)
+            }
+        }
+    } else {
+        $dp = Split-Path -Parent $d
+        if (-not (Test-Path -LiteralPath $dp)) { New-Item -ItemType Directory -Force -Path $dp | Out-Null }
+        [IO.File]::Copy($s, $d, $true)
+    }
+}
+
+function Merge-RustComponentPackage([string]$pkgRoot, [string]$rustDest) {
+    $compFile = Join-Path $pkgRoot 'components'
+    if (Test-Path -LiteralPath $compFile) {
+        $components = @(Get-Content -LiteralPath $compFile | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        foreach ($comp in $components) {
+            $compDir = Join-Path $pkgRoot $comp
+            $manifestIn = Join-Path $compDir 'manifest.in'
+            if (Test-Path -LiteralPath $manifestIn) {
+                foreach ($line in (Get-Content -LiteralPath $manifestIn)) {
+                    $m = $line.Trim()
+                    if (-not $m) { continue }
+                    if ($m.StartsWith('file:')) {
+                        Copy-RelPathChecked $compDir $rustDest $m.Substring(5) $false
+                    } elseif ($m.StartsWith('dir:')) {
+                        Copy-RelPathChecked $compDir $rustDest $m.Substring(4) $true
+                    }
+                }
+            } elseif (Test-Path -LiteralPath $compDir) {
+                foreach ($item in @(Get-ChildItem -LiteralPath $compDir -Force)) {
+                    if ($item.Name -eq 'manifest.in') { continue }
+                    Copy-RelPathChecked $compDir $rustDest $item.Name $item.PSIsContainer
+                }
+            }
+        }
+    } else {
+        foreach ($item in @(Get-ChildItem -LiteralPath $pkgRoot -Force)) {
+            if ($item.Name -in @('install.sh', 'components', 'rust-installer-version', 'version')) { continue }
+            Copy-RelPathChecked $pkgRoot $rustDest $item.Name $item.PSIsContainer
+        }
+    }
+}
+
 $GrantLog = Join-Path $State 'windows_acl_grants.txt'
 $RustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $env:USERPROFILE '.rustup' }
 $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$toolchainCapSid = $null
+if ($Isolation -eq 'fs') {
+    if (-not ('OxideSwarmToolchainAcl' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+
+public static class OxideSwarmToolchainAcl {
+    const uint READ_CONTROL = 0x00020000;
+    const uint WRITE_DAC = 0x00040000;
+    const uint FILE_SHARE_ALL = 0x00000007;
+    const uint OPEN_EXISTING = 3;
+    const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    const uint DACL_SECURITY_INFORMATION = 0x00000004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct FILETIME { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        public uint dwFileAttributes;
+        public FILETIME ftCreationTime;
+        public FILETIME ftLastAccessTime;
+        public FILETIME ftLastWriteTime;
+        public uint dwVolumeSerialNumber;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint nNumberOfLinks;
+        public uint nFileIndexHigh;
+        public uint nFileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(IntPtr hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool GetKernelObjectSecurity(IntPtr Handle, uint RequestedInformation, byte[] pSecurityDescriptor, uint nLength, out uint lpnLengthNeeded);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool SetKernelObjectSecurity(IntPtr Handle, uint SecurityInformation, byte[] SecurityDescriptor);
+
+    [DllImport("kernelbase.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool DeriveCapabilitySidsFromName(string CapName, out IntPtr CapabilityGroupSids, out uint CapabilityGroupSidCount, out IntPtr CapabilitySids, out uint CapabilitySidCount);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool ConvertSidToStringSidW(IntPtr Sid, out IntPtr StringSid);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LocalFree(IntPtr hMem);
+
+    public static string GetToolchainCapabilitySid() {
+        IntPtr groupSids = IntPtr.Zero, capSids = IntPtr.Zero;
+        uint groupCount = 0, capCount = 0;
+        if (!DeriveCapabilitySidsFromName("oxideswarm.toolchain", out groupSids, out groupCount, out capSids, out capCount)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        try {
+            if (capCount == 0 || capSids == IntPtr.Zero) throw new InvalidOperationException("DeriveCapabilitySidsFromName returned 0 SIDs");
+            IntPtr firstSid = Marshal.ReadIntPtr(capSids);
+            IntPtr strPtr = IntPtr.Zero;
+            if (!ConvertSidToStringSidW(firstSid, out strPtr) || strPtr == IntPtr.Zero) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            try { return Marshal.PtrToStringUni(strPtr); } finally { LocalFree(strPtr); }
+        } finally {
+            if (groupSids != IntPtr.Zero) {
+                for (int i = 0; i < (int)groupCount; i++) { IntPtr s = Marshal.ReadIntPtr(groupSids, i * IntPtr.Size); if (s != IntPtr.Zero) LocalFree(s); }
+                LocalFree(groupSids);
+            }
+            if (capSids != IntPtr.Zero) {
+                for (int i = 0; i < (int)capCount; i++) { IntPtr s = Marshal.ReadIntPtr(capSids, i * IntPtr.Size); if (s != IntPtr.Zero) LocalFree(s); }
+                LocalFree(capSids);
+            }
+        }
+    }
+
+    static bool DaclAlreadyHasCapabilityRx(DiscretionaryAcl dacl, SecurityIdentifier capSid, int rxMask, bool requireInherit) {
+        if (dacl == null) return false;
+        foreach (GenericAce ace in dacl) {
+            CommonAce cace = ace as CommonAce;
+            if (cace != null && cace.AceType == AceType.AccessAllowed && cace.SecurityIdentifier.Equals(capSid)) {
+                if ((cace.AccessMask & rxMask) == rxMask) {
+                    if (!requireInherit) return true;
+                    AceFlags need = AceFlags.ContainerInherit | AceFlags.ObjectInherit;
+                    if ((cace.AceFlags & need) == need) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public static string GrantToolchainRx(string path, string capSidStr, bool isDir) {
+        const int RX_MASK = 0x001200A9; // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | SYNCHRONIZE
+        IntPtr h = CreateFileW(path, READ_CONTROL | WRITE_DAC, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (h == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            BY_HANDLE_FILE_INFORMATION info;
+            if (!GetFileInformationByHandle(h, out info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return "link";
+            uint needed = 0;
+            GetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, null, 0, out needed);
+            if (needed == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            byte[] sdBuf = new byte[needed];
+            if (!GetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, sdBuf, needed, out needed)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            RawSecurityDescriptor raw = new RawSecurityDescriptor(sdBuf, 0);
+            CommonSecurityDescriptor csd = new CommonSecurityDescriptor(isDir, false, raw);
+            SecurityIdentifier capSid = new SecurityIdentifier(capSidStr);
+            if (DaclAlreadyHasCapabilityRx(csd.DiscretionaryAcl, capSid, RX_MASK, isDir)) {
+                return null;
+            }
+            InheritanceFlags inh = isDir ? (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) : InheritanceFlags.None;
+            csd.DiscretionaryAcl.AddAccess(AccessControlType.Allow, capSid, RX_MASK, inh, PropagationFlags.None);
+            byte[] outBuf = new byte[csd.BinaryLength];
+            csd.GetBinaryForm(outBuf, 0);
+            if (!SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, outBuf)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return null;
+        } finally {
+            CloseHandle(h);
+        }
+    }
+
+    public static void GrantToolchainRxRecursive(string rootDir, string capSidStr) {
+        string rErr = GrantToolchainRx(rootDir, capSidStr, true);
+        if (rErr == "link") throw new InvalidOperationException(rootDir + " is a link");
+        var stack = new System.Collections.Generic.Stack<string>();
+        stack.Push(rootDir);
+        while (stack.Count > 0) {
+            string cur = stack.Pop();
+            foreach (string subDir in System.IO.Directory.GetDirectories(cur)) {
+                var di = new System.IO.DirectoryInfo(subDir);
+                if ((di.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) continue;
+                GrantToolchainRx(subDir, capSidStr, true);
+                stack.Push(subDir);
+            }
+            foreach (string file in System.IO.Directory.GetFiles(cur)) {
+                var fi = new System.IO.FileInfo(file);
+                if ((fi.Attributes & System.IO.FileAttributes.ReparsePoint) != 0) continue;
+                GrantToolchainRx(file, capSidStr, false);
+            }
+        }
+    }
+}
+'@
+    }
+    $toolchainCapSid = [OxideSwarmToolchainAcl]::GetToolchainCapabilitySid()
+}
+
+if ($selectedToolEntries.Count -gt 0) {
+    New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
+    # Grant (OI)(CI)(RX) on tools\ before creating tool trees so newly extracted files inherit it.
+    if ($Isolation -eq 'fs') {
+        $existingGrants = if (Test-Path -LiteralPath $GrantLog) { @(Get-Content -LiteralPath $GrantLog) } else { @() }
+        if ($existingGrants -notcontains $ToolsDir) {
+            Add-Content -LiteralPath $GrantLog -Value $ToolsDir -Encoding ASCII
+        }
+        $gErr = [OxideSwarmToolchainAcl]::GrantToolchainRx($ToolsDir, $toolchainCapSid, $true)
+        if ($gErr) { Fail "could not grant isolation ACL on ${ToolsDir}: $gErr" }
+    }
+    $existingToolSubdirs = @(Get-ChildItem -LiteralPath $ToolsDir -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(python|rust|mingw|git)-' })
+
+    foreach ($tn in $kitToolset) {
+        $entries = @($selectedToolEntries | Where-Object { $_.Tool -eq $tn })
+        $ver = $entries[0].Version
+        if (-not $ver -or $ver.Contains('..') -or $ver -notmatch '^[A-Za-z0-9.+_-]+$') {
+            Fail "invalid tool version '$ver' for $tn"
+        }
+        $targetDir = Join-Path $ToolsDir ("$tn-$ver")
+        $stamp = (@($entries | ForEach-Object { $_.Sha256 }) -join '+')
+        $stampFile = Join-Path $targetDir '.tool-sha256'
+        $alreadyCurrent = (Test-Path -LiteralPath $stampFile) -and ((Get-Content -Raw -LiteralPath $stampFile).Trim() -eq $stamp)
+        if (-not $alreadyCurrent) {
+            if (Test-Path -LiteralPath $targetDir) { Remove-TreeNoFollow $targetDir }
+            $stageDir = Join-Path $ToolsDir (".stage-$tn-" + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+            try {
+                if ($tn -eq 'rust') {
+                    $rustOut = Join-Path $ToolsDir ("rust-$ver")
+                    New-Item -ItemType Directory -Force -Path $rustOut | Out-Null
+                    foreach ($re in $entries) {
+                        $compStage = Join-Path $stageDir $re.Component
+                        New-Item -ItemType Directory -Force -Path $compStage | Out-Null
+                        Expand-ToolArchive (Join-Path $Kit ("tools\" + $re.FileName)) $compStage
+                        $pkgDirs = @(Get-ChildItem -LiteralPath $compStage -Directory -Force)
+                        $pkgRoot = if ($pkgDirs.Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $compStage 'bin'))) { $pkgDirs[0].FullName } else { $compStage }
+                        Merge-RustComponentPackage $pkgRoot $rustOut
+                    }
+                    New-Item -ItemType Directory -Force -Path $PrivateCargoHome | Out-Null
+                } else {
+                    $arcPath = Join-Path $Kit ("tools\" + $entries[0].FileName)
+                    Expand-ToolArchive $arcPath $stageDir
+                    if ($tn -eq 'mingw') {
+                        $subs = @(Get-ChildItem -LiteralPath $stageDir -Directory -Force)
+                        $unwrapped = if ($subs.Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $stageDir 'bin')) -and (Test-Path -LiteralPath (Join-Path $subs[0].FullName 'bin'))) { $subs[0].FullName } else { $stageDir }
+                        if ($unwrapped -eq $stageDir) {
+                            Move-Item -LiteralPath $stageDir -Destination $targetDir -Force
+                        } else {
+                            Move-Item -LiteralPath $unwrapped -Destination $targetDir -Force
+                            Remove-TreeNoFollow $stageDir
+                        }
+                    } else {
+                        Move-Item -LiteralPath $stageDir -Destination $targetDir -Force
+                    }
+                }
+            } catch {
+                Remove-TreeNoFollow $stageDir
+                Fail "failed to extract $tn tool archive: $_"
+            } finally {
+                if (Test-Path -LiteralPath $stageDir) { Remove-TreeNoFollow $stageDir }
+            }
+            Set-Content -LiteralPath $stampFile -Value $stamp -Encoding ASCII
+        }
+        $installedToolDirs[$tn] = $targetDir
+        $installedToolNames += $tn
+        Say "  tool:    $tn $ver -> $targetDir"
+    }
+    Copy-Item -LiteralPath $KitNoticeFile -Destination (Join-Path $ToolsDir 'NOTICE.txt') -Force
+    if ($Isolation -eq 'fs') {
+        [OxideSwarmToolchainAcl]::GrantToolchainRxRecursive($ToolsDir, $toolchainCapSid)
+    }
+    foreach ($ed in $existingToolSubdirs) {
+        $keepDir = $false
+        foreach ($kv in $installedToolDirs.GetEnumerator()) {
+            if ([string]::Equals($ed.FullName.TrimEnd('\'), $kv.Value.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+                $keepDir = $true
+                break
+            }
+        }
+        if (-not $keepDir) { $oldToolDirsToClean += $ed.FullName }
+    }
+} elseif ($Update -and (Test-Path -LiteralPath $ToolsDir)) {
+    foreach ($tn in @('python', 'rust', 'mingw', 'git')) {
+        $existingMatch = Get-ChildItem -LiteralPath $ToolsDir -Directory -Force -Filter "$tn-*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($existingMatch) {
+            $installedToolDirs[$tn] = $existingMatch.FullName
+            $installedToolNames += $tn
+        }
+    }
+}
+
+# Every command below keeps its state in $State and runs from $InstallRoot.
 $env:OXIDESWARM_HOME = $State
 $env:RUSTY_GRID_ACL_GRANT_LOG = $GrantLog
 $env:RUSTY_GRID_SANDBOX_BASE_DIR = $SandboxBase
@@ -1222,10 +1701,11 @@ if ($slotsSet -ge 1) {
     $slots = $half; $slotsWhy = "half of $cpuTotal processors"
 }
 Write-Host "  slots:   $slots ($slotsWhy; change it with -Slots N)"
+$hasPrivateCargo = ($installedToolDirs.ContainsKey('rust') -and (Test-Path -LiteralPath (Join-Path $installedToolDirs['rust'] 'bin\cargo.exe')))
 $workerArgs = "worker --name $Name --no-portal --max-concurrency $slots --isolation $Isolation"
 # Release 0.1.1 predates FEAT-3d (--workspaces under Windows --isolation fs), so omit --workspaces on 0.1.0/0.1.1 when -Isolation fs is used.
 $supportsIsolatedWorkspaces = ($Isolation -eq 'off') -or ($version -notmatch '\b0\.1\.[01](\b|-)')
-if ($useWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+if ($useWorkspaces -and $supportsIsolatedWorkspaces -and ($hasPrivateCargo -or (Get-Command cargo -ErrorAction SilentlyContinue))) {
     # Always pass an explicit workspace root inside the install folder so the USB worker never shares
     # %LOCALAPPDATA%\oxideswarm\workspaces (the default workspace root used by non-USB workers).
     $WorkspaceRoot = if ([string]::Equals($InstallRoot, $LegacyDefaultRoot, [StringComparison]::OrdinalIgnoreCase)) { Join-Path $InstallRoot 'usb-kit\workspaces' } else { Join-Path $InstallRoot 'workspaces' }
@@ -1248,23 +1728,60 @@ if ($useWorkspaces -and $supportsIsolatedWorkspaces -and (Get-Command cargo -Err
     }
     $workerArgs += ' --workspaces --workspace-root "' + $WorkspaceRoot + '"'
 }
+if ($Isolation -eq 'fs' -and $installedToolNames.Count -gt 0 -and (Test-Path -LiteralPath $ToolsDir) -and ($version -notmatch '\b0\.1\.[01](\b|-)')) {
+    $workerArgs += ' --isolation-read-dir "' + $ToolsDir + '"'
+}
 $log = Join-Path $LogDir 'worker.log'
+
+$toolPathList = @()
+if ($installedToolDirs.ContainsKey('python')) { $toolPathList += $installedToolDirs['python'] }
+if ($installedToolDirs.ContainsKey('rust')) { $toolPathList += (Join-Path $installedToolDirs['rust'] 'bin') }
+if ($installedToolDirs.ContainsKey('mingw')) { $toolPathList += (Join-Path $installedToolDirs['mingw'] 'bin') }
+if ($installedToolDirs.ContainsKey('git')) { $toolPathList += (Join-Path $installedToolDirs['git'] 'cmd') }
+if ($hasPrivateCargo) {
+    $CargoHome = $PrivateCargoHome
+    $gnuLinker = Join-Path $installedToolDirs['rust'] 'lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained\x86_64-w64-mingw32-gcc.exe'
+    $gnuLinkerToml = $gnuLinker.Replace('\', '/')
+    if (-not (Test-Path -LiteralPath $PrivateCargoHome)) {
+        New-Item -ItemType Directory -Force -Path $PrivateCargoHome | Out-Null
+    }
+    # Write cargo-home\config.toml too so AppContainer tasks (--isolation fs, which filter unknown
+    # CARGO_* env vars) still bind Rust's self-contained GNU linker cleanly.
+    Set-Content -LiteralPath (Join-Path $PrivateCargoHome 'config.toml') -Encoding ASCII -Value @(
+        '# Generated by OxideSwarm USB installer (design 0110)',
+        '[target.x86_64-pc-windows-gnu]',
+        ('linker = "' + $gnuLinkerToml + '"')
+    )
+}
 
 # A small launcher that starts the worker hidden with this install's state folder. The HKCU Run
 # entry uses it at every logon.
 $vbs = Join-Path $InstallRoot 'start-worker.vbs'
 $cmdLine = 'cmd /c ""' + $Exe + '" ' + $workerArgs + ' >> "' + $log + '" 2>&1"'
-@(
-    'Set sh = CreateObject("WScript.Shell")',
-    ('sh.Environment("Process")("OXIDESWARM_HOME") = "' + $State + '"'),
-    ('sh.Environment("Process")("HOME") = "' + $State + '"'),
-    ('sh.Environment("Process")("RUSTUP_HOME") = "' + $RustupHome + '"'),
-    ('sh.Environment("Process")("CARGO_HOME") = "' + $CargoHome + '"'),
-    ('sh.Environment("Process")("RUSTY_GRID_ACL_GRANT_LOG") = "' + $GrantLog + '"'),
-    ('sh.Environment("Process")("RUSTY_GRID_SANDBOX_BASE_DIR") = "' + $SandboxBase + '"'),
-    ('sh.CurrentDirectory = "' + $InstallRoot + '"'),
-    ('sh.Run "' + $cmdLine.Replace('"', '""') + '", 0, False')
-) | Set-Content -Path $vbs -Encoding ASCII
+$vbsLines = New-Object 'System.Collections.Generic.List[string]'
+$vbsLines.Add('Set sh = CreateObject("WScript.Shell")')
+$vbsLines.Add('sh.Environment("Process")("OXIDESWARM_HOME") = "' + $State + '"')
+$vbsLines.Add('sh.Environment("Process")("HOME") = "' + $State + '"')
+if ($hasPrivateCargo) {
+    # No rustup in private kit mode: ensure RUSTUP_HOME stays unset and bind Rust's self-contained
+    # GNU linker so w64devkit ld is not selected (missing libgcc_eh).
+    $vbsLines.Add('On Error Resume Next')
+    $vbsLines.Add('sh.Environment("Process").Remove("RUSTUP_HOME")')
+    $vbsLines.Add('sh.Environment("Process").Remove("CARGO_TARGET_DIR")')
+    $vbsLines.Add('On Error GoTo 0')
+    $vbsLines.Add('sh.Environment("Process")("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER") = "' + $gnuLinker + '"')
+} else {
+    $vbsLines.Add('sh.Environment("Process")("RUSTUP_HOME") = "' + $RustupHome + '"')
+}
+$vbsLines.Add('sh.Environment("Process")("CARGO_HOME") = "' + $CargoHome + '"')
+$vbsLines.Add('sh.Environment("Process")("RUSTY_GRID_ACL_GRANT_LOG") = "' + $GrantLog + '"')
+$vbsLines.Add('sh.Environment("Process")("RUSTY_GRID_SANDBOX_BASE_DIR") = "' + $SandboxBase + '"')
+if ($toolPathList.Count -gt 0) {
+    $vbsLines.Add('sh.Environment("Process")("PATH") = "' + ($toolPathList -join ';') + ';" & sh.Environment("Process")("PATH")')
+}
+$vbsLines.Add('sh.CurrentDirectory = "' + $InstallRoot + '"')
+$vbsLines.Add('sh.Run "' + $cmdLine.Replace('"', '""') + '", 0, False')
+$vbsLines | Set-Content -Path $vbs -Encoding ASCII
 
 # A failed start (BUG-31): the end of the worker's log under a header, then the error. The rollback
 # keeps <install folder>\logs ($script:KeepLogs), so the file the error names still exists.
@@ -1322,6 +1839,7 @@ $listScript = {
 }
 $lister = [PowerShell]::Create()
 $connected = $false
+$connectedWorkerTags = @()
 $stoppedAfter = $null
 $waited = 0
 $pending = $null
@@ -1338,16 +1856,31 @@ while (-not $connected -and $null -eq $stoppedAfter -and $waited -lt 30) {
     if (-not $pending.IsCompleted) { try { $lister.Stop() } catch { }; break }
     $list = $null
     try { $list = (@($lister.EndInvoke($pending)) -join "`n") | ConvertFrom-Json } catch { $list = $null }
-    if ($null -eq $stoppedAfter -and @($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }).Count -gt 0) { $connected = $true }
+    if ($null -eq $stoppedAfter) {
+        $matchedWorker = @($list | Where-Object { $_.name -eq $Name -and $_.tags -contains 'state:connected' }) | Select-Object -First 1
+        if ($matchedWorker) {
+            $connected = $true
+            if ($matchedWorker.tags) { $connectedWorkerTags = @($matchedWorker.tags | ForEach-Object { "$_" }) }
+        }
+    }
 }
 if ($pending -and $pending.IsCompleted) { try { $lister.Dispose() } catch { } }
 if ($null -ne $stoppedAfter) { Fail-WorkerStart "the worker stopped $stoppedAfter s after it started (exit code $(Get-WorkerExitCode))" }
 if (-not $connected) { Fail-WorkerStart "the worker ran for 30 s, but the master did not list it" }
 Say "  connected (isolation: $Isolation)"
+if ($Update -and $oldToolDirsToClean.Count -gt 0) {
+    foreach ($oldTd in $oldToolDirsToClean) {
+        if (Test-Path -LiteralPath $oldTd) {
+            Remove-TreeNoFollow $oldTd
+            Say "  tools:   removed old folder $oldTd"
+        }
+    }
 }
-# What an update keeps: the name, the build, the workspace choice, roles and isolation.
+}
+# What an update keeps: the name, the build, the workspace choice, roles, tools and isolation.
 $builtWithGpu = if ($KitHasWorker -and $GpuArchive -and $Archive.FullName -eq $GpuArchive.FullName) { '1' } else { '0' }
 $withWorkspaces = if ($useWorkspaces) { '1' } else { '0' }
+$withTools = if ($useTools) { '1' } else { '0' }
 $withWorkerRole = if ($KitHasWorker) { '1' } else { '0' }
 $withClientRole = if ($KitHasClient) { '1' } else { '0' }
 $recordedSlots = if ($KitHasWorker -and $slotsSet -ge 1) { "$slotsSet" } else { '' }
@@ -1355,6 +1888,8 @@ Set-Content -Path (Join-Path $InstallRoot 'kit-install.txt') -Encoding ASCII -Va
     "name=$Name",
     "gpu=$builtWithGpu",
     "workspaces=$withWorkspaces",
+    "tools=$withTools",
+    "toolset=$($installedToolNames -join ',')",
     "isolation=$Isolation",
     "slots=$recordedSlots",
     "worker=$withWorkerRole",
@@ -1386,13 +1921,88 @@ if ($Update) {
     exit 0
 }
 
-# 9. Check the cluster.
+# 9. Check the cluster (and each installed developer tool per design 0110 D5).
 if ($KitHasClient) {
     $env:RUST_LOG = 'off'
     Write-Host ""
     Write-Host "Checking the cluster (oxideswarm doctor) ..."
     & $Exe doctor @checkArgs
     $doctor = if ($LASTEXITCODE -eq 0) { "passed" } else { "reported a problem (see above)" }
+    if ($KitHasWorker -and $installedToolNames.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Checking installed developer tools ..."
+        $checkTmp = Join-Path ([IO.Path]::GetTempPath()) ("oxideswarm-toolcheck-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $checkTmp | Out-Null
+        function Invoke-ToolCheckCmd([scriptblock]$action) {
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $global:LASTEXITCODE = 0
+                $txt = (& $action 2>&1 | Out-String).Trim()
+                return @{ code = $LASTEXITCODE; output = $txt }
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+        }
+        try {
+            if ($installedToolDirs.ContainsKey('python')) {
+                $pyReqTool = if ($connectedWorkerTags -contains 'tool:python') { @('--require-tool', 'python') } else { @() }
+                if ($pyReqTool.Count -eq 0) {
+                    Say "  note:          worker does not advertise tool:python yet; probing Python via --worker $Name"
+                }
+                $rPy = Invoke-ToolCheckCmd { & $Exe submit --worker $Name @pyReqTool --wait --timeout-secs 30 @checkArgs -- python -c "import sys; print(sys.version)" }
+                if ($rPy.code -eq 0) {
+                    Say "  check python:  OK ($((($rPy.output -split "`r?`n") | Select-Object -Last 1).Trim()))"
+                } else {
+                    Say "  check python:  FAILED ($($rPy.output))"
+                }
+            }
+            if ($installedToolDirs.ContainsKey('rust')) {
+                $rRc = Invoke-ToolCheckCmd { & $Exe submit --worker $Name --require-tool rustc --wait --timeout-secs 30 @checkArgs -- rustc --version }
+                if ($rRc.code -eq 0) {
+                    Say "  check rustc:   OK ($((($rRc.output -split "`r?`n") | Select-Object -Last 1).Trim()))"
+                } else {
+                    Say "  check rustc:   FAILED ($($rRc.output))"
+                }
+                $helloSrc = Join-Path $Kit 'tools\check\hello.rs'
+                $helloExe = Join-Path $checkTmp 'hello.exe'
+                if (Test-Path -LiteralPath $helloSrc) {
+                    $rComp = Invoke-ToolCheckCmd { & $Exe submit --worker $Name --require-tool rustc --type compile --source $helloSrc --output-dir $checkTmp --output-asset $helloExe --timeout-secs 60 @checkArgs -- --crate-type bin -C "linker=$gnuLinker" }
+                    if ($rComp.code -eq 0 -and (Test-Path -LiteralPath $helloExe)) {
+                        $rRunHello = Invoke-ToolCheckCmd { & $helloExe }
+                        if ($rRunHello.code -eq 0 -and $rRunHello.output -match 'oxideswarm-tool-check-ok') {
+                            Say "  check compile: OK ($($rRunHello.output))"
+                        } else {
+                            Say "  check compile: FAILED running compiled binary ($($rRunHello.output))"
+                        }
+                    } else {
+                        Say "  check compile: FAILED ($($rComp.output))"
+                    }
+                }
+            }
+            if ($installedToolDirs.ContainsKey('rust') -and $installedToolDirs.ContainsKey('mingw')) {
+                $ccCheckDir = Join-Path $Kit 'tools\check\cc-check'
+                if (Test-Path -LiteralPath $ccCheckDir) {
+                    $rCc = Invoke-ToolCheckCmd { & $Exe submit --worker $Name --require-tool cargo --input "${ccCheckDir}:cc-check" --wait --timeout-secs 120 @checkArgs -- cmd /c "cargo build --release --offline --manifest-path cc-check\Cargo.toml --target-dir cc-check\target && cc-check\target\release\cc-check.exe" }
+                    if ($rCc.code -eq 0 -and $rCc.output -match 'add_c\(40, 2\) = 42') {
+                        Say "  check mingw:   OK (cc-check --release: add_c(40, 2) = 42)"
+                    } else {
+                        Say "  check mingw:   FAILED ($($rCc.output))"
+                    }
+                }
+            }
+            if ($installedToolDirs.ContainsKey('git')) {
+                $rGit = Invoke-ToolCheckCmd { & $Exe submit --worker $Name --require-tool git --wait --timeout-secs 30 @checkArgs -- git --version }
+                if ($rGit.code -eq 0) {
+                    Say "  check git:     OK ($((($rGit.output -split "`r?`n") | Select-Object -Last 1).Trim()))"
+                } else {
+                    Say "  check git:     FAILED ($($rGit.output))"
+                }
+            }
+        } finally {
+            Remove-Item -LiteralPath $checkTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Write-Host ""
     if ($KitHasWorker) {
         Say "Done. Worker '$Name' is part of the cluster; the doctor check $doctor."

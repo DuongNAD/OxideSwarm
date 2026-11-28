@@ -13,12 +13,18 @@ use std::time::Duration;
 use chrono::{DateTime, Local, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, Semaphore};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Hard cap on a single JSON-line control request or response (8 KiB).
 pub const MAX_CONTROL_LINE_BYTES: usize = 8 * 1024;
+
+/// Maximum concurrent local control IPC connections handled simultaneously.
+const MAX_CONCURRENT_CONTROL_CONNS: usize = 16;
+
+/// Timeout for reading one JSON-line request on an accepted control connection.
+const CONTROL_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default pause rejection prefix understood by D3 masters (as well as 0.4.x masters via
 /// `"rejected by worker"`).
@@ -181,6 +187,8 @@ pub struct ControlStatusSnapshot {
     pub active_tasks: usize,
     pub limits: WorkerLimitsConfig,
     pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_server_error: Option<String>,
 }
 
 /// Control request sent over the worker's local socket or named pipe.
@@ -283,14 +291,14 @@ pub fn sanitize_endpoint_segment(raw: &str) -> String {
     }
 }
 
-/// Default Unix control socket path (`$OXIDESWARM_HOME/...`, `$XDG_RUNTIME_DIR/oxideswarm/...`, or
-/// `$HOME/.oxideswarm/...`).
+/// Default Unix control socket path (`$XDG_RUNTIME_DIR/oxideswarm/...`, `$OXIDESWARM_HOME/...`,
+/// or `$HOME/.oxideswarm/...`, per `design 0113` D2.4).
 #[cfg(unix)]
 pub fn default_unix_socket_path(worker_name: Option<&str>) -> Option<PathBuf> {
     default_unix_socket_path_with(
         worker_name,
-        std::env::var_os("OXIDESWARM_HOME").as_deref(),
         std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        std::env::var_os("OXIDESWARM_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
 }
@@ -298,14 +306,14 @@ pub fn default_unix_socket_path(worker_name: Option<&str>) -> Option<PathBuf> {
 #[cfg(unix)]
 pub(crate) fn default_unix_socket_path_with(
     worker_name: Option<&str>,
-    oxideswarm_home: Option<&std::ffi::OsStr>,
     xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    oxideswarm_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let dir = if let Some(ox_home) = oxideswarm_home.filter(|v| !v.is_empty()) {
-        PathBuf::from(ox_home)
-    } else if let Some(xdg) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
+    let dir = if let Some(xdg) = xdg_runtime_dir.filter(|v| !v.is_empty()) {
         PathBuf::from(xdg).join("oxideswarm")
+    } else if let Some(ox_home) = oxideswarm_home.filter(|v| !v.is_empty()) {
+        PathBuf::from(ox_home)
     } else {
         let home = home.filter(|v| !v.is_empty())?;
         PathBuf::from(home).join(".oxideswarm")
@@ -374,6 +382,7 @@ struct ControlStateInner {
     held: bool,
     hold_reason: Option<String>,
     hold_detail: Option<String>,
+    hold_hand_back_running: bool,
     limits: WorkerLimitsConfig,
 }
 
@@ -384,6 +393,8 @@ pub struct ControlHandle {
     active_tasks: Arc<AtomicUsize>,
     config_path: Mutex<Option<PathBuf>>,
     persist_hook: Option<LimitPersistHook>,
+    control_server_error: Mutex<Option<String>>,
+    limit_update_lock: Mutex<()>,
     inner: Mutex<ControlStateInner>,
     event_tx: broadcast::Sender<ControlEvent>,
     next_rejection_seq: AtomicU64,
@@ -417,6 +428,8 @@ impl ControlHandle {
             active_tasks,
             config_path: Mutex::new(config_path),
             persist_hook,
+            control_server_error: Mutex::new(None),
+            limit_update_lock: Mutex::new(()),
             inner: Mutex::new(ControlStateInner {
                 paused: false,
                 pause_reason: None,
@@ -425,6 +438,7 @@ impl ControlHandle {
                 held: false,
                 hold_reason: None,
                 hold_detail: None,
+                hold_hand_back_running: false,
                 limits,
             }),
             event_tx,
@@ -432,6 +446,46 @@ impl ControlHandle {
             session_pause_rejection_gen: AtomicU64::new(0),
             session_gpu_pause_rejection_gen: AtomicU64::new(0),
         })
+    }
+
+    /// Records or clears a startup/runtime error from the local control server listener.
+    pub fn set_control_server_error(&self, err: Option<String>) {
+        *self
+            .control_server_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = err;
+    }
+
+    /// Returns any recorded control server failure message.
+    pub fn control_server_error(&self) -> Option<String> {
+        self.control_server_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Returns the active hand-back reason if the worker is currently paused (or held with
+    /// running task hand-back) when a session starts or restarts.
+    pub fn active_pause_handback_reason(&self) -> Option<String> {
+        let _ = self.check_pause_expiry();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.paused {
+            Some(
+                inner
+                    .pause_reason
+                    .clone()
+                    .unwrap_or_else(|| "contributor paused worker".to_string()),
+            )
+        } else if inner.held && inner.hold_hand_back_running {
+            Some(
+                inner
+                    .hold_reason
+                    .clone()
+                    .unwrap_or_else(|| "local contributor limit active".to_string()),
+            )
+        } else {
+            None
+        }
     }
 
     /// Subscribes to pause/resume transitions for the active session loop.
@@ -557,6 +611,11 @@ impl ControlHandle {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|p| p.display().to_string());
+        let control_server_error = self
+            .control_server_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         ControlStatusSnapshot {
             worker_id: self.worker_id,
             worker_name: self.worker_name.clone(),
@@ -568,6 +627,7 @@ impl ControlHandle {
             active_tasks: self.active_tasks.load(Ordering::Acquire),
             limits: inner.limits.clone(),
             config_path,
+            control_server_error,
         }
     }
 
@@ -644,6 +704,7 @@ impl ControlHandle {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let was_held = inner.held;
             inner.held = held;
+            inner.hold_hand_back_running = held && hand_back_running;
             inner.hold_reason = if held {
                 Some(
                     reason
@@ -748,6 +809,10 @@ impl ControlHandle {
 
     /// Updates a single limit key, persists via the hook (if set), and commits atomically.
     pub fn set_limit(&self, key: &str, value: &str) -> Result<ControlStatusSnapshot, String> {
+        let _serialize = self
+            .limit_update_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut candidate = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.limits.clone()
@@ -904,26 +969,37 @@ where
         (MAX_CONTROL_LINE_BYTES + 1) as u64,
     ));
     let mut line = String::new();
-    let resp = match limited.read_line(&mut line).await {
-        Ok(0) => return,
-        Ok(n) if n > MAX_CONTROL_LINE_BYTES || !line.ends_with('\n') => ControlResponse::Error {
-            message: format!("control request exceeded {MAX_CONTROL_LINE_BYTES} byte limit"),
-        },
-        Ok(_) => match serde_json::from_str::<ControlRequest>(line.trim()) {
+    let resp = match tokio::time::timeout(CONTROL_STREAM_IO_TIMEOUT, limited.read_line(&mut line))
+        .await
+    {
+        Err(_) => {
+            debug!("Timed out reading local control stream");
+            return;
+        }
+        Ok(Ok(0)) => return,
+        Ok(Ok(n)) if n > MAX_CONTROL_LINE_BYTES || !line.ends_with('\n') => {
+            ControlResponse::Error {
+                message: format!("control request exceeded {MAX_CONTROL_LINE_BYTES} byte limit"),
+            }
+        }
+        Ok(Ok(_)) => match serde_json::from_str::<ControlRequest>(line.trim()) {
             Ok(req) => handle.handle_request(req),
             Err(e) => ControlResponse::Error {
                 message: format!("invalid control request: {e}"),
             },
         },
-        Err(e) => {
+        Ok(Err(e)) => {
             debug!(error = %e, "Failed reading local control stream");
             return;
         }
     };
     if let Ok(mut encoded) = serde_json::to_string(&resp) {
         encoded.push('\n');
-        let _ = writer.write_all(encoded.as_bytes()).await;
-        let _ = writer.flush().await;
+        let _ = tokio::time::timeout(CONTROL_STREAM_IO_TIMEOUT, async {
+            let _ = writer.write_all(encoded.as_bytes()).await;
+            let _ = writer.flush().await;
+        })
+        .await;
     }
 }
 
@@ -940,6 +1016,15 @@ mod unix_ipc {
         }
     }
 
+    pub(super) fn verify_peer_uid(expected_uid: u32, actual_uid: u32) -> Result<(), String> {
+        if actual_uid != expected_uid {
+            return Err(format!(
+                "control socket peer uid {actual_uid} does not match expected uid {expected_uid}"
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn current_process_uid() -> Result<u32, String> {
         let (a, _b) = UnixStream::pair().map_err(|e| format!("unix socketpair failed: {e}"))?;
         let cred = a
@@ -948,7 +1033,21 @@ mod unix_ipc {
         Ok(cred.uid())
     }
 
-    fn ensure_private_socket_dir(dir: &Path, my_uid: u32) -> Result<(), String> {
+    fn is_default_oxideswarm_socket_dir(dir: &Path) -> bool {
+        let mut candidates = Vec::new();
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+            candidates.push(PathBuf::from(xdg).join("oxideswarm"));
+        }
+        if let Some(ox_home) = std::env::var_os("OXIDESWARM_HOME").filter(|v| !v.is_empty()) {
+            candidates.push(PathBuf::from(ox_home));
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            candidates.push(PathBuf::from(home).join(".oxideswarm"));
+        }
+        candidates.into_iter().any(|c| c == dir)
+    }
+
+    pub(super) fn ensure_private_socket_dir(dir: &Path, my_uid: u32) -> Result<(), String> {
         if let Ok(meta) = std::fs::symlink_metadata(dir) {
             if meta.file_type().is_symlink() {
                 return Err(format!(
@@ -969,8 +1068,20 @@ mod unix_ipc {
                     meta.uid()
                 ));
             }
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("failed to set mode 0700 on {}: {e}", dir.display()))?;
+            let mode = meta.mode() & 0o777;
+            if (mode & 0o077) != 0 {
+                if is_default_oxideswarm_socket_dir(dir) {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                        |e| format!("failed to set mode 0700 on {}: {e}", dir.display()),
+                    )?;
+                } else {
+                    return Err(format!(
+                        "control socket directory {} has mode {:04o}; expected 0700 (refusing to chmod custom parent directory)",
+                        dir.display(),
+                        mode
+                    ));
+                }
+            }
             return Ok(());
         }
         std::fs::create_dir_all(dir)
@@ -1046,18 +1157,26 @@ mod unix_ipc {
             .map_err(|e| format!("failed to set mode 0600 on {}: {e}", sock_path.display()))?;
         info!(path = %sock_path.display(), "Worker local control socket listening (mode 0600)");
 
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_CONNS));
         loop {
             tokio::select! {
                 res = listener.accept() => {
                     match res {
                         Ok((stream, _addr)) => {
-                            let peer_ok = stream.peer_cred().is_ok_and(|c| c.uid() == my_uid);
+                            let peer_ok = stream
+                                .peer_cred()
+                                .is_ok_and(|c| verify_peer_uid(my_uid, c.uid()).is_ok());
                             if !peer_ok {
                                 warn!("Rejected worker control connection from mismatched UID");
                                 continue;
                             }
+                            let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+                                debug!("Dropping excess concurrent worker control connection");
+                                continue;
+                            };
                             let h = Arc::clone(&handle);
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 process_control_stream(stream, h).await;
                             });
                         }
@@ -1114,12 +1233,7 @@ mod unix_ipc {
         let peer_cred = stream
             .peer_cred()
             .map_err(|e| format!("cannot verify control server peer_cred: {e}"))?;
-        if peer_cred.uid() != my_uid {
-            return Err(format!(
-                "control socket server uid {} does not match caller uid {my_uid}",
-                peer_cred.uid()
-            ));
-        }
+        verify_peer_uid(my_uid, peer_cred.uid())?;
 
         let mut payload = serde_json::to_string(req)
             .map_err(|e| format!("failed to serialize control request: {e}"))?;
@@ -1155,16 +1269,29 @@ mod unix_ipc {
 }
 
 #[cfg(windows)]
-// LV-4: cfg(windows) named-pipe same-user DACL restricting access to owner (`OW`).
+// LV-4: cfg(windows) named-pipe same-user DACL restricting access to owner (`OW`) and client-side
+// verification that the connected pipe server runs under the caller's own user SID.
 #[allow(unsafe_code)]
 mod windows_ipc {
     use super::*;
-    use tokio::net::windows::named_pipe::{ClientOptions, PipeMode, ServerOptions};
-    use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+    use std::os::windows::io::AsRawHandle;
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    pub(super) const WIN_ERROR_PIPE_BUSY: i32 = 231;
 
     struct LocalSdGuard(PSECURITY_DESCRIPTOR);
     impl Drop for LocalSdGuard {
@@ -1178,10 +1305,157 @@ mod windows_ipc {
         }
     }
 
-    fn create_private_pipe_server(
+    struct HandleGuard(HANDLE);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is an owned Win32 kernel handle opened by `OpenProcess` or `OpenProcessToken`.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    pub(super) fn process_user_sid(process_handle: HANDLE) -> Result<Vec<u8>, String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `process_handle` is a valid process handle and `&mut token` receives an owned token handle.
+        if unsafe { OpenProcessToken(process_handle, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(format!(
+                "OpenProcessToken failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let _token_guard = HandleGuard(token);
+
+        let mut needed: u32 = 0;
+        // SAFETY: `token` is valid; null/0 performs the documented Win32 length probe for `TokenUser`.
+        unsafe {
+            let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 {
+            return Err(format!(
+                "GetTokenInformation size probe failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let words = (needed as usize)
+            .div_ceil(std::mem::size_of::<usize>())
+            .max(1);
+        let mut aligned = vec![0usize; words];
+        let buf_len = (words * std::mem::size_of::<usize>()) as u32;
+        // SAFETY: `aligned` provides `buf_len` writable `usize`-aligned bytes for `TOKEN_USER` + SID.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                aligned.as_mut_ptr().cast(),
+                buf_len,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "GetTokenInformation(TokenUser) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `GetTokenInformation` succeeded on a `usize`-aligned buffer at least `size_of::<TOKEN_USER>()` large.
+        let token_user = unsafe { &*(aligned.as_ptr() as *const TOKEN_USER) };
+        let psid = token_user.User.Sid;
+        // SAFETY: checking pointer nullness before reading validated SID structure.
+        if psid.is_null() || unsafe { IsValidSid(psid) } == 0 {
+            return Err("process token returned an invalid Windows SID".to_string());
+        }
+        // SAFETY: `IsValidSid(psid)` succeeded above.
+        let len = unsafe { GetLengthSid(psid) } as usize;
+        // SAFETY: `psid` is a valid SID allocation inside `aligned` of length `len`.
+        let slice = unsafe { std::slice::from_raw_parts(psid as *const u8, len) };
+        Ok(slice.to_vec())
+    }
+
+    pub(super) fn verify_sids_equal(expected_sid: &[u8], server_sid: &[u8]) -> Result<(), String> {
+        fn aligned_sid_buf(bytes: &[u8]) -> Result<Vec<u32>, String> {
+            if bytes.is_empty() {
+                return Err("invalid Windows SID encountered during pipe owner check".to_string());
+            }
+            let words = bytes.len().div_ceil(std::mem::size_of::<u32>());
+            let mut aligned = vec![0u32; words];
+            // SAFETY: `aligned` is newly allocated with `words * 4 >= bytes.len()` writable bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    aligned.as_mut_ptr().cast(),
+                    bytes.len(),
+                );
+            }
+            let psid = aligned.as_mut_ptr().cast();
+            // SAFETY: `psid` is 4-byte aligned and holds all `bytes.len()` bytes; `IsValidSid`
+            // validates the header before `GetLengthSid` inspects the subauthority count.
+            let valid =
+                unsafe { IsValidSid(psid) != 0 && GetLengthSid(psid) as usize == bytes.len() };
+            if !valid {
+                return Err("invalid Windows SID encountered during pipe owner check".to_string());
+            }
+            Ok(aligned)
+        }
+
+        let mut expected_aligned = aligned_sid_buf(expected_sid)?;
+        let mut server_aligned = aligned_sid_buf(server_sid)?;
+        // SAFETY: both aligned buffers passed `IsValidSid` and exact length verification above.
+        let equal = unsafe {
+            EqualSid(
+                expected_aligned.as_mut_ptr().cast(),
+                server_aligned.as_mut_ptr().cast(),
+            )
+        };
+        if equal == 0 {
+            return Err(
+                "named-pipe server SID does not match caller user SID (refusing impostor pipe)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_pipe_server_same_user(
+        client: &NamedPipeClient,
+        pipe_name: &str,
+    ) -> Result<(), String> {
+        let mut server_pid: u32 = 0;
+        let handle = client.as_raw_handle() as HANDLE;
+        // SAFETY: `handle` is an open connected named-pipe handle and `&mut server_pid` receives the PID.
+        let ok = unsafe { GetNamedPipeServerProcessId(handle, &mut server_pid) };
+        if ok == 0 || server_pid == 0 {
+            return Err(format!(
+                "cannot verify owner of control pipe {pipe_name}: GetNamedPipeServerProcessId failed ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `GetCurrentProcess()` returns the current process pseudo-handle (no closing needed).
+        let caller_sid = process_user_sid(unsafe { GetCurrentProcess() })?;
+        // SAFETY: `server_pid` is non-zero and closed immediately via `HandleGuard`.
+        let server_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+        if server_proc.is_null() {
+            return Err(format!(
+                "refusing control pipe {pipe_name}: cannot query server pid {server_pid} ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let _proc_guard = HandleGuard(server_proc);
+        let server_sid = process_user_sid(server_proc).map_err(|e| {
+            format!(
+                "refusing control pipe {pipe_name}: server pid {server_pid} SID check failed ({e})"
+            )
+        })?;
+        verify_sids_equal(&caller_sid, &server_sid)
+    }
+
+    pub(super) fn create_private_pipe_server(
         pipe_name: &str,
         first: bool,
-    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, String> {
+    ) -> Result<NamedPipeServer, String> {
         // Owner (`OW`) gets Generic All under a Protected DACL (`D:P`).
         let sddl: Vec<u16> = "D:P(A;;GA;;;OW)\0".encode_utf16().collect();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1220,6 +1494,34 @@ mod windows_ipc {
         .map_err(|e| format!("failed to create named pipe {pipe_name}: {e}"))
     }
 
+    async fn next_pipe_server(
+        pipe_name: &str,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<Option<NamedPipeServer>, String> {
+        let mut backoff = Duration::from_millis(50);
+        for attempt in 1..=8u8 {
+            match create_private_pipe_server(pipe_name, false) {
+                Ok(srv) => return Ok(Some(srv)),
+                Err(e) => {
+                    warn!(attempt, error = %e, "Failed creating next named-pipe instance; retrying");
+                    if attempt == 8 {
+                        return Err(e);
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        res = shutdown_rx.changed() => {
+                            if res.is_err() || *shutdown_rx.borrow() {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                }
+            }
+        }
+        unreachable!()
+    }
+
     pub(super) async fn run_windows_server(
         pipe_name: String,
         handle: Arc<ControlHandle>,
@@ -1227,20 +1529,34 @@ mod windows_ipc {
     ) -> Result<(), String> {
         let mut server = create_private_pipe_server(&pipe_name, true)?;
         info!(pipe = %pipe_name, "Worker local named-pipe control server listening");
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_CONNS));
         loop {
             tokio::select! {
                 res = server.connect() => {
                     match res {
                         Ok(()) => {
                             let connected = server;
-                            server = create_private_pipe_server(&pipe_name, false)?;
+                            let Some(next) = next_pipe_server(&pipe_name, &mut shutdown_rx).await? else {
+                                break;
+                            };
+                            server = next;
+                            let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+                                debug!("Dropping excess concurrent named-pipe control connection");
+                                continue;
+                            };
                             let h = Arc::clone(&handle);
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 process_control_stream(connected, h).await;
                             });
                         }
                         Err(e) => {
-                            warn!(error = %e, "Named-pipe control accept error");
+                            warn!(error = %e, "Named-pipe control accept error; recycling pipe instance");
+                            let _ = server.disconnect();
+                            let Some(next) = next_pipe_server(&pipe_name, &mut shutdown_rx).await? else {
+                                break;
+                            };
+                            server = next;
                         }
                     }
                 }
@@ -1258,20 +1574,36 @@ mod windows_ipc {
         pipe_name: &str,
         req: &ControlRequest,
     ) -> Result<ControlResponse, String> {
-        let client = ClientOptions::new()
-            .open(pipe_name)
-            .map_err(|e| format!("failed to open control pipe {pipe_name}: {e}"))?;
+        let busy_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let client = loop {
+            match ClientOptions::new().open(pipe_name) {
+                Ok(c) => break c,
+                Err(e)
+                    if e.raw_os_error() == Some(WIN_ERROR_PIPE_BUSY)
+                        && tokio::time::Instant::now() < busy_deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => {
+                    return Err(format!("failed to open control pipe {pipe_name}: {e}"));
+                }
+            }
+        };
+        verify_pipe_server_same_user(&client, pipe_name)?;
         let mut payload = serde_json::to_string(req)
             .map_err(|e| format!("failed to serialize control request: {e}"))?;
         payload.push('\n');
         let (reader, mut writer) = tokio::io::split(client);
-        writer
-            .write_all(payload.as_bytes())
+        tokio::time::timeout(
+            CONTROL_STREAM_IO_TIMEOUT,
+            writer.write_all(payload.as_bytes()),
+        )
+        .await
+        .map_err(|_| "timed out writing worker control request".to_string())?
+        .map_err(|e| format!("failed writing control request: {e}"))?;
+        tokio::time::timeout(CONTROL_STREAM_IO_TIMEOUT, writer.flush())
             .await
-            .map_err(|e| format!("failed writing control request: {e}"))?;
-        writer
-            .flush()
-            .await
+            .map_err(|_| "timed out flushing worker control request".to_string())?
             .map_err(|e| format!("failed flushing control request: {e}"))?;
         let mut limited = BufReader::new(tokio::io::AsyncReadExt::take(
             reader,
@@ -1284,6 +1616,9 @@ mod windows_ipc {
             .map_err(|e| format!("failed reading worker control response: {e}"))?;
         if read == 0 {
             return Err("worker control server closed connection without responding".to_string());
+        }
+        if read > MAX_CONTROL_LINE_BYTES {
+            return Err("worker control response exceeded size limit".to_string());
         }
         serde_json::from_str::<ControlResponse>(resp_line.trim())
             .map_err(|e| format!("invalid worker control response: {e}"))
@@ -1633,37 +1968,156 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_control_checks_reject_broad_custom_dir_wrong_uid_and_slow_clients() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let broad = dir.path().join("broad-home");
+        std::fs::create_dir(&broad).unwrap();
+        std::fs::set_permissions(&broad, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = unix_ipc::ensure_private_socket_dir(
+            &broad,
+            unix_ipc::current_process_uid().await.unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing to chmod"), "unexpected error: {err}");
+        let mode_after = std::fs::metadata(&broad).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_after, 0o755,
+            "broad custom directory must not be chmodded"
+        );
+
+        // Cross-user rejection checks (helper + real root-owned /tmp dir when non-root).
+        let uid = unix_ipc::current_process_uid().await.unwrap();
+        let err_uid = unix_ipc::verify_peer_uid(uid, uid.saturating_add(1)).unwrap_err();
+        assert!(err_uid.contains("does not match expected uid"));
+        if uid != 0 && std::path::Path::new("/tmp").exists() {
+            let err_root = unix_ipc::ensure_private_socket_dir(Path::new("/tmp"), uid).unwrap_err();
+            assert!(
+                err_root.contains("owned by uid") || err_root.contains("symlink"),
+                "unexpected /tmp ownership error: {err_root}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn default_unix_socket_path_honours_oxideswarm_home_over_xdg_and_home() {
+    fn default_unix_socket_path_honours_xdg_then_oxideswarm_home_then_home() {
         use std::ffi::OsStr;
 
         assert_eq!(
             default_unix_socket_path_with(
                 Some("box1"),
+                Some(OsStr::new("/run/user/1000")),
                 Some(OsStr::new("/custom/ox")),
-                Some(OsStr::new("/run/user/1000")),
-                Some(OsStr::new("/home/alice")),
-            ),
-            Some(PathBuf::from("/custom/ox/box1.control.sock"))
-        );
-        assert_eq!(
-            default_unix_socket_path_with(
-                Some("box1"),
-                Some(OsStr::new("")),
-                Some(OsStr::new("/run/user/1000")),
                 Some(OsStr::new("/home/alice")),
             ),
             Some(PathBuf::from("/run/user/1000/oxideswarm/box1.control.sock"))
         );
         assert_eq!(
             default_unix_socket_path_with(
-                None,
+                Some("box1"),
+                Some(OsStr::new("")),
+                Some(OsStr::new("/custom/ox")),
+                Some(OsStr::new("/home/alice")),
+            ),
+            Some(PathBuf::from("/custom/ox/box1.control.sock"))
+        );
+        assert_eq!(
+            default_unix_socket_path_with(
                 None,
                 Some(OsStr::new("")),
+                None,
                 Some(OsStr::new("/home/alice")),
             ),
             Some(PathBuf::from("/home/alice/.oxideswarm/control.sock"))
         );
         assert_eq!(default_unix_socket_path_with(None, None, None, None), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    // LV-4: cfg(windows) named-pipe test invokes `GetCurrentProcess` for SID self-verification.
+    #[allow(unsafe_code)]
+    async fn windows_named_pipe_round_trip_owner_check_and_early_disconnect_recovery() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // Caller SID matches itself; an altered SID (flipped authority byte) is refused.
+        // SAFETY: `GetCurrentProcess()` returns the current process pseudo-handle.
+        let my_sid = windows_ipc::process_user_sid(unsafe { GetCurrentProcess() }).unwrap();
+        windows_ipc::verify_sids_equal(&my_sid, &my_sid).unwrap();
+        let mut fake_sid = my_sid.clone();
+        if let Some(last) = fake_sid.last_mut() {
+            *last ^= 0xFF;
+        }
+        assert!(windows_ipc::verify_sids_equal(&my_sid, &fake_sid).is_err());
+
+        let pipe_name = format!(r"\\.\pipe\oxideswarm-test-{}", Uuid::new_v4());
+        let handle = test_handle(WorkerLimitsConfig::default(), None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv_handle = Arc::clone(&handle);
+        let srv_pipe = pipe_name.clone();
+        let srv = tokio::spawn(async move {
+            serve_control_endpoint(
+                ControlEndpoint::NamedPipe(srv_pipe),
+                srv_handle,
+                shutdown_rx,
+            )
+            .await
+        });
+
+        let ep = ControlEndpoint::NamedPipe(pipe_name.clone());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let status_resp = loop {
+            match send_control_request(&ep, &ControlRequest::Status).await {
+                Ok(r) => break r,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("pipe server did not become ready: {e}"),
+            }
+        };
+        assert!(matches!(status_resp, ControlResponse::Status { .. }));
+
+        // Second `first_pipe_instance` on the same pipe name must fail visibly.
+        assert!(windows_ipc::create_private_pipe_server(&pipe_name, true).is_err());
+
+        // Early-closing clients must not trap `run_windows_server` in a busy loop or break next RPCs.
+        for _ in 0..3 {
+            let open_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let early = loop {
+                match ClientOptions::new().open(&pipe_name) {
+                    Ok(c) => break c,
+                    Err(e)
+                        if e.raw_os_error() == Some(windows_ipc::WIN_ERROR_PIPE_BUSY)
+                            && tokio::time::Instant::now() < open_deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => panic!("open early: {e}"),
+                }
+            };
+            drop(early);
+        }
+        let resp = send_control_request(
+            &ep,
+            &ControlRequest::Pause {
+                until_epoch_ms: None,
+                reason: Some("win-test".into()),
+            },
+        )
+        .await
+        .expect("pipe server must stay healthy after early client disconnects");
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+        let resp = send_control_request(&ep, &ControlRequest::Resume)
+            .await
+            .unwrap();
+        assert!(matches!(resp, ControlResponse::Ok { .. }));
+
+        let _ = shutdown_tx.send(true);
+        srv.await.unwrap().unwrap();
     }
 }

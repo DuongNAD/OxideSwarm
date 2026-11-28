@@ -29,6 +29,11 @@ The installer:
 If the stick also holds a GPU build, the installer first asks whether the
 cluster may use this computer's GPU as well. Answer n to keep the GPU out.
 
+If the stick holds developer tools (Python, Rust, MinGW-w64 C toolchain,
+Git), the Windows installer asks once whether to install them privately
+inside OxideSwarm's own folder (your system PATH and registry are never
+changed, and Uninstall removes them with everything else).
+
 On Windows with a second NTFS/ReFS drive (for example D:), the installer asks
 where to keep its files. A folder on that drive also holds the task folders
 and the file cache, and only your Windows account can open it.

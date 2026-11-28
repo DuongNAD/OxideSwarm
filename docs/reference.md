@@ -30,7 +30,7 @@ writing standard in [docs/README.md](README.md#writing-standard)).
 
 Use the two-step installer scripts (`scripts/install.sh` on macOS/Linux, `scripts/install.ps1` on
 Windows), download the archives by hand from the
-[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.5`), or
+[Releases page](https://github.com/DuongNAD/OxideSwarm/releases) (the latest is `v0.4.6`), or
 [build from source](#build-from-source).
 
 `scripts/install.sh` (bash 3.2 compatible) and `scripts/install.ps1` (Windows PowerShell) install
@@ -38,13 +38,13 @@ Windows), download the archives by hand from the
 service setup, no daemon start, and no edits to `~/.oxideswarm` / `%USERPROFILE%\.oxideswarm`):
 
 ```bash
-# macOS / Linux (defaults: --version 0.4.5, --dir "$HOME/.local/bin")
+# macOS / Linux (defaults: --version 0.4.6, --dir "$HOME/.local/bin")
 curl -fsSLO https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.sh
 bash install.sh [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
 ```
 
 ```powershell
-# Windows (defaults: --version 0.4.5, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
+# Windows (defaults: --version 0.4.6, --dir "$env:LOCALAPPDATA\OxideSwarm\bin")
 Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/DuongNAD/OxideSwarm/master/scripts/install.ps1 -OutFile install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 [--version <VERSION>] [--dir <DIR>] [--gpu] [--dry-run]
 # PowerShell flag names (-Version, -Dir, -Gpu, -DryRun, -Help) are also accepted.
@@ -70,21 +70,21 @@ installer scripts for that system under `scripts/`. `SHA256SUMS` lists every arc
 ```bash
 # macOS / Linux: verify, unpack, put the binaries on PATH (the file names below are an example)
 shasum -a 256 -c SHA256SUMS --ignore-missing      # Linux: sha256sum -c SHA256SUMS --ignore-missing
-gh attestation verify oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
-tar -xzf oxideswarm-0.4.5-aarch64-apple-darwin.tar.gz
+gh attestation verify oxideswarm-0.4.6-aarch64-apple-darwin.tar.gz --repo DuongNAD/OxideSwarm   # build provenance, see below
+tar -xzf oxideswarm-0.4.6-aarch64-apple-darwin.tar.gz
 # The binaries are not signed or notarized: a browser download is quarantined and Gatekeeper refuses to run it.
-xattr -dr com.apple.quarantine oxideswarm-0.4.5-aarch64-apple-darwin      # macOS only
-sudo install -m 755 oxideswarm-0.4.5-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
+xattr -dr com.apple.quarantine oxideswarm-0.4.6-aarch64-apple-darwin      # macOS only
+sudo install -m 755 oxideswarm-0.4.6-aarch64-apple-darwin/{oxideswarm,rusty-grid,ox-mode} /usr/local/bin/
 oxideswarm --help
 ```
 
 ```powershell
 # Windows: compare the hash with the SHA256SUMS line, unpack, add the folder to PATH
-(Get-FileHash .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
-gh attestation verify .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
-Expand-Archive .\oxideswarm-0.4.5-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
+(Get-FileHash .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+gh attestation verify .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip --repo DuongNAD/OxideSwarm
+Expand-Archive .\oxideswarm-0.4.6-x86_64-pc-windows-msvc.zip -DestinationPath C:\oxideswarm
 $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.5-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
+[Environment]::SetEnvironmentVariable('Path', "$user;C:\oxideswarm\oxideswarm-0.4.6-x86_64-pc-windows-msvc", 'User')   # then open a new terminal
 ```
 
 `gh attestation verify <ARCHIVE> --repo DuongNAD/OxideSwarm` ([GitHub CLI](https://cli.github.com/)) checks the
@@ -401,7 +401,7 @@ Each archive has a `-gpu` variant built with `--features gpu-wgpu`.
 
 ## Status and limits
 
-OxideSwarm `0.4.5` covers the user story above. What it does not do yet:
+OxideSwarm `0.4.6` covers the user story above. What it does not do yet:
 
 | Limit | Effect | Planned work |
 |---|---|---|
@@ -747,7 +747,7 @@ Every subcommand inherits the global flags below and responds to `--help` (`-h`)
 | `--wire-codec <CODEC>` | `bincode` (`RUSTY_GRID_WIRE_CODEC`, `[worker].wire_codec`) | Wire format codec: `bincode` or `json` |
 | `--insecure` | `false` (`RUSTY_GRID_INSECURE`, `[worker].insecure`) | Allow connecting to a remote, `auto`, or P2P master without a cluster secret |
 | `--rendezvous <URL>` | `OXIDESWARM_RENDEZVOUS`, `RUSTY_GRID_RENDEZVOUS` | `http://HOST[:PORT][/PATH]` URL of Tier 3 HTTP rendezvous registry for cross-subnet discovery (`https://` is refused upfront; use a reverse proxy for TLS) |
-| `--control-socket <PATH>` | `$OXIDESWARM_HOME/[<name>.]control.sock`, `$XDG_RUNTIME_DIR/oxideswarm/[<name>.]control.sock`, or `~/.oxideswarm/[<name>.]control.sock` (`\\.\pipe\oxideswarm-<user>-<name>` on Windows; `RUSTY_GRID_CONTROL_SOCKET`) | Local same-user control socket or Windows named pipe for `oxideswarm worker pause\|resume\|status\|limits` (`design 0113` D2) |
+| `--control-socket <PATH>` | `$XDG_RUNTIME_DIR/oxideswarm/[<name>.]control.sock`, `$OXIDESWARM_HOME/[<name>.]control.sock`, or `~/.oxideswarm/[<name>.]control.sock` (`\\.\pipe\oxideswarm-<user>-<name>` on Windows; `RUSTY_GRID_CONTROL_SOCKET`, `OXIDESWARM_CONTROL_SOCKET`) | Local same-user control socket or Windows named pipe for `oxideswarm worker pause\|resume\|status\|limits` (`design 0113` D2) |
 | `--local-max-cpu-pct <P>`, `--hours "<SPEC>"`, `--max-task-hours-per-day <H>`, `--no-tasks-on-battery`, `--no-tasks-on-metered`, `--no-gpu-tasks`, `--hold-ends-tasks` | Contributor Resource Limits table below | Contributor resource limits (`NET-9b`, `design 0113` D1/D2) |
 
 ##### Contributor Resource Limits (NET-9b, design 0113 D1)
@@ -783,7 +783,7 @@ Note: Refusal strings sent back to the master use generic category reasons only 
 | `--arch <ARCH>` | — | Pin to worker CPU architecture: `x86_64` (`amd64`, `x64`), `aarch64` (`arm64`) |
 | `--worker <NAME\|ID>` | — | Pin to a specific worker by name (case-insensitive) or UUID prefix |
 | `--require-tag <TAG>` | Repeatable | Require a worker carrying this user tag (`worker --tag`; reserved prefixes such as `opt:` and `speed:` are refused) |
-| `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, e.g. `cargo`, `rustc`, `git`) |
+| `--require-tool <TOOL>` | Repeatable | Require a worker that advertises this host tool (`tool:<name>`, probed at start-up: `cargo`, `rustc`, `git`, `python`; `python` tries `python` then `python3` and requires `Python 3.` output, skipping `%LOCALAPPDATA%\Microsoft\WindowsApps` on Windows and `/usr/bin/python3` or `/usr/bin/git` on macOS when `xcode-select -p` fails, [design 0110](design/0110-tools-on-kit-machines.md)) |
 | `--require-isolation <LEVEL>` | — | Require a worker confined at least at `fs` or `fs+net` (`worker --isolation`); the constraint is `require:iso=<level>`, met when the worker's `iso:` tag is at that level or above (`off < fs < fs+net`; a worker without the tag counts as `off`) |
 | `--source <PATH[:SANDBOX]>` (alias `--source-dir`) | Repeatable | Compile tasks: Rust source file or Cargo crate directory to compile (`cargo build --offline` when `Cargo.toml` is present, else `rustc`) |
 | `--stdin-file <PATH>` | — | Command tasks: send a local file (at most 32 MiB) as standard input |
@@ -844,7 +844,7 @@ Note: Refusal strings sent back to the master use generic category reasons only 
 | `oxideswarm members rename` | `<NAME\|ID> <NEW_NAME>`, `--master <HOST:PORT\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | Rename an enrolled member in `members.json` |
 | `oxideswarm members release-worker` | `<WORKER_ID>`, `--master <HOST:PORT\|TICKET>`, `--relay-url <URL>`, `--json`, `--insecure` | Release a stopped worker's ID claim from `v2_worker_seq` and member ownership in `members.json` (refuses a live connected worker) so an enrolled v3 member can register with the same persisted named `worker_id` under `--auth both` |
 | `oxideswarm join` | `--code <CODE>`, `--pair-host <HOST:PORT>`, `--invite-file <PATH>`, `--replace-secret`, `--replace-master`, `--expect-workers <N>` (default `0`), `--no-doctor` | With `--code <CODE>` (optional `--pair-host <HOST:PORT>` when broadcasts are blocked), discover the inviting machine on UDP `8087`, run SPAKE2, receive the encrypted invite, send `PairPendingNotice` back after `EnrollPending`, and confirm `[y/N]` on stdin ([design 0052](design/0052-short-code-pairing.md)). With `--invite-file <PATH>`, decrypt a passphrase-protected `invite.oxs` file from a v1 USB setup kit with an invisible passphrase prompt (`[y/N]` + optional 6-digit pairing check, [design 0053](design/0053-usb-setup-kit.md)). Otherwise read an invite (`oxs1-invite:...`, [design 0051](design/0051-machine-identity-and-invites.md)) or a shared-secret join token (`oxs1-join:...`, [design 0048](design/0048-join-token.md)) from **standard input** (piped, or pasted at a no-echo prompt on a terminal; any positional argument is refused without echo). For an invite, `join` requires a controlling terminal (`stdin` when interactive, or `/dev/tty` on Unix and `CONIN$` on Windows when the invite is piped in via e.g. `pbpaste \| oxideswarm join`) to read the `[y/N]` confirmation: for `--no-approval` invites it flushes pending terminal input, prints the pinned master fingerprint and code-execution warning (without a pairing code), and asks `[y/N]` before opening any connection; for approval-required invites it connects with OXS-AUTH v3 purpose `enroll` and the pinned `master_key`, prints the 6-digit pairing check, master fingerprint, and warning, waits for admin approval (`ENROLLED`) and user confirmation (`[y/N]`), and confirms on the stream within 120 s. Only after confirmation does `join` write `~/.oxideswarm/node.key` and `master_key` in `~/.oxideswarm/rusty-grid.toml` and run the checks its roles allow (a worker-only member runs read-only checks; `doctor` task probes require `client`; when migrating a stopped named worker from v2 to v3 under `--auth both`, an admin runs `oxideswarm members release-worker <WORKER_ID>` so it keeps its persisted `worker_id`). For a join token, `join` saves the secret at mode `0600` (Windows: owner-only ACL) and the master address in `~/.oxideswarm/rusty-grid.toml` and runs `doctor` |
-| `oxideswarm usb create` | `<DIR>`, `--machines <N>` (alias `--uses`, default `1`), `--expires <DURATION>` (default `7d`, up to `30d`, or `48h` with `--no-approval`), `--roles <ROLES>` (default `worker`; `admin` refused), `--workspaces`, `--gpu`, `--archives <DIR>` (alias `--from-dir`), `--download`, `--release <VERSION>`, `--no-autostart`, `--isolation <MODE>` (`off` or `fs`), `--no-approval`, `--passphrase-stdin`, `--replace`, `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>`, `--relay-url <URL>`, `--insecure` | Write a v1 passphrase-encrypted USB setup kit into `<DIR>/OxideSwarm` containing `invite.oxs` (Argon2id + ChaCha20-Poly1305 encrypted OXS-AUTH v3 invite), `kit.json`, verified `archives/SHA256SUMS` (local `--archives` or HTTPS `--download`), and cross-platform installers/uninstallers (`install.sh`, `install.ps1`, click-to-run wrappers, [design 0053](design/0053-usb-setup-kit.md)) |
+| `oxideswarm usb create` | `<DIR>`, `--machines <N>` (alias `--uses`, default `1`), `--expires <DURATION>` (default `7d`, up to `30d`, or `48h` with `--no-approval`), `--roles <ROLES>` (default `worker`; `admin` refused), `--workspaces`, `--gpu`, `--archives <DIR>` (alias `--from-dir`), `--download`, `--release <VERSION>`, `--no-autostart`, `--isolation <MODE>` (`off` or `fs`), `--no-approval`, `--passphrase-stdin`, `--replace`, `--master <HOST:PORT>`, `--p2p-ticket <TICKET>`, `--p2p-ticket-file <PATH>`, `--relay-url <URL>`, `--insecure` | Write a v1 passphrase-encrypted USB setup kit into `<DIR>/OxideSwarm` containing `invite.oxs` (Argon2id + ChaCha20-Poly1305 encrypted OXS-AUTH v3 invite), `kit.json`, verified `archives/SHA256SUMS` (local `--archives` or HTTPS `--download`), and cross-platform installers/uninstallers (`install.sh`, `install.ps1`, click-to-run wrappers, [design 0053](design/0053-usb-setup-kit.md)); legacy `packaging/usb/make_kit.sh` also accepts `--toolset full|<comma-list>` and `--tools-dir <DIR>` to bundle SHA-256-pinned private Windows developer tools (`python`, `rust`, `mingw`, `git` from `packaging/usb/tools.lock` + `tools/NOTICE.txt`), and `packaging/usb/install.ps1` accepts `-Tools` / `-NoTools` ([design 0110](design/0110-tools-on-kit-machines.md)) |
 | `oxideswarm mode [MODE] [ACTION]` | `[MODE]` (`test`, `dev`, `doc`, `research`), `[ACTION]`, `-a` / `--action-opt <ACTION>`, `--iterations <N>` (default `5`), `--port <PORT>` (`RUSTY_GRID_DASHBOARD_PORT`; without `--port`, `dev status` probes `.dev_cluster.json` then `8080`), `-i` / `--interactive`, `--json` | Run or inspect workflow modes (`test`, `dev`, `doc`, `research`) or open the interactive menu (`--interactive`) |
 | `oxideswarm mcp` | `--master <ADDR\|auto\|TICKET>`, `--workspace-max-files <N>` (default `100000`), `--workspace-max-mb <MB>` (default `2048`), `--insecure` | Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio (`submit` and `task_result` payloads include `waited_ms`, `task_time_sum_ms`, and `machines` covering the submitted task only, before any `verify` replicas run; `submit` also accepts `matrix` and `max_matrix_cells` for client-side multi-target fan-out, returning per-cell records and marking unplaced cells upfront via `ListWorkers`; `shard` fans out `1..=256` parallel shards with `OX_SHARD_INDEX`/`OX_SHARD_TOTAL`, `build_once`, `fail_fast`, and `junit_out` XML merging, with `files`, `workspace`, `output_dir`, `build_source`, and `junit_out` confined inside the server working directory without `..` or symlinks; for a task submitted in the same session, `task_result` measures `waited_ms` from that session's `submit` call to the `task_result` reply, so it includes caller time between calls and increases on repeat queries, and returns `null` when that session did not submit the task—for example after an MCP restart, from another client, or after entry eviction; [design 0059](design/0059-first-users.md), [design 0101](design/0101-matrix-fanout.md), [design 0103](design/0103-ax2-sharded-runs.md), [MCP guide](guides/mcp-client-setup.md), [sharded-runs guide](guides/sharded-runs.md)) |
 | `oxideswarm rendezvous` | `--listen <ADDR>` (default `127.0.0.1:8090`, `OXIDESWARM_RENDEZVOUS_LISTEN`), `--port-file <PATH>`, `--max-leases <N>` (default `256`), `--max-ttl-secs <SECS>` (default `3600`), `--allow-unsigned`, `--insecure`, `--secret <HEX>`, `--secret-file <PATH>` | Run the standalone Tier 3 HTTP rendezvous registry ([design 0066](design/0066-usable-rendezvous-discovery.md)). Serves multiple clusters isolated by deterministic Ed25519 `lease_key` slots (`X-OxideSwarm-Lease-Auth` required on read) without holding cluster secrets unless `--secret` or `--secret-file` is passed explicitly; refuses unsigned non-loopback binds without `--insecure` |

@@ -42,7 +42,8 @@ pub const ID_TAG_PREFIX: &str = "id:";
 pub const STATE_TAG_PREFIX: &str = "state:";
 /// Prefix of the task isolation tag a worker adds itself (`iso:fs+net`).
 pub const ISO_TAG_PREFIX: &str = "iso:";
-/// Prefix of a probed host-tool tag a worker adds itself (`tool:cargo`, `tool:rustc`, `tool:git`).
+/// Prefix of a probed host-tool tag a worker adds itself (`tool:cargo`, `tool:rustc`, `tool:git`,
+/// `tool:python`).
 pub const TOOL_TAG_PREFIX: &str = "tool:";
 /// Prefix of a protocol-feature tag the master adds to worker listings (`feat:workspaces`).
 pub const FEAT_TAG_PREFIX: &str = "feat:";

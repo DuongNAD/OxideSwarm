@@ -284,7 +284,7 @@ impl TaskQueue {
     ) -> GridResult<TaskId> {
         task.validate().map_err(GridError::Config)?;
         #[cfg(feature = "otel")]
-        let requires_gpu = task.requirements.gpu_required;
+        let requires_gpu = task.requirements.gpu_required || task.spec.requires_gpu();
 
         let (task_id, sequence, ack) = {
             let mut inner = self.inner.write().await;

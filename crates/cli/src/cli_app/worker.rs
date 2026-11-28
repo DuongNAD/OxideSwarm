@@ -138,11 +138,13 @@ pub(super) async fn run_worker(
     secret_opts: SecretOpts,
 ) -> ExitCode {
     rusty_grid_core::capabilities::suppress_windows_error_dialogs();
+    let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     if let Some(action) = args.action.clone() {
         return run_worker_control_action(
             action,
             args.control_socket.as_deref(),
             args.name.as_deref(),
+            worker_cfg.as_ref().and_then(|w| w.name.as_deref()),
         )
         .await;
     }
@@ -154,7 +156,6 @@ pub(super) async fn run_worker(
                 return ExitCode::FAILURE;
             }
         };
-    let worker_cfg = config_file.as_ref().and_then(|c| c.worker.clone());
     let hw_cfg = worker_cfg.as_ref().and_then(|w| w.hardware.clone());
 
     let p2p_minimal = resolve_p2p_minimal();
@@ -819,6 +820,7 @@ fn resolve_control_endpoint_for_cli(
     parent_socket: Option<&std::path::Path>,
     flag_name: Option<&str>,
     parent_name: Option<&str>,
+    config_worker_name: Option<&str>,
 ) -> Result<ControlEndpoint, String> {
     let env_socket = resolve_opt_string(
         None,
@@ -827,10 +829,15 @@ fn resolve_control_endpoint_for_cli(
     )
     .map(PathBuf::from);
     let socket = flag_socket.or(parent_socket).or(env_socket.as_deref());
-    let name = flag_name
-        .or(parent_name)
-        .map(str::to_string)
-        .or_else(|| resolve_opt_string(None, &["RUSTY_GRID_WORKER_NAME", "RUSTY_GRID_NAME"], None));
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let name = clean(flag_name)
+        .or_else(|| clean(parent_name))
+        .or_else(|| resolve_opt_string(None, &["RUSTY_GRID_WORKER_NAME", "RUSTY_GRID_NAME"], None))
+        .or_else(|| clean(config_worker_name));
     ControlEndpoint::resolve(socket, name.as_deref()).ok_or_else(|| {
         "cannot determine default worker control socket (set --control-socket or HOME)".to_string()
     })
@@ -840,6 +847,7 @@ pub(crate) async fn run_worker_control_action(
     action: WorkerControlSubcommand,
     parent_socket: Option<&std::path::Path>,
     parent_name: Option<&str>,
+    config_worker_name: Option<&str>,
 ) -> ExitCode {
     let (socket_flag, name_flag, json, req) = match action {
         WorkerControlSubcommand::Pause(p) => {
@@ -893,6 +901,7 @@ pub(crate) async fn run_worker_control_action(
         parent_socket,
         name_flag.as_deref(),
         parent_name,
+        config_worker_name,
     ) {
         Ok(ep) => ep,
         Err(e) => {
@@ -946,6 +955,9 @@ pub(crate) async fn run_worker_control_action(
             }
             if let Some(ms) = snapshot.paused_until_epoch_ms {
                 println!("  paused_until_epoch_ms={ms}");
+            }
+            if let Some(err) = snapshot.control_server_error {
+                println!("  control_server_error={err}");
             }
             ExitCode::SUCCESS
         }
@@ -1434,6 +1446,24 @@ mod tests {
                 Some(PathBuf::from("/custom/ox")),
             ),
             Some(PathBuf::from("/custom/ox/rusty-grid.toml"))
+        );
+    }
+
+    #[test]
+    fn resolve_control_endpoint_for_cli_falls_back_to_config_worker_name() {
+        let ep = resolve_control_endpoint_for_cli(None, None, None, None, Some("rig-alpha"))
+            .expect("resolve endpoint");
+        assert_eq!(
+            ep,
+            ControlEndpoint::resolve(None, Some("rig-alpha")).expect("worker endpoint")
+        );
+        // Explicit `--name` overrides `[worker].name`.
+        let ep_override =
+            resolve_control_endpoint_for_cli(None, None, Some("rig-beta"), None, Some("rig-alpha"))
+                .expect("resolve override");
+        assert_eq!(
+            ep_override,
+            ControlEndpoint::resolve(None, Some("rig-beta")).expect("worker override")
         );
     }
 }
