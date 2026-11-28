@@ -997,7 +997,27 @@ impl WorkerClient {
             }
         }
         self.control.clear_session_pause_rejection();
+        // Subscribe BEFORE spawning the session task loop and immediately check whether a
+        // pause happened during reconnect or the resume grace window so surviving resumed tasks
+        // are handed back cleanly on session start instead of running to completion while paused.
         let mut control_rx = self.control.subscribe();
+        let handback_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handback_notify = Arc::new(tokio::sync::Notify::new());
+        let mut _handback_guards: Vec<AbortOnDrop> = Vec::new();
+        if let Some(reason) = self.control.active_pause_handback_reason() {
+            if let Some(h) = self
+                .spawn_hand_back_running_tasks_on_pause(
+                    &reason,
+                    session.data_tx.clone(),
+                    Arc::clone(&handback_in_flight),
+                    Arc::clone(&handback_notify),
+                )
+                .await
+            {
+                _handback_guards.push(AbortOnDrop(h));
+            }
+        }
+        let mut pending_resume_reconnect = false;
         let mut pause_expiry_tick = tokio::time::interval(Duration::from_secs(1));
         pause_expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1187,11 +1207,23 @@ impl WorkerClient {
                 ev = control_rx.recv() => {
                     match ev {
                         Ok(crate::control::ControlEvent::PauseHandBack { reason }) => {
-                            self.hand_back_running_tasks_on_pause(&reason, &session.data_tx)
-                                .await;
+                            if let Some(h) = self
+                                .spawn_hand_back_running_tasks_on_pause(
+                                    &reason,
+                                    session.data_tx.clone(),
+                                    Arc::clone(&handback_in_flight),
+                                    Arc::clone(&handback_notify),
+                                )
+                                .await
+                            {
+                                _handback_guards.retain(|g| !g.0.is_finished());
+                                _handback_guards.push(AbortOnDrop(h));
+                            }
                         }
                         Ok(crate::control::ControlEvent::ResumeReconnect) => {
-                            if self.control.take_session_pause_rejection()
+                            if handback_in_flight.load(Ordering::Acquire) > 0 {
+                                pending_resume_reconnect = true;
+                            } else if self.control.take_session_pause_rejection()
                                 && self.active_task_table.read().await.is_empty()
                             {
                                 info!(
@@ -1206,6 +1238,22 @@ impl WorkerClient {
                             tokio::sync::broadcast::error::RecvError::Lagged(_)
                             | tokio::sync::broadcast::error::RecvError::Closed,
                         ) => {}
+                    }
+                }
+
+                _ = handback_notify.notified(), if pending_resume_reconnect => {
+                    if handback_in_flight.load(Ordering::Acquire) == 0 {
+                        pending_resume_reconnect = false;
+                        if self.control.take_session_pause_rejection()
+                            && self.active_task_table.read().await.is_empty()
+                        {
+                            info!(
+                                worker_id = %worker_id,
+                                "Worker resumed after pause hand-back finished; closing session to re-register immediately"
+                            );
+                            self.resume_reconnect_pending.store(true, Ordering::Release);
+                            break Err(GridError::ConnectionClosed);
+                        }
                     }
                 }
 

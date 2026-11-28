@@ -1307,13 +1307,36 @@ impl WorkerRegistry {
         until.checked_duration_since(Instant::now())
     }
 
+    fn advance_pause_holdback(
+        now: Instant,
+        consecutive: &mut u32,
+        until: &mut Option<Instant>,
+    ) -> (Duration, bool) {
+        if let Some(remaining) = until.and_then(|u| u.checked_duration_since(now)) {
+            if !remaining.is_zero() {
+                return (remaining, false);
+            }
+        }
+        *consecutive = consecutive.saturating_add(1);
+        let doublings = (*consecutive - 1).min(16);
+        let hold = PAUSE_HOLDBACK_BASE
+            .saturating_mul(1u32 << doublings)
+            .min(PAUSE_HOLDBACK_MAX);
+        *until = Some(now + hold);
+        (hold, true)
+    }
+
     /// Holds a paused worker back from all scheduling for an exponentially backing-off window
     /// (`60 s` doubling to `10 min`, `design 0113` D3) and surfaces `state:paused`.
+    ///
+    /// Simultaneous hand-backs within an already active hold-back window do not double again;
+    /// each lapsed pause window increments once.
     pub async fn record_pause_holdback(
         &self,
         worker_id: &Uuid,
         expected_session: Option<u64>,
     ) -> Option<Duration> {
+        let now = Instant::now();
         let mut inner = self.inner.write().await;
         let entry = inner.workers.get_mut(worker_id)?;
         if let Some(expected) = expected_session {
@@ -1321,18 +1344,19 @@ impl WorkerRegistry {
                 return None;
             }
         }
-        entry.consecutive_pause_rejections = entry.consecutive_pause_rejections.saturating_add(1);
-        let doublings = (entry.consecutive_pause_rejections - 1).min(16);
-        let hold = PAUSE_HOLDBACK_BASE
-            .saturating_mul(1u32 << doublings)
-            .min(PAUSE_HOLDBACK_MAX);
-        entry.paused_until = Some(Instant::now() + hold);
-        tracing::info!(
-            worker_id = %worker_id,
-            consecutive = entry.consecutive_pause_rejections,
-            hold_secs = hold.as_secs(),
-            "Worker reported paused; holding back from scheduling (state:paused)"
+        let (hold, advanced) = Self::advance_pause_holdback(
+            now,
+            &mut entry.consecutive_pause_rejections,
+            &mut entry.paused_until,
         );
+        if advanced {
+            tracing::info!(
+                worker_id = %worker_id,
+                consecutive = entry.consecutive_pause_rejections,
+                hold_secs = hold.as_secs(),
+                "Worker reported paused; holding back from scheduling (state:paused)"
+            );
+        }
         Some(hold)
     }
 
@@ -1343,6 +1367,7 @@ impl WorkerRegistry {
         worker_id: &Uuid,
         expected_session: Option<u64>,
     ) -> Option<Duration> {
+        let now = Instant::now();
         let mut inner = self.inner.write().await;
         let entry = inner.workers.get_mut(worker_id)?;
         if let Some(expected) = expected_session {
@@ -1350,19 +1375,19 @@ impl WorkerRegistry {
                 return None;
             }
         }
-        entry.consecutive_gpu_pause_rejections =
-            entry.consecutive_gpu_pause_rejections.saturating_add(1);
-        let doublings = (entry.consecutive_gpu_pause_rejections - 1).min(16);
-        let hold = PAUSE_HOLDBACK_BASE
-            .saturating_mul(1u32 << doublings)
-            .min(PAUSE_HOLDBACK_MAX);
-        entry.gpu_paused_until = Some(Instant::now() + hold);
-        tracing::info!(
-            worker_id = %worker_id,
-            consecutive = entry.consecutive_gpu_pause_rejections,
-            hold_secs = hold.as_secs(),
-            "Worker reported no gpu tasks; holding back GPU assignments while keeping CPU work"
+        let (hold, advanced) = Self::advance_pause_holdback(
+            now,
+            &mut entry.consecutive_gpu_pause_rejections,
+            &mut entry.gpu_paused_until,
         );
+        if advanced {
+            tracing::info!(
+                worker_id = %worker_id,
+                consecutive = entry.consecutive_gpu_pause_rejections,
+                hold_secs = hold.as_secs(),
+                "Worker reported no gpu tasks; holding back GPU assignments while keeping CPU work"
+            );
+        }
         Some(hold)
     }
 
@@ -3658,6 +3683,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hold, PAUSE_HOLDBACK_BASE);
+        // Simultaneous hand-backs during an active hold-back do not re-double.
+        let hold_same = registry
+            .record_gpu_pause_holdback(&w_id, Some(reg.session_id))
+            .await
+            .unwrap();
+        assert!(hold_same <= PAUSE_HOLDBACK_BASE);
+        {
+            let mut inner = registry.inner.write().await;
+            inner.workers.get_mut(&w_id).unwrap().gpu_paused_until =
+                Some(Instant::now() - Duration::from_secs(1));
+        }
         let hold2 = registry
             .record_gpu_pause_holdback(&w_id, Some(reg.session_id))
             .await
@@ -3679,12 +3715,26 @@ mod tests {
         registry.clear_pause_holdback(&w_id, true).await;
         assert!(registry.gpu_pause_holdback_remaining(&w_id).await.is_none());
 
-        // Full pause excludes worker from schedulable list while keeping it in registered list.
-        let p_hold = registry
-            .record_pause_holdback(&w_id, Some(reg.session_id))
-            .await
-            .unwrap();
-        assert_eq!(p_hold, PAUSE_HOLDBACK_BASE);
+        // Full pause excludes worker from schedulable list while keeping it in registered list,
+        // and 5 simultaneous hand-back refusals count as 1 doubling (`60 s`).
+        for _ in 0..5 {
+            let p_hold = registry
+                .record_pause_holdback(&w_id, Some(reg.session_id))
+                .await
+                .unwrap();
+            assert!(p_hold <= PAUSE_HOLDBACK_BASE);
+        }
+        assert_eq!(
+            registry
+                .inner
+                .read()
+                .await
+                .workers
+                .get(&w_id)
+                .unwrap()
+                .consecutive_pause_rejections,
+            1
+        );
         let (sched, reg_list, _) = registry.scheduler_snapshot().await;
         assert!(sched.is_empty());
         assert_eq!(reg_list.len(), 1);

@@ -1641,15 +1641,21 @@ impl WorkerClient {
             let mut local_rx = control_shutdown_rx;
             let (srv_stop_tx, srv_stop_rx) = watch::channel(false);
             tokio::spawn(async move {
+                let srv_handle = Arc::clone(&handle);
                 let mut srv_fut = Box::pin(crate::control::serve_control_endpoint(
                     endpoint.clone(),
-                    handle,
+                    srv_handle,
                     srv_stop_rx,
                 ));
                 tokio::select! {
                     res = &mut srv_fut => {
                         if let Err(err) = res {
-                            warn!(endpoint = %endpoint.display_target(), error = %err, "Local worker control server failed");
+                            handle.set_control_server_error(Some(err.clone()));
+                            tracing::error!(endpoint = %endpoint.display_target(), error = %err, "Local worker control server failed");
+                            eprintln!(
+                                "warning: local worker control server failed ({}): {err}",
+                                endpoint.display_target()
+                            );
                         }
                     }
                     _ = merged_shutdown_rx.changed() => {

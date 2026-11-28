@@ -1157,50 +1157,77 @@ impl WorkerClient {
         count
     }
 
-    /// Stops all currently running tasks on contributor pause (`design 0113` D2.3) within 4 s
-    /// (bounded under the 5 s target) and hands each back with `"Task rejected by worker: paused: <reason>"`
-    /// (`exit_code = 1`, `execution_time_ms = 0`, empty stdout) so the Master requeues them
-    /// uncharged and enters `state:paused` hold-back.
-    pub(super) async fn hand_back_running_tasks_on_pause(
+    /// Drains running tasks and starts stopping their process trees synchronously so the session
+    /// `select!` loop never blocks for the up-to-4 s join deadline; the spawned task finishes
+    /// waiting for the kills, sends refusal results, and notifies `notify` on completion.
+    pub(super) async fn spawn_hand_back_running_tasks_on_pause(
         &self,
         reason: &str,
-        outbound_tx: &mpsc::Sender<WorkerMessage>,
-    ) -> usize {
+        outbound_tx: mpsc::Sender<WorkerMessage>,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let mut joins = self.begin_pause_handback_drain(reason).await;
+        if joins.is_empty() {
+            return None;
+        }
+        struct InFlightGuard(
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<tokio::sync::Notify>,
+        );
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+                self.1.notify_waiters();
+            }
+        }
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        let worker_id = self.worker_id;
+        let control = Arc::clone(&self.control);
+        let why = reason.to_string();
+        Some(tokio::spawn(async move {
+            let _guard = InFlightGuard(in_flight, notify);
+            let _ = Self::finish_pause_handback(worker_id, control, why, &mut joins, &outbound_tx)
+                .await;
+        }))
+    }
+
+    async fn begin_pause_handback_drain(
+        &self,
+        reason: &str,
+    ) -> Vec<(TaskId, Option<tokio::task::JoinHandle<()>>)> {
         let drained: Vec<(TaskId, TaskExecutionHandle)> = {
             let mut lock = self.active_task_table.write().await;
             lock.drain().collect()
         };
-        if drained.is_empty() {
-            return 0;
-        }
-        let count = drained.len();
-        let mut task_ids = Vec::with_capacity(count);
-        let mut joins = Vec::with_capacity(count);
-        for (tid, handle) in drained {
-            task_ids.push(tid);
-            if let Some(join) = Self::begin_stop(handle, reason) {
-                joins.push(join);
-            }
-        }
+        drained
+            .into_iter()
+            .map(|(tid, handle)| (tid, Self::begin_stop(handle, reason)))
+            .collect()
+    }
+
+    async fn finish_pause_handback(
+        worker_id: uuid::Uuid,
+        control: Arc<crate::control::ControlHandle>,
+        reason: String,
+        joins: &mut [(TaskId, Option<tokio::task::JoinHandle<()>>)],
+        outbound_tx: &mpsc::Sender<WorkerMessage>,
+    ) -> usize {
+        let count = joins.len();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-        for mut join in joins {
-            if tokio::time::timeout_at(deadline, &mut join).await.is_err() {
-                warn!("Paused task did not stop within hand-back deadline; aborting handle");
-                join.abort();
+        for (_, join_opt) in joins.iter_mut() {
+            if let Some(ref mut join) = join_opt {
+                if tokio::time::timeout_at(deadline, &mut *join).await.is_err() {
+                    warn!("Paused task did not stop within hand-back deadline; aborting handle");
+                    join.abort();
+                }
             }
         }
-        self.control.mark_session_pause_rejection();
-        let msg = crate::control::ControlHandle::format_pause_rejection(reason);
-        for tid in task_ids {
-            let result = TaskResult::failure(
-                self.worker_id,
-                tid,
-                1,
-                "",
-                msg.as_str(),
-                0,
-                Some(msg.clone()),
-            );
+        control.mark_session_pause_rejection();
+        let msg = crate::control::ControlHandle::format_pause_rejection(&reason);
+        for (tid, _) in joins.iter() {
+            let result =
+                TaskResult::failure(worker_id, *tid, 1, "", msg.as_str(), 0, Some(msg.clone()));
             let _ = outbound_tx.send(WorkerMessage::from(result)).await;
         }
         count

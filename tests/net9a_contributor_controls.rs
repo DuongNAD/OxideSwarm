@@ -11,13 +11,14 @@
 //!   limit updates to `rusty-grid.toml` without disturbing unrelated `[worker]` keys.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-#[cfg(unix)]
+use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -29,11 +30,10 @@ use rusty_grid_master::registry::WorkerStatus;
 use rusty_grid_master::scheduler::SchedulerConfig;
 use rusty_grid_master::server::{MasterHandle, MasterServer, ServerConfig};
 use rusty_grid_worker::client::{WorkerClient, WorkerConfig};
-#[cfg(unix)]
 use rusty_grid_worker::control::{
-    send_control_request, ControlRequest, ControlResponse, WorkerControlState,
+    send_control_request, ControlEndpoint, ControlRequest, ControlResponse, WorkerControlState,
+    WorkerLimitsConfig,
 };
-use rusty_grid_worker::control::{ControlEndpoint, WorkerLimitsConfig};
 
 struct Net9Cluster {
     master: MasterHandle,
@@ -522,4 +522,276 @@ async fn t3_control_cli_round_trip_and_limits_persistence() {
     assert!(resume_out.status.success());
     let resume_json: serde_json::Value = serde_json::from_slice(&resume_out.stdout).unwrap();
     assert_eq!(resume_json["snapshot"]["state"], "running");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pause_during_reconnect_hands_back_resumed_task_on_session_start() {
+    let blob_dir = tempfile::tempdir().expect("blob dir");
+    let master = MasterServer::spawn_with_config(
+        ServerConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_blob_store(blob_dir.path(), 64 * 1024 * 1024)
+            .with_session_resume_hold(Duration::from_secs(30)),
+        SchedulerConfig::default().without_host_cpu_backpressure(),
+        ReaperConfig::default(),
+    )
+    .await
+    .expect("master starts");
+    let master_addr = master.server_addr();
+
+    // Controllable TCP proxy so we can put worker_a cleanly into its reconnect / resume grace
+    // window without shutting down the master.
+    let proxy = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let proxy_addr = proxy.local_addr().unwrap().to_string();
+    let allow_connects = Arc::new(AtomicBool::new(true));
+    let drop_conns = Arc::new(Notify::new());
+    let proxy_allow = Arc::clone(&allow_connects);
+    let proxy_drop = Arc::clone(&drop_conns);
+    let proxy_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = proxy.accept().await else {
+                break;
+            };
+            if !proxy_allow.load(Ordering::Acquire) {
+                drop(inbound);
+                continue;
+            }
+            let drop_signal = Arc::clone(&proxy_drop);
+            tokio::spawn(async move {
+                let Ok(mut outbound) = tokio::net::TcpStream::connect(master_addr).await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                    _ = drop_signal.notified() => {}
+                }
+            });
+        }
+    });
+
+    let ctrl_dir = tempfile::tempdir().expect("ctrl dir");
+    let sock_path = ctrl_dir.path().join("priv").join("reconnect.control.sock");
+    let ep_a = ControlEndpoint::UnixSocket(sock_path.clone());
+    let sandbox_a = tempfile::tempdir().expect("sandbox a");
+    let mut cfg_a = WorkerConfig::new(proxy_addr)
+        .with_no_battery(true)
+        .with_name("reconnect-a")
+        .with_cores(1)
+        .with_max_concurrency(1)
+        .with_ram_mb(2048)
+        .with_sandbox_base_dir(sandbox_a.path())
+        .with_redirection_portal(false)
+        .with_control_endpoint(Some(ep_a.clone()));
+    cfg_a = cfg_a.with_session_resume_grace_cap(Some(Duration::from_secs(30)));
+    let mut client_a = WorkerClient::new(cfg_a);
+    let worker_a = client_a.worker_id();
+    let (tx_a, rx_a) = watch::channel(false);
+    let handle_a = tokio::spawn(async move {
+        let _ = client_a.run(rx_a).await;
+    });
+
+    wait_for_file(&sock_path).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if master
+            .list_workers()
+            .await
+            .is_ok_and(|ws| ws.iter().any(|w| w.worker_id == worker_a))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let pid_file = state_dir.path().join("task.pid");
+    let rerun_flag = state_dir.path().join("rerun.flag");
+    let cmd = format!(
+        "if [ -f '{}' ]; then echo resumed_handed_back_ok; else echo $$ > '{}'; sleep 30; fi",
+        rerun_flag.display(),
+        pid_file.display()
+    );
+    let tid = master
+        .submit_task(Task::new(
+            TaskSpec::command("sh", vec!["-c".into(), cmd]),
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        ))
+        .await
+        .expect("submit");
+    wait_for_file(&pid_file).await;
+
+    // Sever worker_a's TCP session so it enters the resume grace window, pause it via control
+    // socket while disconnected, then allow reconnects and bring up worker_b.
+    allow_connects.store(false, Ordering::Release);
+    drop_conns.notify_waiters();
+    let disc_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < disc_deadline {
+        if master.list_workers().await.is_ok_and(|ws| {
+            ws.iter()
+                .any(|w| w.worker_id == worker_a && w.status == WorkerStatus::Disconnected)
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let resp = send_control_request(
+        &ep_a,
+        &ControlRequest::Pause {
+            until_epoch_ms: None,
+            reason: Some("reconnect-pause".into()),
+        },
+    )
+    .await
+    .expect("pause during reconnect");
+    assert!(matches!(resp, ControlResponse::Ok { .. }));
+
+    std::fs::write(&rerun_flag, b"ok").expect("write rerun flag");
+    let mut backup_cluster_workers = Vec::new();
+    let sandbox_b = tempfile::tempdir().expect("sandbox b");
+    let cfg_b = WorkerConfig::new(master_addr.to_string())
+        .with_no_battery(true)
+        .with_name("reconnect-b")
+        .with_cores(1)
+        .with_max_concurrency(1)
+        .with_ram_mb(2048)
+        .with_sandbox_base_dir(sandbox_b.path())
+        .with_redirection_portal(false);
+    let mut client_b = WorkerClient::new(cfg_b);
+    let worker_b = client_b.worker_id();
+    let (tx_b, rx_b) = watch::channel(false);
+    backup_cluster_workers.push((
+        tx_b,
+        tokio::spawn(async move {
+            let _ = client_b.run(rx_b).await;
+        }),
+    ));
+
+    allow_connects.store(true, Ordering::Release);
+    let res = master
+        .wait_task(tid, Some(Duration::from_secs(15)))
+        .await
+        .expect("task handed back on session start must succeed on worker_b");
+    assert_eq!(res.exit_code, 0, "{:?}", res.error);
+    assert_eq!(res.worker_id, worker_b);
+    assert!(res.stdout_str().contains("resumed_handed_back_ok"));
+
+    let _ = tx_a.send(true);
+    handle_a.abort();
+    for (tx, h) in backup_cluster_workers {
+        let _ = tx.send(true);
+        h.abort();
+    }
+    proxy_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t3_control_channel_enforces_same_user_and_refuses_oversized_frames() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    let mut cluster = Net9Cluster::new().await;
+    let ctrl_dir = tempfile::tempdir().expect("ctrl dir");
+    let sock_path = ctrl_dir.path().join("priv").join("t3-sec.control.sock");
+    cluster.spawn_worker(
+        "t3-sec",
+        1,
+        false,
+        Some(ControlEndpoint::UnixSocket(sock_path.clone())),
+        WorkerLimitsConfig::default(),
+        None,
+    );
+    cluster.wait_for_workers(1).await;
+    wait_for_file(&sock_path).await;
+
+    // Oversized JSON line (> 8 KiB) must be answered with an error frame, not crash or grow unboundedly.
+    let stream = UnixStream::connect(&sock_path).await.expect("connect sock");
+    let (reader, mut writer) = tokio::io::split(stream);
+    let oversized = format!(
+        "{{\"op\":\"pause\",\"reason\":\"{}\"}}\n",
+        "x".repeat(rusty_grid_worker::control::MAX_CONTROL_LINE_BYTES + 256)
+    );
+    writer.write_all(oversized.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    let mut reply = String::new();
+    let n = BufReader::new(reader).read_line(&mut reply).await.unwrap();
+    assert!(n > 0);
+    let parsed: ControlResponse = serde_json::from_str(reply.trim()).unwrap();
+    assert!(matches!(parsed, ControlResponse::Error { .. }));
+
+    // Control channel must remain healthy right after an oversized frame.
+    let status = send_control_request(
+        &ControlEndpoint::UnixSocket(sock_path),
+        &ControlRequest::Status,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(status, ControlResponse::Status { .. }));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn t3_windows_named_pipe_cli_round_trip() {
+    let mut cluster = Net9Cluster::new().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pipe_name = format!(r"\\.\pipe\oxideswarm-cli-test-{}", Uuid::new_v4());
+    let cfg_path = tmp.path().join("rusty-grid.toml");
+    std::fs::write(&cfg_path, "[worker]\nname = \"win-cli-box\"\n").unwrap();
+
+    cluster.spawn_worker(
+        "win-cli-box",
+        1,
+        false,
+        Some(ControlEndpoint::NamedPipe(pipe_name.clone())),
+        WorkerLimitsConfig::default(),
+        Some(cfg_path.clone()),
+    );
+    cluster.wait_for_workers(1).await;
+
+    let ep = ControlEndpoint::NamedPipe(pipe_name.clone());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if send_control_request(&ep, &ControlRequest::Status)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let bin = env!("CARGO_BIN_EXE_oxideswarm");
+    let out = Command::new(bin)
+        .env("OXIDESWARM_HOME", tmp.path())
+        .args(["worker", "status", "--control-socket", &pipe_name, "--json"])
+        .output()
+        .await
+        .expect("run oxideswarm CLI on Windows");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status_json["snapshot"]["state"], "running");
+
+    let set_out = Command::new(bin)
+        .env("OXIDESWARM_HOME", tmp.path())
+        .args([
+            "worker",
+            "limits",
+            "set",
+            "no_gpu_tasks",
+            "true",
+            "--control-socket",
+            &pipe_name,
+            "--json",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(set_out.status.success());
+    let saved = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(saved.contains("no_gpu_tasks = true"));
 }
