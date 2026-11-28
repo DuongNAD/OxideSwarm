@@ -80,8 +80,10 @@ impl LocalClock for FixedClock {
 struct ProbeHandles {
     battery: Option<Arc<AtomicU8>>,
     metered: Option<Arc<AtomicU8>>,
+    metered_custom: Option<Arc<dyn MeteredNetworkProbe>>,
     cpu_bits: Option<Arc<AtomicU32>>,
     fixed_clock: Option<NaiveDateTime>,
+    daily_budget_path: Option<std::path::PathBuf>,
     hold_ends_tasks: bool,
 }
 
@@ -137,7 +139,9 @@ impl Net9bCluster {
         if let Some(b) = probes.battery {
             config = config.with_battery_probe(Some(Arc::new(AtomicBatteryProbe(b))));
         }
-        if let Some(m) = probes.metered {
+        if let Some(m_custom) = probes.metered_custom {
+            config = config.with_metered_probe(Some(m_custom));
+        } else if let Some(m) = probes.metered {
             config = config.with_metered_probe(Some(Arc::new(AtomicMeteredProbe(m))));
         }
         if let Some(c) = probes.cpu_bits {
@@ -145,6 +149,9 @@ impl Net9bCluster {
         }
         if let Some(dt) = probes.fixed_clock {
             config = config.with_local_clock(Some(Arc::new(FixedClock(dt))));
+        }
+        if let Some(budget_path) = probes.daily_budget_path {
+            config = config.with_daily_budget_path(Some(budget_path));
         }
 
         self._dirs.push(dir);
@@ -222,7 +229,7 @@ fn ipc_tempdir() -> tempfile::TempDir {
 fn unique_endpoint(dir: &Path, label: &str) -> ControlEndpoint {
     #[cfg(unix)]
     {
-        ControlEndpoint::UnixSocket(dir.join(format!("{label}.sock")))
+        ControlEndpoint::UnixSocket(dir.join("priv").join(format!("{label}.sock")))
     }
     #[cfg(windows)]
     {
@@ -742,6 +749,145 @@ async fn net9b_live_limits_set_hours_cpu_daily_budget_and_manual_resume_while_he
     .await
     .unwrap();
     let snap = poll_control_status(&ep_lim, |s| {
+        s.state == WorkerControlState::Held
+            && s.reason.as_deref() == Some("daily task-hours cap reached")
+    })
+    .await;
+    assert_eq!(snap.reason.as_deref(), Some("daily task-hours cap reached"));
+}
+
+struct SlowMeteredProbe(Duration);
+impl MeteredNetworkProbe for SlowMeteredProbe {
+    fn probe_metered(&self) -> MeteredStatus {
+        std::thread::sleep(self.0);
+        MeteredStatus::Unmetered
+    }
+}
+
+#[tokio::test]
+async fn net9b_slow_metered_probe_does_not_stall_session_tasks_or_control() {
+    let mut cluster = Net9bCluster::new().await;
+    let dir = ipc_tempdir();
+    let ep = unique_endpoint(dir.path(), "slowprobe");
+
+    cluster.spawn_worker(
+        "slow-probe-box",
+        1,
+        Some(ep.clone()),
+        WorkerLimitsConfig {
+            no_tasks_on_metered: Some(true),
+            ..Default::default()
+        },
+        ProbeHandles {
+            metered_custom: Some(Arc::new(SlowMeteredProbe(Duration::from_millis(2500)))),
+            ..Default::default()
+        },
+    );
+    cluster.wait_for_workers(1).await;
+
+    // While the 2.5 s blocking metered probe runs in the background, session task dispatch and
+    // control commands must complete promptly (< 1.5 s) without stalling `run_session`'s select!.
+    let start = Instant::now();
+    let tid = cluster
+        .master
+        .submit_task(echo_task("non-blocking-probe-ok"))
+        .await
+        .unwrap();
+    let res = cluster
+        .master
+        .wait_task(tid, Some(Duration::from_secs(10)))
+        .await
+        .unwrap();
+    assert_eq!(res.exit_code, 0);
+
+    let p = send_control_request(
+        &ep,
+        &ControlRequest::Pause {
+            until_epoch_ms: None,
+            reason: Some("responsiveness".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(p, ControlResponse::Ok { .. }));
+    let r = send_control_request(&ep, &ControlRequest::Resume)
+        .await
+        .unwrap();
+    assert!(matches!(r, ControlResponse::Ok { .. }));
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "slow OS probe stalled session loop: elapsed {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn net9b_daily_budget_persists_across_worker_restart() {
+    let mut cluster = Net9bCluster::new().await;
+    let dir = ipc_tempdir();
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let budget_path = state_dir.path().join("worker.daily-budget.json");
+
+    let ep1 = unique_endpoint(dir.path(), "persist1");
+    cluster.spawn_worker(
+        "persist-box",
+        1,
+        Some(ep1.clone()),
+        WorkerLimitsConfig {
+            max_task_hours_per_day: Some(1.0),
+            ..Default::default()
+        },
+        ProbeHandles {
+            daily_budget_path: Some(budget_path.clone()),
+            ..Default::default()
+        },
+    );
+    cluster.wait_for_workers(1).await;
+
+    let tid = cluster
+        .master
+        .submit_task(Task::new(
+            TaskSpec::BuiltinTest {
+                test_name: "persist-budget".into(),
+                iterations: 1,
+                duration_ms: 120,
+                should_fail: false,
+                require_gpu: false,
+            },
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        ))
+        .await
+        .unwrap();
+    let res = cluster
+        .master
+        .wait_task(tid, Some(WAIT_BOUND))
+        .await
+        .unwrap();
+    assert_eq!(res.exit_code, 0);
+
+    // Gracefully stop the first worker instance and wait for exit so budget flushes to disk.
+    if let Some((tx, handle)) = cluster.workers.pop() {
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+    assert!(budget_path.exists(), "budget file should be created");
+
+    // Restart with a tight cap (0.00001 h = 36 ms): persisted 120 ms immediately puts it in Held.
+    let ep2 = unique_endpoint(dir.path(), "persist2");
+    cluster.spawn_worker(
+        "persist-box",
+        1,
+        Some(ep2.clone()),
+        WorkerLimitsConfig {
+            max_task_hours_per_day: Some(0.00001),
+            ..Default::default()
+        },
+        ProbeHandles {
+            daily_budget_path: Some(budget_path),
+            ..Default::default()
+        },
+    );
+    let snap = poll_control_status(&ep2, |s| {
         s.state == WorkerControlState::Held
             && s.reason.as_deref() == Some("daily task-hours cap reached")
     })

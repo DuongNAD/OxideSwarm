@@ -346,6 +346,8 @@ pub struct WorkerConfig {
     pub cpu_probe: Option<Arc<dyn crate::limits::HostCpuProbe>>,
     /// Optional local wall-clock override (for tests; defaults to [`crate::limits::SystemLocalClock`]).
     pub local_clock: Option<Arc<dyn crate::limits::LocalClock>>,
+    /// Optional private state file path to persist daily task-hours usage across restarts.
+    pub daily_budget_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -426,6 +428,7 @@ impl WorkerConfig {
             metered_probe: None,
             cpu_probe: None,
             local_clock: None,
+            daily_budget_path: None,
         }
     }
 
@@ -798,6 +801,12 @@ impl WorkerConfig {
         self
     }
 
+    /// Sets the private state file path for persisting daily contributor task-hours across restarts.
+    pub fn with_daily_budget_path(mut self, path: Option<PathBuf>) -> Self {
+        self.daily_budget_path = path;
+        self
+    }
+
     /// Builds a baseline simulated worker config with host hardware probes and portals disabled.
     pub fn simulated(
         master_addr: impl Into<String>,
@@ -863,6 +872,23 @@ fn resolve_worker_id(config: &WorkerConfig) -> Uuid {
     Uuid::new_v4()
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CachedLimitProbes {
+    pub(super) battery: crate::limits::BatteryStatus,
+    pub(super) metered: crate::limits::MeteredStatus,
+    pub(super) host_cpu_pct: Option<f32>,
+}
+
+impl Default for CachedLimitProbes {
+    fn default() -> Self {
+        Self {
+            battery: crate::limits::BatteryStatus::Unknown,
+            metered: crate::limits::MeteredStatus::Unknown,
+            host_cpu_pct: None,
+        }
+    }
+}
+
 /// Autonomous Worker client managing connection, registration, task execution, and communication with Master.
 pub struct WorkerClient {
     config: WorkerConfig,
@@ -926,11 +952,14 @@ pub struct WorkerClient {
     resume_reconnect_pending: AtomicBool,
     /// Stateful D1 limits evaluator (30 s CPU averager + daily task-hours budget + weekly hours).
     limits_evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
-    /// Wakes `run_session` after completed tasks record daily runtime.
+    /// Wakes `run_session` after completed tasks record daily runtime or background probes refresh.
     limits_reeval_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the background OS probe poller when limits change.
+    probe_refresh_notify: Arc<tokio::sync::Notify>,
+    cached_limit_probes: Arc<std::sync::Mutex<CachedLimitProbes>>,
     battery_probe: Option<Arc<dyn crate::limits::BatteryProbe>>,
     metered_probe: Arc<dyn crate::limits::MeteredNetworkProbe>,
-    cpu_probe: Arc<dyn crate::limits::HostCpuProbe>,
+    cpu_probe: Option<Arc<dyn crate::limits::HostCpuProbe>>,
     local_clock: Arc<dyn crate::limits::LocalClock>,
     #[cfg(feature = "p2p")]
     p2p_endpoint: Arc<tokio::sync::Mutex<Option<iroh::Endpoint>>>,
@@ -1251,29 +1280,46 @@ impl WorkerClient {
             .metered_probe
             .clone()
             .unwrap_or_else(|| Arc::new(crate::limits::SystemMeteredNetworkProbe));
-        let cpu_probe: Arc<dyn crate::limits::HostCpuProbe> = config
-            .cpu_probe
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::limits::SystemHostCpuProbe));
+        let cpu_probe = config.cpu_probe.clone();
         let mut initial_limits = config.initial_limits.clone();
         initial_limits.hold_ends_tasks |= config.hold_ends_tasks;
         let init_limits = crate::limits::WorkerLimits::from_control_config(&initial_limits);
         let init_day = local_clock.local_now().date();
-        let limits_evaluator = crate::limits::LimitsEvaluator::new(init_limits, init_day)
-            .unwrap_or_else(|e| {
-                warn!(error = %e, "Invalid initial contributor limits ignored; using defaults");
-                crate::limits::LimitsEvaluator::new(
-                    crate::limits::WorkerLimits::default(),
-                    init_day,
-                )
-                .expect("default limits are valid")
-            });
+        let (limits_evaluator, effective_control_limits) =
+            match crate::limits::LimitsEvaluator::with_budget_path(
+                init_limits,
+                init_day,
+                config.daily_budget_path.clone(),
+            ) {
+                Ok(eval) => (eval, initial_limits),
+                Err(e) => {
+                    warn!(error = %e, "Invalid initial contributor limits ignored; using defaults");
+                    (
+                        crate::limits::LimitsEvaluator::with_budget_path(
+                            crate::limits::WorkerLimits::default(),
+                            init_day,
+                            config.daily_budget_path.clone(),
+                        )
+                        .expect("default limits are valid"),
+                        crate::control::WorkerLimitsConfig::default(),
+                    )
+                }
+            };
+        if config.no_battery
+            && config.battery_probe.is_none()
+            && effective_control_limits.no_tasks_on_battery == Some(true)
+        {
+            warn!(
+                worker_id = %worker_id,
+                "Both no_battery and --no-tasks-on-battery are set; battery probing is disabled so --no-tasks-on-battery will never hold tasks"
+            );
+        }
 
         let control = crate::control::ControlHandle::new(
             worker_id,
             capabilities.name.clone(),
             Arc::clone(&active_tasks),
-            initial_limits,
+            effective_control_limits,
             config.control_config_path.clone(),
             config.limit_persist_hook.clone(),
         );
@@ -1314,6 +1360,8 @@ impl WorkerClient {
             resume_reconnect_pending: AtomicBool::new(false),
             limits_evaluator: Arc::new(std::sync::Mutex::new(limits_evaluator)),
             limits_reeval_notify: Arc::new(tokio::sync::Notify::new()),
+            probe_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            cached_limit_probes: Arc::new(std::sync::Mutex::new(CachedLimitProbes::default())),
             battery_probe,
             metered_probe,
             cpu_probe,
@@ -1789,6 +1837,7 @@ impl WorkerClient {
             })
         });
 
+        let _limits_probe_poller = AbortOnDrop(self.spawn_limits_probe_poller());
         self.sync_and_evaluate_limits(false).await;
 
         let mut run_result = Ok(());
@@ -1945,6 +1994,9 @@ impl WorkerClient {
             }
         }
 
+        if let Ok(mut eval) = self.limits_evaluator.lock() {
+            eval.flush_budget();
+        }
         run_result
     }
 }

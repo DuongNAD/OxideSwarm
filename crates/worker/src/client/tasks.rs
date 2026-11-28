@@ -790,6 +790,67 @@ impl WorkerClient {
             let mut exec_cancel_tx = Some(exec_cancel_tx);
             let mut cancelled_reason: Option<String> = None;
             let exec_started = std::time::Instant::now();
+            struct ActiveBudgetGuard {
+                run_id: u64,
+                exec_started: std::time::Instant,
+                evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
+                clock: Arc<dyn crate::limits::LocalClock>,
+                notify: Arc<tokio::sync::Notify>,
+                finished: bool,
+            }
+            impl ActiveBudgetGuard {
+                fn new(
+                    run_id: u64,
+                    exec_started: std::time::Instant,
+                    evaluator: Arc<std::sync::Mutex<crate::limits::LimitsEvaluator>>,
+                    clock: Arc<dyn crate::limits::LocalClock>,
+                    notify: Arc<tokio::sync::Notify>,
+                ) -> Self {
+                    let started_local = clock.local_now();
+                    if let Ok(mut eval) = evaluator.lock() {
+                        eval.begin_active_task(run_id, started_local, exec_started);
+                    }
+                    Self {
+                        run_id,
+                        exec_started,
+                        evaluator,
+                        clock,
+                        notify,
+                        finished: false,
+                    }
+                }
+
+                fn finish(mut self, elapsed: Duration) {
+                    self.finished = true;
+                    let ended_local = self.clock.local_now();
+                    if let Ok(mut eval) = self.evaluator.lock() {
+                        eval.finish_active_task(self.run_id, ended_local, elapsed);
+                    }
+                    self.notify.notify_one();
+                }
+            }
+            impl Drop for ActiveBudgetGuard {
+                fn drop(&mut self) {
+                    if !self.finished {
+                        let ended_local = self.clock.local_now();
+                        if let Ok(mut eval) = self.evaluator.lock() {
+                            eval.finish_active_task(
+                                self.run_id,
+                                ended_local,
+                                self.exec_started.elapsed(),
+                            );
+                        }
+                        self.notify.notify_one();
+                    }
+                }
+            }
+            let budget_guard = ActiveBudgetGuard::new(
+                attempt,
+                exec_started,
+                Arc::clone(&limits_evaluator),
+                Arc::clone(&limits_clock),
+                Arc::clone(&limits_reeval_notify),
+            );
             let mut result = {
                 let exec_fut = runner.execute_task_with_checkpoint(
                     &task,
@@ -818,6 +879,9 @@ impl WorkerClient {
                     }
                 }
             };
+            let budget_elapsed =
+                Duration::from_millis(result.execution_time_ms).max(exec_started.elapsed());
+            budget_guard.finish(budget_elapsed);
             while let Ok(cp_msg) = cp_rx.try_recv() {
                 forward_checkpoint(cp_msg, true).await;
             }
@@ -839,14 +903,6 @@ impl WorkerClient {
                 resume_ack_token(resume_enabled, &result, master_features::result_ack_token);
 
             if cancelled_reason.is_none() && !suppress.load(Ordering::Acquire) {
-                let runtime =
-                    Duration::from_millis(result.execution_time_ms).max(exec_started.elapsed());
-                let local_day = limits_clock.local_now().date();
-                if let Ok(mut eval) = limits_evaluator.lock() {
-                    eval.record_completed_task(local_day, runtime);
-                }
-                limits_reeval_notify.notify_one();
-
                 let (live_tx, evicted_used_blobs) = {
                     let mut outbox = pending_resume_outbox
                         .lock()

@@ -4678,3 +4678,30 @@ fn test_bug40_ticket_plus_explicit_address_falls_back_to_tcp_and_logs_p2p_target
         "fallback warning must name master={expected_p2p} and tcp_fallback={tcp_addr}, got:\n{joined}"
     );
 }
+
+#[test]
+fn invalid_initial_limits_reset_control_handle_to_defaults() {
+    let invalid = crate::control::WorkerLimitsConfig {
+        local_max_cpu_pct: Some(150),
+        hours: Some("funday 10:00-12:00".to_string()),
+        max_task_hours_per_day: Some(-1.0),
+        no_tasks_on_battery: Some(true),
+        no_tasks_on_metered: Some(true),
+        no_gpu_tasks: true,
+        hold_ends_tasks: true,
+    };
+    let client = WorkerClient::new(
+        WorkerConfig::new("127.0.0.1:0")
+            .with_no_battery(true)
+            .with_no_gpu(true)
+            .with_no_blender(true)
+            .with_no_cuda(true)
+            .with_redirection_portal(false)
+            .with_initial_limits(invalid),
+    );
+    assert_eq!(
+        client.control_handle().limits(),
+        crate::control::WorkerLimitsConfig::default(),
+        "ControlHandle limits must reset to defaults when LimitsEvaluator rejects invalid initial limits"
+    );
+}

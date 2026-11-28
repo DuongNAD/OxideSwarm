@@ -9,15 +9,19 @@
 //! - `--no-gpu-tasks`: refuse GPU tasks while continuing to run CPU tasks
 //! - `--hold-ends-tasks`: also hand back running tasks when an automatic limit enters hold
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default sliding window over which host CPU usage is averaged (`design 0113` D1).
 pub const CPU_AVERAGE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Hysteresis drop below `local_max_cpu_pct` required before releasing a CPU hold (`design 0113` D1).
+pub const CPU_RELEASE_HYSTERESIS_PCT: f32 = 10.0;
 
 /// Default cadence for re-evaluating contributor limits (`design 0113` D2).
 pub const LIMITS_EVAL_INTERVAL: Duration = Duration::from_secs(10);
@@ -363,14 +367,39 @@ impl CpuAverager {
         }
     }
 
-    /// Returns the mean CPU % across unexpired samples as of `now`, or `None` if empty.
+    /// Returns the time-weighted mean CPU % across unexpired samples as of `now`, or `None` if empty.
+    ///
+    /// Uses trapezoidal integration across sample timestamps within `[now - window, now]` (and holds
+    /// the last reading up to `now`) so rapid wakeup bursts do not distort the 30 s window.
     pub fn average(&mut self, now: Instant) -> Option<f32> {
         self.prune_before(now);
         if self.samples.is_empty() {
             return None;
         }
-        let sum: f64 = self.samples.iter().map(|(_, v)| f64::from(*v)).sum();
-        Some((sum / self.samples.len() as f64) as f32)
+        if self.samples.len() == 1 {
+            return Some(self.samples[0].1);
+        }
+        let first_t = self.samples[0].0;
+        let total_secs = now.saturating_duration_since(first_t).as_secs_f64();
+        if total_secs <= 0.0 {
+            let sum: f64 = self.samples.iter().map(|(_, v)| f64::from(*v)).sum();
+            return Some((sum / self.samples.len() as f64) as f32);
+        }
+        let mut weighted_sum = 0.0f64;
+        for i in 1..self.samples.len() {
+            let (t0, v0) = self.samples[i - 1];
+            let (t1, v1) = self.samples[i];
+            let dt = t1.saturating_duration_since(t0).as_secs_f64();
+            if dt > 0.0 {
+                weighted_sum += 0.5 * (f64::from(v0) + f64::from(v1)) * dt;
+            }
+        }
+        let (last_t, last_v) = *self.samples.back().expect("non-empty samples");
+        let tail_dt = now.saturating_duration_since(last_t).as_secs_f64();
+        if tail_dt > 0.0 {
+            weighted_sum += f64::from(last_v) * tail_dt;
+        }
+        Some(((weighted_sum / total_secs) as f32).clamp(0.0, 100.0))
     }
 
     /// Returns `true` when the sliding-window average strictly exceeds `limit_pct`.
@@ -380,11 +409,159 @@ impl CpuAverager {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveTaskRun {
+    last_local: NaiveDateTime,
+    started_at: Instant,
+    accounted_monotonic_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedDailyBudget {
+    day: NaiveDate,
+    used_ms: u64,
+}
+
+fn check_not_symlink(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("refusing symbolic link '{}'", path.display()),
+                ));
+            }
+            Ok(Some(meta))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn load_persisted_budget(path: &Path) -> std::io::Result<Option<PersistedDailyBudget>> {
+    let Some(meta) = check_not_symlink(path)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let uid = meta.uid();
+        // SAFETY: `geteuid` is always safe to call and takes no pointers.
+        let euid = unsafe { libc::geteuid() };
+        if uid != euid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "budget state '{}' owned by uid {uid} (expected {euid})",
+                    path.display()
+                ),
+            ));
+        }
+        if (meta.mode() & 0o077) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "budget state '{}' has unsafe permissions {:o}; expected 0600",
+                    path.display(),
+                    meta.mode() & 0o777
+                ),
+            ));
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = opts.open(path)?;
+        let parsed: PersistedDailyBudget = serde_json::from_reader(file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(parsed))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let _ = meta;
+        rusty_grid_core::private_file::warn_if_readable_by_others(path, "daily task budget state");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = opts.open(path)?;
+        let parsed: PersistedDailyBudget = serde_json::from_reader(file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(parsed))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        let file = std::fs::File::open(path)?;
+        let parsed: PersistedDailyBudget = serde_json::from_reader(file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(parsed))
+    }
+}
+
+fn save_persisted_budget(path: &Path, state: &PersistedDailyBudget) -> std::io::Result<()> {
+    let _ = check_not_symlink(path)?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        #[cfg(windows)]
+        rusty_grid_core::private_file::create_private_dir_all(parent)?;
+        #[cfg(not(windows))]
+        {
+            let existed = parent.exists();
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            if !existed {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    let bytes = serde_json::to_vec(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    #[cfg(windows)]
+    {
+        rusty_grid_core::private_file::write_private_replace(path, &bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Write;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "daily-budget.json".to_string());
+        let tmp = path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let res = opts
+            .open(&tmp)
+            .and_then(|mut f| {
+                f.write_all(&bytes)?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
+    }
+}
+
 /// Daily cumulative task runtime budget reset at local midnight (`design 0113` D1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DailyTaskBudget {
     day: NaiveDate,
     used_ms: u64,
+    active_runs: HashMap<u64, ActiveTaskRun>,
+    state_path: Option<PathBuf>,
+    last_persisted: Option<(NaiveDate, u64)>,
 }
 
 impl DailyTaskBudget {
@@ -393,25 +570,212 @@ impl DailyTaskBudget {
         Self {
             day: initial_day,
             used_ms: 0,
+            active_runs: HashMap::new(),
+            state_path: None,
+            last_persisted: None,
         }
     }
 
-    /// Advances to `day`, resetting cumulative runtime if the local calendar date changed.
+    /// Creates a daily counter backed by a same-user private state file at `path`.
+    pub fn with_state_path(initial_day: NaiveDate, path: PathBuf) -> Self {
+        let (day, used_ms, last_persisted) = match load_persisted_budget(&path) {
+            Ok(Some(persisted)) => {
+                if persisted.day >= initial_day {
+                    (
+                        persisted.day,
+                        persisted.used_ms,
+                        Some((persisted.day, persisted.used_ms)),
+                    )
+                } else {
+                    (initial_day, 0, None)
+                }
+            }
+            Ok(None) => (initial_day, 0, None),
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "Ignoring unusable persisted daily task budget file");
+                (initial_day, 0, None)
+            }
+        };
+        Self {
+            day,
+            used_ms,
+            active_runs: HashMap::new(),
+            state_path: Some(path),
+            last_persisted,
+        }
+    }
+
+    fn maybe_persist(&mut self, force: bool) {
+        let Some(ref path) = self.state_path else {
+            return;
+        };
+        let should_write = match self.last_persisted {
+            None => self.used_ms > 0 || force,
+            Some((prev_day, prev_ms)) => {
+                if self.day != prev_day {
+                    true
+                } else if force {
+                    self.used_ms != prev_ms
+                } else {
+                    self.used_ms.saturating_sub(prev_ms) >= 1_000
+                }
+            }
+        };
+        if !should_write {
+            return;
+        }
+        let payload = PersistedDailyBudget {
+            day: self.day,
+            used_ms: self.used_ms,
+        };
+        match save_persisted_budget(path, &payload) {
+            Ok(()) => {
+                self.last_persisted = Some((payload.day, payload.used_ms));
+            }
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "Failed to persist daily task budget");
+            }
+        }
+    }
+
+    /// Forces persistence of any un-flushed daily budget state.
+    pub fn flush(&mut self) {
+        self.maybe_persist(true);
+    }
+
+    /// Advances forward to `day`, resetting cumulative runtime ONLY when `day > self.day` so
+    /// backward wall-clock adjustments or same-day restarts never clear accrued runtime.
     pub fn advance_day(&mut self, day: NaiveDate) {
-        if day != self.day {
+        if day > self.day {
             self.day = day;
             self.used_ms = 0;
         }
     }
 
-    /// Adds completed task `duration` on `day` (resetting first if the day rolled over).
-    pub fn record_task_duration(&mut self, day: NaiveDate, duration: Duration) {
-        self.advance_day(day);
-        let add_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        self.used_ms = self.used_ms.saturating_add(add_ms);
+    /// Splits a local wall-clock interval `[from_local, to_local)` across local midnights.
+    fn record_local_interval(&mut self, from_local: NaiveDateTime, to_local: NaiveDateTime) -> u64 {
+        if to_local <= from_local {
+            return 0;
+        }
+        let mut cur = from_local;
+        let mut total_added_ms = 0u64;
+        while cur < to_local {
+            let cur_day = cur.date();
+            let Some(next_day) = cur_day.succ_opt() else {
+                break;
+            };
+            let next_midnight = next_day.and_hms_opt(0, 0, 0).expect("valid midnight");
+            let seg_end = to_local.min(next_midnight);
+            let seg_ms = u64::try_from((seg_end - cur).num_milliseconds().max(0)).unwrap_or(0);
+            if cur_day == self.day {
+                self.used_ms = self.used_ms.saturating_add(seg_ms);
+            } else if cur_day > self.day {
+                self.day = cur_day;
+                self.used_ms = seg_ms;
+            }
+            total_added_ms = total_added_ms.saturating_add(seg_ms);
+            cur = seg_end;
+        }
+        total_added_ms
     }
 
-    /// Returns total recorded task hours on `day` (resets to `0.0` if `day` is a new day).
+    /// Registers an actively running task so its runtime is accrued before completion.
+    pub fn begin_active_task(
+        &mut self,
+        run_id: u64,
+        started_local: NaiveDateTime,
+        started_at: Instant,
+    ) {
+        self.advance_day(started_local.date());
+        self.active_runs.insert(
+            run_id,
+            ActiveTaskRun {
+                last_local: started_local,
+                started_at,
+                accounted_monotonic_ms: 0,
+            },
+        );
+    }
+
+    /// Accounts elapsed runtime for all currently running tasks up to `(local_now, now)`.
+    pub fn account_active_tasks(&mut self, local_now: NaiveDateTime, now: Instant) {
+        self.advance_day(local_now.date());
+        let run_ids: Vec<u64> = self.active_runs.keys().copied().collect();
+        for run_id in run_ids {
+            let Some((last_local, started_at, accounted_monotonic_ms)) = self
+                .active_runs
+                .get(&run_id)
+                .map(|r| (r.last_local, r.started_at, r.accounted_monotonic_ms))
+            else {
+                continue;
+            };
+            let mono_total_ms =
+                u64::try_from(now.saturating_duration_since(started_at).as_millis())
+                    .unwrap_or(u64::MAX);
+            if local_now > last_local {
+                let wall_ms = self.record_local_interval(last_local, local_now);
+                if let Some(run) = self.active_runs.get_mut(&run_id) {
+                    run.last_local = local_now;
+                    run.accounted_monotonic_ms = run
+                        .accounted_monotonic_ms
+                        .saturating_add(wall_ms)
+                        .max(mono_total_ms);
+                }
+            } else {
+                let extra_ms = mono_total_ms.saturating_sub(accounted_monotonic_ms);
+                if extra_ms > 0 {
+                    if local_now.date() >= self.day {
+                        self.used_ms = self.used_ms.saturating_add(extra_ms);
+                    }
+                    if let Some(run) = self.active_runs.get_mut(&run_id) {
+                        run.accounted_monotonic_ms = mono_total_ms;
+                    }
+                }
+            }
+        }
+        self.maybe_persist(false);
+    }
+
+    /// Finalizes a finished, cancelled, handed-back, or aborted task run and persists state.
+    pub fn finish_active_task(
+        &mut self,
+        run_id: u64,
+        ended_local: NaiveDateTime,
+        elapsed: Duration,
+    ) {
+        let total_elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        if let Some(run) = self.active_runs.remove(&run_id) {
+            let wall_ms = if ended_local > run.last_local {
+                self.record_local_interval(run.last_local, ended_local)
+            } else {
+                0
+            };
+            let total_accounted = run.accounted_monotonic_ms.saturating_add(wall_ms);
+            let rem_ms = total_elapsed_ms.saturating_sub(total_accounted);
+            if rem_ms > 0 {
+                let end_day = ended_local.date();
+                self.advance_day(end_day);
+                if end_day >= self.day {
+                    self.used_ms = self.used_ms.saturating_add(rem_ms);
+                }
+            }
+        } else {
+            self.record_task_duration(ended_local.date(), elapsed);
+        }
+        self.maybe_persist(true);
+    }
+
+    /// Adds completed task `duration` on `day` (resetting first if `day > self.day`).
+    pub fn record_task_duration(&mut self, day: NaiveDate, duration: Duration) {
+        self.advance_day(day);
+        if day >= self.day {
+            let add_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+            self.used_ms = self.used_ms.saturating_add(add_ms);
+        }
+        self.maybe_persist(true);
+    }
+
+    /// Returns total recorded task hours on `day` (resets to `0.0` if `day > self.day`).
     pub fn used_hours(&mut self, day: NaiveDate) -> f64 {
         self.advance_day(day);
         self.used_ms as f64 / 3_600_000.0
@@ -458,6 +822,110 @@ pub trait HostCpuProbe: Send + Sync {
 /// Live host CPU probe backed by the worker's non-blocking telemetry sampler.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemHostCpuProbe;
+
+/// Subtracts the worker's own task process tree CPU% from global host CPU% on a `0..=100` scale.
+pub fn subtract_worker_tree_cpu_pct(
+    global_cpu_pct: f32,
+    worker_tree_cpu_pct_sum: f32,
+    logical_cpus: usize,
+) -> f32 {
+    let cpus = logical_cpus.max(1) as f32;
+    let tree_host_pct = if worker_tree_cpu_pct_sum.is_finite() {
+        worker_tree_cpu_pct_sum.max(0.0) / cpus
+    } else {
+        0.0
+    };
+    let global = if global_cpu_pct.is_finite() {
+        global_cpu_pct.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    (global - tree_host_pct).clamp(0.0, 100.0)
+}
+
+/// Stateful host CPU sampler that excludes the worker's own active task process trees.
+pub struct WorkerTreeCpuSampler {
+    sys: sysinfo::System,
+}
+
+impl std::fmt::Debug for WorkerTreeCpuSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerTreeCpuSampler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for WorkerTreeCpuSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkerTreeCpuSampler {
+    /// Initializes a persistent `sysinfo::System` CPU baseline so subsequent samples produce deltas.
+    pub fn new() -> Self {
+        let mut sys = sysinfo::System::new_with_specifics(
+            sysinfo::RefreshKind::nothing()
+                .with_cpu(sysinfo::CpuRefreshKind::nothing().with_cpu_usage()),
+        );
+        sys.refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing().with_cpu_usage());
+        Self { sys }
+    }
+
+    /// Samples global host CPU utilization minus all descendants of `root_task_pids`.
+    pub fn sample_external_cpu_pct(&mut self, root_task_pids: &[u32]) -> f32 {
+        self.sys
+            .refresh_cpu_specifics(sysinfo::CpuRefreshKind::nothing().with_cpu_usage());
+        let global = self.sys.global_cpu_usage();
+        let roots: Vec<sysinfo::Pid> = root_task_pids
+            .iter()
+            .copied()
+            .filter(|&pid| pid != 0)
+            .map(sysinfo::Pid::from_u32)
+            .collect();
+        if roots.is_empty() {
+            return if global.is_finite() {
+                global.clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+        }
+
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cpu(),
+        );
+        let procs = self.sys.processes();
+        let mut children_by_parent: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+        for (pid, proc_info) in procs {
+            if let Some(parent) = proc_info.parent() {
+                children_by_parent.entry(parent).or_default().push(*pid);
+            }
+        }
+        let mut visited = std::collections::HashSet::with_capacity(roots.len() * 4);
+        let mut queue = VecDeque::new();
+        for root in roots {
+            if visited.insert(root) {
+                queue.push_back(root);
+            }
+        }
+        let mut tree_sum = 0.0f32;
+        while let Some(pid) = queue.pop_front() {
+            if let Some(proc_info) = procs.get(&pid) {
+                tree_sum += proc_info.cpu_usage();
+            }
+            if let Some(children) = children_by_parent.get(&pid) {
+                for child in children {
+                    if visited.insert(*child) {
+                        queue.push_back(*child);
+                    }
+                }
+            }
+        }
+        subtract_worker_tree_cpu_pct(global, tree_sum, self.sys.cpus().len())
+    }
+}
 
 impl HostCpuProbe for SystemHostCpuProbe {
     fn probe_cpu_pct(&self) -> Option<f32> {
@@ -585,14 +1053,24 @@ impl BatteryProbe for SystemBatteryProbe {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemMeteredNetworkProbe;
 
+#[cfg(windows)]
+impl SystemMeteredNetworkProbe {
+    /// Queries Windows NLM cost once and returns `(classified_status, raw_cost)`.
+    pub fn probe_metered_with_raw(&self) -> (MeteredStatus, Option<u32>) {
+        let raw = windows_metered::query_windows_network_cost_raw();
+        let status = match raw {
+            Some(cost) => classify_windows_nlm_cost(cost),
+            None => MeteredStatus::Unknown,
+        };
+        (status, raw)
+    }
+}
+
 impl MeteredNetworkProbe for SystemMeteredNetworkProbe {
     fn probe_metered(&self) -> MeteredStatus {
         #[cfg(windows)]
         {
-            match windows_metered::query_windows_network_cost_raw() {
-                Some(cost) => classify_windows_nlm_cost(cost),
-                None => MeteredStatus::Unknown,
-            }
+            self.probe_metered_with_raw().0
         }
         #[cfg(target_os = "linux")]
         {
@@ -838,6 +1316,7 @@ pub struct LimitsEvaluator {
     limits: WorkerLimits,
     schedule: Option<HoursSchedule>,
     cpu: CpuAverager,
+    cpu_held: bool,
     budget: DailyTaskBudget,
     warned_metered_unknown: bool,
 }
@@ -845,19 +1324,59 @@ pub struct LimitsEvaluator {
 impl LimitsEvaluator {
     /// Builds a validated evaluator initialized on `initial_day`.
     pub fn new(limits: WorkerLimits, initial_day: NaiveDate) -> Result<Self, String> {
+        Self::with_budget_path(limits, initial_day, None)
+    }
+
+    /// Builds a validated evaluator initialized on `initial_day` with optional persistent budget file.
+    pub fn with_budget_path(
+        limits: WorkerLimits,
+        initial_day: NaiveDate,
+        budget_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
         limits.validate()?;
         let schedule = limits
             .hours
             .as_deref()
             .map(HoursSchedule::parse)
             .transpose()?;
+        let budget = match budget_path {
+            Some(path) => DailyTaskBudget::with_state_path(initial_day, path),
+            None => DailyTaskBudget::new(initial_day),
+        };
         Ok(Self {
             limits,
             schedule,
             cpu: CpuAverager::default(),
-            budget: DailyTaskBudget::new(initial_day),
+            cpu_held: false,
+            budget,
             warned_metered_unknown: false,
         })
+    }
+
+    /// Starts accounting wall-clock/monotonic runtime for an active task run.
+    pub fn begin_active_task(
+        &mut self,
+        run_id: u64,
+        started_local: NaiveDateTime,
+        started_at: Instant,
+    ) {
+        self.budget
+            .begin_active_task(run_id, started_local, started_at);
+    }
+
+    /// Finalizes accounting for a completed, cancelled, or handed-back active task run.
+    pub fn finish_active_task(
+        &mut self,
+        run_id: u64,
+        ended_local: NaiveDateTime,
+        elapsed: Duration,
+    ) {
+        self.budget.finish_active_task(run_id, ended_local, elapsed);
+    }
+
+    /// Flushes any dirty daily budget state to disk.
+    pub fn flush_budget(&mut self) {
+        self.budget.flush();
     }
 
     /// Replaces active contributor limits (e.g. from `limits set`) after validation.
@@ -870,6 +1389,9 @@ impl LimitsEvaluator {
             .transpose()?;
         if !limits.no_tasks_on_metered {
             self.warned_metered_unknown = false;
+        }
+        if limits.local_max_cpu_pct.is_none() {
+            self.cpu_held = false;
         }
         self.limits = limits;
         self.schedule = schedule;
@@ -900,14 +1422,43 @@ impl LimitsEvaluator {
         }
     }
 
+    fn update_cpu_hold(&mut self, now: Instant) -> Option<String> {
+        let Some(limit_pct) = self.limits.local_max_cpu_pct else {
+            self.cpu_held = false;
+            return None;
+        };
+        let avg = self.cpu.average(now)?;
+        let threshold = f32::from(limit_pct);
+        let release_below = (threshold - CPU_RELEASE_HYSTERESIS_PCT).max(0.0);
+        if self.cpu_held {
+            let cleared = if release_below > 0.0 {
+                avg < release_below
+            } else {
+                avg <= 0.0
+            };
+            if cleared {
+                self.cpu_held = false;
+            }
+        } else if avg > threshold {
+            self.cpu_held = true;
+        }
+        self.cpu_held.then(|| {
+            format!(
+                "30s average host CPU {avg:.1}% > limit {limit_pct}% (release < {release_below:.0}%)"
+            )
+        })
+    }
+
     /// Evaluates automatic hold limits against `sample`.
     pub fn evaluate(&mut self, sample: LimitSample) -> HoldEvaluation {
         let day = sample.local_now.date();
-        self.budget.advance_day(day);
+        self.budget
+            .account_active_tasks(sample.local_now, sample.now);
 
         if let Some(cpu_pct) = sample.host_cpu_pct {
             self.cpu.record(sample.now, cpu_pct);
         }
+        let cpu_hold_detail = self.update_cpu_hold(sample.now);
 
         let mut metered_unknown_notice = false;
         if self.limits.no_tasks_on_metered
@@ -973,20 +1524,15 @@ impl LimitsEvaluator {
             }
         }
 
-        if let Some(limit_pct) = self.limits.local_max_cpu_pct {
-            if let Some(avg) = self.cpu.average(sample.now) {
-                if avg > f32::from(limit_pct) {
-                    return HoldEvaluation {
-                        held: true,
-                        reason: Some("host cpu above limit".to_string()),
-                        local_detail: Some(format!(
-                            "30s average host CPU {avg:.1}% > limit {limit_pct}%"
-                        )),
-                        hand_back_running,
-                        metered_unknown_notice,
-                    };
-                }
-            }
+        // CPU holds never hand back running tasks (`design 0113` / oscillation guard).
+        if let Some(detail) = cpu_hold_detail {
+            return HoldEvaluation {
+                held: true,
+                reason: Some("host cpu above limit".to_string()),
+                local_detail: Some(detail),
+                hand_back_running: false,
+                metered_unknown_notice,
+            };
         }
 
         HoldEvaluation {
@@ -1269,8 +1815,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn t4_live_windows_network_cost_and_battery_probe() {
-        let raw_cost = windows_metered::query_windows_network_cost_raw();
-        let metered = SystemMeteredNetworkProbe.probe_metered();
+        let (metered, raw_cost) = SystemMeteredNetworkProbe.probe_metered_with_raw();
         let battery = SystemBatteryProbe.probe_battery();
         println!(
             "T4_WINDOWS_LIVE: raw_nlm_cost={raw_cost:?} metered={metered:?} battery={battery:?}"
@@ -1280,5 +1825,284 @@ mod tests {
         } else {
             assert_eq!(metered, MeteredStatus::Unknown);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_daily_budget_refuses_symlinks_and_enforces_0600_mode() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("daily-budget.json");
+        let day = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+
+        let mut eval = LimitsEvaluator::with_budget_path(
+            WorkerLimits::default(),
+            day,
+            Some(real_path.clone()),
+        )
+        .unwrap();
+        eval.record_completed_task(day, Duration::from_secs(60));
+        let mode = std::fs::metadata(&real_path).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "budget file must have mode 0600");
+
+        let link_path = dir.path().join("daily-budget-link.json");
+        symlink(&real_path, &link_path).unwrap();
+        assert!(
+            load_persisted_budget(&link_path).is_err(),
+            "symlink budget path must be refused"
+        );
+    }
+
+    #[test]
+    fn daily_cap_counts_running_tasks_splits_midnight_and_counts_cancelled() {
+        let day1 = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+        let t0 = Instant::now();
+        let limits = WorkerLimits {
+            max_task_hours_per_day: Some(0.1), // 6 minutes
+            ..Default::default()
+        };
+        let mut eval = LimitsEvaluator::new(limits, day1).unwrap();
+
+        // Task starts at 23:55 on day1; after 4 running minutes at 23:59 it has not exceeded 6m.
+        eval.begin_active_task(1, dt(2026, 11, 26, 23, 55), t0);
+        let before_cap = eval.evaluate(LimitSample {
+            now: t0 + Duration::from_secs(240),
+            local_now: dt(2026, 11, 26, 23, 59),
+            host_cpu_pct: None,
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(!before_cap.held);
+        assert!(
+            (eval.used_task_hours_today(day1) - (4.0 / 60.0)).abs() < 0.002,
+            "running task must accrue 4m on day1, got {}",
+            eval.used_task_hours_today(day1)
+        );
+
+        // 3 minutes later at 00:02 on day2, total runtime would be 7m if unsplit, which MUST
+        // split cleanly: 5m on day1 (23:55..24:00) and 2m on day2 (00:00..00:02 < 6m cap)!
+        let cross_midnight = eval.evaluate(LimitSample {
+            now: t0 + Duration::from_secs(420),
+            local_now: dt(2026, 11, 27, 0, 2),
+            host_cpu_pct: None,
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(
+            !cross_midnight.held,
+            "2m after midnight must not trip 6m day2 cap: {cross_midnight:?}"
+        );
+        assert!(
+            (eval.used_task_hours_today(day2) - (2.0 / 60.0)).abs() < 0.002,
+            "expected ~2m accrued on day2 after midnight split, got {}",
+            eval.used_task_hours_today(day2)
+        );
+
+        // Task is cancelled / handed back at 00:07 (5m more -> 7m total on day2 > 6m cap).
+        eval.finish_active_task(1, dt(2026, 11, 27, 0, 7), Duration::from_secs(720));
+        let after_cancel = eval.evaluate(LimitSample {
+            now: t0 + Duration::from_secs(720),
+            local_now: dt(2026, 11, 27, 0, 7),
+            host_cpu_pct: None,
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(
+            after_cancel.held,
+            "cancelled/handed-back runtime must push day2 over 6m cap"
+        );
+        assert_eq!(
+            after_cancel.reason.as_deref(),
+            Some("daily task-hours cap reached")
+        );
+    }
+
+    #[test]
+    fn daily_cap_persists_across_restart_and_resists_clock_step_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("daily-budget.json");
+        let day1 = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 11, 27).unwrap();
+        let limits = WorkerLimits {
+            max_task_hours_per_day: Some(0.1), // 6 minutes
+            ..Default::default()
+        };
+
+        // First worker run records 7 minutes on day2 and persists.
+        let mut eval1 =
+            LimitsEvaluator::with_budget_path(limits.clone(), day2, Some(state_path.clone()))
+                .unwrap();
+        eval1.record_completed_task(day2, Duration::from_secs(420));
+        assert!(eval1.used_task_hours_today(day2) >= 0.1);
+
+        // Restart on same day2 reloads persisted usage and refuses further tasks immediately.
+        let mut eval_same_day =
+            LimitsEvaluator::with_budget_path(limits.clone(), day2, Some(state_path.clone()))
+                .unwrap();
+        let res_same = eval_same_day.evaluate(LimitSample {
+            now: Instant::now(),
+            local_now: dt(2026, 11, 27, 9, 0),
+            host_cpu_pct: None,
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(
+            res_same.held,
+            "persisted exhausted daily budget must stay held after same-day restart"
+        );
+
+        // Clock steps backward from day2 to day1: must NOT reset persisted day2 usage!
+        let mut eval_step_back =
+            LimitsEvaluator::with_budget_path(limits, day1, Some(state_path)).unwrap();
+        let res_back = eval_step_back.evaluate(LimitSample {
+            now: Instant::now(),
+            local_now: dt(2026, 11, 26, 23, 30),
+            host_cpu_pct: None,
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(
+            res_back.held,
+            "backward clock step must not reset persisted daily budget"
+        );
+    }
+
+    #[test]
+    fn cpu_limit_hysteresis_prevents_oscillation_near_threshold() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let t0 = Instant::now();
+        let mut eval = LimitsEvaluator::new(
+            WorkerLimits {
+                local_max_cpu_pct: Some(50),
+                hold_ends_tasks: false,
+                ..Default::default()
+            },
+            day,
+        )
+        .unwrap();
+
+        // Cross above 50% -> Held("host cpu above limit").
+        let r1 = eval.evaluate(LimitSample {
+            now: t0,
+            local_now: dt(2026, 11, 26, 12, 0),
+            host_cpu_pct: Some(65.0),
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(r1.held);
+        assert_eq!(r1.reason.as_deref(), Some("host cpu above limit"));
+        assert!(!r1.hand_back_running);
+
+        // Drop CPU to 45% (above limit - CPU_RELEASE_HYSTERESIS_PCT = 40%) over >30 s:
+        // average is now 45%, which MUST stay held without oscillating!
+        for step in [35u64, 45, 55, 65, 75] {
+            let r = eval.evaluate(LimitSample {
+                now: t0 + Duration::from_secs(step),
+                local_now: dt(2026, 11, 26, 12, 1),
+                host_cpu_pct: Some(45.0),
+                battery: BatteryStatus::OnAc,
+                metered: MeteredStatus::Unmetered,
+            });
+            assert!(
+                r.held,
+                "45% (>= 50 - {CPU_RELEASE_HYSTERESIS_PCT} = 40%) must remain held at +{step}s"
+            );
+            assert!(!r.hand_back_running);
+        }
+
+        // Drop CPU to 35% (< 40%) until 30 s average clears < 40% -> releases hold!
+        let mut released = false;
+        for step in [85u64, 95, 105, 115, 125] {
+            let r = eval.evaluate(LimitSample {
+                now: t0 + Duration::from_secs(step),
+                local_now: dt(2026, 11, 26, 12, 2),
+                host_cpu_pct: Some(35.0),
+                battery: BatteryStatus::OnAc,
+                metered: MeteredStatus::Unmetered,
+            });
+            if !r.held {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "dropping below 40% over 30s must release CPU hold"
+        );
+    }
+
+    #[test]
+    fn cpu_limit_never_hands_back_running_tasks_even_with_hold_ends_tasks() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let t0 = Instant::now();
+        let mut eval = LimitsEvaluator::new(
+            WorkerLimits {
+                local_max_cpu_pct: Some(50),
+                no_tasks_on_battery: true,
+                hold_ends_tasks: true,
+                ..Default::default()
+            },
+            day,
+        )
+        .unwrap();
+
+        // CPU spike holds new tasks, keeps hysteresis, and NEVER sets hand_back_running=true.
+        let r_spike = eval.evaluate(LimitSample {
+            now: t0,
+            local_now: dt(2026, 11, 26, 12, 0),
+            host_cpu_pct: Some(80.0),
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(r_spike.held);
+        assert_eq!(r_spike.reason.as_deref(), Some("host cpu above limit"));
+        assert!(
+            !r_spike.hand_back_running,
+            "CPU limit must never hand back running tasks even when --hold-ends-tasks is enabled"
+        );
+
+        let r_hyst = eval.evaluate(LimitSample {
+            now: t0 + Duration::from_secs(40),
+            local_now: dt(2026, 11, 26, 12, 1),
+            host_cpu_pct: Some(44.0),
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        let r_hyst2 = eval.evaluate(LimitSample {
+            now: t0 + Duration::from_secs(75),
+            local_now: dt(2026, 11, 26, 12, 1),
+            host_cpu_pct: Some(44.0),
+            battery: BatteryStatus::OnAc,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(r_hyst.held && r_hyst2.held);
+        assert!(!r_hyst2.hand_back_running);
+
+        // Battery hold with `--hold-ends-tasks` STILL hands back running tasks as expected.
+        let r_batt = eval.evaluate(LimitSample {
+            now: t0 + Duration::from_secs(80),
+            local_now: dt(2026, 11, 26, 12, 2),
+            host_cpu_pct: Some(10.0),
+            battery: BatteryStatus::OnBattery,
+            metered: MeteredStatus::Unmetered,
+        });
+        assert!(r_batt.held);
+        assert_eq!(r_batt.reason.as_deref(), Some("on battery"));
+        assert!(r_batt.hand_back_running);
+    }
+
+    #[test]
+    fn subtract_worker_tree_cpu_pct_excludes_own_task_load() {
+        // 8 logical CPUs: task tree uses 320% single-core sum = 40% of total host capacity.
+        // Global host CPU = 75% => external non-worker CPU = 35% (< 50% threshold).
+        let adjusted = subtract_worker_tree_cpu_pct(75.0, 320.0, 8);
+        assert!(
+            (adjusted - 35.0).abs() < 0.01,
+            "expected 35.0% external CPU, got {adjusted}"
+        );
+        // Never goes negative if process delta lags slightly ahead of global reading.
+        assert_eq!(subtract_worker_tree_cpu_pct(20.0, 500.0, 4), 0.0);
     }
 }

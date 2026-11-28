@@ -694,12 +694,34 @@ pub(super) async fn run_worker(
             persist_worker_limits_to_toml(&path, limits).map(|()| Some(path.clone()))
         }))
     });
+    let budget_dir = config_write_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .or_else(crate::config::default_oxideswarm_dir);
+    let daily_budget_path = budget_dir.map(|dir| {
+        let file_name = match config
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => format!(
+                "{}.daily-budget.json",
+                rusty_grid_worker::control::sanitize_endpoint_segment(name)
+            ),
+            None => "daily-budget.json".to_string(),
+        };
+        dir.join(file_name)
+    });
     config = config
         .with_control_endpoint(control_endpoint)
         .with_initial_limits(initial_limits)
         .with_hold_ends_tasks(resolved_limits.hold_ends_tasks)
         .with_control_config_path(config_write_path)
-        .with_limit_persist_hook(persist_hook);
+        .with_limit_persist_hook(persist_hook)
+        .with_daily_budget_path(daily_budget_path);
 
     let mut client = WorkerClient::new(config);
     if let Err(e) = client.validate_isolation_config() {
@@ -726,6 +748,11 @@ pub(super) async fn run_worker(
         eprintln!(
             "Warning: host battery and thermal protection is disabled (RUSTY_GRID_NO_BATTERY); this worker will accept tasks regardless of battery level or thermal state"
         );
+        if resolved_limits.no_tasks_on_battery {
+            eprintln!(
+                "Warning: --no-tasks-on-battery is ignored while RUSTY_GRID_NO_BATTERY is enabled"
+            );
+        }
     }
     match peer_outcome {
         PeerSecretOutcome::Authenticated => println!("Cluster authentication: enabled"),

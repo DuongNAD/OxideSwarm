@@ -442,9 +442,145 @@ fn p2p_target_display(ticket: &str) -> String {
 }
 
 impl WorkerClient {
-    /// Evaluates active D1 contributor limits (optionally syncing updated `limits set` config)
-    /// and updates [`ControlHandle::set_held_with_detail`].
+    pub(super) fn spawn_limits_probe_poller(&self) -> tokio::task::JoinHandle<()> {
+        let control = Arc::clone(&self.control);
+        let active_task_table = Arc::clone(&self.active_task_table);
+        let cached_probes = Arc::clone(&self.cached_limit_probes);
+        let limits_reeval_notify = Arc::clone(&self.limits_reeval_notify);
+        let probe_refresh_notify = Arc::clone(&self.probe_refresh_notify);
+        let battery_probe = self.battery_probe.clone();
+        let metered_probe = Arc::clone(&self.metered_probe);
+        let cpu_probe = self.cpu_probe.clone();
+        let interval = self
+            .config
+            .limit_eval_interval
+            .max(Duration::from_millis(50));
+
+        tokio::spawn(async move {
+            let tree_sampler = Arc::new(std::sync::Mutex::new(
+                crate::limits::WorkerTreeCpuSampler::new(),
+            ));
+            let mut battery_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut metered_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut cpu_inflight: Option<tokio::task::JoinHandle<()>> = None;
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                let lim = control.limits();
+                let need_battery = lim.no_tasks_on_battery.unwrap_or(false);
+                let need_metered = lim.no_tasks_on_metered.unwrap_or(false);
+                let need_cpu = lim.local_max_cpu_pct.is_some();
+
+                if need_battery
+                    && battery_inflight
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    if let Some(probe) = battery_probe.as_ref().map(Arc::clone) {
+                        let cache = Arc::clone(&cached_probes);
+                        let notify = Arc::clone(&limits_reeval_notify);
+                        battery_inflight = Some(tokio::spawn(async move {
+                            let val = tokio::task::spawn_blocking(move || probe.probe_battery())
+                                .await
+                                .unwrap_or(crate::limits::BatteryStatus::Unknown);
+                            if let Ok(mut guard) = cache.lock() {
+                                guard.battery = val;
+                            }
+                            notify.notify_one();
+                        }));
+                    }
+                }
+
+                if need_metered
+                    && metered_inflight
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    let probe = Arc::clone(&metered_probe);
+                    let cache = Arc::clone(&cached_probes);
+                    let notify = Arc::clone(&limits_reeval_notify);
+                    metered_inflight = Some(tokio::spawn(async move {
+                        let val = tokio::task::spawn_blocking(move || probe.probe_metered())
+                            .await
+                            .unwrap_or(crate::limits::MeteredStatus::Unknown);
+                        if let Ok(mut guard) = cache.lock() {
+                            guard.metered = val;
+                        }
+                        notify.notify_one();
+                    }));
+                }
+
+                if need_cpu
+                    && cpu_inflight
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    let cache = Arc::clone(&cached_probes);
+                    let notify = Arc::clone(&limits_reeval_notify);
+                    if let Some(probe) = cpu_probe.as_ref().map(Arc::clone) {
+                        cpu_inflight = Some(tokio::spawn(async move {
+                            let val = tokio::task::spawn_blocking(move || probe.probe_cpu_pct())
+                                .await
+                                .ok()
+                                .flatten();
+                            if let Ok(mut guard) = cache.lock() {
+                                guard.host_cpu_pct = val;
+                            }
+                            notify.notify_one();
+                        }));
+                    } else {
+                        let root_pids: Vec<u32> = {
+                            let table = active_task_table.read().await;
+                            table
+                                .values()
+                                .map(|h| h.child_pid.load(Ordering::Acquire))
+                                .filter(|&p| p != 0)
+                                .collect()
+                        };
+                        let sampler = Arc::clone(&tree_sampler);
+                        cpu_inflight = Some(tokio::spawn(async move {
+                            let val = tokio::task::spawn_blocking(move || {
+                                sampler
+                                    .lock()
+                                    .ok()
+                                    .map(|mut s| s.sample_external_cpu_pct(&root_pids))
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Ok(mut guard) = cache.lock() {
+                                guard.host_cpu_pct = val;
+                            }
+                            notify.notify_one();
+                        }));
+                    }
+                }
+
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = probe_refresh_notify.notified() => {}
+                }
+            }
+        })
+    }
+
+    fn limits_probe_needs(&self) -> (bool, bool, bool) {
+        let Ok(eval) = self.limits_evaluator.lock() else {
+            return (false, false, false);
+        };
+        let lim = eval.limits();
+        (
+            lim.no_tasks_on_battery,
+            lim.no_tasks_on_metered,
+            lim.local_max_cpu_pct.is_some(),
+        )
+    }
+
+    /// Evaluates active D1 contributor limits from cached OS probes (optionally syncing updated
+    /// `limits set` config) and updates [`ControlHandle::set_held_with_detail`].
     pub(super) async fn sync_and_evaluate_limits(&self, sync_from_control: bool) {
+        let prev_needs = self.limits_probe_needs();
         if sync_from_control {
             let latest = crate::limits::WorkerLimits::from_control_config(&self.control.limits());
             if let Ok(mut eval) = self.limits_evaluator.lock() {
@@ -454,51 +590,29 @@ impl WorkerClient {
             }
         }
 
-        let (need_battery, need_metered, need_cpu) = {
-            let Ok(eval) = self.limits_evaluator.lock() else {
-                return;
-            };
-            let lim = eval.limits();
-            (
-                lim.no_tasks_on_battery,
-                lim.no_tasks_on_metered,
-                lim.local_max_cpu_pct.is_some(),
-            )
-        };
+        let (need_battery, need_metered, need_cpu) = self.limits_probe_needs();
+        if (need_battery, need_metered, need_cpu) != prev_needs {
+            self.probe_refresh_notify.notify_one();
+        }
 
-        let battery = if need_battery {
-            if let Some(probe) = self.battery_probe.as_ref().map(Arc::clone) {
-                tokio::task::spawn_blocking(move || probe.probe_battery())
-                    .await
-                    .unwrap_or(crate::limits::BatteryStatus::Unknown)
-            } else {
-                crate::limits::BatteryStatus::Unknown
-            }
-        } else {
-            crate::limits::BatteryStatus::Unknown
-        };
-
-        let metered = if need_metered {
-            let probe = Arc::clone(&self.metered_probe);
-            tokio::task::spawn_blocking(move || probe.probe_metered())
-                .await
-                .unwrap_or(crate::limits::MeteredStatus::Unknown)
-        } else {
-            crate::limits::MeteredStatus::Unknown
-        };
-
-        let host_cpu_pct = if need_cpu {
-            self.cpu_probe.probe_cpu_pct()
-        } else {
-            None
-        };
-
+        let cached = *self
+            .cached_limit_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let sample = crate::limits::LimitSample {
             now: std::time::Instant::now(),
             local_now: self.local_clock.local_now(),
-            host_cpu_pct,
-            battery,
-            metered,
+            host_cpu_pct: if need_cpu { cached.host_cpu_pct } else { None },
+            battery: if need_battery {
+                cached.battery
+            } else {
+                crate::limits::BatteryStatus::Unknown
+            },
+            metered: if need_metered {
+                cached.metered
+            } else {
+                crate::limits::MeteredStatus::Unknown
+            },
         };
         let eval_res = {
             let Ok(mut eval) = self.limits_evaluator.lock() else {
@@ -1307,6 +1421,7 @@ impl WorkerClient {
                             }
                         }
                         Ok(crate::control::ControlEvent::LimitsUpdated) => {
+                            self.probe_refresh_notify.notify_one();
                             self.sync_and_evaluate_limits(true).await;
                             if self.should_reconnect_after_hold_clears(&session).await {
                                 info!(
