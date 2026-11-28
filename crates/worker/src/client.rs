@@ -165,12 +165,37 @@ pub const MOBILE_TELEMETRY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 /// re-reads it.
 pub const MOBILE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Aborts the wrapped task when dropped.
-struct AbortOnDrop(JoinHandle<()>);
+/// Aborts the wrapped task when dropped unless gracefully awaited via [`AbortOnDrop::shutdown_gracefully`].
+pub(super) struct AbortOnDrop(Option<JoinHandle<()>>);
+
+impl AbortOnDrop {
+    pub(super) fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.0.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    async fn shutdown_gracefully(
+        mut self,
+        stop_tx: &tokio::sync::watch::Sender<bool>,
+        timeout: Duration,
+    ) {
+        let _ = stop_tx.send(true);
+        if let Some(handle) = self.0.as_mut() {
+            if tokio::time::timeout(timeout, handle).await.is_ok() {
+                self.0 = None;
+            }
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -1806,7 +1831,7 @@ impl WorkerClient {
             let portal_shutdown_rx = shutdown_rx.clone();
             let beacon_ref = Arc::clone(&self.master_beacon);
             let secret = self.config.cluster_secret.clone();
-            AbortOnDrop(tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 spawn_worker_redirection_portal_with_secret(
                     portal_port,
                     beacon_ref,
@@ -1824,7 +1849,7 @@ impl WorkerClient {
             && !self.config.no_battery
             && self.mobile.snapshot().is_some())
         .then(|| {
-            AbortOnDrop(spawn_mobile_poller(
+            AbortOnDrop::new(spawn_mobile_poller(
                 self.mobile.clone(),
                 MOBILE_POLL_INTERVAL,
                 detect_live_mobile_status,
@@ -1868,8 +1893,10 @@ impl WorkerClient {
         });
 
         let (initial_ready_tx, initial_ready_rx) = tokio::sync::oneshot::channel();
-        let _limits_probe_poller =
-            AbortOnDrop(self.spawn_limits_probe_poller(Some(initial_ready_tx)));
+        let (poller_shutdown_tx, poller_shutdown_rx) = watch::channel(false);
+        let limits_probe_poller = AbortOnDrop::new(
+            self.spawn_limits_probe_poller(Some(initial_ready_tx), poller_shutdown_rx),
+        );
         {
             let probe_wait = tokio::time::timeout(Duration::from_secs(1), initial_ready_rx);
             tokio::select! {
@@ -2032,6 +2059,10 @@ impl WorkerClient {
                 handle.abort();
             }
         }
+
+        limits_probe_poller
+            .shutdown_gracefully(&poller_shutdown_tx, Duration::from_secs(2))
+            .await;
 
         let final_persist = self
             .limits_evaluator

@@ -457,6 +457,7 @@ impl WorkerClient {
     pub(super) fn spawn_limits_probe_poller(
         &self,
         mut initial_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let control = Arc::clone(&self.control);
         let active_task_table = Arc::clone(&self.active_task_table);
@@ -505,6 +506,9 @@ impl WorkerClient {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
                 let lim = control.limits();
                 let need_battery = lim.no_tasks_on_battery.unwrap_or(false);
                 let need_metered = lim.no_tasks_on_metered.unwrap_or(false);
@@ -670,6 +674,12 @@ impl WorkerClient {
                 }
 
                 tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
                     _ = tick.tick() => {}
                     _ = probe_refresh_notify.notified() => {
                         // Force immediate refresh when limit needs change.
@@ -678,6 +688,19 @@ impl WorkerClient {
                         last_cpu_poll = None;
                     }
                 }
+            }
+
+            if let Some(h) = battery_inflight.take() {
+                h.abort();
+            }
+            if let Some(h) = metered_inflight.take() {
+                h.abort();
+            }
+            if let Some(h) = cpu_inflight.take() {
+                h.abort();
+            }
+            if let Some(handle) = persist_inflight.take() {
+                let _ = handle.await;
             }
         })
     }
@@ -1325,7 +1348,7 @@ impl WorkerClient {
                 )
                 .await
             {
-                _handback_guards.push(AbortOnDrop(h));
+                _handback_guards.push(AbortOnDrop::new(h));
             }
         }
         let mut pending_resume_reconnect = false;
@@ -1346,7 +1369,7 @@ impl WorkerClient {
             let flush_blob_client = blob_client.clone();
             let flush_runner = Arc::clone(&self.runner);
             let flush_outbox = Arc::clone(&self.pending_resume_outbox);
-            AbortOnDrop(tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 for (tid, cp_msg) in buffered_checkpoints {
                     let cancelled = flush_outbox
                         .lock()
@@ -1533,8 +1556,8 @@ impl WorkerClient {
                                 )
                                 .await
                             {
-                                _handback_guards.retain(|g| !g.0.is_finished());
-                                _handback_guards.push(AbortOnDrop(h));
+                                _handback_guards.retain(|g| !g.is_finished());
+                                _handback_guards.push(AbortOnDrop::new(h));
                             }
                         }
                         Ok(crate::control::ControlEvent::LimitsUpdated) => {

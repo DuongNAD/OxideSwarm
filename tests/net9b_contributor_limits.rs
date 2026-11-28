@@ -868,7 +868,10 @@ async fn net9b_daily_budget_persists_across_worker_restart() {
     // Gracefully stop the first worker instance and wait for exit so budget flushes to disk.
     if let Some((tx, handle)) = cluster.workers.pop() {
         let _ = tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("first worker should shut down within 5s")
+            .expect("first worker task should exit cleanly");
     }
     assert!(budget_path.exists(), "budget file should be created");
 
