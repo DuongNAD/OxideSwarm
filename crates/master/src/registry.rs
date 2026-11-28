@@ -3689,10 +3689,17 @@ mod tests {
             .await
             .unwrap();
         assert!(hold_same <= PAUSE_HOLDBACK_BASE);
+        let expired = match Instant::now().checked_sub(Duration::from_secs(1)) {
+            Some(t) => t,
+            None => {
+                let past = Instant::now();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                past
+            }
+        };
         {
             let mut inner = registry.inner.write().await;
-            inner.workers.get_mut(&w_id).unwrap().gpu_paused_until =
-                Some(Instant::now() - Duration::from_secs(1));
+            inner.workers.get_mut(&w_id).unwrap().gpu_paused_until = Some(expired);
         }
         let hold2 = registry
             .record_gpu_pause_holdback(&w_id, Some(reg.session_id))

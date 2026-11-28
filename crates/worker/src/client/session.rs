@@ -406,6 +406,18 @@ impl Session {
         }
     }
 
+    /// Waits briefly for queued data frames (such as pause hand-back results) to leave `data_tx`
+    /// before closing a session to re-register.
+    pub(super) async fn flush_data_queue_briefly(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.data_tx.capacity() < self.data_tx.max_capacity()
+            && !self.data_tx.is_closed()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Ends the session: queues `farewell`, lets the writers flush the control queue (bounded),
     /// then stops every lane task, which closes the sockets.
     pub(super) async fn close(mut self, farewell: Option<WorkerMessage>) {
@@ -1251,6 +1263,7 @@ impl WorkerClient {
                                 worker_id = %worker_id,
                                 "Worker resumed after pause hand-back finished; closing session to re-register immediately"
                             );
+                            session.flush_data_queue_briefly(Duration::from_millis(500)).await;
                             self.resume_reconnect_pending.store(true, Ordering::Release);
                             break Err(GridError::ConnectionClosed);
                         }
@@ -1259,6 +1272,20 @@ impl WorkerClient {
 
                 _ = pause_expiry_tick.tick() => {
                     let _ = self.control.check_pause_expiry();
+                    if pending_resume_reconnect && handback_in_flight.load(Ordering::Acquire) == 0 {
+                        pending_resume_reconnect = false;
+                        if self.control.take_session_pause_rejection()
+                            && self.active_task_table.read().await.is_empty()
+                        {
+                            info!(
+                                worker_id = %worker_id,
+                                "Worker resumed after pause hand-back finished; closing session to re-register immediately"
+                            );
+                            session.flush_data_queue_briefly(Duration::from_millis(500)).await;
+                            self.resume_reconnect_pending.store(true, Ordering::Release);
+                            break Err(GridError::ConnectionClosed);
+                        }
+                    }
                 }
 
                 // External shutdown signal

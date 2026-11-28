@@ -800,3 +800,84 @@ async fn t3_windows_named_pipe_cli_round_trip() {
     let saved = std::fs::read_to_string(&cfg_path).unwrap();
     assert!(saved.contains("no_gpu_tasks = true"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t2_resume_during_active_pause_handback_reregisters_immediately() {
+    let mut cluster = Net9Cluster::new().await;
+    let ctrl_dir = tempfile::tempdir().expect("ctrl dir");
+    let sock_path = ctrl_dir.path().join("priv").join("resume-hb.control.sock");
+    let ep = ControlEndpoint::UnixSocket(sock_path.clone());
+
+    cluster.spawn_worker(
+        "resume-hb-box",
+        1,
+        true,
+        Some(ep.clone()),
+        WorkerLimitsConfig::default(),
+        None,
+    );
+    cluster.wait_for_workers(1).await;
+    wait_for_file(&sock_path).await;
+
+    let state_dir = tempfile::tempdir().expect("state dir");
+    let pid_file = state_dir.path().join("task.pid");
+    let cmd = format!(
+        "if [ -f '{p}' ]; then echo resumed_tid1_ok; else trap 'sleep 0.7; exit 0' TERM; echo $$ > '{p}'; sleep 30; fi",
+        p = pid_file.display()
+    );
+    let tid1 = cluster
+        .master
+        .submit_task(Task::new(
+            TaskSpec::command("sh", vec!["-c".into(), cmd]),
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        ))
+        .await
+        .expect("submit task 1");
+    wait_for_file(&pid_file).await;
+
+    // Pause to start the 5 s hand-back while the child sleeps 0.7 s inside its TERM handler.
+    let pause_resp = send_control_request(
+        &ep,
+        &ControlRequest::Pause {
+            until_epoch_ms: None,
+            reason: Some("during-handback".into()),
+        },
+    )
+    .await
+    .expect("pause during handback");
+    assert!(matches!(pause_resp, ControlResponse::Ok { .. }));
+
+    // Resume while handback_in_flight > 0, then wait for hand-back to finish and close session.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resume_resp = send_control_request(&ep, &ControlRequest::Resume)
+        .await
+        .expect("resume during handback");
+    assert!(matches!(resume_resp, ControlResponse::Ok { .. }));
+
+    // First verify tid1 finishes on the immediately re-registered worker (< 60s hold-back),
+    // and also run a fresh task tid2 to prove worker eligibility is fully restored.
+    let res1 = cluster
+        .master
+        .wait_task(tid1, Some(Duration::from_secs(12)))
+        .await
+        .expect("handed-back tid1 must rerun promptly once worker resumes (< 60s)");
+    assert_eq!(res1.exit_code, 0, "{:?}", res1.error);
+    assert!(res1.stdout_str().contains("resumed_tid1_ok"));
+
+    let tid2 = cluster
+        .master
+        .submit_task(Task::new(
+            TaskSpec::command("echo", vec!["resumed-during-handback-ok".into()]),
+            TaskRequirements::generic(1, 60).with_max_retries(0),
+        ))
+        .await
+        .expect("submit task 2");
+    let res2 = cluster
+        .master
+        .wait_task(tid2, Some(Duration::from_secs(10)))
+        .await
+        .expect("worker resumed during handback must accept new work (< 60s)");
+    assert_eq!(res2.exit_code, 0, "{:?}", res2.error);
+    assert!(res2.stdout_str().contains("resumed-during-handback-ok"));
+}

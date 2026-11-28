@@ -1397,7 +1397,7 @@ mod windows_ipc {
         .map_err(|e| format!("failed to create named pipe {pipe_name}: {e}"))
     }
 
-    async fn next_pipe_server(
+    pub(super) async fn next_pipe_server(
         pipe_name: &str,
         shutdown_rx: &mut watch::Receiver<bool>,
     ) -> Result<Option<NamedPipeServer>, String> {
@@ -1870,7 +1870,29 @@ mod tests {
         // Second `first_pipe_instance` on the same pipe name must fail visibly.
         assert!(windows_ipc::create_private_pipe_server(&pipe_name, true).is_err());
 
-        // Early-closing clients must not trap `run_windows_server` in a busy loop or break next RPCs.
+        // Early-closing clients before `connect().await` deterministically trigger `ERROR_NO_DATA`
+        // (232) on `ConnectNamedPipe`; verify `connect()` error + `disconnect()` + `next_pipe_server`
+        // recycles cleanly, and stress live server against early client drops too.
+        {
+            const WIN_ERROR_NO_DATA: i32 = 232;
+            let recycle_pipe = format!(r"\\.\pipe\oxideswarm-recycle-{}", Uuid::new_v4());
+            let srv_inst = windows_ipc::create_private_pipe_server(&recycle_pipe, true).unwrap();
+            let c = ClientOptions::new().open(&recycle_pipe).unwrap();
+            drop(c);
+            let err = srv_inst
+                .connect()
+                .await
+                .expect_err("client closing before connect() must yield ERROR_NO_DATA");
+            assert_eq!(err.raw_os_error(), Some(WIN_ERROR_NO_DATA));
+            let _ = srv_inst.disconnect();
+            let (_, mut rx_recycle) = watch::channel(false);
+            let recycled = windows_ipc::next_pipe_server(&recycle_pipe, &mut rx_recycle)
+                .await
+                .unwrap()
+                .expect("recycled pipe instance created");
+            drop(srv_inst);
+            drop(recycled);
+        }
         for _ in 0..3 {
             let open_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let early = loop {
